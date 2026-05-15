@@ -23,6 +23,14 @@
 8. **Numbers**: the benchmark table.
 9. **What's next**: cross-page chunkers, ANN index for >1M chunks.
 
-## Stub status
+## Status
 
-This file is a placeholder. Once the article is drafted, replace this overview with the actual Medium-ready Markdown.
+Live draft at [`01-claudebase-story.md`](01-claudebase-story.md) — extended to ~7965 words / 14 sections. Structure:
+
+- §1-5 — maintainer's origin story (idea → BM25 iter-1 → hybrid iter-2 → 5-step walkthrough)
+- §6 — **Internals for the embedding engineers**: end-to-end data flow diagram, encoder pipeline (XLM-RoBERTa SentencePiece → mean-pooling → L2-normalize), L2-cosine equivalence proof with worked example, exhaustive K-NN vs HNSW math, RRF arithmetic with worked numbers, the Rust fusion loop, the SQLite schema verbatim, failure-mode taxonomy by retrieval mode, 1M+-scale scaling deltas
+- §7-9 — decisions / numbers / migration / what's next (original v1 closing)
+- §10-12 — **Claude Code instance addendum**: a field report with 10 live queries (`/qa-cycle`-style evidence), Claude Code's verdict + recommendation tiers, five upgrades
+- §13 — try it (install + first query)
+
+The numbers and code snippets are derived from `../architecture/technical-decisions.md` and `../benchmarks/2026-05-10-baseline.md` — those remain the canonical engineering record if anything drifts.

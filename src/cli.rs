@@ -40,6 +40,48 @@ impl Default for SearchMode {
     }
 }
 
+/// Corpus selector for the standalone `search` subcommand (Slice 6 of
+/// agent-insights-base). `books` opens `index.db`, `insights` opens
+/// `insights.db`, `all` opens BOTH and cross-corpus RRF-fuses ranked
+/// hits with a `source_corpus` JSON field on each hit.
+///
+/// When `--corpus` is set it overrides `--db-name`. When both are set
+/// the CLI emits a stderr warning and the `--corpus` selection wins —
+/// this is the deliberate forward-compat path (tests that hardcode
+/// `--db-name` continue to work; new agent prompts use `--corpus`).
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Corpus {
+    /// User-curated books / regulations / docs (the default — `index.db`).
+    Books,
+    /// Agent-written cognitive insights (`insights.db`).
+    Insights,
+    /// Cross-corpus RRF fusion of both — hits carry `source_corpus`.
+    All,
+}
+
+/// Salience tag per cognitive-self-check rule. Drives TTL on the insights
+/// corpus: `high` survives forever, `medium` 1 year, `low` 90 days. The
+/// tag is stored verbatim as TEXT in `documents.salience` (schema v4).
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Salience {
+    /// Load-bearing for the whole artifact; retained indefinitely.
+    High,
+    /// Affects correctness of a slice/decision; retained ~1 year.
+    Medium,
+    /// Context-setting only; retained ~90 days then GC'd.
+    Low,
+}
+
+impl Salience {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Salience::High => "high",
+            Salience::Medium => "medium",
+            Salience::Low => "low",
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ProjectRootError {
     #[error("project-root must resolve under current working directory")]
@@ -96,6 +138,34 @@ pub struct IngestArgs {
     pub json: bool,
 }
 
+/// Which corpus file to open under `<project>/.claude/knowledge/`.
+/// `index.db` (default) is the user-curated books corpus.
+/// `insights.db` is the agent-written insights corpus (slice 1+).
+/// Anything else: must end in `.db` and contain no path separators.
+const DEFAULT_DB_NAME: &str = "index.db";
+
+/// Validate a `db_name` value: must end in `.db` and contain no path
+/// separators or parent-directory escapes. The argument is then joined
+/// with `<project>/.claude/knowledge/` to produce the final path —
+/// rejecting traversal patterns here keeps the security backbone (per
+/// `resolve_project_root`) intact for the combined path.
+pub fn validate_db_name(name: &str) -> Result<&str, &'static str> {
+    if name.is_empty() {
+        return Err("db_name must not be empty");
+    }
+    if !name.ends_with(".db") {
+        return Err("db_name must end with `.db`");
+    }
+    if name.contains('/') || name.contains('\\') || name.contains("..") || name.starts_with('.') && name != "index.db" && name != "insights.db" {
+        // Allow only well-formed *.db names; reject anything with separators,
+        // double-dots, or hidden-file prefixes (except the two canonical names).
+        // The `.db` suffix dot is fine; the leading-dot check is for paths
+        // like `.malicious.db`. Permit `index.db` and `insights.db` explicitly.
+        return Err("db_name must be a bare filename ending in `.db`");
+    }
+    Ok(name)
+}
+
 #[derive(Args, Debug)]
 pub struct SearchArgs {
     /// Query string.
@@ -119,6 +189,16 @@ pub struct SearchArgs {
     pub mode: SearchMode,
     #[arg(long)]
     pub project_root: Option<PathBuf>,
+    /// Corpus file (under `<project>/.claude/knowledge/`). Default `index.db`
+    /// (user-curated books); `insights.db` for the agent-written insights corpus.
+    /// Overridden by `--corpus` when both are set.
+    #[arg(long, default_value = DEFAULT_DB_NAME)]
+    pub db_name: String,
+    /// Corpus selector (Slice 6): `books` (default), `insights`, or `all`.
+    /// `all` runs hybrid search against both corpora and RRF-fuses ranks
+    /// — each hit then carries a `source_corpus` field.
+    #[arg(long, value_enum)]
+    pub corpus: Option<Corpus>,
     #[arg(long)]
     pub json: bool,
 }
@@ -127,6 +207,9 @@ pub struct SearchArgs {
 pub struct ListArgs {
     #[arg(long)]
     pub project_root: Option<PathBuf>,
+    /// Corpus file — see `search --db-name`.
+    #[arg(long, default_value = DEFAULT_DB_NAME)]
+    pub db_name: String,
     #[arg(long)]
     pub json: bool,
 }
@@ -135,6 +218,9 @@ pub struct ListArgs {
 pub struct StatusArgs {
     #[arg(long)]
     pub project_root: Option<PathBuf>,
+    /// Corpus file — see `search --db-name`.
+    #[arg(long, default_value = DEFAULT_DB_NAME)]
+    pub db_name: String,
     #[arg(long)]
     pub json: bool,
 }
@@ -239,6 +325,9 @@ pub struct DeleteArgs {
     pub by_id: Option<i64>,
     #[arg(long)]
     pub project_root: Option<PathBuf>,
+    /// Corpus file — see `search --db-name`.
+    #[arg(long, default_value = DEFAULT_DB_NAME)]
+    pub db_name: String,
     #[arg(long)]
     pub json: bool,
 }
@@ -276,6 +365,273 @@ pub enum Command {
     /// schema. Re-parses each PDF via pdfium and populates pages without
     /// touching chunks_fts / chunks_vec — preserves embeddings.
     ReindexPages(ReindexPagesArgs),
+    /// Unified agent-insights subcommand tree (`create / search / list /
+    /// random / get`). Operates exclusively on `insights.db` — the books
+    /// corpus (`index.db`) is untouched. See
+    /// docs/design/agent-insights-base.md.
+    Insight(InsightArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct InsightArgs {
+    #[command(subcommand)]
+    pub sub: InsightSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum InsightSubcommand {
+    /// Persist a cognitive insight. Same body within (agent, sha256) over
+    /// the last 30 days is deduplicated.
+    Create(InsightCreateArgs),
+    /// Vector + lexical search against the insights corpus (hybrid by
+    /// default — BM25 ⊕ dense via RRF k=60, with auto-fallback to lexical
+    /// when the e5 encoder is unavailable).
+    Search(InsightSearchArgs),
+    /// List insights newest-first, 10 per page. `--offset 0` = latest 10,
+    /// `--offset 1` = next 10, and so on.
+    List(InsightListArgs),
+    /// Return one random insight uniformly sampled from the corpus.
+    Random(InsightRandomArgs),
+    /// Fetch one insight by integer `documents.id` or sha256 prefix
+    /// (≥4 hex chars matches the stored sha256 via LIKE 'prefix%').
+    Get(InsightGetArgs),
+    /// Garbage-collect insights past their salience-driven TTL.
+    /// salience=high retained indefinitely. medium retained 365 days.
+    /// low retained 90 days. Runs VACUUM after delete.
+    Gc(InsightGcArgs),
+    /// Delete one insight by integer `documents.id` (with chunks +
+    /// chunks_vec cascade). Refuses to delete non-insight rows.
+    Delete(InsightDeleteArgs),
+}
+
+/// `claudebase insight create "<body>"` — agent write surface for the
+/// insights corpus (schema v4). Persists one cognitive insight per call;
+/// same body within the same `(agent, sha256)` over the last 30 days is
+/// deduplicated by `find_recent_insight_by_sha`.
+///
+/// Body semantics:
+///   - positional `<body>` literal string
+///   - `-` as the positional → read stdin
+///   - omitted positional with piped stdin → read stdin
+///   - omitted positional on an interactive TTY → exits 2 with usage
+#[derive(Args, Debug)]
+pub struct InsightCreateArgs {
+    /// Insight body. Pass `-` or omit (with piped stdin) to read from stdin.
+    /// On an interactive TTY without a body, the command exits 2.
+    pub body: Option<String>,
+
+    /// Insight kind — open enum tied to docs/design/agent-insights-base.md.
+    /// Examples: agent-learned, self-bias-caught, peer-bias-observed,
+    /// red-team-objection, consolidator-drift, prediction-error,
+    /// assumption-falsified, plan-reality-gap, reflection-observation,
+    /// operator-correction.
+    #[arg(long = "type")]
+    pub kind: String,
+
+    /// Emitting agent name (planner, reflection, consolidator, red-team, ...).
+    #[arg(long)]
+    pub agent: String,
+
+    /// Claude Code session id for trace linking. Optional but recommended;
+    /// when absent the field stays NULL.
+    #[arg(long)]
+    pub session: Option<String>,
+
+    /// Feature slug this insight belongs to (matches .claude/plan.md feature).
+    #[arg(long)]
+    pub feature: Option<String>,
+
+    /// Salience tag per cognitive-self-check rule; drives retention TTL.
+    #[arg(long, value_enum, default_value_t = Salience::Medium)]
+    pub salience: Salience,
+
+    /// Path or anchor of the artifact the insight was extracted from
+    /// (e.g. `.claude/plan.md#slice-3`, `docs/PRD.md#FR-7.2`).
+    #[arg(long = "source-artifact")]
+    pub source_artifact: Option<String>,
+
+    #[arg(long)]
+    pub project_root: Option<PathBuf>,
+
+    /// Corpus file — `insights.db` by default. Tests/admin may override.
+    #[arg(long, default_value = "insights.db")]
+    pub db_name: String,
+
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `claudebase insight search "<query>"` — hybrid retrieval against
+/// `insights.db`. Default mode is `hybrid` (BM25 ⊕ dense via RRF k=60);
+/// auto-falls-back to `lexical` when the e5 encoder model or the
+/// chunks_vec virtual table is unavailable.
+///
+/// Slice 4 filter args (`--type / --agent / --salience / --feature /
+/// --since`) post-filter the ranked hits against the document metadata.
+/// Implementation note: filters are applied AFTER ranking — `top_k` is
+/// over-fetched (×4 cap 100) so the filter doesn't starve thin pages.
+#[derive(Args, Debug)]
+pub struct InsightSearchArgs {
+    pub query: String,
+    #[arg(long, default_value_t = 5)]
+    pub top_k: usize,
+    #[arg(long, default_value_t = 0)]
+    pub context: usize,
+    #[arg(long, value_enum, default_value_t = SearchMode::Hybrid)]
+    pub mode: SearchMode,
+    /// Filter by `documents.source_type` (exact match).
+    #[arg(long = "type")]
+    pub kind: Option<String>,
+    /// Filter by `documents.agent_name` (exact match).
+    #[arg(long)]
+    pub agent: Option<String>,
+    /// Filter by `documents.salience` (high|medium|low).
+    #[arg(long, value_enum)]
+    pub salience: Option<Salience>,
+    /// Filter by `documents.feature_slug` (exact match).
+    #[arg(long)]
+    pub feature: Option<String>,
+    /// Relative-time filter on `documents.ingested_at`. Format: `<N><unit>`
+    /// where unit is `s|m|h|d|w` (seconds / minutes / hours / days / weeks).
+    /// Examples: `30d`, `12h`, `90m`, `4w`. Rejected if no unit suffix.
+    #[arg(long)]
+    pub since: Option<String>,
+    #[arg(long)]
+    pub project_root: Option<PathBuf>,
+    #[arg(long, default_value = "insights.db")]
+    pub db_name: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Parse a relative-time filter like `30d` / `12h` / `90m` into seconds.
+///
+/// Returns `Err(...)` for malformed input (empty, no unit, unknown unit,
+/// non-numeric prefix, overflow). The numeric prefix is a `u64` so values
+/// up to ~292B seconds (~9000y) parse cleanly; the practical upper bound
+/// is the timestamp space itself.
+pub fn parse_since(value: &str) -> Result<i64, String> {
+    if value.is_empty() {
+        return Err("--since value is empty".to_string());
+    }
+    let (num_part, unit) = match value.chars().last() {
+        Some(c) if !c.is_ascii_digit() => (&value[..value.len() - c.len_utf8()], c),
+        _ => return Err(format!("--since must end with unit (s|m|h|d|w); got `{value}`")),
+    };
+    if num_part.is_empty() {
+        return Err(format!("--since numeric prefix is empty; got `{value}`"));
+    }
+    let n: u64 = num_part
+        .parse()
+        .map_err(|_| format!("--since numeric prefix must be a positive integer; got `{value}`"))?;
+    let seconds_per_unit: u64 = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3_600,
+        'd' => 86_400,
+        'w' => 7 * 86_400,
+        other => {
+            return Err(format!(
+                "--since unit must be one of s|m|h|d|w; got `{other}` in `{value}`"
+            ));
+        }
+    };
+    let total = n
+        .checked_mul(seconds_per_unit)
+        .ok_or_else(|| format!("--since value overflows i64 seconds: {value}"))?;
+    i64::try_from(total).map_err(|_| format!("--since value overflows i64 seconds: {value}"))
+}
+
+#[derive(Args, Debug)]
+pub struct InsightListArgs {
+    /// Page index (0-based). Page size is fixed at 10 by default but
+    /// overrideable via `--page-size` for batch-scripted exports.
+    #[arg(long, default_value_t = 0)]
+    pub offset: usize,
+    /// Page size — number of insights per page. Default 10. Capped at 100.
+    #[arg(long, default_value_t = 10)]
+    pub page_size: usize,
+    /// Optional filter on `documents.source_type` (exact match).
+    #[arg(long = "type")]
+    pub kind: Option<String>,
+    /// Optional filter on `documents.agent_name` (exact match).
+    #[arg(long)]
+    pub agent: Option<String>,
+    /// Optional filter on `documents.salience` (exact match: high|medium|low).
+    #[arg(long, value_enum)]
+    pub salience: Option<Salience>,
+    /// Optional filter on `documents.feature_slug` (exact match).
+    #[arg(long)]
+    pub feature: Option<String>,
+    #[arg(long)]
+    pub project_root: Option<PathBuf>,
+    #[arg(long, default_value = "insights.db")]
+    pub db_name: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct InsightRandomArgs {
+    /// Optional filter on `documents.source_type` (exact match).
+    #[arg(long = "type")]
+    pub kind: Option<String>,
+    /// Optional filter on `documents.agent_name` (exact match).
+    #[arg(long)]
+    pub agent: Option<String>,
+    /// Optional filter on `documents.salience` (exact match: high|medium|low).
+    #[arg(long, value_enum)]
+    pub salience: Option<Salience>,
+    /// Optional filter on `documents.feature_slug` (exact match).
+    #[arg(long)]
+    pub feature: Option<String>,
+    #[arg(long)]
+    pub project_root: Option<PathBuf>,
+    #[arg(long, default_value = "insights.db")]
+    pub db_name: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct InsightGcArgs {
+    /// Show what would be deleted without actually deleting. JSON output
+    /// surfaces `{would_delete_medium: N, would_delete_low: N}`.
+    #[arg(long)]
+    pub dry_run: bool,
+    #[arg(long)]
+    pub project_root: Option<PathBuf>,
+    #[arg(long, default_value = "insights.db")]
+    pub db_name: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct InsightDeleteArgs {
+    /// Integer `documents.id` of the insight to delete. (Sha-prefix
+    /// targeting is not supported here — use `insight get <prefix>` to
+    /// confirm the id first, then `insight delete <id>`.)
+    pub id: i64,
+    #[arg(long)]
+    pub project_root: Option<PathBuf>,
+    #[arg(long, default_value = "insights.db")]
+    pub db_name: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct InsightGetArgs {
+    /// Insight identifier — integer `documents.id` OR sha256 prefix
+    /// (≥4 hex chars, matched as `sha256 LIKE '<prefix>%'`).
+    pub ident: String,
+    #[arg(long)]
+    pub project_root: Option<PathBuf>,
+    #[arg(long, default_value = "insights.db")]
+    pub db_name: String,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(clap::Parser, Debug)]

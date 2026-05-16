@@ -166,9 +166,10 @@ fn e2e_d_status_json_returns_full_summary() {
     let chunk_count = v.get("chunk_count").and_then(|s| s.as_i64()).expect("i64");
     let db_path = v.get("db_path").and_then(|s| s.as_str()).expect("str");
 
-    // open_or_init_v2 now stamps schema_version=3 on fresh DBs (Slice 12 — adds
-    // page-level addressing on top of Slice 2's sqlite-vec chunks_vec).
-    assert_eq!(schema_version, 3);
+    // open_or_init_v2 now stamps schema_version=4 on fresh DBs (agent-insights
+    // Slice 1 — adds nullable insights-metadata columns on documents on top
+    // of v3's page-level addressing on top of v2's sqlite-vec chunks_vec).
+    assert_eq!(schema_version, 4);
     assert_eq!(doc_count, 1);
     assert_eq!(chunk_count, 8);
     // Absolute path

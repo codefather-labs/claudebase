@@ -171,6 +171,42 @@ CREATE TABLE IF NOT EXISTS pages (
 CREATE INDEX IF NOT EXISTS pages_doc_page_idx ON pages(doc_id, page_no);
 "#;
 
+/// V4 schema delta — agent-insights metadata. Additive and non-destructive.
+///
+/// Adds six nullable columns to `documents` so the same SQLite shape can host
+/// either the user-curated books corpus (all metadata NULL, today's behavior)
+/// or the new agent-written insights corpus (metadata populated by
+/// `claudebase remember`). Books-corpus rows remain unaffected; back-compat
+/// preserved via the NULL default on every new column.
+///
+/// Columns:
+///   - `source_type`     — enum of the insight kind (e.g. reflection-observation,
+///                         consolidator-drift, red-team-objection, decision-record,
+///                         assumption-log, hack-acknowledged). NULL for book docs.
+///   - `agent_name`      — emitting SDLC agent (planner, reflection, etc.).
+///   - `session_id`      — Claude Code session UUID for trace linking.
+///   - `feature_slug`    — feature this insight belongs to (matches `.claude/plan.md` feature).
+///   - `salience`        — `high` | `medium` | `low` per cognitive-self-check rule;
+///                         drives retention (high=∞, medium=1y, low=90d).
+///   - `parent_artifact` — file path of the artifact the insight was extracted from.
+///
+/// Indexes on the four filter columns most likely to appear in `claudebase recall`
+/// WHERE clauses (source_type / agent_name / feature_slug / salience).
+///
+/// SQL discipline: static `&str` literal, no user-data interpolation.
+const SCHEMA_V4_DELTA: &str = r#"
+ALTER TABLE documents ADD COLUMN source_type     TEXT;
+ALTER TABLE documents ADD COLUMN agent_name      TEXT;
+ALTER TABLE documents ADD COLUMN session_id      TEXT;
+ALTER TABLE documents ADD COLUMN feature_slug    TEXT;
+ALTER TABLE documents ADD COLUMN salience        TEXT;
+ALTER TABLE documents ADD COLUMN parent_artifact TEXT;
+CREATE INDEX IF NOT EXISTS idx_documents_source_type ON documents(source_type);
+CREATE INDEX IF NOT EXISTS idx_documents_agent_name  ON documents(agent_name);
+CREATE INDEX IF NOT EXISTS idx_documents_feature     ON documents(feature_slug);
+CREATE INDEX IF NOT EXISTS idx_documents_salience    ON documents(salience);
+"#;
+
 /// Open (or create) the SQLite database at `db_path` with v2 schema enabled.
 /// Loads the sqlite-vec extension at connection-open time (architect OQ-2
 /// resolution: `sqlite_vec::load(&conn)` registers vec0 without enabling
@@ -204,24 +240,27 @@ pub fn open_or_init_v2(db_path: &Path) -> Result<Connection, StoreError> {
         .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
         .unwrap_or(0);
     if v == 0 {
-        // Fresh DB — apply v2 + v3 deltas and stamp version=3.
+        // Fresh DB — apply v2 + v3 + v4 deltas and stamp version=4.
         conn.execute_batch(SCHEMA_V2_DELTA)?;
         conn.execute_batch(SCHEMA_V3_DELTA)?;
+        conn.execute_batch(SCHEMA_V4_DELTA)?;
         conn.execute(
             "INSERT INTO schema_version(version) VALUES (?1)",
-            rusqlite::params![3i64],
+            rusqlite::params![4i64],
         )?;
     } else if v == 2 {
-        // v2 → v3 progression. Additive + non-destructive: ALTER TABLE adds
-        // the page columns, CREATE TABLE IF NOT EXISTS adds the pages table.
-        // Existing chunks keep NULL page_start/page_end until backfilled
-        // (pages table is empty until `claudebase reindex-pages` runs).
-        // Wrap in a transaction so a partially-failed v2→v3 rolls back.
+        // v2 → v4 progression. Additive + non-destructive: page columns +
+        // pages table from v3, then the six agent-insights metadata columns
+        // from v4. Existing chunks keep NULL page_start/page_end + NULL
+        // insights metadata (pages table is empty until `claudebase
+        // reindex-pages` runs; insights metadata stays NULL on books-corpus
+        // rows). Wrap in a transaction so a partially-failed v2→v4 rolls back.
         let tx = conn.transaction()?;
         tx.execute_batch(SCHEMA_V3_DELTA)?;
+        tx.execute_batch(SCHEMA_V4_DELTA)?;
         tx.execute(
             "UPDATE schema_version SET version = ?1",
-            rusqlite::params![3i64],
+            rusqlite::params![4i64],
         )?;
         tx.commit()?;
     } else if v == 3 {
@@ -257,6 +296,49 @@ pub fn open_or_init_v2(db_path: &Path) -> Result<Connection, StoreError> {
                UNIQUE(doc_id, page_no) \
              ); \
              CREATE INDEX IF NOT EXISTS pages_doc_page_idx ON pages(doc_id, page_no);",
+        )?;
+        // v3 → v4 progression. Apply the agent-insights metadata columns +
+        // indexes. Additive + non-destructive on the books corpus: rows that
+        // existed at v3 stay valid; the new columns are NULL on all of them.
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA_V4_DELTA)?;
+        tx.execute(
+            "UPDATE schema_version SET version = ?1",
+            rusqlite::params![4i64],
+        )?;
+        tx.commit()?;
+    } else if v == 4 {
+        // Already at v4 — idempotent re-open. Verify the v4 columns exist via
+        // pragma_table_info; if any are missing (a partially-failed prior
+        // migration left the version stamped at 4 without the schema), apply
+        // the delta in idempotent fashion (`ALTER TABLE ... ADD COLUMN` is
+        // not idempotent natively, so we probe pragma first and only add the
+        // missing ones).
+        let v4_cols = [
+            "source_type", "agent_name", "session_id",
+            "feature_slug", "salience", "parent_artifact",
+        ];
+        for col in v4_cols {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM pragma_table_info('documents') WHERE name = ?1",
+                    rusqlite::params![col],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            if !exists {
+                let stmt = format!("ALTER TABLE documents ADD COLUMN {col} TEXT");
+                conn.execute_batch(&stmt)?;
+            }
+        }
+        // Re-create indexes idempotently (CREATE INDEX IF NOT EXISTS) so a
+        // partial prior migration that added columns but skipped indexes
+        // converges on re-open.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_documents_source_type ON documents(source_type); \
+             CREATE INDEX IF NOT EXISTS idx_documents_agent_name  ON documents(agent_name); \
+             CREATE INDEX IF NOT EXISTS idx_documents_feature     ON documents(feature_slug); \
+             CREATE INDEX IF NOT EXISTS idx_documents_salience    ON documents(salience);",
         )?;
     }
     // v == 1: caller runs migrate_v1_to_v2 explicitly. We don't auto-migrate
@@ -321,11 +403,11 @@ fn validate_schema_inner(conn: &Connection) -> Result<(), rusqlite::Error> {
         return Err(rusqlite::Error::QueryReturnedNoRows);
     }
 
-    // schema_version row exists and is in 1..=3 (forward-compat through v3
-    // page-level addressing — chunks.page_start/page_end + pages table +
-    // documents.total_pages).
+    // schema_version row exists and is in 1..=4 (forward-compat through v4
+    // agent-insights metadata — documents.source_type / agent_name /
+    // session_id / feature_slug / salience / parent_artifact).
     let v: i64 = conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))?;
-    if !(1..=3).contains(&v) {
+    if !(1..=4).contains(&v) {
         return Err(rusqlite::Error::QueryReturnedNoRows);
     }
 
@@ -357,6 +439,665 @@ pub fn upsert_document(
         |r| r.get(0),
     )?;
     Ok(id)
+}
+
+/// Insert or update a documents row carrying the v4 agent-insights metadata.
+///
+/// This is the parallel of `upsert_document` for the insights corpus
+/// (`insights.db`): same `INSERT ... ON CONFLICT(source_path) DO UPDATE`
+/// shape so an in-session re-write of the same synthetic source_path
+/// produces exactly one row, but extended with the six nullable columns
+/// added by `SCHEMA_V4_DELTA`. Books-corpus rows continue to use
+/// `upsert_document` (which leaves the v4 columns NULL).
+///
+/// SQL discipline: parameterized via `?1..?10`; static `&str` literal SQL.
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_insight_document(
+    conn: &Connection,
+    source_path: &str,
+    mtime: i64,
+    sha256: &str,
+    ingested_at: i64,
+    source_type: &str,
+    agent_name: &str,
+    session_id: Option<&str>,
+    feature_slug: Option<&str>,
+    salience: &str,
+    parent_artifact: Option<&str>,
+) -> Result<i64, rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO documents( \
+             source_path, mtime, sha256, ingested_at, \
+             source_type, agent_name, session_id, \
+             feature_slug, salience, parent_artifact) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+         ON CONFLICT(source_path) DO UPDATE SET \
+           mtime           = excluded.mtime, \
+           sha256          = excluded.sha256, \
+           ingested_at     = excluded.ingested_at, \
+           source_type     = excluded.source_type, \
+           agent_name      = excluded.agent_name, \
+           session_id      = excluded.session_id, \
+           feature_slug    = excluded.feature_slug, \
+           salience        = excluded.salience, \
+           parent_artifact = excluded.parent_artifact",
+        rusqlite::params![
+            source_path,
+            mtime,
+            sha256,
+            ingested_at,
+            source_type,
+            agent_name,
+            session_id,
+            feature_slug,
+            salience,
+            parent_artifact,
+        ],
+    )?;
+    let id: i64 = conn.query_row(
+        "SELECT id FROM documents WHERE source_path = ?1",
+        rusqlite::params![source_path],
+        |r| r.get(0),
+    )?;
+    Ok(id)
+}
+
+/// One row returned by the `insight list / random / get` family. Carries
+/// the v4 metadata columns plus the reconstructed body text (chunks joined
+/// with 100-char overlap collapsed, matching the ingest::chunk window).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InsightRecord {
+    pub id: i64,
+    pub source_path: String,
+    pub sha256: String,
+    pub ingested_at: i64,
+    pub source_type: Option<String>,
+    pub agent_name: Option<String>,
+    pub session_id: Option<String>,
+    pub feature_slug: Option<String>,
+    pub salience: Option<String>,
+    pub parent_artifact: Option<String>,
+    pub body: String,
+}
+
+/// Compact summary for the `list` page — same identifying fields as the
+/// full record but with a snippet instead of the full body.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InsightSummary {
+    pub id: i64,
+    pub sha256_short: String,
+    pub ingested_at: i64,
+    pub source_type: Option<String>,
+    pub agent_name: Option<String>,
+    pub salience: Option<String>,
+    pub feature_slug: Option<String>,
+    pub snippet: String,
+}
+
+/// Reconstruct a flat body from `chunks` rows ordered by `ord`. Insights
+/// are written by `ingest::chunk` (flat 500/100 sliding window with
+/// 100-char overlap), so when chunks > 1 the adjacent chunks share the
+/// trailing/leading 100 chars; the helper drops the overlap from chunks
+/// 1..N when stitching. For single-chunk insights the chunk text is
+/// returned verbatim.
+fn reconstruct_body_from_chunks(chunks: &[String]) -> String {
+    if chunks.is_empty() {
+        return String::new();
+    }
+    let mut out = chunks[0].clone();
+    for chunk in &chunks[1..] {
+        let chars: Vec<char> = chunk.chars().collect();
+        // The chunker uses CHUNK_OVERLAP = 100 so the first 100 chars of
+        // every chunk after #0 duplicate the previous chunk's tail.
+        const OVERLAP: usize = 100;
+        if chars.len() > OVERLAP {
+            let suffix: String = chars[OVERLAP..].iter().collect();
+            out.push_str(&suffix);
+        } else {
+            // Chunk shorter than the overlap window — happens only when the
+            // body is exactly window-aligned. Append as-is.
+            out.push_str(chunk);
+        }
+    }
+    out
+}
+
+/// Internal: load the full `InsightRecord` for one `documents.id`. Caller
+/// has already verified the row is an insight (source_type IS NOT NULL).
+fn load_insight_record(
+    conn: &Connection,
+    id: i64,
+) -> Result<Option<InsightRecord>, rusqlite::Error> {
+    use rusqlite::OptionalExtension;
+    let row: Option<(
+        i64,
+        String,
+        String,
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = conn
+        .query_row(
+            "SELECT id, source_path, sha256, ingested_at, source_type, \
+                    agent_name, session_id, feature_slug, salience, parent_artifact \
+             FROM documents WHERE id = ?1",
+            rusqlite::params![id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        id,
+        source_path,
+        sha256,
+        ingested_at,
+        source_type,
+        agent_name,
+        session_id,
+        feature_slug,
+        salience,
+        parent_artifact,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    // Stitch chunks back into the full body. `stmt` must outlive the
+    // MappedRows iterator returned by `query_map`, so we collect inside
+    // the same scope with the stmt binding still alive.
+    let chunk_texts: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT text FROM chunks WHERE doc_id = ?1 ORDER BY ord",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![id], |r| r.get::<_, String>(0))?;
+        let collected: Vec<String> = rows.filter_map(Result::ok).collect();
+        collected
+    };
+    let body = reconstruct_body_from_chunks(&chunk_texts);
+    Ok(Some(InsightRecord {
+        id,
+        source_path,
+        sha256,
+        ingested_at,
+        source_type,
+        agent_name,
+        session_id,
+        feature_slug,
+        salience,
+        parent_artifact,
+        body,
+    }))
+}
+
+/// Count insights (rows where `source_type IS NOT NULL`) optionally
+/// filtered by source_type / agent / salience / feature.
+#[allow(clippy::too_many_arguments)]
+pub fn count_insights(
+    conn: &Connection,
+    kind: Option<&str>,
+    agent: Option<&str>,
+    salience: Option<&str>,
+    feature: Option<&str>,
+) -> Result<i64, rusqlite::Error> {
+    let (sql, params) = build_filter_sql(
+        "SELECT COUNT(*) FROM documents",
+        kind,
+        agent,
+        salience,
+        feature,
+        None,
+        None,
+    );
+    let params_refs: Vec<&dyn rusqlite::ToSql> =
+        params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    conn.query_row(&sql, params_refs.as_slice(), |r| r.get::<_, i64>(0))
+}
+
+/// List insights newest-first with metadata filters and OFFSET/LIMIT
+/// pagination. Returns compact summaries — call `get_insight_by_id` to
+/// fetch a full record with the reconstructed body.
+#[allow(clippy::too_many_arguments)]
+pub fn list_insights(
+    conn: &Connection,
+    kind: Option<&str>,
+    agent: Option<&str>,
+    salience: Option<&str>,
+    feature: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<InsightSummary>, rusqlite::Error> {
+    let (sql, params) = build_filter_sql(
+        "SELECT id, sha256, ingested_at, source_type, agent_name, salience, feature_slug \
+         FROM documents",
+        kind,
+        agent,
+        salience,
+        feature,
+        Some(limit),
+        Some(offset),
+    );
+    let params_refs: Vec<&dyn rusqlite::ToSql> =
+        params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_refs.as_slice(), |r| {
+        let id: i64 = r.get(0)?;
+        let sha: String = r.get(1)?;
+        Ok((
+            id,
+            sha,
+            r.get::<_, i64>(2)?,
+            r.get::<_, Option<String>>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, Option<String>>(5)?,
+            r.get::<_, Option<String>>(6)?,
+        ))
+    })?;
+    let mut summaries: Vec<(i64, String, i64, Option<String>, Option<String>, Option<String>, Option<String>)> = Vec::new();
+    for row in rows {
+        summaries.push(row?);
+    }
+    // Render snippets — pull chunk 0's text up to 200 chars per insight.
+    let mut out = Vec::with_capacity(summaries.len());
+    for (id, sha, ingested_at, st, an, sal, feat) in summaries {
+        let snippet = {
+            use rusqlite::OptionalExtension;
+            let row: Option<String> = conn
+                .query_row(
+                    "SELECT text FROM chunks WHERE doc_id = ?1 ORDER BY ord LIMIT 1",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            row.unwrap_or_default()
+                .chars()
+                .take(200)
+                .collect::<String>()
+        };
+        out.push(InsightSummary {
+            id,
+            sha256_short: sha.chars().take(16).collect(),
+            ingested_at,
+            source_type: st,
+            agent_name: an,
+            salience: sal,
+            feature_slug: feat,
+            snippet,
+        });
+    }
+    Ok(out)
+}
+
+/// Return one random insight (uniform sample) optionally filtered by the
+/// same dimensions as `list_insights`. Returns `Ok(None)` when no row
+/// matches the filters (empty corpus or restrictive filter combination).
+///
+/// Cannot reuse `build_filter_sql` because the random path needs
+/// `ORDER BY RANDOM() LIMIT 1`, not `ORDER BY ingested_at DESC LIMIT ?`.
+pub fn random_insight(
+    conn: &Connection,
+    kind: Option<&str>,
+    agent: Option<&str>,
+    salience: Option<&str>,
+    feature: Option<&str>,
+) -> Result<Option<InsightRecord>, rusqlite::Error> {
+    use rusqlite::OptionalExtension;
+    let mut sql = String::from("SELECT id FROM documents WHERE source_type IS NOT NULL");
+    let mut params: Vec<String> = Vec::new();
+    let mut next_idx = 1usize;
+    for (col, val) in [
+        ("source_type", kind),
+        ("agent_name", agent),
+        ("salience", salience),
+        ("feature_slug", feature),
+    ] {
+        if let Some(v) = val {
+            sql.push_str(&format!(" AND {col} = ?{next_idx}"));
+            params.push(v.to_string());
+            next_idx += 1;
+        }
+    }
+    sql.push_str(" ORDER BY RANDOM() LIMIT 1");
+    let params_refs: Vec<&dyn rusqlite::ToSql> =
+        params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    let id: Option<i64> = conn
+        .query_row(&sql, params_refs.as_slice(), |r| r.get(0))
+        .optional()?;
+    match id {
+        Some(id) => load_insight_record(conn, id),
+        None => Ok(None),
+    }
+}
+
+/// Fetch one insight by integer `documents.id`. Returns `Ok(None)` when no
+/// row exists OR when the row exists but is a books-corpus doc
+/// (source_type IS NULL) — the caller treats the latter as "not an insight".
+pub fn get_insight_by_id(
+    conn: &Connection,
+    id: i64,
+) -> Result<Option<InsightRecord>, rusqlite::Error> {
+    let rec = load_insight_record(conn, id)?;
+    Ok(rec.filter(|r| r.source_type.is_some()))
+}
+
+/// Fetch one insight by sha256 prefix (≥4 hex chars, matched as
+/// `sha256 LIKE 'prefix%'`). Returns `Err(rusqlite::Error)` mapped from
+/// QueryReturnedNoRows when no match; returns the most recently ingested
+/// match when the prefix matches multiple rows (rare; means the user gave
+/// too short a prefix).
+pub fn get_insight_by_sha_prefix(
+    conn: &Connection,
+    prefix: &str,
+) -> Result<Option<InsightRecord>, rusqlite::Error> {
+    use rusqlite::OptionalExtension;
+    let pattern = format!("{prefix}%");
+    let id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM documents \
+             WHERE sha256 LIKE ?1 AND source_type IS NOT NULL \
+             ORDER BY ingested_at DESC LIMIT 1",
+            rusqlite::params![pattern],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match id {
+        Some(id) => load_insight_record(conn, id),
+        None => Ok(None),
+    }
+}
+
+/// Build a parameterized SELECT with optional WHERE filters and
+/// LIMIT/OFFSET clauses for the insight-list / random / count family.
+///
+/// The base SELECT is passed in by the caller (so the same builder works
+/// for `SELECT id, ...` and `SELECT COUNT(*)`). Filters are pushed onto a
+/// `WHERE source_type IS NOT NULL AND ...` chain so books-corpus rows are
+/// always excluded — this is the "insight" semantic boundary.
+fn build_filter_sql(
+    base_select: &str,
+    kind: Option<&str>,
+    agent: Option<&str>,
+    salience: Option<&str>,
+    feature: Option<&str>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> (String, Vec<String>) {
+    let mut sql = format!("{base_select} WHERE source_type IS NOT NULL");
+    let mut params: Vec<String> = Vec::new();
+    let mut next_idx = 1usize;
+    let push_eq = |col: &str, val: &str, sql: &mut String, params: &mut Vec<String>, idx: &mut usize| {
+        sql.push_str(&format!(" AND {col} = ?{idx}"));
+        params.push(val.to_string());
+        *idx += 1;
+    };
+    if let Some(v) = kind {
+        push_eq("source_type", v, &mut sql, &mut params, &mut next_idx);
+    }
+    if let Some(v) = agent {
+        push_eq("agent_name", v, &mut sql, &mut params, &mut next_idx);
+    }
+    if let Some(v) = salience {
+        push_eq("salience", v, &mut sql, &mut params, &mut next_idx);
+    }
+    if let Some(v) = feature {
+        push_eq("feature_slug", v, &mut sql, &mut params, &mut next_idx);
+    }
+    // ORDER BY ingested_at DESC for stable newest-first pagination. The
+    // `random_insight` caller rewrites this clause via string-replace
+    // (see `random_insight`); for list/count this is the canonical order.
+    sql.push_str(" ORDER BY ingested_at DESC");
+    if let Some(l) = limit {
+        sql.push_str(&format!(" LIMIT ?{next_idx}"));
+        params.push(l.to_string());
+        next_idx += 1;
+        if let Some(o) = offset {
+            sql.push_str(&format!(" OFFSET ?{next_idx}"));
+            params.push(o.to_string());
+        }
+    }
+    let _ = next_idx; // suppress unused-mut lint when both Optional are None
+    (sql, params)
+}
+
+/// TTL-driven garbage-collection summary returned by
+/// `gc_insights_by_salience` / `count_insights_past_ttl`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GcSummary {
+    /// Number of medium-salience insights past 365 days.
+    pub medium_deleted: u64,
+    /// Number of low-salience insights past 90 days.
+    pub low_deleted: u64,
+    /// Total chunks_vec rows cleared as a result.
+    pub chunks_vec_orphans_cleared: u64,
+}
+
+/// Compute (without deleting) how many insights would be purged at `now`.
+/// Mirrors `gc_insights_by_salience` but uses SELECT COUNT(*) — used by
+/// the `--dry-run` flag.
+pub fn count_insights_past_ttl(
+    conn: &Connection,
+    now: i64,
+) -> Result<GcSummary, rusqlite::Error> {
+    let medium_cutoff = now - 365 * 86_400;
+    let low_cutoff = now - 90 * 86_400;
+    let medium: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM documents \
+         WHERE source_type IS NOT NULL AND salience = 'medium' AND ingested_at < ?1",
+        rusqlite::params![medium_cutoff],
+        |r| r.get(0),
+    )?;
+    let low: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM documents \
+         WHERE source_type IS NOT NULL AND salience = 'low' AND ingested_at < ?1",
+        rusqlite::params![low_cutoff],
+        |r| r.get(0),
+    )?;
+    Ok(GcSummary {
+        medium_deleted: medium.max(0) as u64,
+        low_deleted: low.max(0) as u64,
+        chunks_vec_orphans_cleared: 0,
+    })
+}
+
+/// TTL purge: delete insights past their salience-driven retention window.
+///
+/// Retention rules (FR-AIB-8.1):
+///   - salience = 'high'   → retained indefinitely (never purged)
+///   - salience = 'medium' → retained 365 days
+///   - salience = 'low'    → retained 90 days
+///   - salience IS NULL    → ignored (defensive — should not occur for insights)
+///
+/// Books-corpus rows (source_type IS NULL) are NEVER touched even when this
+/// helper runs against the books DB by mistake — the WHERE clause guards on
+/// `source_type IS NOT NULL`.
+///
+/// `chunks` rows cascade-delete via `chunks(doc_id) REFERENCES documents(id)
+/// ON DELETE CASCADE` in SCHEMA_V1. `chunks_fts` stays in sync via the
+/// `chunks_ad` trigger. `chunks_vec` rows are NOT cascade-deleted by SQLite
+/// (it's a virtual table — no FK relationship), so we explicitly clear
+/// orphans after the document delete: `DELETE FROM chunks_vec WHERE rowid
+/// NOT IN (SELECT id FROM chunks)`.
+pub fn gc_insights_by_salience(
+    conn: &mut Connection,
+    now: i64,
+) -> Result<GcSummary, rusqlite::Error> {
+    let medium_cutoff = now - 365 * 86_400;
+    let low_cutoff = now - 90 * 86_400;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let n_medium = tx.execute(
+        "DELETE FROM documents \
+         WHERE source_type IS NOT NULL AND salience = 'medium' AND ingested_at < ?1",
+        rusqlite::params![medium_cutoff],
+    )?;
+    let n_low = tx.execute(
+        "DELETE FROM documents \
+         WHERE source_type IS NOT NULL AND salience = 'low' AND ingested_at < ?1",
+        rusqlite::params![low_cutoff],
+    )?;
+    // Orphaned chunks_vec cleanup — skip silently if the virtual table is
+    // absent (v1 DB or chunks_vec never created).
+    let has_vec: bool = tx
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE name='chunks_vec'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    let n_vec_orphans = if has_vec {
+        tx.execute(
+            "DELETE FROM chunks_vec WHERE rowid NOT IN (SELECT id FROM chunks)",
+            [],
+        )?
+    } else {
+        0
+    };
+    tx.commit()?;
+    Ok(GcSummary {
+        medium_deleted: n_medium as u64,
+        low_deleted: n_low as u64,
+        chunks_vec_orphans_cleared: n_vec_orphans as u64,
+    })
+}
+
+/// Delete a single insight by integer id with chunks + chunks_vec cascade.
+///
+/// Guard: refuses to delete rows where `source_type IS NULL` (books-corpus
+/// rows) — returns `Ok(None)` in that case so the CLI can emit a friendly
+/// error message instead of silently truncating the books corpus.
+pub fn insight_delete_with_summary(
+    conn: &mut Connection,
+    id: i64,
+) -> Result<Option<DeleteByIdSummary>, rusqlite::Error> {
+    use rusqlite::OptionalExtension;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // Probe: row exists AND is an insight.
+    let row: Option<(String, Option<String>)> = tx
+        .query_row(
+            "SELECT source_path, source_type FROM documents WHERE id = ?1",
+            rusqlite::params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let (source_path, source_type) = match row {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    if source_type.is_none() {
+        // Books-corpus row — refuse via the same Ok(None) signal so the
+        // CLI can surface a different message ("not an insight").
+        return Ok(None);
+    }
+    let chunks_removed: u64 = tx.query_row(
+        "SELECT COUNT(*) FROM chunks WHERE doc_id = ?1",
+        rusqlite::params![id],
+        |row| row.get::<_, i64>(0).map(|n| n as u64),
+    )?;
+    // Clear chunks_vec rows for this doc's chunks BEFORE the cascade fires
+    // — chunks_vec has no FK relation to chunks. Skip silently when the
+    // virtual table is absent (v1 DB).
+    let has_vec: bool = tx
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE name='chunks_vec'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if has_vec {
+        tx.execute(
+            "DELETE FROM chunks_vec WHERE rowid IN (SELECT id FROM chunks WHERE doc_id = ?1)",
+            rusqlite::params![id],
+        )?;
+    }
+    tx.execute(
+        "DELETE FROM documents WHERE id = ?1",
+        rusqlite::params![id],
+    )?;
+    tx.commit()?;
+    Ok(Some(DeleteByIdSummary {
+        deleted_id: id,
+        source_path,
+        chunks_removed,
+    }))
+}
+
+/// Document metadata snapshot used by `run_insight_search` to post-filter
+/// ranked hits. Single lookup per unique `doc_id` per call (the caller
+/// caches across hits since multiple chunks share a doc_id).
+#[derive(Debug, Clone)]
+pub struct DocMetadata {
+    pub source_type: Option<String>,
+    pub agent_name: Option<String>,
+    pub salience: Option<String>,
+    pub feature_slug: Option<String>,
+    pub ingested_at: i64,
+}
+
+/// Fetch the filter-relevant metadata columns for a single document. Used
+/// by the `insight search` post-filter pass — the canonical retrieval
+/// engine (search.rs) is corpus-agnostic and doesn't know about insights
+/// metadata, so we filter after ranking.
+pub fn get_doc_metadata(
+    conn: &Connection,
+    doc_id: i64,
+) -> Result<Option<DocMetadata>, rusqlite::Error> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT source_type, agent_name, salience, feature_slug, ingested_at \
+         FROM documents WHERE id = ?1",
+        rusqlite::params![doc_id],
+        |r| {
+            Ok(DocMetadata {
+                source_type: r.get(0)?,
+                agent_name: r.get(1)?,
+                salience: r.get(2)?,
+                feature_slug: r.get(3)?,
+                ingested_at: r.get(4)?,
+            })
+        },
+    )
+    .optional()
+}
+
+/// Exact-sha dedup probe for the insights corpus.
+///
+/// Returns the existing `documents.id` when a row with the same `sha256`
+/// AND `agent_name` was ingested at or after `cutoff_ingested_at` (a
+/// unix-seconds timestamp; callers pass `now - 30 * 86400` for the
+/// design-doc-specified 30-day window). `None` means no recent duplicate
+/// — caller proceeds to upsert.
+///
+/// Intentionally narrower than a generic "is this body in the corpus?"
+/// query: cross-agent collisions are NOT deduplicated (two agents
+/// independently surfacing the same observation IS load-bearing signal).
+pub fn find_recent_insight_by_sha(
+    conn: &Connection,
+    sha256: &str,
+    agent_name: &str,
+    cutoff_ingested_at: i64,
+) -> Result<Option<i64>, rusqlite::Error> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT id FROM documents \
+         WHERE sha256 = ?1 AND agent_name = ?2 AND ingested_at >= ?3 \
+         ORDER BY ingested_at DESC LIMIT 1",
+        rusqlite::params![sha256, agent_name, cutoff_ingested_at],
+        |r| r.get(0),
+    )
+    .optional()
 }
 
 /// Replace all chunks for a document: delete prior rows then insert the new set.

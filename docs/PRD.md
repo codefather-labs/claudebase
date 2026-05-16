@@ -254,3 +254,150 @@ The following items are explicitly excluded from this feature:
 - **OQ-3 (OCR model selection)** — PaddleOCR, trocr, or Tesseract. Architect Slice 6 pre-review decides and pins exact ONNX model filenames.
 - knowledge-base: searched "hybrid retrieval RRF reciprocal rank fusion" → 0 hits in any language; consider adding an information-retrieval reference (e.g., the Cormack 2009 paper or BEIR benchmark docs) to the knowledge-base corpus for future retrieval-engineering tasks. This is not a corpus gap for this PRD section — the RRF formula is verified directly from the canonical paper citation in plan.md.
 
+
+---
+
+## §16. Agent Insights Base
+
+**Status:** [IN DEVELOPMENT — Slices 1-3 + admin surface shipped]
+**Date:** 2026-05-16
+**Priority:** High
+**Related:** §15 (vector + multimodal retrieval — agent-insights reuses the v2/v3 hybrid retrieval stack and pdfium parser; schema v4 adds nullable metadata columns on `documents`). §11 (pdfium). §14 (plan auto-persist). Design doc: `docs/design/agent-insights-base.md` is the technical source of truth and supersedes this section on implementation detail.
+
+Changelog: skip — internal (developer-facing tool surface; no end-user behavior change in claudebase. Surfaced to SDLC agents via prompt integration in Slice 8.)
+
+### 16.1 Feature Description
+
+Today every Claude Code session is cognitively isolated. The SDLC pipeline emits new knowledge per session — Reflection observations, Consolidator drift findings, Red-Team adversarial objections, decision rationales — but the knowledge dies at session end because it lives in stdout, scratchpads, and one-shot artifact files that the next session does not read. This feature extends `claudebase` (the local hybrid-retrieval CLI shipped in §15) with a **parallel insights corpus** — a second SQLite database `insights.db` alongside the existing books `index.db` — that agents write to via `claudebase insight create` and read from via `claudebase insight search / list / random / get`. The hippocampal analogue is exact: prior sessions' load-bearing cognitive insights survive into future sessions where they can ground decisions.
+
+The scope is deliberately narrow. The corpus holds **cognitive insights only** along three axes: (1) self-learning (`agent-learned`, `self-bias-caught`), (2) peer-bias detection (`peer-bias-observed`, `red-team-objection`, `consolidator-drift`), and (3) prediction-reality mismatch (`prediction-error`, `assumption-falsified`, `plan-reality-gap`). Factual findings, mechanical narration, restatements of input, and generic best-practice claims do NOT belong in the corpus — they go to PRs, scratchpads, issue trackers, or stay silent.
+
+### 16.2 User Story
+
+As an SDLC pipeline operator, I want each Claude Code session to start with the cognitive insights prior sessions accumulated so that decisions ground in what previous agents actually learned, peer-bias was caught against, and predictions failed against — instead of re-discovering the same lessons every session.
+
+### 16.3 Functional Requirements
+
+#### FR-AIB-1: Schema v4 Migration (Slice 1 — DONE)
+
+1. **FR-AIB-1.1:** A `SCHEMA_V4_DELTA` constant MUST add six nullable columns to `documents`: `source_type`, `agent_name`, `session_id`, `feature_slug`, `salience`, `parent_artifact`.
+2. **FR-AIB-1.2:** Four indexes MUST be created: `idx_documents_source_type`, `idx_documents_agent_name`, `idx_documents_feature`, `idx_documents_salience`.
+3. **FR-AIB-1.3:** Schema progression MUST support v0→4 (fresh), v2→4 (transactional), v3→4 (transactional), v4 idempotent re-open via pragma probe + safe ADD COLUMN.
+4. **FR-AIB-1.4:** Books-corpus rows (existing `documents` entries in `index.db`) MUST be unaffected — all six new columns default to NULL.
+
+#### FR-AIB-2: `--db-name` Parameterization (Slice 2 — DONE)
+
+1. **FR-AIB-2.1:** `SearchArgs`, `ListArgs`, `StatusArgs`, `DeleteArgs` MUST accept `--db-name <name>` (default `index.db`).
+2. **FR-AIB-2.2:** A `validate_db_name` helper MUST reject path separators, parent-directory escapes, and hidden-file prefixes (except canonical `index.db` / `insights.db`).
+3. **FR-AIB-2.3:** The `resolve_project_root` security backbone MUST remain the only path-from-user-input gate; `db_name` resolves to `<project>/.claude/knowledge/<db_name>`.
+
+#### FR-AIB-3: `claudebase insight create` (Slice 3 — DONE)
+
+1. **FR-AIB-3.1:** `insight create "<body>" --type <kind> --agent <agent>` MUST persist one row to `insights.db` with the v4 metadata columns populated.
+2. **FR-AIB-3.2:** Body MUST be readable from (a) positional argument, (b) `-` positional with piped stdin, (c) omitted positional with piped stdin. Interactive TTY without a body MUST exit 2 with usage.
+3. **FR-AIB-3.3:** Exact-sha dedup: when `(agent_name, sha256)` matches a row ingested within the last 30 days, the write MUST be skipped and the response MUST report `status: deduped` with the existing `doc_id`.
+4. **FR-AIB-3.4:** Cross-agent same-body MUST NOT be deduped — two agents independently surfacing the same observation IS load-bearing signal.
+5. **FR-AIB-3.5:** The synthesized `source_path` MUST encode `agent:{agent}:{session}:{feature}:{sha[..16]}` for stable in-session re-write idempotency.
+6. **FR-AIB-3.6:** Dense vector population into `chunks_vec` MUST be best-effort — silent no-op when the e5 encoder is unavailable (degraded-mode parity with the books ingest path).
+
+#### FR-AIB-4: `claudebase insight search` (Slice 3 — DONE)
+
+1. **FR-AIB-4.1:** `insight search "<query>"` MUST default to hybrid mode (BM25 ⊕ dense via RRF k=60) against `insights.db`.
+2. **FR-AIB-4.2:** Encoder unavailable OR `chunks_vec` missing MUST trigger auto-fallback to lexical with a stderr warning — parity with the standalone `search` subcommand.
+3. **FR-AIB-4.3 (PLANNED — Slice 4):** Metadata filters MUST be honored: `--type`, `--agent`, `--salience`, `--feature`, `--since <30d>`. Filters apply as SQL WHERE clauses on the `documents` row before chunk ranking.
+
+#### FR-AIB-5: `claudebase insight list / random / get` (Slice 3 admin surface — DONE)
+
+1. **FR-AIB-5.1:** `insight list [--offset N] [--page-size N]` MUST return newest-first paginated summaries. Default page size 10, capped at 100. `--offset 0` returns the latest page.
+2. **FR-AIB-5.2:** `insight list` MUST honor the same metadata filters as `insight search` (FR-AIB-4.3).
+3. **FR-AIB-5.3:** `insight random` MUST uniform-sample one insight, optionally filtered; exit 1 on empty corpus.
+4. **FR-AIB-5.4:** `insight get <ident>` MUST accept integer `documents.id` OR a hex sha256 prefix of ≥4 characters (matched via `sha256 LIKE 'prefix%'`).
+5. **FR-AIB-5.5:** `insight get` MUST reject too-short prefixes (`<4` chars) and non-hex identifiers with exit 2.
+6. **FR-AIB-5.6:** Returned records MUST carry the reconstructed body — chunks joined with the 100-char chunker overlap collapsed.
+
+#### FR-AIB-6: Semantic Dedup (Slice 5 — PLANNED)
+
+1. **FR-AIB-6.1:** In addition to exact-sha dedup, `insight create` MUST run new chunks against the dense index with a cosine-similarity threshold of 0.92.
+2. **FR-AIB-6.2:** A near-duplicate hit from the same agent within 30 days MUST skip the write and log `cf-dedup: near-duplicate of doc #N`.
+3. **FR-AIB-6.3:** For `source_type=consolidator-drift`, dedup key MUST be the pair of cited `file:line` references rather than the body text alone.
+
+#### FR-AIB-7: `--corpus books|insights|all` on Standalone `search` (Slice 6 — PLANNED)
+
+1. **FR-AIB-7.1:** The existing `search` subcommand MUST gain a `--corpus` flag. `books` (default) opens `index.db`; `insights` opens `insights.db`; `all` opens both, runs hybrid search on each, RRF-fuses across, and emits hits with a `source_corpus` field.
+2. **FR-AIB-7.2:** Backward compatibility: `--corpus books` MUST be byte-identical to today's `search` output.
+
+#### FR-AIB-8: TTL-Driven Garbage Collection + Manual Delete (Slice 7 — PLANNED)
+
+1. **FR-AIB-8.1:** `insight gc` MUST purge rows whose retention TTL has elapsed: `salience=high` retained indefinitely; `salience=medium` retained 365 days; `salience=low` retained 90 days.
+2. **FR-AIB-8.2:** After purge, `gc` MUST run `VACUUM` and FTS5/vec compact.
+3. **FR-AIB-8.3:** `insight delete <id>` MUST remove a single insight by integer id with chunks cascade-deletion (same FK shape the books corpus uses).
+4. **FR-AIB-8.4:** `gc` and `delete` MUST emit a JSON summary on `--json`: `{deleted: N, freed_bytes: B}` for gc; `{deleted_id: N, source_path: ..., chunks_removed: M}` for delete.
+
+#### FR-AIB-9: SDLC Agent-Prompt Integration (Slice 8 — PLANNED)
+
+1. **FR-AIB-9.1:** Each of the 13 in-scope thinking agents (cognitive-self-check `## Application Scope`) plus `reflection`, `consolidator`, `red-team` MUST receive two new prompt sections: `## Insight retrieval (MANDATORY at task receipt)` and `## Insight surfacing (MANDATORY at task end, when applicable)`.
+2. **FR-AIB-9.2:** Retrieval MUST call `claudebase insight search` filtered by feature-slug + salience-high+medium and surface hits in the agent's `## Facts → Verified facts` block as cross-session memory.
+3. **FR-AIB-9.3:** Surfacing MUST call `claudebase insight create --type <enum> --agent <self> --salience <tag>` ONLY for insights matching the three-axis cognitive taxonomy (self-learning / peer-bias / prediction-reality) — never for factual findings.
+
+#### FR-AIB-10: Rule Documentation (Slice 9 — PLANNED)
+
+1. **FR-AIB-10.1:** `~/.claude/rules/knowledge-base-tool.md` MUST gain a section distinguishing the two corpora (books = user-curated, insights = agent-written) and the salience-tag retention contract.
+2. **FR-AIB-10.2:** `~/.claude/rules/cognitive-self-check.md` MUST tie the salience tag explicitly to retention (high=∞, medium=1y, low=90d) so agents understand the cost of marking insights as high-salience.
+
+#### FR-AIB-11: Cross-Repo E2E Verification (Slice 10 — PLANNED)
+
+1. **FR-AIB-11.1:** A full-flow E2E test MUST exercise: insight write → list non-zero → recall top hit → cross-corpus search → gc backdating semantics.
+
+### 16.4 Non-Functional Requirements
+
+- **NFR-AIB-1: Per-project isolation.** Insights are scoped per `<project>/.claude/knowledge/insights.db`. No cross-project read or write surface in v1.
+- **NFR-AIB-2: Schema additivity.** v4 migration MUST NOT touch existing v3 rows or break v3 readers of the books corpus.
+- **NFR-AIB-3: Security backbone preserved.** All path-from-user-input continues to funnel through `cli::resolve_project_root` (the single gate established in §15).
+- **NFR-AIB-4: Books-corpus zero-touch.** `insight create` MUST NOT create or modify `index.db` — verified by the `create_does_not_create_index_db` test in `tests/cli_insight_e2e_test.rs`.
+
+## Facts
+
+### Verified facts
+
+- The schema-v4 migration applies via `store::open_or_init_v2` with v0/v2/v3→4 progression and v4 idempotent re-open — verified by `tests/store_v2_test.rs` (`schema_version_is_four_on_fresh_v2_db`) and `tests/store_test.rs` (`fresh_db_has_four_tables`) — salience: high.
+- The 19 E2E tests in `tests/cli_insight_e2e_test.rs` cover all five `insight` subcommands and all FR-AIB-3 / FR-AIB-4.1/4.2 / FR-AIB-5 requirements — verified by `cargo test --test cli_insight_e2e_test` returning 19/19 pass at commit `e7bcc1c` — salience: high.
+- The full claudebase test surface (23 suites) passes alongside the new tests — verified by `cargo test` exiting 0 across all suites at commit `e7bcc1c` — salience: high.
+- The synthesized `source_path` shape `agent:{agent}:{session}:{feature}:{sha[..16]}` is exercised by `create_source_path_encodes_metadata_segments` — verified — salience: medium.
+
+### External contracts
+
+- **SQLite FTS5 + `bm25()` function** — symbol: `bm25(chunks_fts)`; ranking via `-bm25(...) AS score ORDER BY score DESC` (positive larger-is-better in JSON) — source: `src/search.rs:75` (existing §15 contract, unchanged in this feature) — verified: yes — salience: medium.
+- **`sqlite-vec` `vec0` virtual table** — symbol: `CREATE VIRTUAL TABLE chunks_vec USING vec0(embedding float[384])` — source: §15 FR-VR-3.1 (existing contract, unchanged) — verified: yes — salience: medium.
+- **`intfloat/multilingual-e5-small` model** — used via `encoder::encode_passages` / `encode_query` for dense vector population on `insight create` — source: §15 contract — verified: yes (model loads via `fastembed` after `claudebase warmup`) — salience: medium.
+- **rusqlite `INSERT ... ON CONFLICT(source_path) DO UPDATE`** — symbol: parameterized via `?1..?10` — source: `store::upsert_insight_document` at `src/store.rs` — verified: yes — salience: high.
+
+### Assumptions
+
+- The 30-day exact-sha dedup window is the right default. Risk: agents in long-running sessions may re-emit identical insights and the dedup masks novelty signal. How to verify: monitor `deduped` vs `written` ratio in real pipeline runs; tune if dedup hit rate exceeds 30%. Salience: medium.
+- The 100-char chunker overlap collapse in `reconstruct_body_from_chunks` matches the ingest chunker exactly. Risk: a future chunker change would silently corrupt body reconstruction. How to verify: existing test `get_by_integer_id_returns_full_record` round-trips the body and asserts the literal string survives. Salience: medium.
+- The synthetic `source_path` `agent:...` prefix never collides with a real file path in the documents table. Risk: a user file literally named starting with `agent:` could collide. How to verify: filesystems prohibit `:` in path components on most platforms; on macOS/Linux the prefix is unique in practice. Salience: low.
+
+### Open questions
+
+- knowledge-base: corpus is AI / ML / RAG books; task is agent-cognitive-memory infrastructure; partial overlap. The retrieval mechanics (BM25 / RRF / sqlite-vec) are well-covered (verified against `Generative_AI_With_LangChain`, `AI_Agents_and_Applications`, `Building_AI_Agents_With_LLMs_RAG_And_Knowledge_Graphs` in §15 PRD citations). The cognitive-bias / hippocampal-replay framing is NOT in the corpus and was not queried for this PRD — the framing comes from `~/.claude/CLAUDE.md` neuroscience-inspired protocols. Salience: low.
+- Should `insight gc` run automatically on a schedule, or only via explicit user invocation? Current plan (FR-AIB-8): manual only. Salience: low.
+
+## Decisions
+
+### Inbound validation
+
+- The user's session-driven refinement (the original plan said `claudebase remember`, mid-session the user asked to restructure under `insight create` plus admin surface). Challenged: yes — Mira pushed back on the apparent scope expansion mid-implementation. Outcome: proceeded as restructured — the unified `insight` namespace is cleaner than two top-level commands (`remember` + `insights status/list/delete`) and the cost of the rename is one search-and-replace in tests. Salience: medium.
+
+### Decisions made
+
+- Unified `insight <subcommand>` tree replacing the planned `remember` + `insights status/list/delete/gc` split. Alternatives considered: (a) keep `remember` as the write verb and `insights` as the admin namespace — rejected because two top-level surfaces fragment agent prompt integration; (b) put everything under `insights` (plural) — rejected because the singular form reads more naturally (`claudebase insight create "..."` vs `claudebase insights create "..."`). Q1-Q5: hack? no. Sane? yes. Alternatives evaluated. Symptom-or-cause? cause. n/a. Salience: high.
+- `insight get <ident>` accepts both integer id and hex sha prefix in the same positional, disambiguated by `i64::parse`. Alternatives: separate `--by-id` and `--by-sha` flags — rejected as more verbose for the common interactive case. Q1-Q5: hack? no. Sane? yes. Alternatives evaluated. Salience: medium.
+- Exact-sha dedup is `agent_name`-keyed, NOT global. The same body emitted by two agents produces two rows. Reasoning: cross-agent agreement on an observation IS load-bearing signal — deduping it would mask consensus. Q1-Q5: hack? no. Sane? yes. Alternatives evaluated. Symptom-or-cause? cause. Salience: high.
+
+### Hacks acknowledged
+
+(none) — no shipped band-aids. The pre-v4 schema-v3 path still works untouched for the books corpus.
+
+### Symptom-only patches (with root-cause links)
+
+(none) — no symptom-only patches in this feature.

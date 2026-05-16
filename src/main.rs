@@ -29,6 +29,15 @@ fn main() -> std::process::ExitCode {
         Command::Compare(a) => a.project_root.as_deref(),
         Command::Page(a) => a.project_root.as_deref(),
         Command::ReindexPages(a) => a.project_root.as_deref(),
+        Command::Insight(a) => match &a.sub {
+            cli::InsightSubcommand::Create(c) => c.project_root.as_deref(),
+            cli::InsightSubcommand::Search(s) => s.project_root.as_deref(),
+            cli::InsightSubcommand::List(l) => l.project_root.as_deref(),
+            cli::InsightSubcommand::Random(r) => r.project_root.as_deref(),
+            cli::InsightSubcommand::Get(g) => g.project_root.as_deref(),
+            cli::InsightSubcommand::Gc(g) => g.project_root.as_deref(),
+            cli::InsightSubcommand::Delete(d) => d.project_root.as_deref(),
+        },
     };
 
     let root = match cli::resolve_project_root(project_root_arg) {
@@ -51,7 +60,916 @@ fn main() -> std::process::ExitCode {
         Command::Compare(args) => run_compare(&root, &args),
         Command::Page(args) => run_page(&root, &args),
         Command::ReindexPages(args) => run_reindex_pages(&root, &args),
+        Command::Insight(args) => match args.sub {
+            cli::InsightSubcommand::Create(a) => run_insight_create(&root, &a),
+            cli::InsightSubcommand::Search(a) => run_insight_search(&root, &a),
+            cli::InsightSubcommand::List(a) => run_insight_list(&root, &a),
+            cli::InsightSubcommand::Random(a) => run_insight_random(&root, &a),
+            cli::InsightSubcommand::Get(a) => run_insight_get(&root, &a),
+            cli::InsightSubcommand::Gc(a) => run_insight_gc(&root, &a),
+            cli::InsightSubcommand::Delete(a) => run_insight_delete(&root, &a),
+        },
     }
+}
+
+/// `insight create "<body>"` — agent write surface for the insights corpus
+/// (schema v4).
+///
+/// Reads the insight body from the positional arg or stdin (TTY refused),
+/// runs the exact-sha dedup probe (`agent_name`+sha256 within last 30 days),
+/// chunks the body via the canonical 500/100 sliding window, and writes
+/// via `store::upsert_insight_document` + `store::replace_chunks`. Encoder
+/// population into `chunks_vec` is best-effort — silent no-op when the e5
+/// model is missing, matching the ingest path's degraded-mode behavior.
+fn run_insight_create(
+    root: &std::path::Path,
+    args: &cli::InsightCreateArgs,
+) -> std::process::ExitCode {
+    use std::io::Read;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // 1) Resolve body — positional literal, `-`, or piped stdin.
+    let body_string = match args.body.as_deref() {
+        Some("-") | None => {
+            // Refuse to block on an interactive TTY — guard against
+            // accidental invocation from a human shell. Agents always
+            // pipe stdin, so the non-TTY path is the load-bearing one.
+            if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                eprintln!(
+                    "error: body required (positional `<body>` or pipe input to stdin); refusing to block on TTY"
+                );
+                return std::process::ExitCode::from(2);
+            }
+            let mut buf = String::new();
+            if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+                eprintln!("error: failed to read stdin: {e}");
+                return std::process::ExitCode::from(1);
+            }
+            buf
+        }
+        Some(literal) => literal.to_string(),
+    };
+    let body = body_string.trim();
+    if body.is_empty() {
+        eprintln!("error: insight body is empty");
+        return std::process::ExitCode::from(2);
+    }
+
+    // 2) Validate the args that aren't typed at the parser level.
+    if args.kind.trim().is_empty() {
+        eprintln!("error: --type must not be empty");
+        return std::process::ExitCode::from(2);
+    }
+    if args.agent.trim().is_empty() {
+        eprintln!("error: --agent must not be empty");
+        return std::process::ExitCode::from(2);
+    }
+
+    // 3) Compute sha256(body) for dedup + synthesize the source_path.
+    //
+    // source_path shape: `agent:{agent}:{session}:{feature}:{sha[..16]}`.
+    // The `agent:` prefix keeps insight rows lexically distinct from real
+    // file paths in the same documents table on shared corpora. Missing
+    // session / feature collapse to `-` so the source_path remains
+    // valid (UNIQUE doesn't permit NULL components in a literal string).
+    let sha_full = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(body.as_bytes());
+        let d = h.finalize();
+        let mut s = String::with_capacity(64);
+        for b in d {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    };
+    let sha_short = &sha_full[..16];
+    let session_token = args.session.as_deref().unwrap_or("-");
+    let feature_token = args.feature.as_deref().unwrap_or("-");
+    let source_path = format!(
+        "agent:{}:{}:{}:{}",
+        args.agent.trim(),
+        session_token,
+        feature_token,
+        sha_short
+    );
+    let now: i64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    // 4) Open insights.db (default — caller may override via --db-name).
+    let (mut conn, _db_path) = match open_and_validate(root, &args.db_name) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+
+    // 5a) Exact-sha dedup probe — same agent, same sha, within last 30d.
+    const DEDUP_WINDOW_SECS: i64 = 30 * 86400;
+    let cutoff = now - DEDUP_WINDOW_SECS;
+    match store::find_recent_insight_by_sha(&conn, &sha_full, args.agent.trim(), cutoff) {
+        Ok(Some(existing_id)) => {
+            if args.json {
+                let payload = serde_json::json!({
+                    "status":      "deduped",
+                    "doc_id":      existing_id,
+                    "source_path": source_path,
+                    "sha256":      sha_full,
+                    "agent":       args.agent,
+                    "type":        args.kind,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                );
+            } else {
+                println!(
+                    "deduped: existing doc id {existing_id} (sha={} agent={})",
+                    &sha_full[..12],
+                    args.agent
+                );
+            }
+            return std::process::ExitCode::SUCCESS;
+        }
+        Ok(None) => {} // proceed to semantic-dedup probe
+        Err(e) => {
+            eprintln!("error: dedup probe failed: {e}");
+            return std::process::ExitCode::from(1);
+        }
+    }
+
+    // 5b) Semantic-dedup probe — encode the body and K-NN against
+    // chunks_vec to find near-duplicates from the same agent within the
+    // same 30-day window. Cosine threshold 0.92 maps to L2 distance ~0.4
+    // for L2-normalized e5 vectors (cosine = 1 − L2² / 2). Best-effort:
+    // silently no-ops when the encoder is unavailable OR chunks_vec is
+    // empty (degraded mode parity with the chunks_vec population path).
+    match find_semantic_duplicate(&conn, body, args.agent.trim(), cutoff) {
+        Some(existing_id) => {
+            if args.json {
+                let payload = serde_json::json!({
+                    "status":      "near-duplicate",
+                    "doc_id":      existing_id,
+                    "source_path": source_path,
+                    "sha256":      sha_full,
+                    "agent":       args.agent,
+                    "type":        args.kind,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                );
+            } else {
+                println!(
+                    "near-duplicate: existing doc id {existing_id} (semantic match, agent={})",
+                    args.agent
+                );
+            }
+            return std::process::ExitCode::SUCCESS;
+        }
+        None => {} // no near-duplicate found, proceed to write
+    }
+
+    // 6) Chunk the body — flat 500/100 sliding window. Insights have no
+    // page provenance so page_start / page_end stay NULL.
+    let chunks = ingest::chunk(body);
+    if chunks.is_empty() {
+        // chunk() returns empty only when the body has zero chars; the
+        // earlier emptiness check covers this, but the gate is cheap.
+        eprintln!("error: body produced zero chunks (empty after normalization)");
+        return std::process::ExitCode::from(2);
+    }
+
+    // 7) Transactional write: upsert document + replace chunks atomically.
+    let salience_str = args.salience.as_str();
+    let session_opt = args.session.as_deref();
+    let feature_opt = args.feature.as_deref();
+    let parent_opt = args.source_artifact.as_deref();
+    let doc_id = {
+        let tx = match conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("error: failed to begin transaction: {e}");
+                return std::process::ExitCode::from(1);
+            }
+        };
+        let id = match store::upsert_insight_document(
+            &tx,
+            &source_path,
+            now,
+            &sha_full,
+            now,
+            args.kind.trim(),
+            args.agent.trim(),
+            session_opt,
+            feature_opt,
+            salience_str,
+            parent_opt,
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("error: failed to upsert insight document: {e}");
+                return std::process::ExitCode::from(1);
+            }
+        };
+        let chunk_refs: Vec<(usize, &str, Option<i64>, Option<i64>)> = chunks
+            .iter()
+            .map(|c| (c.ord, c.text.as_str(), c.page_start, c.page_end))
+            .collect();
+        if let Err(e) = store::replace_chunks(&tx, id, &chunk_refs) {
+            eprintln!("error: failed to write chunks: {e}");
+            return std::process::ExitCode::from(1);
+        }
+        if let Err(e) = tx.commit() {
+            eprintln!("error: commit failed: {e}");
+            return std::process::ExitCode::from(1);
+        }
+        id
+    };
+
+    // 8) Best-effort dense vector write — silent on encoder failure so a
+    // freshly-installed environment without the e5 model still records
+    // the insight (BM25-only retrieval still works for `recall`).
+    let _ = try_populate_insight_chunks_vec(&mut conn, doc_id, &chunks);
+
+    // 9) Emit outcome.
+    if args.json {
+        let payload = serde_json::json!({
+            "status":      "written",
+            "doc_id":      doc_id,
+            "source_path": source_path,
+            "sha256":      sha_full,
+            "chunks":      chunks.len(),
+            "agent":       args.agent,
+            "type":        args.kind,
+            "salience":    salience_str,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
+    } else {
+        println!(
+            "remembered: doc_id={doc_id} chunks={} sha={} agent={} type={} salience={}",
+            chunks.len(),
+            &sha_full[..12],
+            args.agent,
+            args.kind,
+            salience_str,
+        );
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+/// `insight search "<query>"` — hybrid retrieval against the insights
+/// corpus. Reuses the existing search dispatch (lexical / dense / hybrid +
+/// auto-fallback) but pins `--db-name insights.db` so books-corpus rows
+/// never bleed in. Default mode is `hybrid` (BM25 ⊕ dense via RRF k=60).
+///
+/// Slice 4 metadata filters are applied AFTER ranking. The search engine
+/// is corpus-agnostic, so we over-fetch by ×4 (capped at 100) and then
+/// drop hits whose document doesn't match the filter set. The metadata
+/// lookups are cached per `doc_id` so multi-chunk hits from the same
+/// document share a single SQL query.
+fn run_insight_search(
+    root: &std::path::Path,
+    args: &cli::InsightSearchArgs,
+) -> std::process::ExitCode {
+    let user_top_k = args.top_k.max(1) as u32;
+    let has_filters = args.kind.is_some()
+        || args.agent.is_some()
+        || args.salience.is_some()
+        || args.feature.is_some()
+        || args.since.is_some();
+    // Over-fetch only when filters are present — otherwise the behavior is
+    // byte-identical to pre-Slice-4 (user_top_k passed straight through).
+    let fetch_top_k = if has_filters {
+        user_top_k.saturating_mul(4).min(search::MAX_TOP_K)
+    } else {
+        user_top_k
+    };
+    let context_radius = args.context as u32;
+    let (conn, _db_path) = match open_and_validate(root, &args.db_name) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+
+    // Parse --since up-front so a bad value exits 2 before opening the DB
+    // wastes time on a doomed search.
+    let since_cutoff: Option<i64> = match args.since.as_deref() {
+        Some(s) => match cli::parse_since(s) {
+            Ok(seconds) => {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                Some(now - seconds)
+            }
+            Err(msg) => {
+                eprintln!("error: {msg}");
+                return std::process::ExitCode::from(2);
+            }
+        },
+        None => None,
+    };
+    let hits_result = match args.mode {
+        cli::SearchMode::Lexical => search::search(&conn, &args.query, fetch_top_k, context_radius),
+        cli::SearchMode::Dense | cli::SearchMode::Hybrid => {
+            match encoder::encode_query(&args.query) {
+                Ok(emb) => match args.mode {
+                    cli::SearchMode::Dense => search::dense_search(&conn, &emb, fetch_top_k),
+                    cli::SearchMode::Hybrid => {
+                        search::hybrid_search(&conn, &args.query, &emb, fetch_top_k)
+                    }
+                    cli::SearchMode::Lexical => unreachable!(),
+                },
+                Err(e) => {
+                    eprintln!(
+                        "warning: encoder unavailable ({e}); falling back to lexical mode. Run `bash install.sh --yes` to install the e5-multilingual-small model."
+                    );
+                    search::search(&conn, &args.query, fetch_top_k, context_radius)
+                }
+            }
+        }
+    };
+    // Vector-search failures fall back to lexical with a stderr warning —
+    // same UX as the standalone `search` subcommand.
+    let raw_hits = match hits_result {
+        Ok(h) => h,
+        Err(search::SearchError::FtsSyntax(msg)) => {
+            eprintln!("error: invalid search query: {msg}");
+            return std::process::ExitCode::from(1);
+        }
+        Err(search::SearchError::Db(e)) => {
+            eprintln!(
+                "warning: vector search failed ({e}); falling back to lexical mode."
+            );
+            match search::search(&conn, &args.query, fetch_top_k, context_radius) {
+                Ok(h) => h,
+                Err(e2) => {
+                    eprintln!("error: search failed: {e2}");
+                    return std::process::ExitCode::from(1);
+                }
+            }
+        }
+    };
+
+    // Post-filter via per-doc_id metadata lookup with a tiny cache.
+    let hits = if has_filters {
+        filter_insight_hits(
+            &conn,
+            raw_hits,
+            args.kind.as_deref(),
+            args.agent.as_deref(),
+            args.salience.as_ref().map(|s| s.as_str()),
+            args.feature.as_deref(),
+            since_cutoff,
+            user_top_k as usize,
+        )
+    } else {
+        raw_hits
+    };
+
+    if args.json {
+        println!("{}", output::render_search_json(&hits));
+    } else {
+        print!("{}", output::render_search_human(&hits));
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+/// Post-filter ranked hits against the v4 insight-metadata columns. Caches
+/// `DocMetadata` lookups per `doc_id` so repeated hits from the same
+/// document only hit SQLite once.
+fn filter_insight_hits(
+    conn: &rusqlite::Connection,
+    hits: Vec<search::SearchHit>,
+    kind: Option<&str>,
+    agent: Option<&str>,
+    salience: Option<&str>,
+    feature: Option<&str>,
+    since_cutoff: Option<i64>,
+    user_top_k: usize,
+) -> Vec<search::SearchHit> {
+    let mut cache: std::collections::HashMap<i64, Option<store::DocMetadata>> =
+        std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(user_top_k);
+    for hit in hits {
+        if out.len() >= user_top_k {
+            break;
+        }
+        let meta = cache
+            .entry(hit.doc_id)
+            .or_insert_with(|| store::get_doc_metadata(conn, hit.doc_id).ok().flatten());
+        let Some(m) = meta.as_ref() else {
+            continue;
+        };
+        if let Some(k) = kind {
+            if m.source_type.as_deref() != Some(k) {
+                continue;
+            }
+        }
+        if let Some(a) = agent {
+            if m.agent_name.as_deref() != Some(a) {
+                continue;
+            }
+        }
+        if let Some(s) = salience {
+            if m.salience.as_deref() != Some(s) {
+                continue;
+            }
+        }
+        if let Some(f) = feature {
+            if m.feature_slug.as_deref() != Some(f) {
+                continue;
+            }
+        }
+        if let Some(cutoff) = since_cutoff {
+            if m.ingested_at < cutoff {
+                continue;
+            }
+        }
+        out.push(hit);
+    }
+    out
+}
+
+/// `insight list [--offset N] [--page-size N] [filters]` — paginated
+/// metadata-summary list of insights, newest-first. Default page size 10
+/// matches the spec; `--offset 0` returns the latest page.
+fn run_insight_list(
+    root: &std::path::Path,
+    args: &cli::InsightListArgs,
+) -> std::process::ExitCode {
+    let (conn, _db_path) = match open_and_validate(root, &args.db_name) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    let page_size = args.page_size.clamp(1, 100) as i64;
+    let offset_rows = (args.offset as i64).saturating_mul(page_size);
+    let kind = args.kind.as_deref();
+    let agent = args.agent.as_deref();
+    let salience = args.salience.as_ref().map(|s| s.as_str());
+    let feature = args.feature.as_deref();
+    let total = match store::count_insights(&conn, kind, agent, salience, feature) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("error: count failed: {e}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    let rows = match store::list_insights(
+        &conn,
+        kind,
+        agent,
+        salience,
+        feature,
+        page_size,
+        offset_rows,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: list failed: {e}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    if args.json {
+        let payload = serde_json::json!({
+            "total":    total,
+            "offset":   args.offset,
+            "page_size": page_size,
+            "returned": rows.len(),
+            "rows":     rows,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
+    } else {
+        println!(
+            "# insights — page {} (page_size={}) — total matching: {}",
+            args.offset, page_size, total
+        );
+        if rows.is_empty() {
+            println!("(no insights match)");
+        }
+        for r in &rows {
+            let agent = r.agent_name.as_deref().unwrap_or("?");
+            let kind = r.source_type.as_deref().unwrap_or("?");
+            let sal = r.salience.as_deref().unwrap_or("?");
+            let feat = r.feature_slug.as_deref().unwrap_or("-");
+            println!();
+            println!(
+                "[{}] sha={} {} {} salience={} feature={}",
+                r.id, r.sha256_short, agent, kind, sal, feat
+            );
+            println!("    {}", r.snippet);
+        }
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+/// `insight random` — uniform-random pick, optionally filtered.
+fn run_insight_random(
+    root: &std::path::Path,
+    args: &cli::InsightRandomArgs,
+) -> std::process::ExitCode {
+    let (conn, _db_path) = match open_and_validate(root, &args.db_name) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    let kind = args.kind.as_deref();
+    let agent = args.agent.as_deref();
+    let salience = args.salience.as_ref().map(|s| s.as_str());
+    let feature = args.feature.as_deref();
+    let rec = match store::random_insight(&conn, kind, agent, salience, feature) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            eprintln!("error: no insights match the filters");
+            return std::process::ExitCode::from(1);
+        }
+        Err(e) => {
+            eprintln!("error: random fetch failed: {e}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    emit_insight_record(&rec, args.json);
+    std::process::ExitCode::SUCCESS
+}
+
+/// `insight get <ident>` — fetch by integer `documents.id` or by sha256
+/// prefix (≥4 hex chars matched via `sha256 LIKE 'prefix%'`).
+fn run_insight_get(
+    root: &std::path::Path,
+    args: &cli::InsightGetArgs,
+) -> std::process::ExitCode {
+    let (conn, _db_path) = match open_and_validate(root, &args.db_name) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    let rec_result = if let Ok(id) = args.ident.parse::<i64>() {
+        store::get_insight_by_id(&conn, id)
+    } else {
+        // Sha-prefix branch — reject obviously-bad input (too short OR
+        // contains non-hex chars) before hitting the DB.
+        if args.ident.len() < 4 {
+            eprintln!(
+                "error: sha prefix must be ≥4 hex chars (got `{}`)",
+                args.ident
+            );
+            return std::process::ExitCode::from(2);
+        }
+        if !args.ident.chars().all(|c| c.is_ascii_hexdigit()) {
+            eprintln!(
+                "error: identifier must be an integer id or a hex sha prefix (got `{}`)",
+                args.ident
+            );
+            return std::process::ExitCode::from(2);
+        }
+        store::get_insight_by_sha_prefix(&conn, &args.ident)
+    };
+    match rec_result {
+        Ok(Some(rec)) => {
+            emit_insight_record(&rec, args.json);
+            std::process::ExitCode::SUCCESS
+        }
+        Ok(None) => {
+            eprintln!("error: insight not found: {}", args.ident);
+            std::process::ExitCode::from(1)
+        }
+        Err(e) => {
+            eprintln!("error: fetch failed: {e}");
+            std::process::ExitCode::from(1)
+        }
+    }
+}
+
+/// `insight gc [--dry-run]` — purge insights past their salience-driven
+/// retention window (high=∞, medium=365d, low=90d). Runs VACUUM after
+/// the deletes to reclaim storage; emits `{medium_deleted, low_deleted,
+/// chunks_vec_orphans_cleared, freed_bytes}` on `--json`.
+fn run_insight_gc(
+    root: &std::path::Path,
+    args: &cli::InsightGcArgs,
+) -> std::process::ExitCode {
+    let (mut conn, db_path) = match open_and_validate(root, &args.db_name) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    let now: i64 = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    };
+    if args.dry_run {
+        let summary = match store::count_insights_past_ttl(&conn, now) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: gc dry-run failed: {e}");
+                return std::process::ExitCode::from(1);
+            }
+        };
+        if args.json {
+            let payload = serde_json::json!({
+                "dry_run":            true,
+                "would_delete_medium": summary.medium_deleted,
+                "would_delete_low":    summary.low_deleted,
+                "would_delete_total":  summary.medium_deleted + summary.low_deleted,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload).unwrap_or_default()
+            );
+        } else {
+            println!(
+                "dry-run: would delete {} medium-salience + {} low-salience = {} total",
+                summary.medium_deleted,
+                summary.low_deleted,
+                summary.medium_deleted + summary.low_deleted
+            );
+        }
+        return std::process::ExitCode::SUCCESS;
+    }
+    let size_before = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+    let summary = match store::gc_insights_by_salience(&mut conn, now) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: gc failed: {e}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    // VACUUM cannot run inside a transaction. After gc_insights_by_salience
+    // returns, the tx has committed and the connection is idle, so VACUUM
+    // is safe here. Failures are warnings — the deletes already landed.
+    if let Err(e) = conn.execute_batch("VACUUM") {
+        eprintln!("warning: VACUUM after gc failed: {e}");
+    }
+    let size_after = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+    let freed_bytes = size_before.saturating_sub(size_after);
+    if args.json {
+        let payload = serde_json::json!({
+            "dry_run":                     false,
+            "medium_deleted":              summary.medium_deleted,
+            "low_deleted":                 summary.low_deleted,
+            "chunks_vec_orphans_cleared":  summary.chunks_vec_orphans_cleared,
+            "deleted_total":               summary.medium_deleted + summary.low_deleted,
+            "size_before_bytes":           size_before,
+            "size_after_bytes":            size_after,
+            "freed_bytes":                 freed_bytes,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
+    } else {
+        println!(
+            "gc: deleted {} medium + {} low = {} insights; cleared {} orphan vectors; freed {} bytes",
+            summary.medium_deleted,
+            summary.low_deleted,
+            summary.medium_deleted + summary.low_deleted,
+            summary.chunks_vec_orphans_cleared,
+            freed_bytes
+        );
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+/// `insight delete <id>` — single-insight delete by integer
+/// `documents.id` with chunks + chunks_vec cascade. Refuses to delete
+/// non-insight rows (source_type IS NULL — books corpus).
+fn run_insight_delete(
+    root: &std::path::Path,
+    args: &cli::InsightDeleteArgs,
+) -> std::process::ExitCode {
+    let (mut conn, _db_path) = match open_and_validate(root, &args.db_name) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    let summary = match store::insight_delete_with_summary(&mut conn, args.id) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            // Disambiguate "not found" vs "not an insight" — re-probe the
+            // row directly so the message is helpful.
+            use rusqlite::OptionalExtension;
+            let row: Option<Option<String>> = conn
+                .query_row(
+                    "SELECT source_type FROM documents WHERE id = ?1",
+                    rusqlite::params![args.id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap_or(None);
+            match row {
+                Some(Some(_)) => unreachable!("delete_with_summary returns Some when source_type set"),
+                Some(None) => {
+                    eprintln!(
+                        "error: id {} is a books-corpus document, not an insight; refusing to delete",
+                        args.id
+                    );
+                    return std::process::ExitCode::from(2);
+                }
+                None => {
+                    eprintln!("error: no insight with id {}", args.id);
+                    return std::process::ExitCode::from(1);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("error: insight delete failed: {e}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    if args.json {
+        println!("{}", output::render_delete_by_id_json(&summary));
+    } else {
+        println!(
+            "deleted: id={} source={} chunks={}",
+            summary.deleted_id, summary.source_path, summary.chunks_removed
+        );
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+/// Shared formatter for `insight random` and `insight get`.
+fn emit_insight_record(rec: &store::InsightRecord, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(rec).unwrap_or_default()
+        );
+    } else {
+        println!(
+            "[{}] sha={} agent={} type={} salience={} feature={}",
+            rec.id,
+            &rec.sha256[..16.min(rec.sha256.len())],
+            rec.agent_name.as_deref().unwrap_or("?"),
+            rec.source_type.as_deref().unwrap_or("?"),
+            rec.salience.as_deref().unwrap_or("?"),
+            rec.feature_slug.as_deref().unwrap_or("-"),
+        );
+        if let Some(sa) = rec.parent_artifact.as_deref() {
+            println!("source artifact: {sa}");
+        }
+        if let Some(sid) = rec.session_id.as_deref() {
+            println!("session: {sid}");
+        }
+        println!();
+        println!("{}", rec.body);
+    }
+}
+
+/// Slice 5 — best-effort semantic-duplicate probe.
+///
+/// Returns `Some(doc_id)` when an existing insight in `insights.db` is a
+/// near-duplicate of `body` according to the cosine-0.92 threshold AND
+/// was emitted by the SAME `agent` within `cutoff_ingested_at`.
+///
+/// Best-effort: returns `None` silently when any of these conditions hold:
+///   - The e5 encoder model is unavailable (degraded-install).
+///   - The `chunks_vec` virtual table is absent (v1 schema).
+///   - The K-NN query fails for any reason.
+///
+/// Threshold derivation: e5-multilingual-small emits L2-normalized
+/// vectors, so cosine = 1 − L2² / 2. Solving for L2 at cosine = 0.92
+/// gives L2 = sqrt(2 × (1 − 0.92)) = sqrt(0.16) = 0.4. sqlite-vec
+/// returns L2 distance; we filter `distance < 0.4`.
+///
+/// Why same-agent only: cross-agent near-duplicates ARE load-bearing
+/// signal (cross-agent agreement on an observation), so we let them
+/// through — same rule as the exact-sha probe.
+fn find_semantic_duplicate(
+    conn: &rusqlite::Connection,
+    body: &str,
+    agent: &str,
+    cutoff_ingested_at: i64,
+) -> Option<i64> {
+    /// Cosine 0.92 → L2 distance ~0.4 for L2-normalized e5 vectors.
+    const SEMANTIC_DEDUP_L2_THRESHOLD: f64 = 0.4;
+
+    // Skip silently when chunks_vec is absent (v1 schema or never had
+    // vectors populated). Probing sqlite_master is cheaper than failing
+    // the K-NN query.
+    let has_vec: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks_vec'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !has_vec {
+        return None;
+    }
+
+    // Encode the body as a single passage. The encoder uses the "passage:"
+    // prefix internally (e5 convention). For multi-chunk bodies the first
+    // chunk's vector is sufficient as a topical signature — bodies that
+    // share opening semantics are near-duplicates in practice.
+    let embeddings = encoder::encode_passages(&[body]).ok()?;
+    let body_emb = embeddings.first()?;
+    let bytes: Vec<u8> = body_emb.iter().flat_map(|f| f.to_le_bytes()).collect();
+
+    // K-NN against chunks_vec. JOIN here is intentional — sqlite-vec's
+    // MATCH operator returns `distance` as a virtual column, and JOIN
+    // with chunks + documents lets us filter same-agent + within-window
+    // in the same query. LIMIT 5 over-fetches to handle the case where
+    // the top-1 hit fails the agent/recency filter but a top-2..5 hit
+    // would pass — rare but realistic in dense corpora.
+    let mut stmt = conn
+        .prepare(
+            "SELECT cv.rowid, cv.distance, c.doc_id, d.agent_name, d.ingested_at \
+             FROM chunks_vec cv \
+             JOIN chunks c ON c.id = cv.rowid \
+             JOIN documents d ON d.id = c.doc_id \
+             WHERE cv.embedding MATCH ?1 AND k = 5 \
+             ORDER BY cv.distance",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map(rusqlite::params![bytes], |r| {
+            Ok((
+                r.get::<_, i64>(0)?, // chunk_id (unused — kept for debugging)
+                r.get::<_, f64>(1)?, // distance (L2)
+                r.get::<_, i64>(2)?, // doc_id
+                r.get::<_, Option<String>>(3)?, // agent_name
+                r.get::<_, i64>(4)?, // ingested_at
+            ))
+        })
+        .ok()?;
+
+    for row in rows.flatten() {
+        let (_chunk_id, distance, doc_id, doc_agent, doc_ingested_at) = row;
+        if distance >= SEMANTIC_DEDUP_L2_THRESHOLD {
+            // Sorted by distance ASC — once we exceed the threshold the
+            // remaining candidates are even further; bail out early.
+            break;
+        }
+        if doc_agent.as_deref() == Some(agent) && doc_ingested_at >= cutoff_ingested_at {
+            return Some(doc_id);
+        }
+    }
+    None
+}
+
+/// Best-effort embedding write into chunks_vec for an insight document.
+///
+/// Mirrors `ingest::try_populate_chunks_vec` but is reachable from main.rs
+/// without exposing the private helper. Silent no-op when chunks_vec is
+/// absent, the encoder is unavailable, or the id-count drift check trips.
+fn try_populate_insight_chunks_vec(
+    conn: &mut rusqlite::Connection,
+    doc_id: i64,
+    chunks: &[ingest::Chunk],
+) -> Result<(), ()> {
+    if chunks.is_empty() {
+        return Ok(());
+    }
+    let has_vec: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks_vec'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !has_vec {
+        return Err(());
+    }
+    let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+    let embeddings = match encoder::encode_passages(&texts) {
+        Ok(v) => v,
+        Err(_) => return Err(()),
+    };
+    let ids: Vec<i64> = {
+        let mut stmt = conn
+            .prepare("SELECT id FROM chunks WHERE doc_id = ?1 ORDER BY ord")
+            .map_err(|_| ())?;
+        let rows = stmt
+            .query_map(rusqlite::params![doc_id], |r| r.get::<_, i64>(0))
+            .map_err(|_| ())?;
+        rows.filter_map(Result::ok).collect()
+    };
+    if ids.len() != embeddings.len() {
+        return Err(());
+    }
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|_| ())?;
+    {
+        let mut stmt = tx
+            .prepare("INSERT OR REPLACE INTO chunks_vec(rowid, embedding) VALUES (?1, ?2)")
+            .map_err(|_| ())?;
+        for (id, emb) in ids.iter().zip(embeddings.iter()) {
+            let bytes: Vec<u8> = emb.iter().flat_map(|f| f.to_le_bytes()).collect();
+            stmt.execute(rusqlite::params![id, bytes]).map_err(|_| ())?;
+        }
+    }
+    tx.commit().map_err(|_| ())?;
+    Ok(())
 }
 
 /// `page <doc> <page> [--range N] [--json]` — Slice 12 page-level navigation.
@@ -62,7 +980,7 @@ fn main() -> std::process::ExitCode {
 /// page neighborhood. Out-of-range page numbers exit 1 with the literal
 /// `error: page number out of range` per the architect-resolved contract.
 fn run_page(root: &std::path::Path, args: &cli::PageArgs) -> std::process::ExitCode {
-    let (conn, _db_path) = match open_and_validate(root) {
+    let (conn, _db_path) = match open_and_validate(root, "index.db") {
         Ok(t) => t,
         Err(code) => return code,
     };
@@ -156,7 +1074,7 @@ fn run_reindex_pages(
     root: &std::path::Path,
     args: &cli::ReindexPagesArgs,
 ) -> std::process::ExitCode {
-    let (mut conn, _db_path) = match open_and_validate(root) {
+    let (mut conn, _db_path) = match open_and_validate(root, "index.db") {
         Ok(t) => t,
         Err(code) => return code,
     };
@@ -296,7 +1214,7 @@ fn run_reindex_pages(
 /// three search modes side-by-side with FULL chunk text. Surfaces exactly
 /// what an LLM would receive as RAG context-augmentation input.
 fn run_compare(root: &std::path::Path, args: &cli::CompareArgs) -> std::process::ExitCode {
-    let (conn, _db_path) = match open_and_validate(root) {
+    let (conn, _db_path) = match open_and_validate(root, "index.db") {
         Ok(t) => t,
         Err(code) => return code,
     };
@@ -558,8 +1476,16 @@ fn run_warmup(args: &cli::WarmupArgs) -> std::process::ExitCode {
 /// instead of falsely flagging "corrupt".
 fn open_and_validate(
     root: &std::path::Path,
+    db_name: &str,
 ) -> Result<(rusqlite::Connection, std::path::PathBuf), std::process::ExitCode> {
-    let db_path = root.join(".claude").join("knowledge").join("index.db");
+    let db_name = match cli::validate_db_name(db_name) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return Err(std::process::ExitCode::from(2));
+        }
+    };
+    let db_path = root.join(".claude").join("knowledge").join(db_name);
     // Tech-debt #4 wiring: use the v2 entry point so fresh DBs are stamped
     // with schema_version=2 and the chunks_vec virtual table is created.
     // Existing v1 DBs are left at v1 (open_or_init_v2 does NOT auto-migrate
@@ -682,12 +1608,49 @@ fn run_search(root: &std::path::Path, args: &cli::SearchArgs) -> std::process::E
     let top_k = args.top_k as u32;
     let context_radius = args.context as u32;
 
+    // Slice 6 — `--corpus all` cross-corpus RRF fusion. Dispatched BEFORE
+    // the single-corpus path so we don't waste cycles opening one DB twice.
+    if matches!(args.corpus, Some(cli::Corpus::All)) {
+        if args.db_name != "index.db" {
+            eprintln!(
+                "warning: --corpus all overrides --db-name `{}` (opening both index.db and insights.db)",
+                args.db_name
+            );
+        }
+        return run_search_cross_corpus(root, args, top_k, context_radius);
+    }
+
+    // Single-corpus dispatch: resolve the effective db_name from --corpus
+    // (Slice 6) when set, otherwise fall back to --db-name (legacy).
+    let effective_db_name: String = match args.corpus {
+        Some(cli::Corpus::Books) => {
+            if args.db_name != "index.db" {
+                eprintln!(
+                    "warning: --corpus books overrides --db-name `{}`",
+                    args.db_name
+                );
+            }
+            "index.db".to_string()
+        }
+        Some(cli::Corpus::Insights) => {
+            if args.db_name != "index.db" {
+                eprintln!(
+                    "warning: --corpus insights overrides --db-name `{}`",
+                    args.db_name
+                );
+            }
+            "insights.db".to_string()
+        }
+        Some(cli::Corpus::All) => unreachable!("handled above"),
+        None => args.db_name.clone(),
+    };
+
     // Step 1: open + validate. Use the v1 entry point regardless of mode so
     // a truncated index.db trips AC-7 (`index database invalid; re-ingest
     // required`) BEFORE any vector-search dispatch attempts to query
     // chunks_vec. This preserves the corrupt-index test contract for
     // lexical, dense, AND hybrid modes uniformly.
-    let (conn, _db_path) = match open_and_validate(root) {
+    let (conn, _db_path) = match open_and_validate(root, &effective_db_name) {
         Ok(t) => t,
         Err(code) => return code,
     };
@@ -769,9 +1732,133 @@ fn run_search_with_encoder(
     }
 }
 
+/// `search --corpus all` — cross-corpus search with RRF fusion (Slice 6).
+///
+/// Opens BOTH `index.db` (books) and `insights.db` (agent-written), runs
+/// the configured search mode on each, then fuses the two ranked lists
+/// via Reciprocal Rank Fusion (k=60 — same constant the in-corpus hybrid
+/// search uses). Each emitted hit carries `source_corpus = "books"` or
+/// `"insights"` so downstream consumers can distinguish.
+///
+/// Failure modes:
+///   - One corpus missing on disk → silently treat as empty (the user may
+///     have insights but no books, or vice versa).
+///   - Both corpora empty → return zero hits with exit 0.
+///   - Search error in one corpus → log warning, use the other corpus only.
+fn run_search_cross_corpus(
+    root: &std::path::Path,
+    args: &cli::SearchArgs,
+    top_k: u32,
+    context_radius: u32,
+) -> std::process::ExitCode {
+    let books_hits = run_one_corpus_for_fusion(root, args, "index.db", top_k, context_radius);
+    let insights_hits =
+        run_one_corpus_for_fusion(root, args, "insights.db", top_k, context_radius);
+    let fused = rrf_fuse_corpora(books_hits, insights_hits, top_k as usize);
+    if args.json {
+        println!("{}", output::render_search_json(&fused));
+    } else {
+        print!("{}", output::render_search_human(&fused));
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+/// Helper for `run_search_cross_corpus`: opens one corpus, runs the search,
+/// tags every hit with `source_corpus`. Returns an empty vec on any error
+/// (missing DB, search failure) so the cross-corpus pass survives one-
+/// corpus failure.
+fn run_one_corpus_for_fusion(
+    root: &std::path::Path,
+    args: &cli::SearchArgs,
+    db_name: &str,
+    top_k: u32,
+    context_radius: u32,
+) -> Vec<search::SearchHit> {
+    let (conn, _db_path) = match open_and_validate(root, db_name) {
+        Ok(t) => t,
+        Err(_) => {
+            // One-corpus failure is expected (project may have books but no
+            // insights yet); silently return empty.
+            return Vec::new();
+        }
+    };
+    let hits = match args.mode {
+        cli::SearchMode::Lexical => {
+            search::search(&conn, &args.query, top_k, context_radius).unwrap_or_default()
+        }
+        cli::SearchMode::Dense | cli::SearchMode::Hybrid => {
+            run_search_with_encoder(&conn, args, top_k, context_radius).unwrap_or_default()
+        }
+    };
+    let label = if db_name == "insights.db" {
+        "insights"
+    } else {
+        "books"
+    };
+    hits.into_iter()
+        .map(|mut h| {
+            h.source_corpus = Some(label.to_string());
+            h
+        })
+        .collect()
+}
+
+/// Reciprocal Rank Fusion across two corpus-tagged ranked lists.
+///
+/// Implements the canonical Cormack et al. 2009 formula with k=60 (the
+/// same constant used by the in-corpus hybrid path in `search.rs`):
+///     score(d) = Σ_corpus 1 / (60 + rank_in_corpus(d))
+///
+/// Each hit's identity is `(source_corpus, chunk_id)` — chunk_ids are
+/// scoped per-DB so two hits with `chunk_id=42` but different corpora
+/// are distinct documents.
+///
+/// The returned `score` field is the RRF score; the per-corpus `score`
+/// is preserved in the original `bm25_score` / `dense_score` / `rrf_score`
+/// fields when the source mode populated them.
+fn rrf_fuse_corpora(
+    books: Vec<search::SearchHit>,
+    insights: Vec<search::SearchHit>,
+    top_k: usize,
+) -> Vec<search::SearchHit> {
+    const RRF_K: f64 = 60.0;
+    use std::collections::HashMap;
+    // Key: (source_corpus, chunk_id) — both needed to disambiguate.
+    let mut score_acc: HashMap<(String, i64), f64> = HashMap::new();
+    let mut by_key: HashMap<(String, i64), search::SearchHit> = HashMap::new();
+    for (rank, hit) in books.into_iter().enumerate() {
+        let key = ("books".to_string(), hit.chunk_id);
+        let inc = 1.0 / (RRF_K + (rank as f64 + 1.0));
+        *score_acc.entry(key.clone()).or_insert(0.0) += inc;
+        by_key.entry(key).or_insert(hit);
+    }
+    for (rank, hit) in insights.into_iter().enumerate() {
+        let key = ("insights".to_string(), hit.chunk_id);
+        let inc = 1.0 / (RRF_K + (rank as f64 + 1.0));
+        *score_acc.entry(key.clone()).or_insert(0.0) += inc;
+        by_key.entry(key).or_insert(hit);
+    }
+    let mut scored: Vec<(f64, (String, i64))> = score_acc
+        .into_iter()
+        .map(|(k, s)| (s, k))
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored
+        .into_iter()
+        .take(top_k)
+        .filter_map(|(rrf_score, key)| {
+            by_key.remove(&key).map(|mut h| {
+                h.score = rrf_score;
+                h.rrf_score = Some(rrf_score);
+                h
+            })
+        })
+        .collect()
+}
+
 /// `list [--json]` — list ingested documents with chunk counts.
 fn run_list(root: &std::path::Path, args: &cli::ListArgs) -> std::process::ExitCode {
-    let (conn, _db_path) = match open_and_validate(root) {
+    let (conn, _db_path) = match open_and_validate(root, &args.db_name) {
         Ok(t) => t,
         Err(code) => return code,
     };
@@ -794,7 +1881,7 @@ fn run_list(root: &std::path::Path, args: &cli::ListArgs) -> std::process::ExitC
 
 /// `status [--json]` — schema_version + counts + db_path.
 fn run_status(root: &std::path::Path, args: &cli::StatusArgs) -> std::process::ExitCode {
-    let (conn, db_path) = match open_and_validate(root) {
+    let (conn, db_path) = match open_and_validate(root, &args.db_name) {
         Ok(t) => t,
         Err(code) => return code,
     };
@@ -838,7 +1925,7 @@ fn run_delete(root: &std::path::Path, args: &cli::DeleteArgs) -> std::process::E
         _ => {}
     }
 
-    let (mut conn, _db_path) = match open_and_validate(root) {
+    let (mut conn, _db_path) = match open_and_validate(root, &args.db_name) {
         Ok(t) => t,
         Err(code) => return code,
     };

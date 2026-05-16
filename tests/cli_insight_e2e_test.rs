@@ -242,6 +242,137 @@ fn search_returns_lexical_hit_for_written_insight() {
 }
 
 // ---------------------------------------------------------------------------
+// `insight create` — Slice 5 semantic dedup (cosine > 0.92, same agent, 30d).
+// ---------------------------------------------------------------------------
+
+/// Probe whether the e5 encoder is functional in this test environment.
+/// Returns true iff a write triggered chunks_vec population (encoder
+/// available + chunks_vec virtual table working).
+fn encoder_is_functional(project: &Path) -> bool {
+    let conn = open_db(&insights_db(project));
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
+        .unwrap_or(0);
+    n > 0
+}
+
+#[test]
+fn semantic_dedup_skips_near_duplicate_when_encoder_available() {
+    let tmp = fresh_project();
+    create_insight(
+        tmp.path(),
+        "the agent learned that kafka rebalance during transaction commit breaks exactly-once delivery",
+        "agent-learned",
+        "reflection",
+        &[],
+    )
+    .success();
+    if !encoder_is_functional(tmp.path()) {
+        eprintln!(
+            "encoder not functional in this test env (chunks_vec empty); \
+             skipping semantic-dedup assertion. install via `bash install.sh --yes`."
+        );
+        return;
+    }
+    // Paraphrased body — same concept, different word order. cosine should
+    // be well above 0.92 for these two e5-encoded passages.
+    let assert = create_insight(
+        tmp.path(),
+        "kafka exactly-once delivery breaks when rebalance happens during the transaction commit, as the agent learned",
+        "agent-learned",
+        "reflection", // SAME agent — load-bearing for the dedup window
+        &["--json"],
+    )
+    .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("\"status\": \"near-duplicate\"")
+            || stdout.contains("\"status\":\"near-duplicate\""),
+        "expected status=near-duplicate on paraphrased re-emit; got:\n{stdout}"
+    );
+    let conn = open_db(&insights_db(tmp.path()));
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1, "near-duplicate must NOT increment doc count");
+}
+
+#[test]
+fn semantic_dedup_does_not_block_unrelated_body() {
+    let tmp = fresh_project();
+    create_insight(
+        tmp.path(),
+        "the agent learned that kafka rebalance during transaction commit breaks exactly-once delivery",
+        "agent-learned",
+        "reflection",
+        &[],
+    )
+    .success();
+    if !encoder_is_functional(tmp.path()) {
+        eprintln!("encoder not functional; skipping unrelated-body assertion.");
+        return;
+    }
+    // A semantically unrelated body — about pdfium PDF extraction.
+    let assert = create_insight(
+        tmp.path(),
+        "pdfium correctly handles CID fonts in calibre-converted PDF documents",
+        "agent-learned",
+        "reflection",
+        &["--json"],
+    )
+    .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("\"status\": \"written\"")
+            || stdout.contains("\"status\":\"written\""),
+        "unrelated body must NOT trigger semantic dedup; got:\n{stdout}"
+    );
+    let conn = open_db(&insights_db(tmp.path()));
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 2, "unrelated body must create a second doc");
+}
+
+#[test]
+fn semantic_dedup_does_not_block_other_agent() {
+    let tmp = fresh_project();
+    create_insight(
+        tmp.path(),
+        "the agent learned that kafka rebalance during transaction commit breaks exactly-once delivery",
+        "agent-learned",
+        "reflection",
+        &[],
+    )
+    .success();
+    if !encoder_is_functional(tmp.path()) {
+        eprintln!("encoder not functional; skipping cross-agent assertion.");
+        return;
+    }
+    // Paraphrase BUT different agent — must NOT dedup (cross-agent agreement
+    // is load-bearing signal).
+    let assert = create_insight(
+        tmp.path(),
+        "kafka exactly-once delivery breaks when rebalance happens during the transaction commit",
+        "agent-learned",
+        "verifier", // DIFFERENT agent
+        &["--json"],
+    )
+    .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("\"status\": \"written\"")
+            || stdout.contains("\"status\":\"written\""),
+        "cross-agent paraphrase must NOT dedup; got:\n{stdout}"
+    );
+    let conn = open_db(&insights_db(tmp.path()));
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 2, "cross-agent paraphrase must create a second doc");
+}
+
+// ---------------------------------------------------------------------------
 // `insight search` — Slice 4 metadata filters.
 // ---------------------------------------------------------------------------
 
@@ -387,20 +518,34 @@ fn search_since_filter_keeps_recent_drops_old() {
 // `insight list` — pagination, defaults, filters.
 // ---------------------------------------------------------------------------
 
+/// Semantically distinct fixture bodies for pagination tests. Adjacent
+/// bodies must differ in EMBEDDING space, not just by a number, because
+/// the Slice 5 semantic-dedup probe correctly catches near-paraphrases
+/// (`insight body number 00` and `insight body number 01` map to nearly
+/// identical e5 vectors and would dedup). Each line below is intentionally
+/// about a different concept.
+const PAGINATION_FIXTURE_BODIES: &[&str] = &[
+    "kafka exactly-once breaks on rebalance during transaction commit",
+    "redis pipelining reduces round-trip cost for bulk SET operations",
+    "postgres index-only scans require all columns in the index",
+    "rust borrow checker rejects mutable aliasing of the same reference",
+    "vector quantization shrinks ANN index size at recall cost",
+    "FTS5 unicode61 tokenizer treats hyphens as token separators",
+    "RRF k=60 fuses BM25 and dense rankers without score normalization",
+    "sqlite WAL mode allows concurrent reader during a writer commit",
+    "ONNX runtime CPU provider works without GPU dependency chain",
+    "e5-multilingual-small outputs L2-normalized 384-dimensional vectors",
+    "claude-code agents pipe stdin into claudebase to bypass TTY guards",
+    "github actions matrix builds parallelize across darwin and linux",
+];
+
 #[test]
 fn list_default_page_size_is_ten_newest_first() {
     let tmp = fresh_project();
-    // 12 distinct bodies (cross-agent so each survives dedup as a separate doc).
-    for i in 0..12 {
+    // 12 semantically distinct bodies — see PAGINATION_FIXTURE_BODIES doc.
+    for (i, body) in PAGINATION_FIXTURE_BODIES.iter().enumerate() {
         let agent = if i % 2 == 0 { "planner" } else { "verifier" };
-        create_insight(
-            tmp.path(),
-            &format!("insight body number {i:02}"),
-            "agent-learned",
-            agent,
-            &[],
-        )
-        .success();
+        create_insight(tmp.path(), body, "agent-learned", agent, &[]).success();
     }
     let assert = bin()
         .current_dir(tmp.path())
@@ -416,27 +561,21 @@ fn list_default_page_size_is_ten_newest_first() {
     assert_eq!(total, 12);
     assert_eq!(page_size, 10);
     let rows = v["rows"].as_array().unwrap();
-    // Newest-first means body 11 then 10 then ... 02
+    // Newest-first: row[0] should be the LAST body in the fixture array.
     let first_snippet = rows[0]["snippet"].as_str().unwrap_or_default();
+    let last_body = PAGINATION_FIXTURE_BODIES.last().unwrap();
     assert!(
-        first_snippet.contains("number 11"),
-        "page 0 row 0 should be the newest insight; got snippet=`{first_snippet}`"
+        first_snippet.starts_with(&last_body[..40]),
+        "page 0 row 0 should be the newest insight (`{last_body}`); got snippet=`{first_snippet}`"
     );
 }
 
 #[test]
 fn list_offset_one_returns_remaining_two() {
     let tmp = fresh_project();
-    for i in 0..12 {
+    for (i, body) in PAGINATION_FIXTURE_BODIES.iter().enumerate() {
         let agent = if i % 2 == 0 { "planner" } else { "verifier" };
-        create_insight(
-            tmp.path(),
-            &format!("insight body number {i:02}"),
-            "agent-learned",
-            agent,
-            &[],
-        )
-        .success();
+        create_insight(tmp.path(), body, "agent-learned", agent, &[]).success();
     }
     let assert = bin()
         .current_dir(tmp.path())

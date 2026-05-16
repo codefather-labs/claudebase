@@ -161,7 +161,7 @@ fn run_insight_create(
         Err(code) => return code,
     };
 
-    // 5) Exact-sha dedup probe — same agent, same sha, within last 30d.
+    // 5a) Exact-sha dedup probe — same agent, same sha, within last 30d.
     const DEDUP_WINDOW_SECS: i64 = 30 * 86400;
     let cutoff = now - DEDUP_WINDOW_SECS;
     match store::find_recent_insight_by_sha(&conn, &sha_full, args.agent.trim(), cutoff) {
@@ -188,11 +188,43 @@ fn run_insight_create(
             }
             return std::process::ExitCode::SUCCESS;
         }
-        Ok(None) => {} // proceed
+        Ok(None) => {} // proceed to semantic-dedup probe
         Err(e) => {
             eprintln!("error: dedup probe failed: {e}");
             return std::process::ExitCode::from(1);
         }
+    }
+
+    // 5b) Semantic-dedup probe — encode the body and K-NN against
+    // chunks_vec to find near-duplicates from the same agent within the
+    // same 30-day window. Cosine threshold 0.92 maps to L2 distance ~0.4
+    // for L2-normalized e5 vectors (cosine = 1 − L2² / 2). Best-effort:
+    // silently no-ops when the encoder is unavailable OR chunks_vec is
+    // empty (degraded mode parity with the chunks_vec population path).
+    match find_semantic_duplicate(&conn, body, args.agent.trim(), cutoff) {
+        Some(existing_id) => {
+            if args.json {
+                let payload = serde_json::json!({
+                    "status":      "near-duplicate",
+                    "doc_id":      existing_id,
+                    "source_path": source_path,
+                    "sha256":      sha_full,
+                    "agent":       args.agent,
+                    "type":        args.kind,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                );
+            } else {
+                println!(
+                    "near-duplicate: existing doc id {existing_id} (semantic match, agent={})",
+                    args.agent
+                );
+            }
+            return std::process::ExitCode::SUCCESS;
+        }
+        None => {} // no near-duplicate found, proceed to write
     }
 
     // 6) Chunk the body — flat 500/100 sliding window. Insights have no
@@ -638,6 +670,98 @@ fn emit_insight_record(rec: &store::InsightRecord, json: bool) {
         println!();
         println!("{}", rec.body);
     }
+}
+
+/// Slice 5 — best-effort semantic-duplicate probe.
+///
+/// Returns `Some(doc_id)` when an existing insight in `insights.db` is a
+/// near-duplicate of `body` according to the cosine-0.92 threshold AND
+/// was emitted by the SAME `agent` within `cutoff_ingested_at`.
+///
+/// Best-effort: returns `None` silently when any of these conditions hold:
+///   - The e5 encoder model is unavailable (degraded-install).
+///   - The `chunks_vec` virtual table is absent (v1 schema).
+///   - The K-NN query fails for any reason.
+///
+/// Threshold derivation: e5-multilingual-small emits L2-normalized
+/// vectors, so cosine = 1 − L2² / 2. Solving for L2 at cosine = 0.92
+/// gives L2 = sqrt(2 × (1 − 0.92)) = sqrt(0.16) = 0.4. sqlite-vec
+/// returns L2 distance; we filter `distance < 0.4`.
+///
+/// Why same-agent only: cross-agent near-duplicates ARE load-bearing
+/// signal (cross-agent agreement on an observation), so we let them
+/// through — same rule as the exact-sha probe.
+fn find_semantic_duplicate(
+    conn: &rusqlite::Connection,
+    body: &str,
+    agent: &str,
+    cutoff_ingested_at: i64,
+) -> Option<i64> {
+    /// Cosine 0.92 → L2 distance ~0.4 for L2-normalized e5 vectors.
+    const SEMANTIC_DEDUP_L2_THRESHOLD: f64 = 0.4;
+
+    // Skip silently when chunks_vec is absent (v1 schema or never had
+    // vectors populated). Probing sqlite_master is cheaper than failing
+    // the K-NN query.
+    let has_vec: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks_vec'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !has_vec {
+        return None;
+    }
+
+    // Encode the body as a single passage. The encoder uses the "passage:"
+    // prefix internally (e5 convention). For multi-chunk bodies the first
+    // chunk's vector is sufficient as a topical signature — bodies that
+    // share opening semantics are near-duplicates in practice.
+    let embeddings = encoder::encode_passages(&[body]).ok()?;
+    let body_emb = embeddings.first()?;
+    let bytes: Vec<u8> = body_emb.iter().flat_map(|f| f.to_le_bytes()).collect();
+
+    // K-NN against chunks_vec. JOIN here is intentional — sqlite-vec's
+    // MATCH operator returns `distance` as a virtual column, and JOIN
+    // with chunks + documents lets us filter same-agent + within-window
+    // in the same query. LIMIT 5 over-fetches to handle the case where
+    // the top-1 hit fails the agent/recency filter but a top-2..5 hit
+    // would pass — rare but realistic in dense corpora.
+    let mut stmt = conn
+        .prepare(
+            "SELECT cv.rowid, cv.distance, c.doc_id, d.agent_name, d.ingested_at \
+             FROM chunks_vec cv \
+             JOIN chunks c ON c.id = cv.rowid \
+             JOIN documents d ON d.id = c.doc_id \
+             WHERE cv.embedding MATCH ?1 AND k = 5 \
+             ORDER BY cv.distance",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map(rusqlite::params![bytes], |r| {
+            Ok((
+                r.get::<_, i64>(0)?, // chunk_id (unused — kept for debugging)
+                r.get::<_, f64>(1)?, // distance (L2)
+                r.get::<_, i64>(2)?, // doc_id
+                r.get::<_, Option<String>>(3)?, // agent_name
+                r.get::<_, i64>(4)?, // ingested_at
+            ))
+        })
+        .ok()?;
+
+    for row in rows.flatten() {
+        let (_chunk_id, distance, doc_id, doc_agent, doc_ingested_at) = row;
+        if distance >= SEMANTIC_DEDUP_L2_THRESHOLD {
+            // Sorted by distance ASC — once we exceed the threshold the
+            // remaining candidates are even further; bail out early.
+            break;
+        }
+        if doc_agent.as_deref() == Some(agent) && doc_ingested_at >= cutoff_ingested_at {
+            return Some(doc_id);
+        }
+    }
+    None
 }
 
 /// Best-effort embedding write into chunks_vec for an insight document.

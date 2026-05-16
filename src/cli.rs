@@ -40,6 +40,29 @@ impl Default for SearchMode {
     }
 }
 
+/// Salience tag per cognitive-self-check rule. Drives TTL on the insights
+/// corpus: `high` survives forever, `medium` 1 year, `low` 90 days. The
+/// tag is stored verbatim as TEXT in `documents.salience` (schema v4).
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Salience {
+    /// Load-bearing for the whole artifact; retained indefinitely.
+    High,
+    /// Affects correctness of a slice/decision; retained ~1 year.
+    Medium,
+    /// Context-setting only; retained ~90 days then GC'd.
+    Low,
+}
+
+impl Salience {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Salience::High => "high",
+            Salience::Medium => "medium",
+            Salience::Low => "low",
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ProjectRootError {
     #[error("project-root must resolve under current working directory")]
@@ -317,6 +340,178 @@ pub enum Command {
     /// schema. Re-parses each PDF via pdfium and populates pages without
     /// touching chunks_fts / chunks_vec — preserves embeddings.
     ReindexPages(ReindexPagesArgs),
+    /// Unified agent-insights subcommand tree (`create / search / list /
+    /// random / get`). Operates exclusively on `insights.db` — the books
+    /// corpus (`index.db`) is untouched. See
+    /// docs/design/agent-insights-base.md.
+    Insight(InsightArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct InsightArgs {
+    #[command(subcommand)]
+    pub sub: InsightSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum InsightSubcommand {
+    /// Persist a cognitive insight. Same body within (agent, sha256) over
+    /// the last 30 days is deduplicated.
+    Create(InsightCreateArgs),
+    /// Vector + lexical search against the insights corpus (hybrid by
+    /// default — BM25 ⊕ dense via RRF k=60, with auto-fallback to lexical
+    /// when the e5 encoder is unavailable).
+    Search(InsightSearchArgs),
+    /// List insights newest-first, 10 per page. `--offset 0` = latest 10,
+    /// `--offset 1` = next 10, and so on.
+    List(InsightListArgs),
+    /// Return one random insight uniformly sampled from the corpus.
+    Random(InsightRandomArgs),
+    /// Fetch one insight by integer `documents.id` or sha256 prefix
+    /// (≥4 hex chars matches the stored sha256 via LIKE 'prefix%').
+    Get(InsightGetArgs),
+}
+
+/// `claudebase insight create "<body>"` — agent write surface for the
+/// insights corpus (schema v4). Persists one cognitive insight per call;
+/// same body within the same `(agent, sha256)` over the last 30 days is
+/// deduplicated by `find_recent_insight_by_sha`.
+///
+/// Body semantics:
+///   - positional `<body>` literal string
+///   - `-` as the positional → read stdin
+///   - omitted positional with piped stdin → read stdin
+///   - omitted positional on an interactive TTY → exits 2 with usage
+#[derive(Args, Debug)]
+pub struct InsightCreateArgs {
+    /// Insight body. Pass `-` or omit (with piped stdin) to read from stdin.
+    /// On an interactive TTY without a body, the command exits 2.
+    pub body: Option<String>,
+
+    /// Insight kind — open enum tied to docs/design/agent-insights-base.md.
+    /// Examples: agent-learned, self-bias-caught, peer-bias-observed,
+    /// red-team-objection, consolidator-drift, prediction-error,
+    /// assumption-falsified, plan-reality-gap, reflection-observation,
+    /// operator-correction.
+    #[arg(long = "type")]
+    pub kind: String,
+
+    /// Emitting agent name (planner, reflection, consolidator, red-team, ...).
+    #[arg(long)]
+    pub agent: String,
+
+    /// Claude Code session id for trace linking. Optional but recommended;
+    /// when absent the field stays NULL.
+    #[arg(long)]
+    pub session: Option<String>,
+
+    /// Feature slug this insight belongs to (matches .claude/plan.md feature).
+    #[arg(long)]
+    pub feature: Option<String>,
+
+    /// Salience tag per cognitive-self-check rule; drives retention TTL.
+    #[arg(long, value_enum, default_value_t = Salience::Medium)]
+    pub salience: Salience,
+
+    /// Path or anchor of the artifact the insight was extracted from
+    /// (e.g. `.claude/plan.md#slice-3`, `docs/PRD.md#FR-7.2`).
+    #[arg(long = "source-artifact")]
+    pub source_artifact: Option<String>,
+
+    #[arg(long)]
+    pub project_root: Option<PathBuf>,
+
+    /// Corpus file — `insights.db` by default. Tests/admin may override.
+    #[arg(long, default_value = "insights.db")]
+    pub db_name: String,
+
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `claudebase insight search "<query>"` — hybrid retrieval against
+/// `insights.db`. Default mode is `hybrid` (BM25 ⊕ dense via RRF k=60);
+/// auto-falls-back to `lexical` when the e5 encoder model or the
+/// chunks_vec virtual table is unavailable.
+#[derive(Args, Debug)]
+pub struct InsightSearchArgs {
+    pub query: String,
+    #[arg(long, default_value_t = 5)]
+    pub top_k: usize,
+    #[arg(long, default_value_t = 0)]
+    pub context: usize,
+    #[arg(long, value_enum, default_value_t = SearchMode::Hybrid)]
+    pub mode: SearchMode,
+    #[arg(long)]
+    pub project_root: Option<PathBuf>,
+    #[arg(long, default_value = "insights.db")]
+    pub db_name: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct InsightListArgs {
+    /// Page index (0-based). Page size is fixed at 10 by default but
+    /// overrideable via `--page-size` for batch-scripted exports.
+    #[arg(long, default_value_t = 0)]
+    pub offset: usize,
+    /// Page size — number of insights per page. Default 10. Capped at 100.
+    #[arg(long, default_value_t = 10)]
+    pub page_size: usize,
+    /// Optional filter on `documents.source_type` (exact match).
+    #[arg(long = "type")]
+    pub kind: Option<String>,
+    /// Optional filter on `documents.agent_name` (exact match).
+    #[arg(long)]
+    pub agent: Option<String>,
+    /// Optional filter on `documents.salience` (exact match: high|medium|low).
+    #[arg(long, value_enum)]
+    pub salience: Option<Salience>,
+    /// Optional filter on `documents.feature_slug` (exact match).
+    #[arg(long)]
+    pub feature: Option<String>,
+    #[arg(long)]
+    pub project_root: Option<PathBuf>,
+    #[arg(long, default_value = "insights.db")]
+    pub db_name: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct InsightRandomArgs {
+    /// Optional filter on `documents.source_type` (exact match).
+    #[arg(long = "type")]
+    pub kind: Option<String>,
+    /// Optional filter on `documents.agent_name` (exact match).
+    #[arg(long)]
+    pub agent: Option<String>,
+    /// Optional filter on `documents.salience` (exact match: high|medium|low).
+    #[arg(long, value_enum)]
+    pub salience: Option<Salience>,
+    /// Optional filter on `documents.feature_slug` (exact match).
+    #[arg(long)]
+    pub feature: Option<String>,
+    #[arg(long)]
+    pub project_root: Option<PathBuf>,
+    #[arg(long, default_value = "insights.db")]
+    pub db_name: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct InsightGetArgs {
+    /// Insight identifier — integer `documents.id` OR sha256 prefix
+    /// (≥4 hex chars, matched as `sha256 LIKE '<prefix>%'`).
+    pub ident: String,
+    #[arg(long)]
+    pub project_root: Option<PathBuf>,
+    #[arg(long, default_value = "insights.db")]
+    pub db_name: String,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(clap::Parser, Debug)]

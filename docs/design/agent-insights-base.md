@@ -79,29 +79,74 @@ documents) with the same migration system. The only differences:
 The retrieval engine is unchanged. Both DBs are searchable independently,
 and a `--corpus all` flag fuses results across them.
 
-## Insight types (the `source_type` enum)
+## Insight types — cognitive insights only (the `source_type` enum)
 
-| `source_type` | Emitter | Trigger | Typical content |
-|---|---|---|---|
-| `reflection-observation` | `reflection` agent | `/reflect` invocation | Free-form non-obvious observation about the project state |
-| `consolidator-drift` | `consolidator` agent | Auto-chained between waves in `/develop-feature`, or `/consolidate` | Two-point drift finding (file:line A diverged from file:line B) |
-| `red-team-objection` | `red-team` agent | Auto-chained Step 5.25 in `/bootstrap-feature` | Adversarial finding (premise/scope/dependency/etc.) |
-| `decision-record` | Any agent | A load-bearing decision where Q1-Q5 of cognitive-self-check had real ambiguity (not mechanical) | The decision + outcome summary |
-| `assumption-log` | Any agent | A high-salience assumption with non-obvious risk | The assumption + risk + verification path |
-| `hack-acknowledged` | Any agent | A shipped workaround with non-trivial removal cost | The hack + removal path |
-| `project-observation` | Any agent | A non-obvious structural finding about the codebase or repo state | The observation |
-| `agent-handoff-note` | Any agent | A contract drift or hand-off failure with another agent that next agents should know | The drift + which agents involved + reproducer |
-| `operator-correction` | Any agent | The operator (Vlad) corrected the agent in a way that should propagate to future agents | The correction + context where it applied |
-| `self-observation` | Any agent | The agent noticed something about its own reasoning — blind spot, prompting technique that worked unexpectedly, etc. | The self-observation |
+**The scope is COGNITIVE insights, not factual findings.** This is the
+sharpest version of the quality gate. An agent writes to `claudebase
+remember` only when the insight falls along one of three cognitive axes:
 
-The taxonomy mirrors the cognitive-self-check rule's output structure where
-applicable, and adds three new types — `project-observation`,
-`agent-handoff-note`, `operator-correction` — for findings that are real but
-do not fit the structured decision/assumption/hack vocabulary.
+1. **Self-learning** — the agent noticed it learned something new about the
+   domain, the codebase, the operator, or its own reasoning.
+2. **Peer-bias detection** — the agent noticed cognitive bias / blind spot /
+   premature convergence in another agent's output (or in its own past
+   outputs).
+3. **Prediction-reality mismatch** — what was planned, expected, or asserted
+   did not match what actually happened. This is the predictive-coding
+   analogue (per protocol 8 in cognitive-self-check.md) — prediction error
+   is the most load-bearing learning signal.
 
-Important: **the agent decides whether a finding is "real" before choosing a
-source_type**. The taxonomy is a *classifier* for findings that already pass
-the quality gate, not a list of compulsory categories to populate every run.
+**Factual findings DO NOT belong here.** A bug in file X, a missing test, a
+broken contract, a stale comment — those go into PRs, scratchpads, issue
+trackers. The insights corpus is reserved for *learning about cognition*.
+
+### Axis 1 — Self-learning
+
+| `source_type` | Emitter | Trigger |
+|---|---|---|
+| `agent-learned` | Any agent | The agent acquired new domain knowledge / new skill / new prompting technique during the task. Example: "I learned that this codebase's `repository::sidebar_data` is invoked on every page render, not lazily — future agents touching layout should expect that cost." |
+| `self-bias-caught` | Any agent | The agent caught its OWN confirmation bias, premature convergence, or pattern-completion mistake mid-task and corrected. Example: "I assumed sqlx migrations were file-based; reading store.rs revealed they're inline `&str` constants. Correcting prevented a phantom-files plan." |
+
+### Axis 2 — Peer-bias detection
+
+| `source_type` | Emitter | Trigger |
+|---|---|---|
+| `peer-bias-observed` | Any agent | The agent observed cognitive bias in another agent's output — confirmation bias, premature scope-lock, treating a hack as a real fix, missing alternatives, propagating an upstream error mechanically. Example: "Planner emitted a slice with the verb 'simply' on a 4-file change — anchoring on apparent simplicity; red-team needs to push back." |
+| `red-team-objection` | `red-team` agent | Adversarial finding from the red-team agent specifically — its job IS structural confirmation-bias debiasing. |
+| `consolidator-drift` | `consolidator` agent | Drift between two artifacts (PRD ↔ plan, plan ↔ implementation, etc.) — drift is bias-shaped: a downstream artifact internalized an upstream framing that has since changed. |
+
+### Axis 3 — Prediction-reality mismatch (Friston prediction error)
+
+| `source_type` | Emitter | Trigger |
+|---|---|---|
+| `prediction-error` | Any agent | An explicit "predicted outcome" did not match the actual outcome. Per protocol 8 — `Predicted outcome:` field on slices vs verifier's actual measurement. The DELTA is the insight. |
+| `assumption-falsified` | Any agent | An explicitly-labelled `### Assumption` in the agent's Facts block was tested and proved wrong. The falsification is more valuable than a thousand verified facts. |
+| `plan-reality-gap` | Any agent | Broader gap: the plan said X would take 1 hour and 1 slice; reality took 4 hours and 3 slices. The structural reason for the gap is the insight (not the time-overrun itself). |
+
+### Special axes
+
+| `source_type` | Emitter | Trigger |
+|---|---|---|
+| `reflection-observation` | `reflection` agent | Default Mode Network analogue — unfocused observations the agent surfaced during `/reflect`. By construction these are cognitive (the agent is in DMN mode), not factual. |
+| `operator-correction` | Any agent | The operator (Vlad) corrected the agent in a way that revealed a misalignment between agent expectation and operator reality. The cognitive lesson is what should propagate to future agents — NOT the literal correction. Example: not "Vlad wants Y not X" but "agents in this project tend to over-explain; Vlad's terseness is signal, not preference." |
+
+### NOT cognitive insights — do not write
+
+- Factual bug reports → PR / issue tracker
+- Mechanical execution narration → scratchpad
+- Re-statements of PRD requirements → scratchpad
+- Generic best practices ("tests are good") → corpus already has these
+- Style preferences → CLAUDE.md
+- Code review comments → PR
+- One-off observations with no cognitive lesson behind them
+
+The agent's mental gate before calling `claudebase remember`:
+
+> Did my work just teach me / catch a bias / falsify a prediction?
+> If no — silence is the correct output. Don't write.
+
+This is the same gate a senior engineer applies before writing a postmortem:
+the postmortem is worth writing iff there was a cognitive surprise. Mechanical
+execution doesn't earn one.
 
 ## CLI surface — new subcommands
 
@@ -228,35 +273,30 @@ executor agents both — including `test-writer`, `build-runner`, `e2e-runner`,
 cognitive-self-check rule) MAY call `claudebase remember`. The previous
 "12 in-scope thinking agents" restriction is lifted.
 
-**Quality bar (NEW, non-negotiable):** Agents call `claudebase remember`
-**only when a real intellectual finding exists**. Writing for the sake of
-writing — repeating well-known facts, paraphrasing input, narrating mechanical
-steps — is forbidden. The dedup layer (Slice 5) will catch some of this; the
-agent prompt language must explicitly gate the call.
+**Quality bar (non-negotiable):** Agents call `claudebase remember`
+**only when a COGNITIVE insight exists** — see the three-axis taxonomy
+in `## Insight types` below. Factual findings, mechanical narration,
+re-statements of input, and generic best-practice claims do NOT belong
+here. They go into PRs, scratchpads, issue trackers, or stay silent.
 
-A "real insight" is any of:
+The three cognitive axes (full detail in `## Insight types`):
 
-- **About the project** — a non-obvious structural observation about the
-  codebase, an emergent constraint, a load-bearing decision rationale, a
-  pattern the agent noticed across files, a counter-intuitive interaction.
-- **About working with other agents** — a contract that previously held but
-  drifted, a hand-off failure mode the agent encountered, a missing affordance
-  in an upstream agent's output, a pattern in how Vlad (the operator) corrects
-  the pipeline.
-- **About the operator** — preferences observed, recurring corrections, signal
-  about what Vlad considers important vs noise, working-style cues that should
-  inform how future agents respond. *Memory of human-in-the-loop interaction.*
-- **About self** — surprising things the agent learned about its own
-  reasoning, blind spots it discovered, prompting techniques that worked
-  unexpectedly well or poorly.
+1. **Self-learning** — agent noticed it learned something (new domain
+   knowledge, prompting technique, blind spot caught mid-task).
+2. **Peer-bias detection** — agent observed cognitive bias in another
+   agent (or in its own past outputs).
+3. **Prediction-reality mismatch** — what was planned/expected didn't
+   match what happened. Friston-style prediction error.
 
-What is **NOT** an insight (do not write):
+What is **NOT** a cognitive insight (do not write):
 
 - Mechanical execution narration ("I read file X then edited Y").
+- Factual bug reports — those go into PR / issue tracker.
 - Restating PRD requirements or plan slices.
 - Generic best-practice claims (e.g. "tests are good").
 - Anything already searchable in the books corpus.
 - Hedge-language summaries ("this might be useful later").
+- Style preferences — those go into CLAUDE.md.
 
 Per-agent triggers (suggested, not exhaustive):
 

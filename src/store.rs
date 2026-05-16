@@ -441,6 +441,466 @@ pub fn upsert_document(
     Ok(id)
 }
 
+/// Insert or update a documents row carrying the v4 agent-insights metadata.
+///
+/// This is the parallel of `upsert_document` for the insights corpus
+/// (`insights.db`): same `INSERT ... ON CONFLICT(source_path) DO UPDATE`
+/// shape so an in-session re-write of the same synthetic source_path
+/// produces exactly one row, but extended with the six nullable columns
+/// added by `SCHEMA_V4_DELTA`. Books-corpus rows continue to use
+/// `upsert_document` (which leaves the v4 columns NULL).
+///
+/// SQL discipline: parameterized via `?1..?10`; static `&str` literal SQL.
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_insight_document(
+    conn: &Connection,
+    source_path: &str,
+    mtime: i64,
+    sha256: &str,
+    ingested_at: i64,
+    source_type: &str,
+    agent_name: &str,
+    session_id: Option<&str>,
+    feature_slug: Option<&str>,
+    salience: &str,
+    parent_artifact: Option<&str>,
+) -> Result<i64, rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO documents( \
+             source_path, mtime, sha256, ingested_at, \
+             source_type, agent_name, session_id, \
+             feature_slug, salience, parent_artifact) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+         ON CONFLICT(source_path) DO UPDATE SET \
+           mtime           = excluded.mtime, \
+           sha256          = excluded.sha256, \
+           ingested_at     = excluded.ingested_at, \
+           source_type     = excluded.source_type, \
+           agent_name      = excluded.agent_name, \
+           session_id      = excluded.session_id, \
+           feature_slug    = excluded.feature_slug, \
+           salience        = excluded.salience, \
+           parent_artifact = excluded.parent_artifact",
+        rusqlite::params![
+            source_path,
+            mtime,
+            sha256,
+            ingested_at,
+            source_type,
+            agent_name,
+            session_id,
+            feature_slug,
+            salience,
+            parent_artifact,
+        ],
+    )?;
+    let id: i64 = conn.query_row(
+        "SELECT id FROM documents WHERE source_path = ?1",
+        rusqlite::params![source_path],
+        |r| r.get(0),
+    )?;
+    Ok(id)
+}
+
+/// One row returned by the `insight list / random / get` family. Carries
+/// the v4 metadata columns plus the reconstructed body text (chunks joined
+/// with 100-char overlap collapsed, matching the ingest::chunk window).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InsightRecord {
+    pub id: i64,
+    pub source_path: String,
+    pub sha256: String,
+    pub ingested_at: i64,
+    pub source_type: Option<String>,
+    pub agent_name: Option<String>,
+    pub session_id: Option<String>,
+    pub feature_slug: Option<String>,
+    pub salience: Option<String>,
+    pub parent_artifact: Option<String>,
+    pub body: String,
+}
+
+/// Compact summary for the `list` page — same identifying fields as the
+/// full record but with a snippet instead of the full body.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InsightSummary {
+    pub id: i64,
+    pub sha256_short: String,
+    pub ingested_at: i64,
+    pub source_type: Option<String>,
+    pub agent_name: Option<String>,
+    pub salience: Option<String>,
+    pub feature_slug: Option<String>,
+    pub snippet: String,
+}
+
+/// Reconstruct a flat body from `chunks` rows ordered by `ord`. Insights
+/// are written by `ingest::chunk` (flat 500/100 sliding window with
+/// 100-char overlap), so when chunks > 1 the adjacent chunks share the
+/// trailing/leading 100 chars; the helper drops the overlap from chunks
+/// 1..N when stitching. For single-chunk insights the chunk text is
+/// returned verbatim.
+fn reconstruct_body_from_chunks(chunks: &[String]) -> String {
+    if chunks.is_empty() {
+        return String::new();
+    }
+    let mut out = chunks[0].clone();
+    for chunk in &chunks[1..] {
+        let chars: Vec<char> = chunk.chars().collect();
+        // The chunker uses CHUNK_OVERLAP = 100 so the first 100 chars of
+        // every chunk after #0 duplicate the previous chunk's tail.
+        const OVERLAP: usize = 100;
+        if chars.len() > OVERLAP {
+            let suffix: String = chars[OVERLAP..].iter().collect();
+            out.push_str(&suffix);
+        } else {
+            // Chunk shorter than the overlap window — happens only when the
+            // body is exactly window-aligned. Append as-is.
+            out.push_str(chunk);
+        }
+    }
+    out
+}
+
+/// Internal: load the full `InsightRecord` for one `documents.id`. Caller
+/// has already verified the row is an insight (source_type IS NOT NULL).
+fn load_insight_record(
+    conn: &Connection,
+    id: i64,
+) -> Result<Option<InsightRecord>, rusqlite::Error> {
+    use rusqlite::OptionalExtension;
+    let row: Option<(
+        i64,
+        String,
+        String,
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = conn
+        .query_row(
+            "SELECT id, source_path, sha256, ingested_at, source_type, \
+                    agent_name, session_id, feature_slug, salience, parent_artifact \
+             FROM documents WHERE id = ?1",
+            rusqlite::params![id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        id,
+        source_path,
+        sha256,
+        ingested_at,
+        source_type,
+        agent_name,
+        session_id,
+        feature_slug,
+        salience,
+        parent_artifact,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    // Stitch chunks back into the full body. `stmt` must outlive the
+    // MappedRows iterator returned by `query_map`, so we collect inside
+    // the same scope with the stmt binding still alive.
+    let chunk_texts: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT text FROM chunks WHERE doc_id = ?1 ORDER BY ord",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![id], |r| r.get::<_, String>(0))?;
+        let collected: Vec<String> = rows.filter_map(Result::ok).collect();
+        collected
+    };
+    let body = reconstruct_body_from_chunks(&chunk_texts);
+    Ok(Some(InsightRecord {
+        id,
+        source_path,
+        sha256,
+        ingested_at,
+        source_type,
+        agent_name,
+        session_id,
+        feature_slug,
+        salience,
+        parent_artifact,
+        body,
+    }))
+}
+
+/// Count insights (rows where `source_type IS NOT NULL`) optionally
+/// filtered by source_type / agent / salience / feature.
+#[allow(clippy::too_many_arguments)]
+pub fn count_insights(
+    conn: &Connection,
+    kind: Option<&str>,
+    agent: Option<&str>,
+    salience: Option<&str>,
+    feature: Option<&str>,
+) -> Result<i64, rusqlite::Error> {
+    let (sql, params) = build_filter_sql(
+        "SELECT COUNT(*) FROM documents",
+        kind,
+        agent,
+        salience,
+        feature,
+        None,
+        None,
+    );
+    let params_refs: Vec<&dyn rusqlite::ToSql> =
+        params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    conn.query_row(&sql, params_refs.as_slice(), |r| r.get::<_, i64>(0))
+}
+
+/// List insights newest-first with metadata filters and OFFSET/LIMIT
+/// pagination. Returns compact summaries — call `get_insight_by_id` to
+/// fetch a full record with the reconstructed body.
+#[allow(clippy::too_many_arguments)]
+pub fn list_insights(
+    conn: &Connection,
+    kind: Option<&str>,
+    agent: Option<&str>,
+    salience: Option<&str>,
+    feature: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<InsightSummary>, rusqlite::Error> {
+    let (sql, params) = build_filter_sql(
+        "SELECT id, sha256, ingested_at, source_type, agent_name, salience, feature_slug \
+         FROM documents",
+        kind,
+        agent,
+        salience,
+        feature,
+        Some(limit),
+        Some(offset),
+    );
+    let params_refs: Vec<&dyn rusqlite::ToSql> =
+        params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_refs.as_slice(), |r| {
+        let id: i64 = r.get(0)?;
+        let sha: String = r.get(1)?;
+        Ok((
+            id,
+            sha,
+            r.get::<_, i64>(2)?,
+            r.get::<_, Option<String>>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, Option<String>>(5)?,
+            r.get::<_, Option<String>>(6)?,
+        ))
+    })?;
+    let mut summaries: Vec<(i64, String, i64, Option<String>, Option<String>, Option<String>, Option<String>)> = Vec::new();
+    for row in rows {
+        summaries.push(row?);
+    }
+    // Render snippets — pull chunk 0's text up to 200 chars per insight.
+    let mut out = Vec::with_capacity(summaries.len());
+    for (id, sha, ingested_at, st, an, sal, feat) in summaries {
+        let snippet = {
+            use rusqlite::OptionalExtension;
+            let row: Option<String> = conn
+                .query_row(
+                    "SELECT text FROM chunks WHERE doc_id = ?1 ORDER BY ord LIMIT 1",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            row.unwrap_or_default()
+                .chars()
+                .take(200)
+                .collect::<String>()
+        };
+        out.push(InsightSummary {
+            id,
+            sha256_short: sha.chars().take(16).collect(),
+            ingested_at,
+            source_type: st,
+            agent_name: an,
+            salience: sal,
+            feature_slug: feat,
+            snippet,
+        });
+    }
+    Ok(out)
+}
+
+/// Return one random insight (uniform sample) optionally filtered by the
+/// same dimensions as `list_insights`. Returns `Ok(None)` when no row
+/// matches the filters (empty corpus or restrictive filter combination).
+///
+/// Cannot reuse `build_filter_sql` because the random path needs
+/// `ORDER BY RANDOM() LIMIT 1`, not `ORDER BY ingested_at DESC LIMIT ?`.
+pub fn random_insight(
+    conn: &Connection,
+    kind: Option<&str>,
+    agent: Option<&str>,
+    salience: Option<&str>,
+    feature: Option<&str>,
+) -> Result<Option<InsightRecord>, rusqlite::Error> {
+    use rusqlite::OptionalExtension;
+    let mut sql = String::from("SELECT id FROM documents WHERE source_type IS NOT NULL");
+    let mut params: Vec<String> = Vec::new();
+    let mut next_idx = 1usize;
+    for (col, val) in [
+        ("source_type", kind),
+        ("agent_name", agent),
+        ("salience", salience),
+        ("feature_slug", feature),
+    ] {
+        if let Some(v) = val {
+            sql.push_str(&format!(" AND {col} = ?{next_idx}"));
+            params.push(v.to_string());
+            next_idx += 1;
+        }
+    }
+    sql.push_str(" ORDER BY RANDOM() LIMIT 1");
+    let params_refs: Vec<&dyn rusqlite::ToSql> =
+        params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    let id: Option<i64> = conn
+        .query_row(&sql, params_refs.as_slice(), |r| r.get(0))
+        .optional()?;
+    match id {
+        Some(id) => load_insight_record(conn, id),
+        None => Ok(None),
+    }
+}
+
+/// Fetch one insight by integer `documents.id`. Returns `Ok(None)` when no
+/// row exists OR when the row exists but is a books-corpus doc
+/// (source_type IS NULL) — the caller treats the latter as "not an insight".
+pub fn get_insight_by_id(
+    conn: &Connection,
+    id: i64,
+) -> Result<Option<InsightRecord>, rusqlite::Error> {
+    let rec = load_insight_record(conn, id)?;
+    Ok(rec.filter(|r| r.source_type.is_some()))
+}
+
+/// Fetch one insight by sha256 prefix (≥4 hex chars, matched as
+/// `sha256 LIKE 'prefix%'`). Returns `Err(rusqlite::Error)` mapped from
+/// QueryReturnedNoRows when no match; returns the most recently ingested
+/// match when the prefix matches multiple rows (rare; means the user gave
+/// too short a prefix).
+pub fn get_insight_by_sha_prefix(
+    conn: &Connection,
+    prefix: &str,
+) -> Result<Option<InsightRecord>, rusqlite::Error> {
+    use rusqlite::OptionalExtension;
+    let pattern = format!("{prefix}%");
+    let id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM documents \
+             WHERE sha256 LIKE ?1 AND source_type IS NOT NULL \
+             ORDER BY ingested_at DESC LIMIT 1",
+            rusqlite::params![pattern],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match id {
+        Some(id) => load_insight_record(conn, id),
+        None => Ok(None),
+    }
+}
+
+/// Build a parameterized SELECT with optional WHERE filters and
+/// LIMIT/OFFSET clauses for the insight-list / random / count family.
+///
+/// The base SELECT is passed in by the caller (so the same builder works
+/// for `SELECT id, ...` and `SELECT COUNT(*)`). Filters are pushed onto a
+/// `WHERE source_type IS NOT NULL AND ...` chain so books-corpus rows are
+/// always excluded — this is the "insight" semantic boundary.
+fn build_filter_sql(
+    base_select: &str,
+    kind: Option<&str>,
+    agent: Option<&str>,
+    salience: Option<&str>,
+    feature: Option<&str>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> (String, Vec<String>) {
+    let mut sql = format!("{base_select} WHERE source_type IS NOT NULL");
+    let mut params: Vec<String> = Vec::new();
+    let mut next_idx = 1usize;
+    let push_eq = |col: &str, val: &str, sql: &mut String, params: &mut Vec<String>, idx: &mut usize| {
+        sql.push_str(&format!(" AND {col} = ?{idx}"));
+        params.push(val.to_string());
+        *idx += 1;
+    };
+    if let Some(v) = kind {
+        push_eq("source_type", v, &mut sql, &mut params, &mut next_idx);
+    }
+    if let Some(v) = agent {
+        push_eq("agent_name", v, &mut sql, &mut params, &mut next_idx);
+    }
+    if let Some(v) = salience {
+        push_eq("salience", v, &mut sql, &mut params, &mut next_idx);
+    }
+    if let Some(v) = feature {
+        push_eq("feature_slug", v, &mut sql, &mut params, &mut next_idx);
+    }
+    // ORDER BY ingested_at DESC for stable newest-first pagination. The
+    // `random_insight` caller rewrites this clause via string-replace
+    // (see `random_insight`); for list/count this is the canonical order.
+    sql.push_str(" ORDER BY ingested_at DESC");
+    if let Some(l) = limit {
+        sql.push_str(&format!(" LIMIT ?{next_idx}"));
+        params.push(l.to_string());
+        next_idx += 1;
+        if let Some(o) = offset {
+            sql.push_str(&format!(" OFFSET ?{next_idx}"));
+            params.push(o.to_string());
+        }
+    }
+    let _ = next_idx; // suppress unused-mut lint when both Optional are None
+    (sql, params)
+}
+
+/// Exact-sha dedup probe for the insights corpus.
+///
+/// Returns the existing `documents.id` when a row with the same `sha256`
+/// AND `agent_name` was ingested at or after `cutoff_ingested_at` (a
+/// unix-seconds timestamp; callers pass `now - 30 * 86400` for the
+/// design-doc-specified 30-day window). `None` means no recent duplicate
+/// — caller proceeds to upsert.
+///
+/// Intentionally narrower than a generic "is this body in the corpus?"
+/// query: cross-agent collisions are NOT deduplicated (two agents
+/// independently surfacing the same observation IS load-bearing signal).
+pub fn find_recent_insight_by_sha(
+    conn: &Connection,
+    sha256: &str,
+    agent_name: &str,
+    cutoff_ingested_at: i64,
+) -> Result<Option<i64>, rusqlite::Error> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT id FROM documents \
+         WHERE sha256 = ?1 AND agent_name = ?2 AND ingested_at >= ?3 \
+         ORDER BY ingested_at DESC LIMIT 1",
+        rusqlite::params![sha256, agent_name, cutoff_ingested_at],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
 /// Replace all chunks for a document: delete prior rows then insert the new set.
 /// FTS5 triggers fire for each row, so the FTS5 index stays in sync.
 ///

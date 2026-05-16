@@ -29,6 +29,13 @@ fn main() -> std::process::ExitCode {
         Command::Compare(a) => a.project_root.as_deref(),
         Command::Page(a) => a.project_root.as_deref(),
         Command::ReindexPages(a) => a.project_root.as_deref(),
+        Command::Insight(a) => match &a.sub {
+            cli::InsightSubcommand::Create(c) => c.project_root.as_deref(),
+            cli::InsightSubcommand::Search(s) => s.project_root.as_deref(),
+            cli::InsightSubcommand::List(l) => l.project_root.as_deref(),
+            cli::InsightSubcommand::Random(r) => r.project_root.as_deref(),
+            cli::InsightSubcommand::Get(g) => g.project_root.as_deref(),
+        },
     };
 
     let root = match cli::resolve_project_root(project_root_arg) {
@@ -51,7 +58,535 @@ fn main() -> std::process::ExitCode {
         Command::Compare(args) => run_compare(&root, &args),
         Command::Page(args) => run_page(&root, &args),
         Command::ReindexPages(args) => run_reindex_pages(&root, &args),
+        Command::Insight(args) => match args.sub {
+            cli::InsightSubcommand::Create(a) => run_insight_create(&root, &a),
+            cli::InsightSubcommand::Search(a) => run_insight_search(&root, &a),
+            cli::InsightSubcommand::List(a) => run_insight_list(&root, &a),
+            cli::InsightSubcommand::Random(a) => run_insight_random(&root, &a),
+            cli::InsightSubcommand::Get(a) => run_insight_get(&root, &a),
+        },
     }
+}
+
+/// `insight create "<body>"` — agent write surface for the insights corpus
+/// (schema v4).
+///
+/// Reads the insight body from the positional arg or stdin (TTY refused),
+/// runs the exact-sha dedup probe (`agent_name`+sha256 within last 30 days),
+/// chunks the body via the canonical 500/100 sliding window, and writes
+/// via `store::upsert_insight_document` + `store::replace_chunks`. Encoder
+/// population into `chunks_vec` is best-effort — silent no-op when the e5
+/// model is missing, matching the ingest path's degraded-mode behavior.
+fn run_insight_create(
+    root: &std::path::Path,
+    args: &cli::InsightCreateArgs,
+) -> std::process::ExitCode {
+    use std::io::Read;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // 1) Resolve body — positional literal, `-`, or piped stdin.
+    let body_string = match args.body.as_deref() {
+        Some("-") | None => {
+            // Refuse to block on an interactive TTY — guard against
+            // accidental invocation from a human shell. Agents always
+            // pipe stdin, so the non-TTY path is the load-bearing one.
+            if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                eprintln!(
+                    "error: body required (positional `<body>` or pipe input to stdin); refusing to block on TTY"
+                );
+                return std::process::ExitCode::from(2);
+            }
+            let mut buf = String::new();
+            if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+                eprintln!("error: failed to read stdin: {e}");
+                return std::process::ExitCode::from(1);
+            }
+            buf
+        }
+        Some(literal) => literal.to_string(),
+    };
+    let body = body_string.trim();
+    if body.is_empty() {
+        eprintln!("error: insight body is empty");
+        return std::process::ExitCode::from(2);
+    }
+
+    // 2) Validate the args that aren't typed at the parser level.
+    if args.kind.trim().is_empty() {
+        eprintln!("error: --type must not be empty");
+        return std::process::ExitCode::from(2);
+    }
+    if args.agent.trim().is_empty() {
+        eprintln!("error: --agent must not be empty");
+        return std::process::ExitCode::from(2);
+    }
+
+    // 3) Compute sha256(body) for dedup + synthesize the source_path.
+    //
+    // source_path shape: `agent:{agent}:{session}:{feature}:{sha[..16]}`.
+    // The `agent:` prefix keeps insight rows lexically distinct from real
+    // file paths in the same documents table on shared corpora. Missing
+    // session / feature collapse to `-` so the source_path remains
+    // valid (UNIQUE doesn't permit NULL components in a literal string).
+    let sha_full = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(body.as_bytes());
+        let d = h.finalize();
+        let mut s = String::with_capacity(64);
+        for b in d {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    };
+    let sha_short = &sha_full[..16];
+    let session_token = args.session.as_deref().unwrap_or("-");
+    let feature_token = args.feature.as_deref().unwrap_or("-");
+    let source_path = format!(
+        "agent:{}:{}:{}:{}",
+        args.agent.trim(),
+        session_token,
+        feature_token,
+        sha_short
+    );
+    let now: i64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    // 4) Open insights.db (default — caller may override via --db-name).
+    let (mut conn, _db_path) = match open_and_validate(root, &args.db_name) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+
+    // 5) Exact-sha dedup probe — same agent, same sha, within last 30d.
+    const DEDUP_WINDOW_SECS: i64 = 30 * 86400;
+    let cutoff = now - DEDUP_WINDOW_SECS;
+    match store::find_recent_insight_by_sha(&conn, &sha_full, args.agent.trim(), cutoff) {
+        Ok(Some(existing_id)) => {
+            if args.json {
+                let payload = serde_json::json!({
+                    "status":      "deduped",
+                    "doc_id":      existing_id,
+                    "source_path": source_path,
+                    "sha256":      sha_full,
+                    "agent":       args.agent,
+                    "type":        args.kind,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                );
+            } else {
+                println!(
+                    "deduped: existing doc id {existing_id} (sha={} agent={})",
+                    &sha_full[..12],
+                    args.agent
+                );
+            }
+            return std::process::ExitCode::SUCCESS;
+        }
+        Ok(None) => {} // proceed
+        Err(e) => {
+            eprintln!("error: dedup probe failed: {e}");
+            return std::process::ExitCode::from(1);
+        }
+    }
+
+    // 6) Chunk the body — flat 500/100 sliding window. Insights have no
+    // page provenance so page_start / page_end stay NULL.
+    let chunks = ingest::chunk(body);
+    if chunks.is_empty() {
+        // chunk() returns empty only when the body has zero chars; the
+        // earlier emptiness check covers this, but the gate is cheap.
+        eprintln!("error: body produced zero chunks (empty after normalization)");
+        return std::process::ExitCode::from(2);
+    }
+
+    // 7) Transactional write: upsert document + replace chunks atomically.
+    let salience_str = args.salience.as_str();
+    let session_opt = args.session.as_deref();
+    let feature_opt = args.feature.as_deref();
+    let parent_opt = args.source_artifact.as_deref();
+    let doc_id = {
+        let tx = match conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("error: failed to begin transaction: {e}");
+                return std::process::ExitCode::from(1);
+            }
+        };
+        let id = match store::upsert_insight_document(
+            &tx,
+            &source_path,
+            now,
+            &sha_full,
+            now,
+            args.kind.trim(),
+            args.agent.trim(),
+            session_opt,
+            feature_opt,
+            salience_str,
+            parent_opt,
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("error: failed to upsert insight document: {e}");
+                return std::process::ExitCode::from(1);
+            }
+        };
+        let chunk_refs: Vec<(usize, &str, Option<i64>, Option<i64>)> = chunks
+            .iter()
+            .map(|c| (c.ord, c.text.as_str(), c.page_start, c.page_end))
+            .collect();
+        if let Err(e) = store::replace_chunks(&tx, id, &chunk_refs) {
+            eprintln!("error: failed to write chunks: {e}");
+            return std::process::ExitCode::from(1);
+        }
+        if let Err(e) = tx.commit() {
+            eprintln!("error: commit failed: {e}");
+            return std::process::ExitCode::from(1);
+        }
+        id
+    };
+
+    // 8) Best-effort dense vector write — silent on encoder failure so a
+    // freshly-installed environment without the e5 model still records
+    // the insight (BM25-only retrieval still works for `recall`).
+    let _ = try_populate_insight_chunks_vec(&mut conn, doc_id, &chunks);
+
+    // 9) Emit outcome.
+    if args.json {
+        let payload = serde_json::json!({
+            "status":      "written",
+            "doc_id":      doc_id,
+            "source_path": source_path,
+            "sha256":      sha_full,
+            "chunks":      chunks.len(),
+            "agent":       args.agent,
+            "type":        args.kind,
+            "salience":    salience_str,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
+    } else {
+        println!(
+            "remembered: doc_id={doc_id} chunks={} sha={} agent={} type={} salience={}",
+            chunks.len(),
+            &sha_full[..12],
+            args.agent,
+            args.kind,
+            salience_str,
+        );
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+/// `insight search "<query>"` — hybrid retrieval against the insights
+/// corpus. Reuses the existing search dispatch (lexical / dense / hybrid +
+/// auto-fallback) but pins `--db-name insights.db` so books-corpus rows
+/// never bleed in. Default mode is `hybrid` (BM25 ⊕ dense via RRF k=60).
+fn run_insight_search(
+    root: &std::path::Path,
+    args: &cli::InsightSearchArgs,
+) -> std::process::ExitCode {
+    let top_k = args.top_k as u32;
+    let context_radius = args.context as u32;
+    let (conn, _db_path) = match open_and_validate(root, &args.db_name) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    // Bridge to the existing search dispatch by synthesizing a SearchArgs
+    // shape locally. We don't allocate a SearchArgs struct because its
+    // fields are heavier (db_name owned String); we just call the same
+    // helpers directly.
+    let hits_result = match args.mode {
+        cli::SearchMode::Lexical => search::search(&conn, &args.query, top_k, context_radius),
+        cli::SearchMode::Dense | cli::SearchMode::Hybrid => {
+            match encoder::encode_query(&args.query) {
+                Ok(emb) => match args.mode {
+                    cli::SearchMode::Dense => search::dense_search(&conn, &emb, top_k),
+                    cli::SearchMode::Hybrid => {
+                        search::hybrid_search(&conn, &args.query, &emb, top_k)
+                    }
+                    cli::SearchMode::Lexical => unreachable!(),
+                },
+                Err(e) => {
+                    eprintln!(
+                        "warning: encoder unavailable ({e}); falling back to lexical mode. Run `bash install.sh --yes` to install the e5-multilingual-small model."
+                    );
+                    search::search(&conn, &args.query, top_k, context_radius)
+                }
+            }
+        }
+    };
+    // Vector-search failures fall back to lexical with a stderr warning —
+    // same UX as the standalone `search` subcommand.
+    let hits = match hits_result {
+        Ok(h) => h,
+        Err(search::SearchError::FtsSyntax(msg)) => {
+            eprintln!("error: invalid search query: {msg}");
+            return std::process::ExitCode::from(1);
+        }
+        Err(search::SearchError::Db(e)) => {
+            eprintln!(
+                "warning: vector search failed ({e}); falling back to lexical mode."
+            );
+            match search::search(&conn, &args.query, top_k, context_radius) {
+                Ok(h) => h,
+                Err(e2) => {
+                    eprintln!("error: search failed: {e2}");
+                    return std::process::ExitCode::from(1);
+                }
+            }
+        }
+    };
+    if args.json {
+        println!("{}", output::render_search_json(&hits));
+    } else {
+        print!("{}", output::render_search_human(&hits));
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+/// `insight list [--offset N] [--page-size N] [filters]` — paginated
+/// metadata-summary list of insights, newest-first. Default page size 10
+/// matches the spec; `--offset 0` returns the latest page.
+fn run_insight_list(
+    root: &std::path::Path,
+    args: &cli::InsightListArgs,
+) -> std::process::ExitCode {
+    let (conn, _db_path) = match open_and_validate(root, &args.db_name) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    let page_size = args.page_size.clamp(1, 100) as i64;
+    let offset_rows = (args.offset as i64).saturating_mul(page_size);
+    let kind = args.kind.as_deref();
+    let agent = args.agent.as_deref();
+    let salience = args.salience.as_ref().map(|s| s.as_str());
+    let feature = args.feature.as_deref();
+    let total = match store::count_insights(&conn, kind, agent, salience, feature) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("error: count failed: {e}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    let rows = match store::list_insights(
+        &conn,
+        kind,
+        agent,
+        salience,
+        feature,
+        page_size,
+        offset_rows,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: list failed: {e}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    if args.json {
+        let payload = serde_json::json!({
+            "total":    total,
+            "offset":   args.offset,
+            "page_size": page_size,
+            "returned": rows.len(),
+            "rows":     rows,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
+    } else {
+        println!(
+            "# insights — page {} (page_size={}) — total matching: {}",
+            args.offset, page_size, total
+        );
+        if rows.is_empty() {
+            println!("(no insights match)");
+        }
+        for r in &rows {
+            let agent = r.agent_name.as_deref().unwrap_or("?");
+            let kind = r.source_type.as_deref().unwrap_or("?");
+            let sal = r.salience.as_deref().unwrap_or("?");
+            let feat = r.feature_slug.as_deref().unwrap_or("-");
+            println!();
+            println!(
+                "[{}] sha={} {} {} salience={} feature={}",
+                r.id, r.sha256_short, agent, kind, sal, feat
+            );
+            println!("    {}", r.snippet);
+        }
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+/// `insight random` — uniform-random pick, optionally filtered.
+fn run_insight_random(
+    root: &std::path::Path,
+    args: &cli::InsightRandomArgs,
+) -> std::process::ExitCode {
+    let (conn, _db_path) = match open_and_validate(root, &args.db_name) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    let kind = args.kind.as_deref();
+    let agent = args.agent.as_deref();
+    let salience = args.salience.as_ref().map(|s| s.as_str());
+    let feature = args.feature.as_deref();
+    let rec = match store::random_insight(&conn, kind, agent, salience, feature) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            eprintln!("error: no insights match the filters");
+            return std::process::ExitCode::from(1);
+        }
+        Err(e) => {
+            eprintln!("error: random fetch failed: {e}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    emit_insight_record(&rec, args.json);
+    std::process::ExitCode::SUCCESS
+}
+
+/// `insight get <ident>` — fetch by integer `documents.id` or by sha256
+/// prefix (≥4 hex chars matched via `sha256 LIKE 'prefix%'`).
+fn run_insight_get(
+    root: &std::path::Path,
+    args: &cli::InsightGetArgs,
+) -> std::process::ExitCode {
+    let (conn, _db_path) = match open_and_validate(root, &args.db_name) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    let rec_result = if let Ok(id) = args.ident.parse::<i64>() {
+        store::get_insight_by_id(&conn, id)
+    } else {
+        // Sha-prefix branch — reject obviously-bad input (too short OR
+        // contains non-hex chars) before hitting the DB.
+        if args.ident.len() < 4 {
+            eprintln!(
+                "error: sha prefix must be ≥4 hex chars (got `{}`)",
+                args.ident
+            );
+            return std::process::ExitCode::from(2);
+        }
+        if !args.ident.chars().all(|c| c.is_ascii_hexdigit()) {
+            eprintln!(
+                "error: identifier must be an integer id or a hex sha prefix (got `{}`)",
+                args.ident
+            );
+            return std::process::ExitCode::from(2);
+        }
+        store::get_insight_by_sha_prefix(&conn, &args.ident)
+    };
+    match rec_result {
+        Ok(Some(rec)) => {
+            emit_insight_record(&rec, args.json);
+            std::process::ExitCode::SUCCESS
+        }
+        Ok(None) => {
+            eprintln!("error: insight not found: {}", args.ident);
+            std::process::ExitCode::from(1)
+        }
+        Err(e) => {
+            eprintln!("error: fetch failed: {e}");
+            std::process::ExitCode::from(1)
+        }
+    }
+}
+
+/// Shared formatter for `insight random` and `insight get`.
+fn emit_insight_record(rec: &store::InsightRecord, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(rec).unwrap_or_default()
+        );
+    } else {
+        println!(
+            "[{}] sha={} agent={} type={} salience={} feature={}",
+            rec.id,
+            &rec.sha256[..16.min(rec.sha256.len())],
+            rec.agent_name.as_deref().unwrap_or("?"),
+            rec.source_type.as_deref().unwrap_or("?"),
+            rec.salience.as_deref().unwrap_or("?"),
+            rec.feature_slug.as_deref().unwrap_or("-"),
+        );
+        if let Some(sa) = rec.parent_artifact.as_deref() {
+            println!("source artifact: {sa}");
+        }
+        if let Some(sid) = rec.session_id.as_deref() {
+            println!("session: {sid}");
+        }
+        println!();
+        println!("{}", rec.body);
+    }
+}
+
+/// Best-effort embedding write into chunks_vec for an insight document.
+///
+/// Mirrors `ingest::try_populate_chunks_vec` but is reachable from main.rs
+/// without exposing the private helper. Silent no-op when chunks_vec is
+/// absent, the encoder is unavailable, or the id-count drift check trips.
+fn try_populate_insight_chunks_vec(
+    conn: &mut rusqlite::Connection,
+    doc_id: i64,
+    chunks: &[ingest::Chunk],
+) -> Result<(), ()> {
+    if chunks.is_empty() {
+        return Ok(());
+    }
+    let has_vec: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks_vec'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !has_vec {
+        return Err(());
+    }
+    let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+    let embeddings = match encoder::encode_passages(&texts) {
+        Ok(v) => v,
+        Err(_) => return Err(()),
+    };
+    let ids: Vec<i64> = {
+        let mut stmt = conn
+            .prepare("SELECT id FROM chunks WHERE doc_id = ?1 ORDER BY ord")
+            .map_err(|_| ())?;
+        let rows = stmt
+            .query_map(rusqlite::params![doc_id], |r| r.get::<_, i64>(0))
+            .map_err(|_| ())?;
+        rows.filter_map(Result::ok).collect()
+    };
+    if ids.len() != embeddings.len() {
+        return Err(());
+    }
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|_| ())?;
+    {
+        let mut stmt = tx
+            .prepare("INSERT OR REPLACE INTO chunks_vec(rowid, embedding) VALUES (?1, ?2)")
+            .map_err(|_| ())?;
+        for (id, emb) in ids.iter().zip(embeddings.iter()) {
+            let bytes: Vec<u8> = emb.iter().flat_map(|f| f.to_le_bytes()).collect();
+            stmt.execute(rusqlite::params![id, bytes]).map_err(|_| ())?;
+        }
+    }
+    tx.commit().map_err(|_| ())?;
+    Ok(())
 }
 
 /// `page <doc> <page> [--range N] [--json]` — Slice 12 page-level navigation.

@@ -40,6 +40,25 @@ impl Default for SearchMode {
     }
 }
 
+/// Corpus selector for the standalone `search` subcommand (Slice 6 of
+/// agent-insights-base). `books` opens `index.db`, `insights` opens
+/// `insights.db`, `all` opens BOTH and cross-corpus RRF-fuses ranked
+/// hits with a `source_corpus` JSON field on each hit.
+///
+/// When `--corpus` is set it overrides `--db-name`. When both are set
+/// the CLI emits a stderr warning and the `--corpus` selection wins —
+/// this is the deliberate forward-compat path (tests that hardcode
+/// `--db-name` continue to work; new agent prompts use `--corpus`).
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Corpus {
+    /// User-curated books / regulations / docs (the default — `index.db`).
+    Books,
+    /// Agent-written cognitive insights (`insights.db`).
+    Insights,
+    /// Cross-corpus RRF fusion of both — hits carry `source_corpus`.
+    All,
+}
+
 /// Salience tag per cognitive-self-check rule. Drives TTL on the insights
 /// corpus: `high` survives forever, `medium` 1 year, `low` 90 days. The
 /// tag is stored verbatim as TEXT in `documents.salience` (schema v4).
@@ -172,8 +191,14 @@ pub struct SearchArgs {
     pub project_root: Option<PathBuf>,
     /// Corpus file (under `<project>/.claude/knowledge/`). Default `index.db`
     /// (user-curated books); `insights.db` for the agent-written insights corpus.
+    /// Overridden by `--corpus` when both are set.
     #[arg(long, default_value = DEFAULT_DB_NAME)]
     pub db_name: String,
+    /// Corpus selector (Slice 6): `books` (default), `insights`, or `all`.
+    /// `all` runs hybrid search against both corpora and RRF-fuses ranks
+    /// — each hit then carries a `source_corpus` field.
+    #[arg(long, value_enum)]
+    pub corpus: Option<Corpus>,
     #[arg(long)]
     pub json: bool,
 }

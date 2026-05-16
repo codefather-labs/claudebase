@@ -515,6 +515,119 @@ fn search_since_filter_keeps_recent_drops_old() {
 }
 
 // ---------------------------------------------------------------------------
+// `search --corpus` — Slice 6 cross-corpus flag on the standalone `search`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn search_corpus_insights_opens_insights_db() {
+    let tmp = fresh_project();
+    create_insight(
+        tmp.path(),
+        "redis pipelining reduces round-trip cost dramatically",
+        "agent-learned",
+        "planner",
+        &[],
+    )
+    .success();
+    let assert = bin()
+        .current_dir(tmp.path())
+        .args([
+            "search",
+            "pipelining",
+            "--corpus",
+            "insights",
+            "--mode",
+            "lexical",
+            "--json",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("redis") || stdout.contains("pipelining"),
+        "--corpus insights should hit the insights.db; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn search_corpus_books_does_not_see_insights() {
+    let tmp = fresh_project();
+    // Write only to insights — books index.db doesn't exist yet (will be
+    // created empty when `--corpus books` opens it).
+    create_insight(
+        tmp.path(),
+        "kafka exactly-once semantics break on rebalance",
+        "agent-learned",
+        "planner",
+        &[],
+    )
+    .success();
+    // `--corpus books` opens (or creates) index.db; since the insight was
+    // written to insights.db, the books-corpus search must return ZERO
+    // results — no cross-corpus bleed-through.
+    let assert = bin()
+        .current_dir(tmp.path())
+        .args([
+            "search",
+            "kafka",
+            "--corpus",
+            "books",
+            "--mode",
+            "lexical",
+            "--json",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
+    let hits = v.as_array().expect("search returns array");
+    assert!(
+        hits.is_empty(),
+        "books corpus must NOT see insight content; got hits:\n{stdout}"
+    );
+}
+
+#[test]
+fn search_corpus_all_with_only_insights_present_returns_hits_with_source_corpus() {
+    let tmp = fresh_project();
+    create_insight(
+        tmp.path(),
+        "kafka exactly-once semantics break on rebalance during commit",
+        "agent-learned",
+        "planner",
+        &[],
+    )
+    .success();
+    // index.db does NOT exist — Slice-6 contract: silently treat missing
+    // corpus as empty, return hits from the other corpus.
+    let assert = bin()
+        .current_dir(tmp.path())
+        .args([
+            "search",
+            "kafka",
+            "--corpus",
+            "all",
+            "--mode",
+            "lexical",
+            "--json",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
+    let hits = v.as_array().expect("search returns array");
+    assert!(!hits.is_empty(), "expected ≥1 hit from insights corpus");
+    // Every hit must be labeled `source_corpus=insights` since books.db is absent.
+    for h in hits {
+        let label = h["source_corpus"].as_str().unwrap_or("");
+        assert_eq!(
+            label, "insights",
+            "hit should be labeled `insights` when only insights corpus has data; got:\n{h}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // `insight list` — pagination, defaults, filters.
 // ---------------------------------------------------------------------------
 

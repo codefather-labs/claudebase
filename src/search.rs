@@ -91,6 +91,12 @@ pub struct SearchHit {
     /// the canonical RRF formula (Cormack et al. 2009, k=60).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rrf_score: Option<f64>,
+    /// Origin corpus label populated only when the search ran in
+    /// `--corpus all` mode (Slice 6 of agent-insights-base). Values:
+    /// `"books"` for hits from `index.db`, `"insights"` for hits from
+    /// `insights.db`. Omitted from JSON for single-corpus searches.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_corpus: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -164,7 +170,7 @@ pub fn search(
                 bm25_score: Some(score),
                 dense_score: None,
                 rrf_score: None,
-            })
+                source_corpus: None,            })
         })
         .map_err(map_fts_syntax)?;
 
@@ -304,7 +310,7 @@ pub fn dense_search(
             bm25_score: None,
             dense_score: Some(dense_score),
             rrf_score: None,
-        })
+            source_corpus: None,        })
     })?;
     let mut out = Vec::new();
     for r in rows {

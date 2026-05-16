@@ -23,7 +23,7 @@ fn synth_hit(chunk_id: i64, score: f64, mode: &str) -> SearchHit {
         bm25_score: if mode == "lexical" { Some(score) } else { None },
         dense_score: if mode == "dense" { Some(score) } else { None },
         rrf_score: None,
-    }
+        source_corpus: None,    }
 }
 
 #[test]

@@ -1456,12 +1456,49 @@ fn run_search(root: &std::path::Path, args: &cli::SearchArgs) -> std::process::E
     let top_k = args.top_k as u32;
     let context_radius = args.context as u32;
 
+    // Slice 6 — `--corpus all` cross-corpus RRF fusion. Dispatched BEFORE
+    // the single-corpus path so we don't waste cycles opening one DB twice.
+    if matches!(args.corpus, Some(cli::Corpus::All)) {
+        if args.db_name != "index.db" {
+            eprintln!(
+                "warning: --corpus all overrides --db-name `{}` (opening both index.db and insights.db)",
+                args.db_name
+            );
+        }
+        return run_search_cross_corpus(root, args, top_k, context_radius);
+    }
+
+    // Single-corpus dispatch: resolve the effective db_name from --corpus
+    // (Slice 6) when set, otherwise fall back to --db-name (legacy).
+    let effective_db_name: String = match args.corpus {
+        Some(cli::Corpus::Books) => {
+            if args.db_name != "index.db" {
+                eprintln!(
+                    "warning: --corpus books overrides --db-name `{}`",
+                    args.db_name
+                );
+            }
+            "index.db".to_string()
+        }
+        Some(cli::Corpus::Insights) => {
+            if args.db_name != "index.db" {
+                eprintln!(
+                    "warning: --corpus insights overrides --db-name `{}`",
+                    args.db_name
+                );
+            }
+            "insights.db".to_string()
+        }
+        Some(cli::Corpus::All) => unreachable!("handled above"),
+        None => args.db_name.clone(),
+    };
+
     // Step 1: open + validate. Use the v1 entry point regardless of mode so
     // a truncated index.db trips AC-7 (`index database invalid; re-ingest
     // required`) BEFORE any vector-search dispatch attempts to query
     // chunks_vec. This preserves the corrupt-index test contract for
     // lexical, dense, AND hybrid modes uniformly.
-    let (conn, _db_path) = match open_and_validate(root, &args.db_name) {
+    let (conn, _db_path) = match open_and_validate(root, &effective_db_name) {
         Ok(t) => t,
         Err(code) => return code,
     };
@@ -1541,6 +1578,130 @@ fn run_search_with_encoder(
         }
         Err(other) => Err(other),
     }
+}
+
+/// `search --corpus all` — cross-corpus search with RRF fusion (Slice 6).
+///
+/// Opens BOTH `index.db` (books) and `insights.db` (agent-written), runs
+/// the configured search mode on each, then fuses the two ranked lists
+/// via Reciprocal Rank Fusion (k=60 — same constant the in-corpus hybrid
+/// search uses). Each emitted hit carries `source_corpus = "books"` or
+/// `"insights"` so downstream consumers can distinguish.
+///
+/// Failure modes:
+///   - One corpus missing on disk → silently treat as empty (the user may
+///     have insights but no books, or vice versa).
+///   - Both corpora empty → return zero hits with exit 0.
+///   - Search error in one corpus → log warning, use the other corpus only.
+fn run_search_cross_corpus(
+    root: &std::path::Path,
+    args: &cli::SearchArgs,
+    top_k: u32,
+    context_radius: u32,
+) -> std::process::ExitCode {
+    let books_hits = run_one_corpus_for_fusion(root, args, "index.db", top_k, context_radius);
+    let insights_hits =
+        run_one_corpus_for_fusion(root, args, "insights.db", top_k, context_radius);
+    let fused = rrf_fuse_corpora(books_hits, insights_hits, top_k as usize);
+    if args.json {
+        println!("{}", output::render_search_json(&fused));
+    } else {
+        print!("{}", output::render_search_human(&fused));
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+/// Helper for `run_search_cross_corpus`: opens one corpus, runs the search,
+/// tags every hit with `source_corpus`. Returns an empty vec on any error
+/// (missing DB, search failure) so the cross-corpus pass survives one-
+/// corpus failure.
+fn run_one_corpus_for_fusion(
+    root: &std::path::Path,
+    args: &cli::SearchArgs,
+    db_name: &str,
+    top_k: u32,
+    context_radius: u32,
+) -> Vec<search::SearchHit> {
+    let (conn, _db_path) = match open_and_validate(root, db_name) {
+        Ok(t) => t,
+        Err(_) => {
+            // One-corpus failure is expected (project may have books but no
+            // insights yet); silently return empty.
+            return Vec::new();
+        }
+    };
+    let hits = match args.mode {
+        cli::SearchMode::Lexical => {
+            search::search(&conn, &args.query, top_k, context_radius).unwrap_or_default()
+        }
+        cli::SearchMode::Dense | cli::SearchMode::Hybrid => {
+            run_search_with_encoder(&conn, args, top_k, context_radius).unwrap_or_default()
+        }
+    };
+    let label = if db_name == "insights.db" {
+        "insights"
+    } else {
+        "books"
+    };
+    hits.into_iter()
+        .map(|mut h| {
+            h.source_corpus = Some(label.to_string());
+            h
+        })
+        .collect()
+}
+
+/// Reciprocal Rank Fusion across two corpus-tagged ranked lists.
+///
+/// Implements the canonical Cormack et al. 2009 formula with k=60 (the
+/// same constant used by the in-corpus hybrid path in `search.rs`):
+///     score(d) = Σ_corpus 1 / (60 + rank_in_corpus(d))
+///
+/// Each hit's identity is `(source_corpus, chunk_id)` — chunk_ids are
+/// scoped per-DB so two hits with `chunk_id=42` but different corpora
+/// are distinct documents.
+///
+/// The returned `score` field is the RRF score; the per-corpus `score`
+/// is preserved in the original `bm25_score` / `dense_score` / `rrf_score`
+/// fields when the source mode populated them.
+fn rrf_fuse_corpora(
+    books: Vec<search::SearchHit>,
+    insights: Vec<search::SearchHit>,
+    top_k: usize,
+) -> Vec<search::SearchHit> {
+    const RRF_K: f64 = 60.0;
+    use std::collections::HashMap;
+    // Key: (source_corpus, chunk_id) — both needed to disambiguate.
+    let mut score_acc: HashMap<(String, i64), f64> = HashMap::new();
+    let mut by_key: HashMap<(String, i64), search::SearchHit> = HashMap::new();
+    for (rank, hit) in books.into_iter().enumerate() {
+        let key = ("books".to_string(), hit.chunk_id);
+        let inc = 1.0 / (RRF_K + (rank as f64 + 1.0));
+        *score_acc.entry(key.clone()).or_insert(0.0) += inc;
+        by_key.entry(key).or_insert(hit);
+    }
+    for (rank, hit) in insights.into_iter().enumerate() {
+        let key = ("insights".to_string(), hit.chunk_id);
+        let inc = 1.0 / (RRF_K + (rank as f64 + 1.0));
+        *score_acc.entry(key.clone()).or_insert(0.0) += inc;
+        by_key.entry(key).or_insert(hit);
+    }
+    let mut scored: Vec<(f64, (String, i64))> = score_acc
+        .into_iter()
+        .map(|(k, s)| (s, k))
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored
+        .into_iter()
+        .take(top_k)
+        .filter_map(|(rrf_score, key)| {
+            by_key.remove(&key).map(|mut h| {
+                h.score = rrf_score;
+                h.rrf_score = Some(rrf_score);
+                h
+            })
+        })
+        .collect()
 }
 
 /// `list [--json]` — list ingested documents with chunk counts.

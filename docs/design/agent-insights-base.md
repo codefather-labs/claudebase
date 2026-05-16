@@ -86,13 +86,22 @@ and a `--corpus all` flag fuses results across them.
 | `reflection-observation` | `reflection` agent | `/reflect` invocation | Free-form non-obvious observation about the project state |
 | `consolidator-drift` | `consolidator` agent | Auto-chained between waves in `/develop-feature`, or `/consolidate` | Two-point drift finding (file:line A diverged from file:line B) |
 | `red-team-objection` | `red-team` agent | Auto-chained Step 5.25 in `/bootstrap-feature` | Adversarial finding (premise/scope/dependency/etc.) |
-| `decision-record` | Any thinking agent | Every artifact's `## Decisions → Decisions made` block | Q1-Q5 outcome summary on a load-bearing decision |
-| `assumption-log` | Any thinking agent | Every artifact's `## Facts → Assumptions` block | Unverified-but-labelled assumption + risk + verification path |
-| `hack-acknowledged` | Any thinking agent | Every artifact's `## Decisions → Hacks acknowledged` block | Band-aid shipped + removal path tracked |
+| `decision-record` | Any agent | A load-bearing decision where Q1-Q5 of cognitive-self-check had real ambiguity (not mechanical) | The decision + outcome summary |
+| `assumption-log` | Any agent | A high-salience assumption with non-obvious risk | The assumption + risk + verification path |
+| `hack-acknowledged` | Any agent | A shipped workaround with non-trivial removal cost | The hack + removal path |
+| `project-observation` | Any agent | A non-obvious structural finding about the codebase or repo state | The observation |
+| `agent-handoff-note` | Any agent | A contract drift or hand-off failure with another agent that next agents should know | The drift + which agents involved + reproducer |
+| `operator-correction` | Any agent | The operator (Vlad) corrected the agent in a way that should propagate to future agents | The correction + context where it applied |
+| `self-observation` | Any agent | The agent noticed something about its own reasoning — blind spot, prompting technique that worked unexpectedly, etc. | The self-observation |
 
-The taxonomy mirrors the cognitive-self-check rule's output structure.
-The agent doesn't have to translate — it pastes its existing structured
-block plus context envelope.
+The taxonomy mirrors the cognitive-self-check rule's output structure where
+applicable, and adds three new types — `project-observation`,
+`agent-handoff-note`, `operator-correction` — for findings that are real but
+do not fit the structured decision/assumption/hack vocabulary.
+
+Important: **the agent decides whether a finding is "real" before choosing a
+source_type**. The taxonomy is a *classifier* for findings that already pass
+the quality gate, not a list of compulsory categories to populate every run.
 
 ## CLI surface — new subcommands
 
@@ -211,24 +220,68 @@ keep the corpus signal-dense:
 
 Dedup happens inside `claudebase remember` before chunking.
 
-## Write protocol — which agents call `remember`
+## Write protocol — every agent contributes, but only when there is a real insight
 
-Each of the in-scope thinking agents (per cognitive-self-check rule)
-adds one call at end-of-task:
+**Scope (UPDATED 2026-05-16):** Every agent in the SDLC pipeline (thinking AND
+executor agents both — including `test-writer`, `build-runner`, `e2e-runner`,
+`doc-updater`, `changelog-writer` that were previously exempt from the
+cognitive-self-check rule) MAY call `claudebase remember`. The previous
+"12 in-scope thinking agents" restriction is lifted.
 
-| Agent | When | Body |
+**Quality bar (NEW, non-negotiable):** Agents call `claudebase remember`
+**only when a real intellectual finding exists**. Writing for the sake of
+writing — repeating well-known facts, paraphrasing input, narrating mechanical
+steps — is forbidden. The dedup layer (Slice 5) will catch some of this; the
+agent prompt language must explicitly gate the call.
+
+A "real insight" is any of:
+
+- **About the project** — a non-obvious structural observation about the
+  codebase, an emergent constraint, a load-bearing decision rationale, a
+  pattern the agent noticed across files, a counter-intuitive interaction.
+- **About working with other agents** — a contract that previously held but
+  drifted, a hand-off failure mode the agent encountered, a missing affordance
+  in an upstream agent's output, a pattern in how Vlad (the operator) corrects
+  the pipeline.
+- **About the operator** — preferences observed, recurring corrections, signal
+  about what Vlad considers important vs noise, working-style cues that should
+  inform how future agents respond. *Memory of human-in-the-loop interaction.*
+- **About self** — surprising things the agent learned about its own
+  reasoning, blind spots it discovered, prompting techniques that worked
+  unexpectedly well or poorly.
+
+What is **NOT** an insight (do not write):
+
+- Mechanical execution narration ("I read file X then edited Y").
+- Restating PRD requirements or plan slices.
+- Generic best-practice claims (e.g. "tests are good").
+- Anything already searchable in the books corpus.
+- Hedge-language summaries ("this might be useful later").
+
+Per-agent triggers (suggested, not exhaustive):
+
+| Agent | When the gate opens | Sample body |
 |---|---|---|
-| `reflection` | After each `/reflect` run | The full observation report |
+| `reflection` | After each `/reflect` run, per surfaced observation | Verbatim observation report |
 | `consolidator` | Per drift finding emitted | Two-point citation + drift type |
-| `red-team` | Per objection emitted | The objection block (severity-tagged) |
-| All others | Per non-trivial `## Decisions → Decisions made` entry where Q1-Q5 had ambiguity | The decision + outcome summary |
+| `red-team` | Per objection emitted | The severity-tagged objection block |
+| `architect` | When the design has a non-obvious trade-off the next architect should know | Trade-off + rationale |
+| `planner` | When a slice ordering decision is load-bearing for future planners | The ordering rationale |
+| `qa-engineer` | When a test surfaced an unexpected production behavior | The behavior + reproducible trigger |
+| `test-writer` | When a TDD slice revealed a missing requirement | The missing requirement |
+| `code-reviewer` | When a review uncovered a class-of-bug worth surfacing | The class + canonical example |
+| `verifier` | When goal-backward verification caught wiring drift | The wired-vs-unwired pair |
+| `build-runner` | When a build failure pattern matters for future runs | The pattern + reproducer |
+| `refactor-cleaner` | When dead code revealed an architectural smell | The smell |
+| **Every agent** | When the operator (Vlad) corrects the agent in a way that should propagate | The correction + context |
 
-The call is fire-and-forget per the existing tracing pattern — claudebase
-remember writes are async-safe (SQLite WAL mode + single-writer).
+The call is fire-and-forget per the existing tracing pattern — `claudebase
+remember` writes are async-safe (SQLite WAL mode + single-writer).
 
-If `claudebase remember` exits non-zero for any reason (DB locked, disk
-full, schema mismatch), the agent's primary output is unaffected; the
-miss is logged at warn level.
+If `claudebase remember` exits non-zero (DB locked, disk full, schema
+mismatch), the agent's primary output is unaffected; the miss is logged at
+`warn` level. If the agent has nothing real to write, it does NOT call the
+tool — silence is the correct default.
 
 ## Privacy + security
 

@@ -171,6 +171,42 @@ CREATE TABLE IF NOT EXISTS pages (
 CREATE INDEX IF NOT EXISTS pages_doc_page_idx ON pages(doc_id, page_no);
 "#;
 
+/// V4 schema delta — agent-insights metadata. Additive and non-destructive.
+///
+/// Adds six nullable columns to `documents` so the same SQLite shape can host
+/// either the user-curated books corpus (all metadata NULL, today's behavior)
+/// or the new agent-written insights corpus (metadata populated by
+/// `claudebase remember`). Books-corpus rows remain unaffected; back-compat
+/// preserved via the NULL default on every new column.
+///
+/// Columns:
+///   - `source_type`     — enum of the insight kind (e.g. reflection-observation,
+///                         consolidator-drift, red-team-objection, decision-record,
+///                         assumption-log, hack-acknowledged). NULL for book docs.
+///   - `agent_name`      — emitting SDLC agent (planner, reflection, etc.).
+///   - `session_id`      — Claude Code session UUID for trace linking.
+///   - `feature_slug`    — feature this insight belongs to (matches `.claude/plan.md` feature).
+///   - `salience`        — `high` | `medium` | `low` per cognitive-self-check rule;
+///                         drives retention (high=∞, medium=1y, low=90d).
+///   - `parent_artifact` — file path of the artifact the insight was extracted from.
+///
+/// Indexes on the four filter columns most likely to appear in `claudebase recall`
+/// WHERE clauses (source_type / agent_name / feature_slug / salience).
+///
+/// SQL discipline: static `&str` literal, no user-data interpolation.
+const SCHEMA_V4_DELTA: &str = r#"
+ALTER TABLE documents ADD COLUMN source_type     TEXT;
+ALTER TABLE documents ADD COLUMN agent_name      TEXT;
+ALTER TABLE documents ADD COLUMN session_id      TEXT;
+ALTER TABLE documents ADD COLUMN feature_slug    TEXT;
+ALTER TABLE documents ADD COLUMN salience        TEXT;
+ALTER TABLE documents ADD COLUMN parent_artifact TEXT;
+CREATE INDEX IF NOT EXISTS idx_documents_source_type ON documents(source_type);
+CREATE INDEX IF NOT EXISTS idx_documents_agent_name  ON documents(agent_name);
+CREATE INDEX IF NOT EXISTS idx_documents_feature     ON documents(feature_slug);
+CREATE INDEX IF NOT EXISTS idx_documents_salience    ON documents(salience);
+"#;
+
 /// Open (or create) the SQLite database at `db_path` with v2 schema enabled.
 /// Loads the sqlite-vec extension at connection-open time (architect OQ-2
 /// resolution: `sqlite_vec::load(&conn)` registers vec0 without enabling
@@ -204,24 +240,27 @@ pub fn open_or_init_v2(db_path: &Path) -> Result<Connection, StoreError> {
         .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
         .unwrap_or(0);
     if v == 0 {
-        // Fresh DB — apply v2 + v3 deltas and stamp version=3.
+        // Fresh DB — apply v2 + v3 + v4 deltas and stamp version=4.
         conn.execute_batch(SCHEMA_V2_DELTA)?;
         conn.execute_batch(SCHEMA_V3_DELTA)?;
+        conn.execute_batch(SCHEMA_V4_DELTA)?;
         conn.execute(
             "INSERT INTO schema_version(version) VALUES (?1)",
-            rusqlite::params![3i64],
+            rusqlite::params![4i64],
         )?;
     } else if v == 2 {
-        // v2 → v3 progression. Additive + non-destructive: ALTER TABLE adds
-        // the page columns, CREATE TABLE IF NOT EXISTS adds the pages table.
-        // Existing chunks keep NULL page_start/page_end until backfilled
-        // (pages table is empty until `claudebase reindex-pages` runs).
-        // Wrap in a transaction so a partially-failed v2→v3 rolls back.
+        // v2 → v4 progression. Additive + non-destructive: page columns +
+        // pages table from v3, then the six agent-insights metadata columns
+        // from v4. Existing chunks keep NULL page_start/page_end + NULL
+        // insights metadata (pages table is empty until `claudebase
+        // reindex-pages` runs; insights metadata stays NULL on books-corpus
+        // rows). Wrap in a transaction so a partially-failed v2→v4 rolls back.
         let tx = conn.transaction()?;
         tx.execute_batch(SCHEMA_V3_DELTA)?;
+        tx.execute_batch(SCHEMA_V4_DELTA)?;
         tx.execute(
             "UPDATE schema_version SET version = ?1",
-            rusqlite::params![3i64],
+            rusqlite::params![4i64],
         )?;
         tx.commit()?;
     } else if v == 3 {
@@ -257,6 +296,49 @@ pub fn open_or_init_v2(db_path: &Path) -> Result<Connection, StoreError> {
                UNIQUE(doc_id, page_no) \
              ); \
              CREATE INDEX IF NOT EXISTS pages_doc_page_idx ON pages(doc_id, page_no);",
+        )?;
+        // v3 → v4 progression. Apply the agent-insights metadata columns +
+        // indexes. Additive + non-destructive on the books corpus: rows that
+        // existed at v3 stay valid; the new columns are NULL on all of them.
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA_V4_DELTA)?;
+        tx.execute(
+            "UPDATE schema_version SET version = ?1",
+            rusqlite::params![4i64],
+        )?;
+        tx.commit()?;
+    } else if v == 4 {
+        // Already at v4 — idempotent re-open. Verify the v4 columns exist via
+        // pragma_table_info; if any are missing (a partially-failed prior
+        // migration left the version stamped at 4 without the schema), apply
+        // the delta in idempotent fashion (`ALTER TABLE ... ADD COLUMN` is
+        // not idempotent natively, so we probe pragma first and only add the
+        // missing ones).
+        let v4_cols = [
+            "source_type", "agent_name", "session_id",
+            "feature_slug", "salience", "parent_artifact",
+        ];
+        for col in v4_cols {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM pragma_table_info('documents') WHERE name = ?1",
+                    rusqlite::params![col],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            if !exists {
+                let stmt = format!("ALTER TABLE documents ADD COLUMN {col} TEXT");
+                conn.execute_batch(&stmt)?;
+            }
+        }
+        // Re-create indexes idempotently (CREATE INDEX IF NOT EXISTS) so a
+        // partial prior migration that added columns but skipped indexes
+        // converges on re-open.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_documents_source_type ON documents(source_type); \
+             CREATE INDEX IF NOT EXISTS idx_documents_agent_name  ON documents(agent_name); \
+             CREATE INDEX IF NOT EXISTS idx_documents_feature     ON documents(feature_slug); \
+             CREATE INDEX IF NOT EXISTS idx_documents_salience    ON documents(salience);",
         )?;
     }
     // v == 1: caller runs migrate_v1_to_v2 explicitly. We don't auto-migrate
@@ -321,11 +403,11 @@ fn validate_schema_inner(conn: &Connection) -> Result<(), rusqlite::Error> {
         return Err(rusqlite::Error::QueryReturnedNoRows);
     }
 
-    // schema_version row exists and is in 1..=3 (forward-compat through v3
-    // page-level addressing — chunks.page_start/page_end + pages table +
-    // documents.total_pages).
+    // schema_version row exists and is in 1..=4 (forward-compat through v4
+    // agent-insights metadata — documents.source_type / agent_name /
+    // session_id / feature_slug / salience / parent_artifact).
     let v: i64 = conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))?;
-    if !(1..=3).contains(&v) {
+    if !(1..=4).contains(&v) {
         return Err(rusqlite::Error::QueryReturnedNoRows);
     }
 

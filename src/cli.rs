@@ -96,6 +96,34 @@ pub struct IngestArgs {
     pub json: bool,
 }
 
+/// Which corpus file to open under `<project>/.claude/knowledge/`.
+/// `index.db` (default) is the user-curated books corpus.
+/// `insights.db` is the agent-written insights corpus (slice 1+).
+/// Anything else: must end in `.db` and contain no path separators.
+const DEFAULT_DB_NAME: &str = "index.db";
+
+/// Validate a `db_name` value: must end in `.db` and contain no path
+/// separators or parent-directory escapes. The argument is then joined
+/// with `<project>/.claude/knowledge/` to produce the final path —
+/// rejecting traversal patterns here keeps the security backbone (per
+/// `resolve_project_root`) intact for the combined path.
+pub fn validate_db_name(name: &str) -> Result<&str, &'static str> {
+    if name.is_empty() {
+        return Err("db_name must not be empty");
+    }
+    if !name.ends_with(".db") {
+        return Err("db_name must end with `.db`");
+    }
+    if name.contains('/') || name.contains('\\') || name.contains("..") || name.starts_with('.') && name != "index.db" && name != "insights.db" {
+        // Allow only well-formed *.db names; reject anything with separators,
+        // double-dots, or hidden-file prefixes (except the two canonical names).
+        // The `.db` suffix dot is fine; the leading-dot check is for paths
+        // like `.malicious.db`. Permit `index.db` and `insights.db` explicitly.
+        return Err("db_name must be a bare filename ending in `.db`");
+    }
+    Ok(name)
+}
+
 #[derive(Args, Debug)]
 pub struct SearchArgs {
     /// Query string.
@@ -119,6 +147,10 @@ pub struct SearchArgs {
     pub mode: SearchMode,
     #[arg(long)]
     pub project_root: Option<PathBuf>,
+    /// Corpus file (under `<project>/.claude/knowledge/`). Default `index.db`
+    /// (user-curated books); `insights.db` for the agent-written insights corpus.
+    #[arg(long, default_value = DEFAULT_DB_NAME)]
+    pub db_name: String,
     #[arg(long)]
     pub json: bool,
 }
@@ -127,6 +159,9 @@ pub struct SearchArgs {
 pub struct ListArgs {
     #[arg(long)]
     pub project_root: Option<PathBuf>,
+    /// Corpus file — see `search --db-name`.
+    #[arg(long, default_value = DEFAULT_DB_NAME)]
+    pub db_name: String,
     #[arg(long)]
     pub json: bool,
 }
@@ -135,6 +170,9 @@ pub struct ListArgs {
 pub struct StatusArgs {
     #[arg(long)]
     pub project_root: Option<PathBuf>,
+    /// Corpus file — see `search --db-name`.
+    #[arg(long, default_value = DEFAULT_DB_NAME)]
+    pub db_name: String,
     #[arg(long)]
     pub json: bool,
 }
@@ -239,6 +277,9 @@ pub struct DeleteArgs {
     pub by_id: Option<i64>,
     #[arg(long)]
     pub project_root: Option<PathBuf>,
+    /// Corpus file — see `search --db-name`.
+    #[arg(long, default_value = DEFAULT_DB_NAME)]
+    pub db_name: String,
     #[arg(long)]
     pub json: bool,
 }

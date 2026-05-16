@@ -62,7 +62,7 @@ fn main() -> std::process::ExitCode {
 /// page neighborhood. Out-of-range page numbers exit 1 with the literal
 /// `error: page number out of range` per the architect-resolved contract.
 fn run_page(root: &std::path::Path, args: &cli::PageArgs) -> std::process::ExitCode {
-    let (conn, _db_path) = match open_and_validate(root) {
+    let (conn, _db_path) = match open_and_validate(root, "index.db") {
         Ok(t) => t,
         Err(code) => return code,
     };
@@ -156,7 +156,7 @@ fn run_reindex_pages(
     root: &std::path::Path,
     args: &cli::ReindexPagesArgs,
 ) -> std::process::ExitCode {
-    let (mut conn, _db_path) = match open_and_validate(root) {
+    let (mut conn, _db_path) = match open_and_validate(root, "index.db") {
         Ok(t) => t,
         Err(code) => return code,
     };
@@ -296,7 +296,7 @@ fn run_reindex_pages(
 /// three search modes side-by-side with FULL chunk text. Surfaces exactly
 /// what an LLM would receive as RAG context-augmentation input.
 fn run_compare(root: &std::path::Path, args: &cli::CompareArgs) -> std::process::ExitCode {
-    let (conn, _db_path) = match open_and_validate(root) {
+    let (conn, _db_path) = match open_and_validate(root, "index.db") {
         Ok(t) => t,
         Err(code) => return code,
     };
@@ -558,8 +558,16 @@ fn run_warmup(args: &cli::WarmupArgs) -> std::process::ExitCode {
 /// instead of falsely flagging "corrupt".
 fn open_and_validate(
     root: &std::path::Path,
+    db_name: &str,
 ) -> Result<(rusqlite::Connection, std::path::PathBuf), std::process::ExitCode> {
-    let db_path = root.join(".claude").join("knowledge").join("index.db");
+    let db_name = match cli::validate_db_name(db_name) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return Err(std::process::ExitCode::from(2));
+        }
+    };
+    let db_path = root.join(".claude").join("knowledge").join(db_name);
     // Tech-debt #4 wiring: use the v2 entry point so fresh DBs are stamped
     // with schema_version=2 and the chunks_vec virtual table is created.
     // Existing v1 DBs are left at v1 (open_or_init_v2 does NOT auto-migrate
@@ -687,7 +695,7 @@ fn run_search(root: &std::path::Path, args: &cli::SearchArgs) -> std::process::E
     // required`) BEFORE any vector-search dispatch attempts to query
     // chunks_vec. This preserves the corrupt-index test contract for
     // lexical, dense, AND hybrid modes uniformly.
-    let (conn, _db_path) = match open_and_validate(root) {
+    let (conn, _db_path) = match open_and_validate(root, &args.db_name) {
         Ok(t) => t,
         Err(code) => return code,
     };
@@ -771,7 +779,7 @@ fn run_search_with_encoder(
 
 /// `list [--json]` — list ingested documents with chunk counts.
 fn run_list(root: &std::path::Path, args: &cli::ListArgs) -> std::process::ExitCode {
-    let (conn, _db_path) = match open_and_validate(root) {
+    let (conn, _db_path) = match open_and_validate(root, &args.db_name) {
         Ok(t) => t,
         Err(code) => return code,
     };
@@ -794,7 +802,7 @@ fn run_list(root: &std::path::Path, args: &cli::ListArgs) -> std::process::ExitC
 
 /// `status [--json]` — schema_version + counts + db_path.
 fn run_status(root: &std::path::Path, args: &cli::StatusArgs) -> std::process::ExitCode {
-    let (conn, db_path) = match open_and_validate(root) {
+    let (conn, db_path) = match open_and_validate(root, &args.db_name) {
         Ok(t) => t,
         Err(code) => return code,
     };
@@ -838,7 +846,7 @@ fn run_delete(root: &std::path::Path, args: &cli::DeleteArgs) -> std::process::E
         _ => {}
     }
 
-    let (mut conn, _db_path) = match open_and_validate(root) {
+    let (mut conn, _db_path) = match open_and_validate(root, &args.db_name) {
         Ok(t) => t,
         Err(code) => return code,
     };

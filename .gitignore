@@ -29,3 +29,4 @@ target
 # claudebase: release-pipeline staging dir + local benchmark outputs
 dist/
 bench/reports/local-*.md
+.DS_Store

@@ -35,6 +35,8 @@ fn main() -> std::process::ExitCode {
             cli::InsightSubcommand::List(l) => l.project_root.as_deref(),
             cli::InsightSubcommand::Random(r) => r.project_root.as_deref(),
             cli::InsightSubcommand::Get(g) => g.project_root.as_deref(),
+            cli::InsightSubcommand::Gc(g) => g.project_root.as_deref(),
+            cli::InsightSubcommand::Delete(d) => d.project_root.as_deref(),
         },
     };
 
@@ -64,6 +66,8 @@ fn main() -> std::process::ExitCode {
             cli::InsightSubcommand::List(a) => run_insight_list(&root, &a),
             cli::InsightSubcommand::Random(a) => run_insight_random(&root, &a),
             cli::InsightSubcommand::Get(a) => run_insight_get(&root, &a),
+            cli::InsightSubcommand::Gc(a) => run_insight_gc(&root, &a),
+            cli::InsightSubcommand::Delete(a) => run_insight_delete(&root, &a),
         },
     }
 }
@@ -642,6 +646,154 @@ fn run_insight_get(
             std::process::ExitCode::from(1)
         }
     }
+}
+
+/// `insight gc [--dry-run]` — purge insights past their salience-driven
+/// retention window (high=∞, medium=365d, low=90d). Runs VACUUM after
+/// the deletes to reclaim storage; emits `{medium_deleted, low_deleted,
+/// chunks_vec_orphans_cleared, freed_bytes}` on `--json`.
+fn run_insight_gc(
+    root: &std::path::Path,
+    args: &cli::InsightGcArgs,
+) -> std::process::ExitCode {
+    let (mut conn, db_path) = match open_and_validate(root, &args.db_name) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    let now: i64 = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    };
+    if args.dry_run {
+        let summary = match store::count_insights_past_ttl(&conn, now) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: gc dry-run failed: {e}");
+                return std::process::ExitCode::from(1);
+            }
+        };
+        if args.json {
+            let payload = serde_json::json!({
+                "dry_run":            true,
+                "would_delete_medium": summary.medium_deleted,
+                "would_delete_low":    summary.low_deleted,
+                "would_delete_total":  summary.medium_deleted + summary.low_deleted,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload).unwrap_or_default()
+            );
+        } else {
+            println!(
+                "dry-run: would delete {} medium-salience + {} low-salience = {} total",
+                summary.medium_deleted,
+                summary.low_deleted,
+                summary.medium_deleted + summary.low_deleted
+            );
+        }
+        return std::process::ExitCode::SUCCESS;
+    }
+    let size_before = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+    let summary = match store::gc_insights_by_salience(&mut conn, now) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: gc failed: {e}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    // VACUUM cannot run inside a transaction. After gc_insights_by_salience
+    // returns, the tx has committed and the connection is idle, so VACUUM
+    // is safe here. Failures are warnings — the deletes already landed.
+    if let Err(e) = conn.execute_batch("VACUUM") {
+        eprintln!("warning: VACUUM after gc failed: {e}");
+    }
+    let size_after = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+    let freed_bytes = size_before.saturating_sub(size_after);
+    if args.json {
+        let payload = serde_json::json!({
+            "dry_run":                     false,
+            "medium_deleted":              summary.medium_deleted,
+            "low_deleted":                 summary.low_deleted,
+            "chunks_vec_orphans_cleared":  summary.chunks_vec_orphans_cleared,
+            "deleted_total":               summary.medium_deleted + summary.low_deleted,
+            "size_before_bytes":           size_before,
+            "size_after_bytes":            size_after,
+            "freed_bytes":                 freed_bytes,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
+    } else {
+        println!(
+            "gc: deleted {} medium + {} low = {} insights; cleared {} orphan vectors; freed {} bytes",
+            summary.medium_deleted,
+            summary.low_deleted,
+            summary.medium_deleted + summary.low_deleted,
+            summary.chunks_vec_orphans_cleared,
+            freed_bytes
+        );
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+/// `insight delete <id>` — single-insight delete by integer
+/// `documents.id` with chunks + chunks_vec cascade. Refuses to delete
+/// non-insight rows (source_type IS NULL — books corpus).
+fn run_insight_delete(
+    root: &std::path::Path,
+    args: &cli::InsightDeleteArgs,
+) -> std::process::ExitCode {
+    let (mut conn, _db_path) = match open_and_validate(root, &args.db_name) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    let summary = match store::insight_delete_with_summary(&mut conn, args.id) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            // Disambiguate "not found" vs "not an insight" — re-probe the
+            // row directly so the message is helpful.
+            use rusqlite::OptionalExtension;
+            let row: Option<Option<String>> = conn
+                .query_row(
+                    "SELECT source_type FROM documents WHERE id = ?1",
+                    rusqlite::params![args.id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap_or(None);
+            match row {
+                Some(Some(_)) => unreachable!("delete_with_summary returns Some when source_type set"),
+                Some(None) => {
+                    eprintln!(
+                        "error: id {} is a books-corpus document, not an insight; refusing to delete",
+                        args.id
+                    );
+                    return std::process::ExitCode::from(2);
+                }
+                None => {
+                    eprintln!("error: no insight with id {}", args.id);
+                    return std::process::ExitCode::from(1);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("error: insight delete failed: {e}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    if args.json {
+        println!("{}", output::render_delete_by_id_json(&summary));
+    } else {
+        println!(
+            "deleted: id={} source={} chunks={}",
+            summary.deleted_id, summary.source_path, summary.chunks_removed
+        );
+    }
+    std::process::ExitCode::SUCCESS
 }
 
 /// Shared formatter for `insight random` and `insight get`.

@@ -873,6 +873,167 @@ fn build_filter_sql(
     (sql, params)
 }
 
+/// TTL-driven garbage-collection summary returned by
+/// `gc_insights_by_salience` / `count_insights_past_ttl`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GcSummary {
+    /// Number of medium-salience insights past 365 days.
+    pub medium_deleted: u64,
+    /// Number of low-salience insights past 90 days.
+    pub low_deleted: u64,
+    /// Total chunks_vec rows cleared as a result.
+    pub chunks_vec_orphans_cleared: u64,
+}
+
+/// Compute (without deleting) how many insights would be purged at `now`.
+/// Mirrors `gc_insights_by_salience` but uses SELECT COUNT(*) — used by
+/// the `--dry-run` flag.
+pub fn count_insights_past_ttl(
+    conn: &Connection,
+    now: i64,
+) -> Result<GcSummary, rusqlite::Error> {
+    let medium_cutoff = now - 365 * 86_400;
+    let low_cutoff = now - 90 * 86_400;
+    let medium: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM documents \
+         WHERE source_type IS NOT NULL AND salience = 'medium' AND ingested_at < ?1",
+        rusqlite::params![medium_cutoff],
+        |r| r.get(0),
+    )?;
+    let low: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM documents \
+         WHERE source_type IS NOT NULL AND salience = 'low' AND ingested_at < ?1",
+        rusqlite::params![low_cutoff],
+        |r| r.get(0),
+    )?;
+    Ok(GcSummary {
+        medium_deleted: medium.max(0) as u64,
+        low_deleted: low.max(0) as u64,
+        chunks_vec_orphans_cleared: 0,
+    })
+}
+
+/// TTL purge: delete insights past their salience-driven retention window.
+///
+/// Retention rules (FR-AIB-8.1):
+///   - salience = 'high'   → retained indefinitely (never purged)
+///   - salience = 'medium' → retained 365 days
+///   - salience = 'low'    → retained 90 days
+///   - salience IS NULL    → ignored (defensive — should not occur for insights)
+///
+/// Books-corpus rows (source_type IS NULL) are NEVER touched even when this
+/// helper runs against the books DB by mistake — the WHERE clause guards on
+/// `source_type IS NOT NULL`.
+///
+/// `chunks` rows cascade-delete via `chunks(doc_id) REFERENCES documents(id)
+/// ON DELETE CASCADE` in SCHEMA_V1. `chunks_fts` stays in sync via the
+/// `chunks_ad` trigger. `chunks_vec` rows are NOT cascade-deleted by SQLite
+/// (it's a virtual table — no FK relationship), so we explicitly clear
+/// orphans after the document delete: `DELETE FROM chunks_vec WHERE rowid
+/// NOT IN (SELECT id FROM chunks)`.
+pub fn gc_insights_by_salience(
+    conn: &mut Connection,
+    now: i64,
+) -> Result<GcSummary, rusqlite::Error> {
+    let medium_cutoff = now - 365 * 86_400;
+    let low_cutoff = now - 90 * 86_400;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let n_medium = tx.execute(
+        "DELETE FROM documents \
+         WHERE source_type IS NOT NULL AND salience = 'medium' AND ingested_at < ?1",
+        rusqlite::params![medium_cutoff],
+    )?;
+    let n_low = tx.execute(
+        "DELETE FROM documents \
+         WHERE source_type IS NOT NULL AND salience = 'low' AND ingested_at < ?1",
+        rusqlite::params![low_cutoff],
+    )?;
+    // Orphaned chunks_vec cleanup — skip silently if the virtual table is
+    // absent (v1 DB or chunks_vec never created).
+    let has_vec: bool = tx
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE name='chunks_vec'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    let n_vec_orphans = if has_vec {
+        tx.execute(
+            "DELETE FROM chunks_vec WHERE rowid NOT IN (SELECT id FROM chunks)",
+            [],
+        )?
+    } else {
+        0
+    };
+    tx.commit()?;
+    Ok(GcSummary {
+        medium_deleted: n_medium as u64,
+        low_deleted: n_low as u64,
+        chunks_vec_orphans_cleared: n_vec_orphans as u64,
+    })
+}
+
+/// Delete a single insight by integer id with chunks + chunks_vec cascade.
+///
+/// Guard: refuses to delete rows where `source_type IS NULL` (books-corpus
+/// rows) — returns `Ok(None)` in that case so the CLI can emit a friendly
+/// error message instead of silently truncating the books corpus.
+pub fn insight_delete_with_summary(
+    conn: &mut Connection,
+    id: i64,
+) -> Result<Option<DeleteByIdSummary>, rusqlite::Error> {
+    use rusqlite::OptionalExtension;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // Probe: row exists AND is an insight.
+    let row: Option<(String, Option<String>)> = tx
+        .query_row(
+            "SELECT source_path, source_type FROM documents WHERE id = ?1",
+            rusqlite::params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let (source_path, source_type) = match row {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    if source_type.is_none() {
+        // Books-corpus row — refuse via the same Ok(None) signal so the
+        // CLI can surface a different message ("not an insight").
+        return Ok(None);
+    }
+    let chunks_removed: u64 = tx.query_row(
+        "SELECT COUNT(*) FROM chunks WHERE doc_id = ?1",
+        rusqlite::params![id],
+        |row| row.get::<_, i64>(0).map(|n| n as u64),
+    )?;
+    // Clear chunks_vec rows for this doc's chunks BEFORE the cascade fires
+    // — chunks_vec has no FK relation to chunks. Skip silently when the
+    // virtual table is absent (v1 DB).
+    let has_vec: bool = tx
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE name='chunks_vec'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if has_vec {
+        tx.execute(
+            "DELETE FROM chunks_vec WHERE rowid IN (SELECT id FROM chunks WHERE doc_id = ?1)",
+            rusqlite::params![id],
+        )?;
+    }
+    tx.execute(
+        "DELETE FROM documents WHERE id = ?1",
+        rusqlite::params![id],
+    )?;
+    tx.commit()?;
+    Ok(Some(DeleteByIdSummary {
+        deleted_id: id,
+        source_path,
+        chunks_removed,
+    }))
+}
+
 /// Document metadata snapshot used by `run_insight_search` to post-filter
 /// ranked hits. Single lookup per unique `doc_id` per call (the caller
 /// caches across hits since multiple chunks share a doc_id).

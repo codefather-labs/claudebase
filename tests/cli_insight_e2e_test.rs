@@ -242,6 +242,113 @@ fn search_returns_lexical_hit_for_written_insight() {
 }
 
 // ---------------------------------------------------------------------------
+// `insight gc / delete` — Slice 7 TTL purge + single delete.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gc_purges_low_salience_past_90_days() {
+    let tmp = fresh_project();
+    // Three insights at distinct salience tiers, different agents to bypass
+    // semantic dedup.
+    create_insight(tmp.path(), "high-tier insight body alpha", "agent-learned", "a",
+                   &["--salience", "high"]).success();
+    create_insight(tmp.path(), "medium-tier insight body beta", "agent-learned", "b",
+                   &["--salience", "medium"]).success();
+    create_insight(tmp.path(), "low-tier insight body gamma", "agent-learned", "c",
+                   &["--salience", "low"]).success();
+    // Backdate the LOW one by 100 days.
+    let conn = open_db(&insights_db(tmp.path()));
+    let now: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    let old_ts = now - 100 * 86_400;
+    conn.execute(
+        "UPDATE documents SET ingested_at = ?1 WHERE salience = 'low'",
+        params![old_ts],
+    ).unwrap();
+    drop(conn);
+    // Run gc.
+    let assert = bin()
+        .current_dir(tmp.path())
+        .args(["insight", "gc", "--json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
+    assert_eq!(v["low_deleted"].as_u64().unwrap(), 1);
+    assert_eq!(v["medium_deleted"].as_u64().unwrap(), 0);
+    // Verify the right ones survive.
+    let conn = open_db(&insights_db(tmp.path()));
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 2, "high and medium must survive; low must be purged");
+    let salience_left: Vec<String> = conn
+        .prepare("SELECT salience FROM documents ORDER BY salience").unwrap()
+        .query_map([], |r| r.get::<_, String>(0)).unwrap()
+        .filter_map(Result::ok).collect();
+    assert_eq!(salience_left, vec!["high".to_string(), "medium".to_string()]);
+}
+
+#[test]
+fn gc_purges_medium_salience_past_365_days() {
+    let tmp = fresh_project();
+    create_insight(tmp.path(), "medium-tier insight body delta", "agent-learned", "a",
+                   &["--salience", "medium"]).success();
+    let conn = open_db(&insights_db(tmp.path()));
+    let now: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    // 400 days back — past the 365-day TTL.
+    let old_ts = now - 400 * 86_400;
+    conn.execute("UPDATE documents SET ingested_at = ?1", params![old_ts]).unwrap();
+    drop(conn);
+    let assert = bin().current_dir(tmp.path()).args(["insight", "gc", "--json"]).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
+    assert_eq!(v["medium_deleted"].as_u64().unwrap(), 1);
+}
+
+#[test]
+fn gc_dry_run_reports_without_deleting() {
+    let tmp = fresh_project();
+    create_insight(tmp.path(), "low body would be deleted soon", "agent-learned", "a",
+                   &["--salience", "low"]).success();
+    let conn = open_db(&insights_db(tmp.path()));
+    let now: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    conn.execute("UPDATE documents SET ingested_at = ?1", params![now - 100*86_400]).unwrap();
+    drop(conn);
+    let assert = bin().current_dir(tmp.path()).args(["insight", "gc", "--dry-run", "--json"]).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
+    assert_eq!(v["dry_run"].as_bool().unwrap(), true);
+    assert_eq!(v["would_delete_low"].as_u64().unwrap(), 1);
+    // Row still present.
+    let conn = open_db(&insights_db(tmp.path()));
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 1, "dry-run must NOT delete rows");
+}
+
+#[test]
+fn delete_removes_one_insight_by_id() {
+    let tmp = fresh_project();
+    create_insight(tmp.path(), "redis pipelining halves the latency", "agent-learned", "x", &[]).success();
+    let conn = open_db(&insights_db(tmp.path()));
+    let id: i64 = conn.query_row("SELECT id FROM documents LIMIT 1", [], |r| r.get(0)).unwrap();
+    drop(conn);
+    bin().current_dir(tmp.path()).args(["insight", "delete", &id.to_string()]).assert().success();
+    let conn = open_db(&insights_db(tmp.path()));
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 0);
+    let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0)).unwrap();
+    assert_eq!(chunks, 0, "chunks must cascade-delete");
+}
+
+#[test]
+fn delete_unknown_id_exits_1() {
+    let tmp = fresh_project();
+    create_insight(tmp.path(), "anything", "agent-learned", "x", &[]).success();
+    bin().current_dir(tmp.path()).args(["insight", "delete", "99999"]).assert().failure().code(1);
+}
+
+// ---------------------------------------------------------------------------
 // `insight create` — Slice 5 semantic dedup (cosine > 0.92, same agent, 30d).
 // ---------------------------------------------------------------------------
 

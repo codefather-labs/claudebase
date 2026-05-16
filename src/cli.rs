@@ -395,6 +395,13 @@ pub enum InsightSubcommand {
     /// Fetch one insight by integer `documents.id` or sha256 prefix
     /// (≥4 hex chars matches the stored sha256 via LIKE 'prefix%').
     Get(InsightGetArgs),
+    /// Garbage-collect insights past their salience-driven TTL.
+    /// salience=high retained indefinitely. medium retained 365 days.
+    /// low retained 90 days. Runs VACUUM after delete.
+    Gc(InsightGcArgs),
+    /// Delete one insight by integer `documents.id` (with chunks +
+    /// chunks_vec cascade). Refuses to delete non-insight rows.
+    Delete(InsightDeleteArgs),
 }
 
 /// `claudebase insight create "<body>"` — agent write surface for the
@@ -578,6 +585,34 @@ pub struct InsightRandomArgs {
     /// Optional filter on `documents.feature_slug` (exact match).
     #[arg(long)]
     pub feature: Option<String>,
+    #[arg(long)]
+    pub project_root: Option<PathBuf>,
+    #[arg(long, default_value = "insights.db")]
+    pub db_name: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct InsightGcArgs {
+    /// Show what would be deleted without actually deleting. JSON output
+    /// surfaces `{would_delete_medium: N, would_delete_low: N}`.
+    #[arg(long)]
+    pub dry_run: bool,
+    #[arg(long)]
+    pub project_root: Option<PathBuf>,
+    #[arg(long, default_value = "insights.db")]
+    pub db_name: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct InsightDeleteArgs {
+    /// Integer `documents.id` of the insight to delete. (Sha-prefix
+    /// targeting is not supported here — use `insight get <prefix>` to
+    /// confirm the id first, then `insight delete <id>`.)
+    pub id: i64,
     #[arg(long)]
     pub project_root: Option<PathBuf>,
     #[arg(long, default_value = "insights.db")]

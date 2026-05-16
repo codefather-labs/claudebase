@@ -433,6 +433,11 @@ pub struct InsightCreateArgs {
 /// `insights.db`. Default mode is `hybrid` (BM25 ⊕ dense via RRF k=60);
 /// auto-falls-back to `lexical` when the e5 encoder model or the
 /// chunks_vec virtual table is unavailable.
+///
+/// Slice 4 filter args (`--type / --agent / --salience / --feature /
+/// --since`) post-filter the ranked hits against the document metadata.
+/// Implementation note: filters are applied AFTER ranking — `top_k` is
+/// over-fetched (×4 cap 100) so the filter doesn't starve thin pages.
 #[derive(Args, Debug)]
 pub struct InsightSearchArgs {
     pub query: String,
@@ -442,12 +447,67 @@ pub struct InsightSearchArgs {
     pub context: usize,
     #[arg(long, value_enum, default_value_t = SearchMode::Hybrid)]
     pub mode: SearchMode,
+    /// Filter by `documents.source_type` (exact match).
+    #[arg(long = "type")]
+    pub kind: Option<String>,
+    /// Filter by `documents.agent_name` (exact match).
+    #[arg(long)]
+    pub agent: Option<String>,
+    /// Filter by `documents.salience` (high|medium|low).
+    #[arg(long, value_enum)]
+    pub salience: Option<Salience>,
+    /// Filter by `documents.feature_slug` (exact match).
+    #[arg(long)]
+    pub feature: Option<String>,
+    /// Relative-time filter on `documents.ingested_at`. Format: `<N><unit>`
+    /// where unit is `s|m|h|d|w` (seconds / minutes / hours / days / weeks).
+    /// Examples: `30d`, `12h`, `90m`, `4w`. Rejected if no unit suffix.
+    #[arg(long)]
+    pub since: Option<String>,
     #[arg(long)]
     pub project_root: Option<PathBuf>,
     #[arg(long, default_value = "insights.db")]
     pub db_name: String,
     #[arg(long)]
     pub json: bool,
+}
+
+/// Parse a relative-time filter like `30d` / `12h` / `90m` into seconds.
+///
+/// Returns `Err(...)` for malformed input (empty, no unit, unknown unit,
+/// non-numeric prefix, overflow). The numeric prefix is a `u64` so values
+/// up to ~292B seconds (~9000y) parse cleanly; the practical upper bound
+/// is the timestamp space itself.
+pub fn parse_since(value: &str) -> Result<i64, String> {
+    if value.is_empty() {
+        return Err("--since value is empty".to_string());
+    }
+    let (num_part, unit) = match value.chars().last() {
+        Some(c) if !c.is_ascii_digit() => (&value[..value.len() - c.len_utf8()], c),
+        _ => return Err(format!("--since must end with unit (s|m|h|d|w); got `{value}`")),
+    };
+    if num_part.is_empty() {
+        return Err(format!("--since numeric prefix is empty; got `{value}`"));
+    }
+    let n: u64 = num_part
+        .parse()
+        .map_err(|_| format!("--since numeric prefix must be a positive integer; got `{value}`"))?;
+    let seconds_per_unit: u64 = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3_600,
+        'd' => 86_400,
+        'w' => 7 * 86_400,
+        other => {
+            return Err(format!(
+                "--since unit must be one of s|m|h|d|w; got `{other}` in `{value}`"
+            ));
+        }
+    };
+    let total = n
+        .checked_mul(seconds_per_unit)
+        .ok_or_else(|| format!("--since value overflows i64 seconds: {value}"))?;
+    i64::try_from(total).map_err(|_| format!("--since value overflows i64 seconds: {value}"))
 }
 
 #[derive(Args, Debug)]

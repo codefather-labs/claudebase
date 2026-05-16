@@ -873,6 +873,44 @@ fn build_filter_sql(
     (sql, params)
 }
 
+/// Document metadata snapshot used by `run_insight_search` to post-filter
+/// ranked hits. Single lookup per unique `doc_id` per call (the caller
+/// caches across hits since multiple chunks share a doc_id).
+#[derive(Debug, Clone)]
+pub struct DocMetadata {
+    pub source_type: Option<String>,
+    pub agent_name: Option<String>,
+    pub salience: Option<String>,
+    pub feature_slug: Option<String>,
+    pub ingested_at: i64,
+}
+
+/// Fetch the filter-relevant metadata columns for a single document. Used
+/// by the `insight search` post-filter pass — the canonical retrieval
+/// engine (search.rs) is corpus-agnostic and doesn't know about insights
+/// metadata, so we filter after ranking.
+pub fn get_doc_metadata(
+    conn: &Connection,
+    doc_id: i64,
+) -> Result<Option<DocMetadata>, rusqlite::Error> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT source_type, agent_name, salience, feature_slug, ingested_at \
+         FROM documents WHERE id = ?1",
+        rusqlite::params![doc_id],
+        |r| {
+            Ok(DocMetadata {
+                source_type: r.get(0)?,
+                agent_name: r.get(1)?,
+                salience: r.get(2)?,
+                feature_slug: r.get(3)?,
+                ingested_at: r.get(4)?,
+            })
+        },
+    )
+    .optional()
+}
+
 /// Exact-sha dedup probe for the insights corpus.
 ///
 /// Returns the existing `documents.id` when a row with the same `sha256`

@@ -292,28 +292,62 @@ fn run_insight_create(
 /// corpus. Reuses the existing search dispatch (lexical / dense / hybrid +
 /// auto-fallback) but pins `--db-name insights.db` so books-corpus rows
 /// never bleed in. Default mode is `hybrid` (BM25 ⊕ dense via RRF k=60).
+///
+/// Slice 4 metadata filters are applied AFTER ranking. The search engine
+/// is corpus-agnostic, so we over-fetch by ×4 (capped at 100) and then
+/// drop hits whose document doesn't match the filter set. The metadata
+/// lookups are cached per `doc_id` so multi-chunk hits from the same
+/// document share a single SQL query.
 fn run_insight_search(
     root: &std::path::Path,
     args: &cli::InsightSearchArgs,
 ) -> std::process::ExitCode {
-    let top_k = args.top_k as u32;
+    let user_top_k = args.top_k.max(1) as u32;
+    let has_filters = args.kind.is_some()
+        || args.agent.is_some()
+        || args.salience.is_some()
+        || args.feature.is_some()
+        || args.since.is_some();
+    // Over-fetch only when filters are present — otherwise the behavior is
+    // byte-identical to pre-Slice-4 (user_top_k passed straight through).
+    let fetch_top_k = if has_filters {
+        user_top_k.saturating_mul(4).min(search::MAX_TOP_K)
+    } else {
+        user_top_k
+    };
     let context_radius = args.context as u32;
     let (conn, _db_path) = match open_and_validate(root, &args.db_name) {
         Ok(t) => t,
         Err(code) => return code,
     };
-    // Bridge to the existing search dispatch by synthesizing a SearchArgs
-    // shape locally. We don't allocate a SearchArgs struct because its
-    // fields are heavier (db_name owned String); we just call the same
-    // helpers directly.
+
+    // Parse --since up-front so a bad value exits 2 before opening the DB
+    // wastes time on a doomed search.
+    let since_cutoff: Option<i64> = match args.since.as_deref() {
+        Some(s) => match cli::parse_since(s) {
+            Ok(seconds) => {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                Some(now - seconds)
+            }
+            Err(msg) => {
+                eprintln!("error: {msg}");
+                return std::process::ExitCode::from(2);
+            }
+        },
+        None => None,
+    };
     let hits_result = match args.mode {
-        cli::SearchMode::Lexical => search::search(&conn, &args.query, top_k, context_radius),
+        cli::SearchMode::Lexical => search::search(&conn, &args.query, fetch_top_k, context_radius),
         cli::SearchMode::Dense | cli::SearchMode::Hybrid => {
             match encoder::encode_query(&args.query) {
                 Ok(emb) => match args.mode {
-                    cli::SearchMode::Dense => search::dense_search(&conn, &emb, top_k),
+                    cli::SearchMode::Dense => search::dense_search(&conn, &emb, fetch_top_k),
                     cli::SearchMode::Hybrid => {
-                        search::hybrid_search(&conn, &args.query, &emb, top_k)
+                        search::hybrid_search(&conn, &args.query, &emb, fetch_top_k)
                     }
                     cli::SearchMode::Lexical => unreachable!(),
                 },
@@ -321,14 +355,14 @@ fn run_insight_search(
                     eprintln!(
                         "warning: encoder unavailable ({e}); falling back to lexical mode. Run `bash install.sh --yes` to install the e5-multilingual-small model."
                     );
-                    search::search(&conn, &args.query, top_k, context_radius)
+                    search::search(&conn, &args.query, fetch_top_k, context_radius)
                 }
             }
         }
     };
     // Vector-search failures fall back to lexical with a stderr warning —
     // same UX as the standalone `search` subcommand.
-    let hits = match hits_result {
+    let raw_hits = match hits_result {
         Ok(h) => h,
         Err(search::SearchError::FtsSyntax(msg)) => {
             eprintln!("error: invalid search query: {msg}");
@@ -338,7 +372,7 @@ fn run_insight_search(
             eprintln!(
                 "warning: vector search failed ({e}); falling back to lexical mode."
             );
-            match search::search(&conn, &args.query, top_k, context_radius) {
+            match search::search(&conn, &args.query, fetch_top_k, context_radius) {
                 Ok(h) => h,
                 Err(e2) => {
                     eprintln!("error: search failed: {e2}");
@@ -347,12 +381,85 @@ fn run_insight_search(
             }
         }
     };
+
+    // Post-filter via per-doc_id metadata lookup with a tiny cache.
+    let hits = if has_filters {
+        filter_insight_hits(
+            &conn,
+            raw_hits,
+            args.kind.as_deref(),
+            args.agent.as_deref(),
+            args.salience.as_ref().map(|s| s.as_str()),
+            args.feature.as_deref(),
+            since_cutoff,
+            user_top_k as usize,
+        )
+    } else {
+        raw_hits
+    };
+
     if args.json {
         println!("{}", output::render_search_json(&hits));
     } else {
         print!("{}", output::render_search_human(&hits));
     }
     std::process::ExitCode::SUCCESS
+}
+
+/// Post-filter ranked hits against the v4 insight-metadata columns. Caches
+/// `DocMetadata` lookups per `doc_id` so repeated hits from the same
+/// document only hit SQLite once.
+fn filter_insight_hits(
+    conn: &rusqlite::Connection,
+    hits: Vec<search::SearchHit>,
+    kind: Option<&str>,
+    agent: Option<&str>,
+    salience: Option<&str>,
+    feature: Option<&str>,
+    since_cutoff: Option<i64>,
+    user_top_k: usize,
+) -> Vec<search::SearchHit> {
+    let mut cache: std::collections::HashMap<i64, Option<store::DocMetadata>> =
+        std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(user_top_k);
+    for hit in hits {
+        if out.len() >= user_top_k {
+            break;
+        }
+        let meta = cache
+            .entry(hit.doc_id)
+            .or_insert_with(|| store::get_doc_metadata(conn, hit.doc_id).ok().flatten());
+        let Some(m) = meta.as_ref() else {
+            continue;
+        };
+        if let Some(k) = kind {
+            if m.source_type.as_deref() != Some(k) {
+                continue;
+            }
+        }
+        if let Some(a) = agent {
+            if m.agent_name.as_deref() != Some(a) {
+                continue;
+            }
+        }
+        if let Some(s) = salience {
+            if m.salience.as_deref() != Some(s) {
+                continue;
+            }
+        }
+        if let Some(f) = feature {
+            if m.feature_slug.as_deref() != Some(f) {
+                continue;
+            }
+        }
+        if let Some(cutoff) = since_cutoff {
+            if m.ingested_at < cutoff {
+                continue;
+            }
+        }
+        out.push(hit);
+    }
+    out
 }
 
 /// `insight list [--offset N] [--page-size N] [filters]` — paginated

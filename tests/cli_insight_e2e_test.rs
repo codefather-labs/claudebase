@@ -242,6 +242,148 @@ fn search_returns_lexical_hit_for_written_insight() {
 }
 
 // ---------------------------------------------------------------------------
+// `insight search` — Slice 4 metadata filters.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn search_filter_by_agent_drops_other_agents_hits() {
+    let tmp = fresh_project();
+    create_insight(tmp.path(), "alpha rebalance commit", "agent-learned", "planner", &[]).success();
+    create_insight(tmp.path(), "beta rebalance commit", "agent-learned", "verifier", &[]).success();
+    let assert = bin()
+        .current_dir(tmp.path())
+        .args([
+            "insight", "search", "rebalance",
+            "--mode", "lexical",
+            "--agent", "planner",
+            "--top-k", "5",
+            "--json",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    assert!(stdout.contains("alpha"), "expected alpha (planner) hit; got:\n{stdout}");
+    assert!(!stdout.contains("beta"), "verifier's hit should be filtered out; got:\n{stdout}");
+}
+
+#[test]
+fn search_filter_by_salience_keeps_only_matching_tier() {
+    let tmp = fresh_project();
+    create_insight(tmp.path(), "highsal rebalance commit", "agent-learned", "a", &["--salience", "high"]).success();
+    create_insight(tmp.path(), "medsal rebalance commit", "agent-learned", "b", &["--salience", "medium"]).success();
+    let assert = bin()
+        .current_dir(tmp.path())
+        .args([
+            "insight", "search", "rebalance",
+            "--mode", "lexical",
+            "--salience", "high",
+            "--top-k", "5",
+            "--json",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    assert!(stdout.contains("highsal"));
+    assert!(!stdout.contains("medsal"));
+}
+
+#[test]
+fn search_filter_by_type_and_feature_combine() {
+    let tmp = fresh_project();
+    create_insight(
+        tmp.path(),
+        "kafka rebalance commit window",
+        "agent-learned",
+        "a",
+        &["--feature", "payments-v2"],
+    ).success();
+    create_insight(
+        tmp.path(),
+        "kafka rebalance commit batches",
+        "consolidator-drift",
+        "b",
+        &["--feature", "payments-v2"],
+    ).success();
+    create_insight(
+        tmp.path(),
+        "kafka rebalance commit elsewhere",
+        "agent-learned",
+        "c",
+        &["--feature", "checkout-v1"],
+    ).success();
+    let assert = bin()
+        .current_dir(tmp.path())
+        .args([
+            "insight", "search", "rebalance",
+            "--mode", "lexical",
+            "--type", "agent-learned",
+            "--feature", "payments-v2",
+            "--top-k", "5",
+            "--json",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    assert!(stdout.contains("window"), "expected agent-learned + payments-v2 hit");
+    assert!(!stdout.contains("batches"), "consolidator-drift type filtered out");
+    assert!(!stdout.contains("elsewhere"), "checkout-v1 feature filtered out");
+}
+
+#[test]
+fn search_since_filter_rejects_malformed_value() {
+    let tmp = fresh_project();
+    create_insight(tmp.path(), "anything", "agent-learned", "x", &[]).success();
+    // No unit suffix.
+    bin()
+        .current_dir(tmp.path())
+        .args(["insight", "search", "anything", "--since", "30", "--mode", "lexical"])
+        .assert()
+        .failure()
+        .code(2);
+    // Unknown unit.
+    bin()
+        .current_dir(tmp.path())
+        .args(["insight", "search", "anything", "--since", "30x", "--mode", "lexical"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn search_since_filter_keeps_recent_drops_old() {
+    let tmp = fresh_project();
+    create_insight(tmp.path(), "fresh rebalance commit text", "agent-learned", "x", &[]).success();
+    let db_path = insights_db(tmp.path());
+    // Backdate the row by 100 days.
+    let conn = open_db(&db_path);
+    let now: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let old_ts = now - 100 * 86_400;
+    conn.execute("UPDATE documents SET ingested_at = ?1 WHERE id = 1", params![old_ts])
+        .unwrap();
+    drop(conn);
+    // --since 7d → should drop the 100-day-old insight.
+    let assert = bin()
+        .current_dir(tmp.path())
+        .args([
+            "insight", "search", "rebalance",
+            "--mode", "lexical",
+            "--since", "7d",
+            "--top-k", "5",
+            "--json",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    assert!(
+        !stdout.contains("fresh rebalance commit"),
+        "100-day-old insight should be filtered by --since 7d; got:\n{stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // `insight list` — pagination, defaults, filters.
 // ---------------------------------------------------------------------------
 

@@ -14,15 +14,53 @@ Alongside the read-side **books corpus**, claudebase v0.5.0 ships a write-side *
 
 ## Quick install
 
-The recommended path is via [`claude-code-sdlc`](https://github.com/codefather-labs/claude-code-sdlc), which installs `claudebase` as part of its agent toolkit:
+`claudebase` ships its own installer that bundles the CLI binary, the PDFium native library, the e5 encoder cache, AND an agent toolkit (rules, commands, agents) that get deployed into `~/.claude/` for Claude Code to pick up at session start.
+
+**One-shot install** (Linux / macOS):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/codefather-labs/claude-code-sdlc/main/install.sh | bash -s -- --yes
+curl -fsSL https://raw.githubusercontent.com/codefather-labs/claudebase/main/install.sh | bash -s -- --yes
 ```
 
-This downloads the platform-appropriate binary from this repo's releases (`claudebase-darwin-arm64`, `claudebase-linux-x64`, `claudebase-windows-x64.exe`), places it at `~/.claude/tools/claudebase/claudebase`, registers a global `claudebase` alias, and wires up the e5 encoder + pdfium dynamic library.
+**One-shot install** (Windows PowerShell):
 
-For a standalone install without the agent SDK:
+```powershell
+iwr -useb https://raw.githubusercontent.com/codefather-labs/claudebase/main/install.ps1 | iex
+```
+
+**From a local checkout**:
+
+```bash
+git clone https://github.com/codefather-labs/claudebase
+cd claudebase
+bash install.sh --yes --local        # or .\install.ps1 -Yes -Local on Windows
+```
+
+### What gets installed
+
+| Path | Content |
+|---|---|
+| `~/.claude/tools/claudebase/claudebase` | CLI binary downloaded from this repo's GitHub releases |
+| `~/.claude/tools/claudebase/pdfium/` | PDFium native library for PDF text extraction |
+| `~/.claude/tools/claudebase/models/` | e5-multilingual-small encoder cache (pre-warmed) |
+| `~/.claude/rules/knowledge-base.md` | CLI contract + citation discipline |
+| `~/.claude/rules/knowledge-base-tool.md` | When/how agents query the corpora (incl. insights) |
+| `~/.claude/rules/tool-limitations.md` | Read/grep/bash truncation gotchas |
+| `~/.claude/commands/knowledge-ingest.md` | `/knowledge-ingest` skill (Claude Code slash command) |
+| `~/.claude/commands/reflect.md` | `/reflect` skill — DMN unfocused observation pass |
+| `~/.claude/commands/consolidate.md` | `/consolidate` skill — cross-artifact drift detection |
+| `~/.claude/agents/reflection.md` | `reflection` agent (Drift persona) |
+| `~/.claude/agents/consolidator.md` | `consolidator` agent (Mnem persona) |
+| `/usr/local/bin/claudebase` (or `~/.claude/bin/claudebase.cmd` on Win) | Global alias on PATH |
+| `~/.claude/settings.json` | `~/.claude/tools/claudebase/claudebase *` Bash allowlist entry merged |
+
+### Companion: claude-code-sdlc
+
+For the full documentation-first TDD pipeline (PRD writer, business analyst, planner, QA engineer, code reviewer, security auditor, etc. — 19 specialist agents plus the orchestrator persona Mira), install [`claude-code-sdlc`](https://github.com/codefather-labs/claude-code-sdlc). Its installer chains to this one — running the SDLC installer will install claudebase first, then layer the SDLC pipeline on top. Either repo can also be installed standalone: claudebase alone gives you the memory + observation infrastructure (books corpus, insights corpus, reflection, consolidation) without the workflow pipeline.
+
+### Binary-only install (no agent toolkit)
+
+If you just want the CLI binary without the prompts/rules/agents:
 
 ```bash
 # darwin-arm64 example; substitute your platform
@@ -30,6 +68,8 @@ curl -fsSL -o ~/.local/bin/claudebase \
   https://github.com/codefather-labs/claudebase/releases/latest/download/claudebase-darwin-arm64
 chmod +x ~/.local/bin/claudebase
 ```
+
+You'll still need to install PDFium and the e5 encoder manually for full functionality.
 
 ## Subcommands
 

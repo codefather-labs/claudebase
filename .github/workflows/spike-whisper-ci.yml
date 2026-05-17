@@ -1,0 +1,162 @@
+name: spike-whisper-ci
+
+# Slice 0b spike for agent-chat-daemon — validates that `whisper-rs ~0.13`
+# builds cleanly on linux-x64, macos-arm64, and windows-x64 with each
+# platform's CMake + clang toolchain. The result GATES Slice 6-MVP dispatch:
+#
+#   - linux-x64 + macos-arm64 green  → Slice 6-MVP ships `asr-whisper` on
+#     all three platforms (Windows green) OR with windows-x64 disabled
+#     (`cfg!(windows) { return Err("ASR disabled on Windows v1") }`).
+#   - any GA platform red             → Slice 6-MVP gated on root-cause fix
+#     OR documents the FAIL-path stub.
+#
+# This workflow does NOT touch claudebase's main Cargo.toml — Slice 6-MVP
+# adds the whisper-rs dep there. Instead, it bootstraps the
+# `whisper-build-test/` subcrate (standalone Cargo project, NOT in claudebase
+# workspace) to exercise the dependency in isolation.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/spike-whisper-ci.yml'
+      - 'whisper-build-test/**'
+  workflow_dispatch: {}
+
+# Least-privilege; this spike never writes to the repo or publishes anything.
+permissions:
+  contents: read
+
+concurrency:
+  group: spike-whisper-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    runs-on: ${{ matrix.runs-on }}
+    # 30-minute cap per platform — whisper.cpp first compile is ~5-15 min
+    # depending on host, plus matrix overhead. A platform that exceeds 30 min
+    # is itself a load-bearing FAIL signal worth surfacing to Slice 6-MVP.
+    timeout-minutes: 30
+    strategy:
+      # fail-fast: false — if Windows fails, linux + macos must still be
+      # observable as PASS so the FAIL-path decision (disable asr-whisper on
+      # Windows v1) can be made on the platform matrix evidence.
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runs-on: ubuntu-latest
+            arch: x64
+          - platform: macos-arm64
+            # macos-latest resolves to an arm64 runner on M1+ since 2024-01.
+            runs-on: macos-latest
+            arch: arm64
+          - platform: windows-x64
+            runs-on: windows-latest
+            arch: x64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      # -----------------------------------------------------------------------
+      # Platform-specific CMake + clang install. whisper-rs's build.rs invokes
+      # whisper.cpp's CMake build, which requires both tools on PATH at build
+      # time. The host runners ship most of this preinstalled — explicit
+      # installs are belt-and-braces to make the spike reproducible across
+      # runner-image refreshes.
+      # -----------------------------------------------------------------------
+      - name: Install CMake + clang (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang
+          cmake --version
+          clang --version
+
+      - name: Install CMake + LLVM (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          # macos-latest images ship Xcode's Apple-clang and cmake already,
+          # but `brew install cmake llvm` ensures the versions are recent
+          # and idempotent across runner-image refreshes. `|| true` lets the
+          # build proceed if cmake/llvm are already kegged.
+          brew install cmake llvm || true
+          cmake --version
+          clang --version
+
+      - name: Install CMake + LLVM (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Chocolatey is preinstalled on windows-latest runners.
+          choco install cmake llvm -y --no-progress
+          # Refresh PATH so the just-installed tools are visible to subsequent
+          # steps (GitHub Actions does NOT auto-refresh between steps).
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+          cmake --version
+          clang --version
+
+      # -----------------------------------------------------------------------
+      # Cargo registry + target cache. Speeds up subsequent runs by ~3-5 min
+      # on cache-hit. Cache key includes the whisper-build-test Cargo.lock if
+      # it exists (first run has no lock; subsequent runs do).
+      # -----------------------------------------------------------------------
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            whisper-build-test/target
+          key: spike-whisper-${{ matrix.platform }}-${{ hashFiles('whisper-build-test/Cargo.toml') }}
+          restore-keys: |
+            spike-whisper-${{ matrix.platform }}-
+
+      # -----------------------------------------------------------------------
+      # The actual spike: build the whisper-build-test/ subcrate. Success ⇔
+      # whisper-rs's whisper.cpp build.rs completes AND links cleanly with the
+      # platform's C++ runtime AND the Rust binding's public API surface is
+      # reachable from a consumer crate.
+      #
+      # `--verbose` so any CMake / clang / linker error is visible in the job
+      # log without needing to enable ACTIONS_RUNNER_DEBUG.
+      # -----------------------------------------------------------------------
+      - name: cargo build --release (whisper-build-test)
+        shell: bash
+        working-directory: whisper-build-test
+        run: |
+          cargo build --release --verbose 2>&1 | tee build.log
+
+      - name: Smoke run (assert binary links + executes)
+        shell: bash
+        working-directory: whisper-build-test
+        run: |
+          EXT=""
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            EXT=".exe"
+          fi
+          BIN="target/release/whisper-build-test${EXT}"
+          test -f "$BIN" || { echo "ERROR: binary not found at $BIN"; exit 1; }
+          "$BIN"
+
+      # -----------------------------------------------------------------------
+      # On failure, upload the build log so the FAIL-path decision in Slice
+      # 6-MVP pre-review notes has concrete CMake/clang/linker output to cite.
+      # Without this, a Windows-only FAIL is opaque and Slice 6-MVP cannot
+      # decide whether the cause is fixable or requires the disable-on-Windows
+      # stub.
+      # -----------------------------------------------------------------------
+      - name: Upload build log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spike-whisper-build-log-${{ matrix.platform }}
+          path: whisper-build-test/build.log
+          if-no-files-found: warn
+          retention-days: 14

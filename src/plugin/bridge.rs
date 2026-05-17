@@ -106,7 +106,7 @@ pub async fn run() -> anyhow::Result<()> {
                 return Ok(());
             }
             Err(e) => {
-                eprintln!("claudebase plugin: stdin read error: {e}");
+                tracing::error!(error = %e, "stdin read error");
                 drop(pending);
                 drop(uds);
                 return Ok(());
@@ -176,8 +176,11 @@ pub async fn run() -> anyhow::Result<()> {
                         }
 
                         // SEC-5: log only clientInfo.name (≤64) + version (≤32).
-                        // No capabilities / no other fields. Keeps PII / fingerprint
-                        // surface minimal until Slice 1c brings tracing.
+                        // No capabilities / no other fields. Keeps PII /
+                        // fingerprint surface minimal. Routed through
+                        // structured tracing (Slice 1c) so the two
+                        // truncated fields land as JSON attributes, not
+                        // a free-form line.
                         let client_name = params
                             .get("clientInfo")
                             .and_then(|c| c.get("name"))
@@ -190,9 +193,10 @@ pub async fn run() -> anyhow::Result<()> {
                             .and_then(|v| v.as_str())
                             .map(|s| truncate(s, 32))
                             .unwrap_or_default();
-                        eprintln!(
-                            "claudebase plugin: initialize from '{}' v'{}'",
-                            client_name, client_ver
+                        tracing::info!(
+                            client = %client_name,
+                            version = %client_ver,
+                            "plugin initialize"
                         );
 
                         write_mcp_line(&mut stdout, &initialize_response(id)).await?;
@@ -379,9 +383,21 @@ async fn connect_with_retries(
             return Some(stream);
         }
         if attempt + 1 < retries {
+            tracing::warn!(
+                attempt = attempt + 1,
+                of = retries,
+                delay_ms = delay_ms,
+                socket = %socket.display(),
+                "daemon connect failed; retrying"
+            );
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
     }
+    tracing::warn!(
+        retries = retries,
+        socket = %socket.display(),
+        "daemon connect retries exhausted; entering daemon-down mode"
+    );
     None
 }
 

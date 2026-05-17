@@ -6,31 +6,42 @@
 //! body so every filesystem-touching subcommand receives a canonical project
 //! root (Phase 1.5 Security MUST #3 + #4 + #7).
 //
-// INVARIANT (Slice 1a — async discipline):
-// No `.await` point in any tokio task may execute while a `std::sync::Mutex`
-// guard (PDFIUM in src/pdf.rs, ENCODER in src/encoder.rs, OCR_ENGINE in
-// src/ocr.rs) is held. These are BLOCKING mutexes (std::sync::Mutex, NOT
-// tokio::sync::Mutex); holding one across an `.await` blocks the tokio
-// worker thread, which deadlocks the runtime if all workers reach the
-// same wait point.
+// INVARIANTS (Slice 1c — async discipline). Five rules, summarised here;
+// the canonical reference is `src/daemon/ASYNC_INVARIANTS.md`. A change
+// that breaks any of these is a regression.
 //
-// Slice 1a daemon code does NOT touch these mutexes. Future slices that
-// DO need them (e.g., Slice 5+ insight-search citation enrichment) MUST
-// wrap the lock-and-use site in `tokio::task::spawn_blocking`:
+//   1. `fn main` STAYS synchronous. The tokio runtime is constructed by
+//      `crate::daemon::run_tokio()` lazily inside `run_daemon_serve` and
+//      `run_plugin_serve` ONLY. Do NOT convert to `#[tokio::main]`.
 //
-//     let result = tokio::task::spawn_blocking(move || {
-//         let guard = MUTEX.lock().expect("mutex poisoned");
-//         do_blocking_work(&guard)
-//     }).await?;
+//   2. NEVER `.await` while holding a `std::sync::Mutex` guard. The three
+//      blocking mutexes (`PDFIUM` in src/pdf.rs, `ENCODER` in
+//      src/encoder.rs, `OCR_ENGINE` in src/ocr.rs) are blocking, NOT
+//      tokio mutexes. Holding one across `.await` deadlocks the worker.
+//      Wrap the lock-and-use site in `tokio::task::spawn_blocking`:
 //
-// Do NOT use `tokio::task::block_in_place` — it requires the multi-thread
-// runtime AND has subtle correctness traps when nested or when only one
-// worker thread remains.
+//          let result = tokio::task::spawn_blocking(move || {
+//              let guard = PDFIUM.lock().expect("mutex poisoned");
+//              do_blocking_work(&guard)
+//          }).await?;
 //
-// Do NOT use `lock().unwrap()` inline in async context — that is the bug
-// this invariant exists to prevent.
+//      Do NOT use `tokio::task::block_in_place` — it has subtle traps
+//      with nested calls and with single-worker runtimes.
 //
-// See src/daemon/ASYNC_INVARIANTS.md (Slice 1c) for the full rules.
+//   3. `tokio::spawn` MUST be panic-safe. Wrap spawned bodies in
+//      `if let Err(e) = ... { tracing::error!(...) }`; never let a panic
+//      vanish silently.
+//
+//   4. `tokio::select!` MUST be cancellation-safe. Only pass branches
+//      futures whose docs explicitly say they are cancellation-safe
+//      (e.g. `AsyncBufReadExt::read_line`, `tokio::time::sleep`).
+//
+//   5. NEVER `.unwrap()` on runtime values inside a spawned task body.
+//      Propagate via `Result` to the task entry point where a
+//      `tracing::error!` logs the failure before the task ends.
+//
+// Slice 1a/1b/1c daemon code does NOT touch the blocking mutexes. Future
+// slices that DO need them MUST follow rule 2 verbatim.
 
 use clap::Parser;
 
@@ -111,20 +122,38 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// Initialise the structured-logging subscriber for daemon/plugin arms.
+///
+/// fmt::json() emits one JSON-encoded line per event to stderr. The
+/// env-filter honours `RUST_LOG` with a sensible info-level default.
+/// `try_init()` is idempotent and is the supported entry point — a
+/// double-install (e.g. plugin spawning a daemon in-process during
+/// tests) becomes a silent no-op rather than a panic.
+fn init_tracing() {
+    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer().json().with_writer(std::io::stderr))
+        .try_init();
+}
+
 /// `claudebase daemon serve` — entry point. Constructs the tokio
 /// runtime (the ONLY tokio entry in the binary; sync subcommands
 /// remain on the sync dispatch path) and runs the accept loop until
 /// fatal error or graceful shutdown.
 fn run_daemon_serve(args: &cli::DaemonServeArgs) -> std::process::ExitCode {
+    init_tracing();
     match claudebase::daemon::run_tokio(claudebase::daemon::server::serve(args)) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
-            // server::serve already logs the human-readable cause line
-            // via eprintln! (e.g. "already running (pid 12345)") before
-            // bailing; we surface the anyhow chain here for diagnostic
-            // depth. Always exit 1 on failure — single-instance
-            // conflict, bind failure, etc. all map to the same code.
-            eprintln!("claudebase daemon: fatal: {e:#}");
+            // Subscriber is installed; route the fatal cause through
+            // tracing so the JSON line carries the standard fields. The
+            // anyhow chain is appended with the alternate formatter.
+            tracing::error!(error = %format!("{e:#}"), "claudebase daemon fatal");
             std::process::ExitCode::FAILURE
         }
     }
@@ -132,10 +161,11 @@ fn run_daemon_serve(args: &cli::DaemonServeArgs) -> std::process::ExitCode {
 
 /// `claudebase plugin serve` — entry point. Slice 1a stub.
 fn run_plugin_serve(args: &cli::PluginServeArgs) -> std::process::ExitCode {
+    init_tracing();
     match claudebase::daemon::run_tokio(claudebase::plugin::serve(args)) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("claudebase plugin: {e:#}");
+            tracing::error!(error = %format!("{e:#}"), "claudebase plugin fatal");
             std::process::ExitCode::FAILURE
         }
     }

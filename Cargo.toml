@@ -68,6 +68,13 @@ interprocess = { version = "2", features = ["tokio"] }
 fslock = "0.2"
 uuid = { version = "1", features = ["v4"] }
 
+# Slice 1c — structured JSON logging for daemon + plugin dispatch arms.
+# fmt::json + env-filter cover the canonical stdlib RUST_LOG semantics.
+# Subscriber init is confined to run_daemon_serve / run_plugin_serve so
+# sync subcommands stay unaffected. See src/daemon/ASYNC_INVARIANTS.md.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"

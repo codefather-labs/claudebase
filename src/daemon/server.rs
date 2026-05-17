@@ -144,7 +144,7 @@ fn reap_on_boot_stub() -> anyhow::Result<()> {
     ) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("claudebase daemon: chat.db open failed (non-fatal): {e}");
+            tracing::warn!(error = %e, "chat.db open failed (non-fatal)");
             return Ok(());
         }
     };
@@ -158,7 +158,7 @@ fn reap_on_boot_stub() -> anyhow::Result<()> {
     ) {
         Ok(n) => n,
         Err(e) => {
-            eprintln!("claudebase daemon: agent_registry probe failed (non-fatal): {e}");
+            tracing::warn!(error = %e, "agent_registry probe failed (non-fatal)");
             return Ok(());
         }
     };
@@ -174,7 +174,7 @@ fn reap_on_boot_stub() -> anyhow::Result<()> {
         "UPDATE agent_registry SET state='orphaned' WHERE state='alive'",
         [],
     ) {
-        eprintln!("claudebase daemon: reap-on-boot UPDATE failed (non-fatal): {e}");
+        tracing::warn!(error = %e, "reap-on-boot UPDATE failed (non-fatal)");
     }
     Ok(())
 }
@@ -207,7 +207,7 @@ pub async fn serve(_args: &DaemonServeArgs) -> anyhow::Result<()> {
             .ok()
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|| "unknown".to_string());
-        eprintln!("claudebase daemon: already running (pid {other_pid})");
+        tracing::error!(other_pid = %other_pid, "claudebase daemon already running");
         // Bail with a unique error so main.rs can map this to exit code 1.
         // We rely on anyhow's Display; the exit code comes from main.rs
         // which always uses ExitCode::FAILURE on Err return.
@@ -305,10 +305,10 @@ pub async fn serve(_args: &DaemonServeArgs) -> anyhow::Result<()> {
         let _ = fs::set_permissions(&socket, fs::Permissions::from_mode(0o600));
     }
 
-    eprintln!(
-        "claudebase daemon: listening on {} (pid {})",
-        socket.display(),
-        std::process::id()
+    tracing::info!(
+        socket = %socket.display(),
+        pid = std::process::id(),
+        "claudebase daemon listening"
     );
 
     let semaphore = Arc::new(Semaphore::new(ACCEPT_STORM_LIMIT));
@@ -330,22 +330,22 @@ pub async fn serve(_args: &DaemonServeArgs) -> anyhow::Result<()> {
             Ok(s) => s,
             Err(e) => {
                 // Transient accept errors (EMFILE, ECONNABORTED) — log
-                // and continue. Persistent errors will spin the loop
-                // hot; in Slice 1c we add tracing-based rate limiting.
-                eprintln!("claudebase daemon: accept error (continuing): {e}");
+                // and continue. Persistent errors would spin the loop
+                // hot; future slices may add tracing-based rate limiting.
+                tracing::warn!(error = %e, "accept error (continuing)");
                 drop(permit);
                 continue;
             }
         };
 
         let connection_id = Uuid::new_v4();
-        eprintln!("claudebase daemon: accepted connection {connection_id}");
+        tracing::info!(%connection_id, "accepted connection");
 
         tokio::spawn(async move {
+            // Rule 3 / Rule 5 from ASYNC_INVARIANTS.md: panic-safe spawned
+            // task body — propagate via Result, surface via tracing::error.
             if let Err(e) = handle_connection(stream, connection_id, permit).await {
-                eprintln!(
-                    "claudebase daemon: connection {connection_id} handler error: {e}"
-                );
+                tracing::error!(%connection_id, error = %e, "connection handler error");
             }
         });
     }
@@ -372,7 +372,7 @@ async fn handle_connection(
                 // disconnect, log at "info" not "error".
                 if let Some(io_err) = e.downcast_ref::<io::Error>() {
                     if io_err.kind() == io::ErrorKind::UnexpectedEof {
-                        eprintln!("claudebase daemon: connection {connection_id} EOF");
+                        tracing::info!(%connection_id, "connection EOF");
                         return Ok(());
                     }
                 }
@@ -392,9 +392,7 @@ async fn handle_connection(
                 // Note: do NOT include the serde error in the response —
                 // leaking parse-error internals is a data-leak risk and
                 // breaks the spec's "generic Parse error" guidance.
-                eprintln!(
-                    "claudebase daemon: connection {connection_id} malformed JSON frame (sending Parse Error)"
-                );
+                tracing::warn!(%connection_id, "malformed JSON frame (sending Parse Error)");
                 let err_resp = serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": serde_json::Value::Null,

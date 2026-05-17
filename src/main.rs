@@ -127,6 +127,8 @@ fn main() -> std::process::ExitCode {
                 cli::DaemonAccessSubcommand::Pair(a) => run_daemon_access_pair(&a),
                 cli::DaemonAccessSubcommand::List(a) => run_daemon_access_list(&a),
             },
+            cli::DaemonSubcommand::Doctor(a) => run_daemon_doctor(&a),
+            cli::DaemonSubcommand::Warmup(a) => run_daemon_warmup(&a),
         },
         Command::Plugin(args) => match &args.sub {
             cli::PluginSubcommand::Serve(serve_args) => run_plugin_serve(serve_args),
@@ -571,6 +573,123 @@ fn run_daemon_access_list(args: &cli::DaemonAccessListArgs) -> std::process::Exi
         println!("pending = {pending_count}");
     }
     std::process::ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// Slice 6-MVP — `daemon doctor` + `daemon warmup` runners.
+//
+// Both stay synchronous. They load daemon.toml, build the Asr factory,
+// and exercise either the health_check() surface (doctor) or the
+// model-download path (warmup). Neither requires the tokio runtime.
+// ---------------------------------------------------------------------------
+
+/// `claudebase daemon doctor [--asr]` — health-check the ASR backend
+/// (Slice 6-MVP scope; other backends added later). Exit 0 = healthy,
+/// 1 = unhealthy. The full stderr / stdout shape is consumed by
+/// `tests/daemon_doctor_test.rs` and TC-6.16 / TC-6.17.
+fn run_daemon_doctor(_args: &cli::DaemonDoctorArgs) -> std::process::ExitCode {
+    use claudebase::daemon::asr;
+    use claudebase::daemon::config;
+
+    // Load daemon.toml. Missing file → exit 1 with a clear message.
+    let toml_path = config::user_level_daemon_toml_path();
+    let cfg = if toml_path.exists() {
+        match config::load_daemon_toml(&toml_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("error: failed to load daemon.toml: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+    } else {
+        eprintln!(
+            "error: daemon.toml not found at {} — run `claudebase daemon config edit` first",
+            toml_path.display()
+        );
+        return std::process::ExitCode::FAILURE;
+    };
+
+    let backend_name = cfg.asr.backend.as_deref().unwrap_or("<none>");
+    match asr::make_asr(&cfg) {
+        Ok(handle) => match handle.health_check() {
+            Ok(()) => {
+                println!("{backend_name} — OK (model loaded successfully)");
+                std::process::ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{backend_name}: ERROR — {e}");
+                std::process::ExitCode::FAILURE
+            }
+        },
+        Err(e) => {
+            eprintln!("{backend_name}: ERROR — {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// `claudebase daemon warmup [--asr]` — pre-fetch the configured ASR
+/// model so the first voice note doesn't pay the cold-start download
+/// stall (PRD FR-ACD-7.9). Exit 0 on success, 1 on failure.
+fn run_daemon_warmup(_args: &cli::DaemonWarmupArgs) -> std::process::ExitCode {
+    use claudebase::daemon::config;
+
+    let toml_path = config::user_level_daemon_toml_path();
+    let cfg = if toml_path.exists() {
+        match config::load_daemon_toml(&toml_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("error: failed to load daemon.toml: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+    } else {
+        eprintln!(
+            "error: daemon.toml not found at {} — run `claudebase daemon config edit` first",
+            toml_path.display()
+        );
+        return std::process::ExitCode::FAILURE;
+    };
+
+    let backend_name = cfg.asr.backend.as_deref().unwrap_or("<none>");
+    if backend_name != "whisper" {
+        // Slice 6-MVP: only whisper has a warmup path. sherpa/nim
+        // would have their own model file conventions; we surface
+        // an informative exit 1 so the operator knows there's no-op.
+        eprintln!(
+            "warmup: backend '{backend_name}' has no warmup path in v1 — see Wave 6"
+        );
+        return std::process::ExitCode::FAILURE;
+    }
+
+    #[cfg(feature = "asr-whisper")]
+    {
+        use claudebase::daemon::asr::whisper;
+        let path = match whisper::model_path() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("warmup: cannot resolve model path: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+        match whisper::ensure_model(&path) {
+            Ok(()) => {
+                println!("whisper: model present at {}", path.display());
+                std::process::ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("warmup: whisper model download failed: {e}");
+                std::process::ExitCode::FAILURE
+            }
+        }
+    }
+    #[cfg(not(feature = "asr-whisper"))]
+    {
+        eprintln!(
+            "warmup: asr-whisper feature not compiled in — rebuild with `cargo build --features asr-whisper`"
+        );
+        std::process::ExitCode::FAILURE
+    }
 }
 
 /// `insight create "<body>"` — agent write surface for the insights corpus

@@ -452,6 +452,29 @@ pub enum DaemonSubcommand {
     /// `daemon access pair <code>` / `daemon access list` — manage access.json
     /// (telegram permission/pairing flow, Slice 4).
     Access(DaemonAccessArgs),
+    /// `daemon doctor [--asr]` — health-check runtime backends without
+    /// performing actual work. Exit 0 = healthy, 1 = unhealthy. The
+    /// `--asr` flag scopes to the ASR backend (the only doctor target
+    /// in Slice 6-MVP; informational in v1).
+    Doctor(DaemonDoctorArgs),
+    /// `daemon warmup [--asr]` — pre-fetch models / open lazy resources
+    /// so the first user-facing operation doesn't pay a cold-start
+    /// stall. Slice 6-MVP wires the whisper model download.
+    Warmup(DaemonWarmupArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct DaemonDoctorArgs {
+    /// Limit the health check to the ASR backend.
+    #[arg(long)]
+    pub asr: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct DaemonWarmupArgs {
+    /// Limit warmup to the ASR backend (downloads model if missing).
+    #[arg(long)]
+    pub asr: bool,
 }
 
 /// `claudebase daemon serve` — no flags in Slice 1a. The runtime dir

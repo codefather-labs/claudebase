@@ -16,6 +16,7 @@
 //! that DO must wrap the lock-and-use site in
 //! `tokio::task::spawn_blocking`.
 
+pub mod asr;
 pub mod chat;
 pub mod config;
 pub mod ipc;

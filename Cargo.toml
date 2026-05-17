@@ -94,6 +94,69 @@ getrandom = "0.2"
 # Same version teloxide → reqwest transitively pin so cargo unifies on one.
 url = "2"
 
+# Slice 6-MVP — ASR pipeline deps.
+#
+# `async-trait` — type-erasure for async trait methods. The `Asr` trait
+# in src/daemon/asr/mod.rs returns Pin<Box<dyn Future + Send>> via the
+# macro so `dyn Asr` is object-safe AND auto-Send-bound at the trait
+# boundary. One heap allocation per `transcribe` call — acceptable for a
+# call that runs once per voice note (~30s interval).
+async-trait = "0.1"
+#
+# Opus codec — pure-Rust decoder, RFC 8251 conformant, no FFI. Telegram
+# voice notes are always Opus-in-Ogg per Telegram Bot API spec. Picked
+# over the `opus = "0.3"` C-binding crate to keep the single-binary
+# contract intact (architect insight #10 — the v1 plan-bug fix).
+opus-decoder = "0.1"
+#
+# Ogg container parser — pure Rust. Pairs with `opus-decoder` to read
+# packetized Opus frames out of the .ogg container Telegram returns.
+ogg = "0.9"
+#
+# Sample-rate conversion (48 kHz → 16 kHz) is implemented in-house via
+# linear interpolation in `src/daemon/asr/decoder.rs` — keeps the dep
+# tree lean (rubato pulls realfft + transpose + primal-check at ~50KB+
+# compiled) and the quality is ample for whisper ASR (whisper itself
+# applies a 80-channel mel-spectrogram preprocessing pipeline that
+# dwarfs any artefacts a linear resampler introduces). When a future
+# slice needs higher-fidelity resampling (TTS, audio mastering, etc.)
+# rubato can be added back behind a feature gate.
+
+# Slice 6-MVP — whisper-rs local ASR backend, opt-in via `--features
+# asr-whisper`. Whisper-rs depends on libwhisper.cpp (cmake build);
+# enabling it pulls a ~2-3 minute first-build cost. NOT in the default
+# feature set: developers and CI keep the fast-build baseline; turn the
+# feature on when running ASR e2e tests OR when shipping a release.
+# When the feature is OFF, the `make_asr("whisper")` factory bails with
+# a runtime "asr-whisper feature not compiled in" error per PRD
+# FR-ACD-7.4 (stubs always compile; runtime errors over panics).
+whisper-rs = { version = "0.16", optional = true }
+
+# Slice 6-MVP — model-file SHA256 verification + interruptible download.
+# `reqwest` is already pulled transitively by teloxide; expose it as a
+# direct dep so the model-download path can use the blocking client
+# without depending on teloxide internals.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "stream"] }
+
+[features]
+# Slice 6-MVP — ASR backend features. `asr-whisper` enables the local
+# whisper-rs backend; `asr-sherpa` and `asr-nim` are reserved for future
+# slices (Wave 6 per plan.md). All three are runtime-selectable from
+# `daemon.toml`; the factory in `src/daemon/asr/mod.rs::make_asr` returns
+# clean Err strings when the requested backend's feature is absent.
+#
+# IMPORTANT: `asr-whisper` is INTENTIONALLY NOT a default feature so that
+# `cargo build` / `cargo test` stay fast for non-ASR work. Enable
+# explicitly via `cargo build --features asr-whisper` when shipping the
+# Telegram-voice-note pipeline. See `### Inbound validation` push-back
+# in the Slice 6-MVP commit message for the rationale (the spawn prompt
+# proposed `default = ["asr-whisper"]`; that would regress every
+# non-ASR-bearing CI run with a ~2-3 minute whisper.cpp compile).
+default = []
+asr-whisper = ["dep:whisper-rs"]
+asr-sherpa = []
+asr-nim = []
+
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"

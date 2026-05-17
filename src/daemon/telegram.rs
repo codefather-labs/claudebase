@@ -60,6 +60,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use serde::Deserialize;
 
+use crate::daemon::asr::Asr;
 use crate::daemon::chat::{self, SharedBus};
 use crate::daemon::config::RedactedToken;
 use crate::daemon::permissions::{self, Access};
@@ -322,13 +323,14 @@ pub fn spawn_long_poll(
     token: RedactedToken,
     access_path: PathBuf,
     bus: SharedBus,
+    asr: Option<Arc<dyn Asr>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // ASYNC_INVARIANTS Rule 3 — wrap the long-poll body so any
         // unhandled error logs structured (without leaking the token) and
         // the daemon's other tasks keep running.
         let token_str = token.as_str().to_string();
-        if let Err(e) = run_long_poll(token, access_path, bus).await {
+        if let Err(e) = run_long_poll(token, access_path, bus, asr).await {
             tracing::error!(
                 error = %redact_error_string(&format!("{e:#}"), &token_str),
                 "telegram long-poll fatal"
@@ -349,6 +351,7 @@ async fn run_long_poll(
     token: RedactedToken,
     access_path: PathBuf,
     bus: SharedBus,
+    asr: Option<Arc<dyn Asr>>,
 ) -> Result<()> {
     // Allow tests / local dev to point at a mock Telegram endpoint via
     // TELOXIDE_API_URL. teloxide 0.17 reads this env var directly via
@@ -545,6 +548,34 @@ async fn run_long_poll(
             continue;
         }
 
+        // Slice 6-MVP: voice-note transcription happens HERE, BEFORE
+        // the spawn_blocking(process_batch) call so the SEC-13 DB
+        // transaction stays short (architect axis-5). Per update, if
+        // `voice` is set and `text` is absent, fetch the file via the
+        // teloxide client, decode Opus, run ASR, mutate the update to
+        // `text = Some(transcript); voice = None`. Failures surface as
+        // a bracketed `[voice transcription failed: ...]` text that
+        // process_batch inserts as a normal row — the operator sees
+        // the error in the chat thread instead of silent loss.
+        for update in decoded.iter_mut() {
+            if let Some(msg) = &mut update.message {
+                if msg.text.is_none() && msg.voice.is_some() {
+                    let voice_text = match transcribe_voice_note(&bot, msg, asr.as_ref()).await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %redact_error_string(&format!("{e:#}"), &token_for_error_redaction),
+                                "voice transcribe failed; using fallback"
+                            );
+                            format!("[voice transcription failed: {e}]")
+                        }
+                    };
+                    msg.text = Some(voice_text);
+                    msg.voice = None;
+                }
+            }
+        }
+
         let access_clone = access_clone;
         let batch = decoded;
         let process_outcome = tokio::task::spawn_blocking(move || -> Result<BatchOutcome> {
@@ -591,6 +622,69 @@ async fn run_long_poll(
             }
         }
     }
+}
+
+/// Slice 6-MVP — transcribe one Telegram voice note end-to-end.
+///
+/// 1. `bot.get_file(file_id)` → File metadata (carries `path` and
+///    `file_size`).
+/// 2. `bot.download_file(path, &mut buf)` → raw Opus-in-Ogg bytes.
+/// 3. `decoder::decode_ogg_opus_to_16k_mono_pcm(&bytes)` → 16 kHz mono
+///    Vec<f32>.
+/// 4. `asr.transcribe(pcm, 16_000).await` → transcript string.
+///
+/// Returns Err when:
+///   - the message has no voice field
+///   - `asr` is None (no backend configured / feature off)
+///   - the file fetch, decode, or transcribe step fails
+///
+/// The caller decides how to surface the error to the chat thread —
+/// the current `run_long_poll` integration wraps Err in the literal
+/// `[voice transcription failed: ...]` placeholder so the operator
+/// sees the failure inline (NEVER silent loss).
+async fn transcribe_voice_note(
+    bot: &teloxide::Bot,
+    msg: &Message,
+    asr: Option<&Arc<dyn Asr>>,
+) -> Result<String> {
+    use teloxide::net::Download;
+    use teloxide::requests::Requester;
+    use teloxide::types::FileId;
+
+    let voice = msg
+        .voice
+        .as_ref()
+        .context("voice transcribe: message has no voice field")?;
+    let asr = asr.context("voice transcribe: ASR backend not configured")?;
+
+    // Step 1: get_file resolves the Telegram file path from file_id.
+    let file = bot
+        .get_file(FileId(voice.file_id.clone()))
+        .await
+        .with_context(|| format!("voice transcribe: get_file {}", voice.file_id))?;
+
+    // Step 2: download into an in-memory buffer. Voice notes max out
+    // around ~1 MB for 10-minute clips at Opus's 24 kbps default; we
+    // pre-size the buffer with file_size when available.
+    let mut buf: Vec<u8> = Vec::with_capacity(file.size as usize);
+    bot.download_file(&file.path, &mut buf)
+        .await
+        .with_context(|| format!("voice transcribe: download_file {}", file.path))?;
+
+    // Step 3: decode Opus-in-Ogg → 16 kHz mono PCM. Run on the blocking
+    // pool so the codec work doesn't hog the tokio worker.
+    let pcm = tokio::task::spawn_blocking(move || {
+        crate::daemon::asr::decoder::decode_ogg_opus_to_16k_mono_pcm(&buf)
+    })
+    .await
+    .context("voice transcribe: decode spawn_blocking join failed")?
+    .context("voice transcribe: decode failed")?;
+
+    // Step 4: hand the PCM to the configured ASR backend. The trait's
+    // own implementation chooses how to dispatch (sync blocking pool
+    // for whisper; HTTP for nim; etc.).
+    let transcript = asr.transcribe(pcm, 16_000).await.context("voice transcribe: ASR failed")?;
+    Ok(transcript)
 }
 
 /// Cleanup helper — keep `Arc` so the daemon's lifetime guards work even

@@ -381,7 +381,39 @@ pub async fn serve(_args: &DaemonServeArgs) -> anyhow::Result<()> {
     if let Some(token) = telegram_token_opt {
         let access_path = crate::daemon::permissions::user_level_access_json_path();
         let bus_for_tg = bus.clone();
-        let _ = crate::daemon::telegram::spawn_long_poll(token, access_path, bus_for_tg);
+
+        // Slice 6-MVP — best-effort Asr construction. When daemon.toml
+        // has no `[asr] backend` configured, OR the configured backend
+        // isn't compiled in / is a Wave-6 stub, the daemon still runs
+        // (text messages keep working) and voice notes get the
+        // `[voice transcription failed: ...]` placeholder per the
+        // transcribe_voice_note error path.
+        let asr_opt: Option<std::sync::Arc<dyn crate::daemon::asr::Asr>> = {
+            let toml_path = crate::daemon::config::user_level_daemon_toml_path();
+            if toml_path.exists() {
+                match crate::daemon::config::load_daemon_toml(&toml_path) {
+                    Ok(cfg) => match crate::daemon::asr::make_asr(&cfg) {
+                        Ok(b) => Some(std::sync::Arc::from(b)),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "ASR factory failed; voice notes will use fallback placeholder"
+                            );
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(error = %e, "daemon.toml reload failed in server.serve");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        };
+
+        let _ =
+            crate::daemon::telegram::spawn_long_poll(token, access_path, bus_for_tg, asr_opt);
         tracing::info!("telegram long-poll spawned");
     }
 

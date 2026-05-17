@@ -380,19 +380,28 @@ async fn handle_connection(
             }
         };
 
-        // Parse the inbound ping. We only look for the integer `ping`
-        // field; everything else is ignored in Slice 1a.
+        // Parse the inbound frame. Slice 1b: emit JSON-RPC 2.0 Parse
+        // Error envelope on malformed input (SEC-3 from Vault pre-review)
+        // — the prior Slice 1a `{"error": "malformed JSON: ..."}` shape
+        // leaked `serde_json::Error::to_string()` and was NOT JSON-RPC
+        // compliant. The new shape uses `id: null` and a generic
+        // "Parse error" string per the JSON-RPC 2.0 spec.
         let inbound: serde_json::Value = match serde_json::from_slice(&body) {
             Ok(v) => v,
-            Err(e) => {
+            Err(_) => {
+                // Note: do NOT include the serde error in the response —
+                // leaking parse-error internals is a data-leak risk and
+                // breaks the spec's "generic Parse error" guidance.
                 eprintln!(
-                    "claudebase daemon: connection {connection_id} malformed JSON frame: {e}"
+                    "claudebase daemon: connection {connection_id} malformed JSON frame (sending Parse Error)"
                 );
-                // Reply with a structured error so the client sees
-                // something specific. Slice 1b will define a proper
-                // error envelope; for now a minimal shape.
                 let err_resp = serde_json::json!({
-                    "error": format!("malformed JSON: {e}"),
+                    "jsonrpc": "2.0",
+                    "id": serde_json::Value::Null,
+                    "error": {
+                        "code": -32700,
+                        "message": "Parse error"
+                    }
                 });
                 let err_bytes = serde_json::to_vec(&err_resp)?;
                 write_frame(&mut stream, &err_bytes).await?;
@@ -400,8 +409,71 @@ async fn handle_connection(
             }
         };
 
-        // Echo: extract the integer ping value (default 0 if absent or
-        // non-integer) and reply with the same value as `pong`.
+        // Slice 1b: minimal MCP-shaped dispatch added so the plugin
+        // bridge can proxy `tools/list` and `tools/call
+        // claudebase_daemon_status` to the daemon when up. Everything
+        // else still falls through to the legacy ping/pong echo so
+        // existing Slice 1a smoke tests continue to pass.
+        let echo_id = inbound.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        let method = inbound
+            .get("method")
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+
+        if method == "tools/list" {
+            // Daemon-up `tools/list` is empty until Slice 3 lands the
+            // chat tools. The plugin's daemon-down code path returns
+            // the sentinel tool independently.
+            let resp = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": echo_id,
+                "result": { "tools": [] }
+            });
+            let resp_bytes = serde_json::to_vec(&resp)?;
+            write_frame(&mut stream, &resp_bytes).await?;
+            continue;
+        }
+
+        if method == "tools/call" {
+            let tool_name = inbound
+                .get("params")
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            if tool_name == "claudebase_daemon_status" {
+                // Daemon-up status: report "up" with a short message.
+                // The verbatim daemon-down literal lives in the plugin
+                // (SEC-8); daemon-up has freedom.
+                let resp = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": echo_id,
+                    "result": {
+                        "content": [{
+                            "type": "text",
+                            "text": "{\"status\":\"up\"}"
+                        }]
+                    }
+                });
+                let resp_bytes = serde_json::to_vec(&resp)?;
+                write_frame(&mut stream, &resp_bytes).await?;
+                continue;
+            }
+            // Unknown tool — JSON-RPC Method not found.
+            let resp = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": echo_id,
+                "error": {
+                    "code": -32601,
+                    "message": "Method not found"
+                }
+            });
+            let resp_bytes = serde_json::to_vec(&resp)?;
+            write_frame(&mut stream, &resp_bytes).await?;
+            continue;
+        }
+
+        // Legacy Slice 1a ping/pong echo for any non-MCP frame. The
+        // smoke tests in `tests/daemon_smoke.rs` rely on this path.
         let ping_value = inbound
             .get("ping")
             .and_then(|v| v.as_u64())

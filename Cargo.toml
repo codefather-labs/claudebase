@@ -28,6 +28,9 @@ pdfium-render = "0.9"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
+# SECURITY: do NOT enable arbitrary_precision or unbounded_depth features.
+# Slice 1b defense-in-depth — MCP plugin parses untrusted JSON from stdin
+# and the default depth/precision caps are part of the threat model.
 serde_json = "1"
 
 # Hashing (content-hash dedupe in Slice 2)
@@ -60,7 +63,7 @@ ocr-rs = "2.2.2"
 # and library see the same crate graph. The `Daemon` and `Plugin` CLI arms
 # are the ONLY callers of these deps (tokio runtime confined to those
 # dispatch arms per src/main.rs INVARIANT comment).
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "net", "time", "sync"] }
 interprocess = { version = "2", features = ["tokio"] }
 fslock = "0.2"
 uuid = { version = "1", features = ["v4"] }

@@ -54,18 +54,31 @@ anyhow = "1"
 thiserror = "1"
 ocr-rs = "2.2.2"
 
+# Slice 1a — agent-chat-daemon (UDS/named-pipe server + tokio runtime).
+# Production deps mirroring the [dev-dependencies] entries the test-writer
+# added; cargo unifies versions across both sections so the test binaries
+# and library see the same crate graph. The `Daemon` and `Plugin` CLI arms
+# are the ONLY callers of these deps (tokio runtime confined to those
+# dispatch arms per src/main.rs INVARIANT comment).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync"] }
+interprocess = { version = "2", features = ["tokio"] }
+fslock = "0.2"
+uuid = { version = "1", features = ["v4"] }
+
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
 
-# Note: Slice 0a's `interprocess` + `tokio` dev-deps were removed when the
-# spike was relocated from `examples/ipc_concurrent_accept.rs` to a
-# standalone subcrate at `spikes/ipc_concurrent_accept/` to avoid the cold-
-# CI-cache failure mode where Cargo recompiles the full claudebase dep
-# tree (pdfium, image, fastembed, ocr-rs, ...) before reaching the spike
-# binary. The subcrate has its own Cargo.toml with only the narrow deps
-# needed for IPC validation. Production `tokio` dep arrives in Slice 1a.
+# Slice 1a TDD integration tests: UDS/named-pipe server + concurrent accept
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync", "process"] }
+interprocess = { version = "2", features = ["tokio"] }
+serde_json = "1"
+anyhow = "1"
+
+# Unix-specific signal handling (SIGTERM in daemon_single_instance tests)
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.27", features = ["signal"] }
 
 [[bin]]
 name = "claudebase-bench"

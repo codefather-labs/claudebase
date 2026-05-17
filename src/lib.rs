@@ -7,6 +7,7 @@
 
 pub mod chunker;
 pub mod cli;
+pub mod daemon;
 pub mod encoder;
 pub mod ingest;
 pub mod migrations;
@@ -14,6 +15,7 @@ pub mod ocr;
 pub mod output;
 pub mod parser;
 pub mod pdf;
+pub mod plugin;
 pub mod search;
 pub mod store;
 pub mod text;

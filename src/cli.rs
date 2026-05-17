@@ -370,7 +370,58 @@ pub enum Command {
     /// corpus (`index.db`) is untouched. See
     /// docs/design/agent-insights-base.md.
     Insight(InsightArgs),
+    /// Run as a persistent daemon — owns the local IPC surface (UDS on
+    /// Unix, named pipe on Windows) for MCP plugin bridges and
+    /// agent-chat. Slice 1a wires the accept loop + echo; richer
+    /// subcommands (install/uninstall/start/stop/status/logs/config)
+    /// land in Slice 2.
+    Daemon(DaemonArgs),
+    /// Claude Code MCP plugin entry point. Slice 1b implements the
+    /// STDIO↔daemon bridge; Slice 1a ships a stub that errors out.
+    Plugin(PluginArgs),
 }
+
+/// `claudebase daemon ...` — daemon lifecycle subcommands. Slice 1a
+/// only implements `serve`; the lifecycle wrappers (install, start,
+/// stop, status, logs, config) land in Slice 2.
+#[derive(Args, Debug)]
+pub struct DaemonArgs {
+    #[command(subcommand)]
+    pub sub: DaemonSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DaemonSubcommand {
+    /// Bind the UDS / named pipe and serve concurrent IPC connections.
+    /// Single-instance enforced via fslock on `daemon.pid`.
+    Serve(DaemonServeArgs),
+}
+
+/// `claudebase daemon serve` — no flags in Slice 1a. The runtime dir
+/// is computed from `$XDG_RUNTIME_DIR` (Unix) or `$LOCALAPPDATA`
+/// (Windows). Slice 2 adds `--config`, `--log-level`, etc.
+#[derive(Args, Debug)]
+pub struct DaemonServeArgs {}
+
+/// `claudebase plugin ...` — plugin subcommands. Slice 1a only exposes
+/// `serve`; the stub returns an error so harness wiring is testable
+/// without committing to the full MCP shape.
+#[derive(Args, Debug)]
+pub struct PluginArgs {
+    #[command(subcommand)]
+    pub sub: PluginSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PluginSubcommand {
+    /// Bridge stdin/stdout JSON-RPC frames to the daemon UDS.
+    Serve(PluginServeArgs),
+}
+
+/// `claudebase plugin serve` — no flags in Slice 1a. Slice 1b adds
+/// `--daemon-socket` override etc.
+#[derive(Args, Debug)]
+pub struct PluginServeArgs {}
 
 #[derive(Args, Debug)]
 pub struct InsightArgs {

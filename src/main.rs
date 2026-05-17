@@ -5,6 +5,32 @@
 //! security backbone in `cli::resolve_project_root` runs BEFORE any subcommand
 //! body so every filesystem-touching subcommand receives a canonical project
 //! root (Phase 1.5 Security MUST #3 + #4 + #7).
+//
+// INVARIANT (Slice 1a — async discipline):
+// No `.await` point in any tokio task may execute while a `std::sync::Mutex`
+// guard (PDFIUM in src/pdf.rs, ENCODER in src/encoder.rs, OCR_ENGINE in
+// src/ocr.rs) is held. These are BLOCKING mutexes (std::sync::Mutex, NOT
+// tokio::sync::Mutex); holding one across an `.await` blocks the tokio
+// worker thread, which deadlocks the runtime if all workers reach the
+// same wait point.
+//
+// Slice 1a daemon code does NOT touch these mutexes. Future slices that
+// DO need them (e.g., Slice 5+ insight-search citation enrichment) MUST
+// wrap the lock-and-use site in `tokio::task::spawn_blocking`:
+//
+//     let result = tokio::task::spawn_blocking(move || {
+//         let guard = MUTEX.lock().expect("mutex poisoned");
+//         do_blocking_work(&guard)
+//     }).await?;
+//
+// Do NOT use `tokio::task::block_in_place` — it requires the multi-thread
+// runtime AND has subtle correctness traps when nested or when only one
+// worker thread remains.
+//
+// Do NOT use `lock().unwrap()` inline in async context — that is the bug
+// this invariant exists to prevent.
+//
+// See src/daemon/ASYNC_INVARIANTS.md (Slice 1c) for the full rules.
 
 use clap::Parser;
 
@@ -38,6 +64,13 @@ fn main() -> std::process::ExitCode {
             cli::InsightSubcommand::Gc(g) => g.project_root.as_deref(),
             cli::InsightSubcommand::Delete(d) => d.project_root.as_deref(),
         },
+        // Daemon / Plugin do NOT operate on a project filesystem — they
+        // own a runtime-dir-scoped socket and chat.db under ~/.claude/.
+        // The path-canonicalization gate still runs (project_root will
+        // resolve to the current cwd) but the resolved root is unused
+        // by the daemon/plugin dispatch.
+        Command::Daemon(_) => None,
+        Command::Plugin(_) => None,
     };
 
     let root = match cli::resolve_project_root(project_root_arg) {
@@ -69,6 +102,42 @@ fn main() -> std::process::ExitCode {
             cli::InsightSubcommand::Gc(a) => run_insight_gc(&root, &a),
             cli::InsightSubcommand::Delete(a) => run_insight_delete(&root, &a),
         },
+        Command::Daemon(args) => match &args.sub {
+            cli::DaemonSubcommand::Serve(serve_args) => run_daemon_serve(serve_args),
+        },
+        Command::Plugin(args) => match &args.sub {
+            cli::PluginSubcommand::Serve(serve_args) => run_plugin_serve(serve_args),
+        },
+    }
+}
+
+/// `claudebase daemon serve` — entry point. Constructs the tokio
+/// runtime (the ONLY tokio entry in the binary; sync subcommands
+/// remain on the sync dispatch path) and runs the accept loop until
+/// fatal error or graceful shutdown.
+fn run_daemon_serve(args: &cli::DaemonServeArgs) -> std::process::ExitCode {
+    match claudebase::daemon::run_tokio(claudebase::daemon::server::serve(args)) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            // server::serve already logs the human-readable cause line
+            // via eprintln! (e.g. "already running (pid 12345)") before
+            // bailing; we surface the anyhow chain here for diagnostic
+            // depth. Always exit 1 on failure — single-instance
+            // conflict, bind failure, etc. all map to the same code.
+            eprintln!("claudebase daemon: fatal: {e:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// `claudebase plugin serve` — entry point. Slice 1a stub.
+fn run_plugin_serve(args: &cli::PluginServeArgs) -> std::process::ExitCode {
+    match claudebase::daemon::run_tokio(claudebase::plugin::serve(args)) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("claudebase plugin: {e:#}");
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 

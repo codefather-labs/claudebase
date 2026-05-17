@@ -59,14 +59,13 @@ assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
 
-# Slice 0a spike (agent-chat-daemon feature) — `interprocess` v2 with the
-# `tokio` feature exposes a cross-platform local-socket abstraction over
-# Unix domain sockets and Windows named pipes. `tokio` runtime is needed
-# to drive the spike's async accept/connect tasks. Both are dev-only —
-# the spike example lives under `examples/` and ships nothing into the
-# production binary.
-interprocess = { version = "2", features = ["tokio"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync"] }
+# Note: Slice 0a's `interprocess` + `tokio` dev-deps were removed when the
+# spike was relocated from `examples/ipc_concurrent_accept.rs` to a
+# standalone subcrate at `spikes/ipc_concurrent_accept/` to avoid the cold-
+# CI-cache failure mode where Cargo recompiles the full claudebase dep
+# tree (pdfium, image, fastembed, ocr-rs, ...) before reaching the spike
+# binary. The subcrate has its own Cargo.toml with only the narrow deps
+# needed for IPC validation. Production `tokio` dep arrives in Slice 1a.
 
 [[bin]]
 name = "claudebase-bench"

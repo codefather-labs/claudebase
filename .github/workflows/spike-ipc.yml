@@ -12,16 +12,20 @@ name: spike-ipc
 #                                 tokio::net::windows::named_pipe::ServerOptions on Windows)
 #
 # Triggered by:
-#   - pull_request touching the spike example or this workflow file
+#   - pull_request touching the standalone spike subcrate or this workflow
 #   - workflow_dispatch (manual re-run from the Actions UI)
+#
+# The spike is a STANDALONE subcrate at `spikes/ipc_concurrent_accept/`
+# (NOT in the claudebase workspace and NOT in the main Cargo.toml). This
+# isolation avoids the cold-CI-cache failure mode where Cargo recompiles
+# the full claudebase dep tree (pdfium, image, fastembed, ocr-rs, ...)
+# before reaching the spike binary, blowing past per-step timeouts.
 
 on:
   pull_request:
     paths:
-      - 'examples/ipc_concurrent_accept.rs'
+      - 'spikes/ipc_concurrent_accept/**'
       - '.github/workflows/spike-ipc.yml'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
   workflow_dispatch: {}
 
 permissions:
@@ -53,16 +57,18 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: spike-ipc-${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+            spikes/ipc_concurrent_accept/target
+          key: spike-ipc-${{ runner.os }}-cargo-${{ hashFiles('spikes/ipc_concurrent_accept/Cargo.lock') }}
           restore-keys: |
             spike-ipc-${{ runner.os }}-cargo-
 
       - name: Run interprocess concurrent-accept spike
         shell: bash
-        timeout-minutes: 2
+        timeout-minutes: 5
+        working-directory: spikes/ipc_concurrent_accept
         run: |
-          # 60 s hard wallclock cap on the spike binary itself; cargo
-          # compile time is excluded. The spike's internal timeout is
-          # 30 s (see examples/ipc_concurrent_accept.rs main()).
-          cargo run --example ipc_concurrent_accept
+          # The spike binary's internal 30s tokio::time::timeout caps the
+          # actual test runtime; this step timeout (5 min) accommodates
+          # cold-cache compile of just `interprocess` + `tokio` on Windows
+          # MSVC, where MSVC link is slower than Unix.
+          cargo run --release

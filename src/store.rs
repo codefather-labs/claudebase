@@ -1480,6 +1480,25 @@ pub fn fetch_page_range(
     Ok(out)
 }
 
+/// User-level chat.db path: `$HOME/.claude/knowledge/chat.db`.
+///
+/// Slice 3 (agent-chat-daemon) — chat is global to the user, NOT per project,
+/// per architect OQ-ACD-4. The daemon owns this file; the CLI `chat list` /
+/// `chat threads` subcommands and tests open it directly via rusqlite.
+///
+/// On HOME-unset (extremely unusual), falls back to USERPROFILE (Windows)
+/// then `/tmp` — the same fallback chain `reap_on_boot_stub` already uses
+/// so behavior is consistent across the daemon and the CLI.
+pub fn user_level_chat_db_path() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
+    std::path::PathBuf::from(home)
+        .join(".claude")
+        .join("knowledge")
+        .join("chat.db")
+}
+
 /// Delete a documents row by exact `source_path` string. Returns rows deleted.
 ///
 /// SECURITY: callers MUST canonicalize-and-prefix-check the `source_path`

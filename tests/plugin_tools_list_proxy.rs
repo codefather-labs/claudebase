@@ -144,11 +144,15 @@ async fn send_mcp_request(
     Ok(response)
 }
 
-/// Test: daemon running, tools/list returns empty list (no chat tools yet in Slice 1b).
-/// Maps to: TC-1.7 — happy path, daemon up
+/// Test: daemon running, tools/list returns the 4 chat tools landed in
+/// Slice 3 (chat_post, chat_subscribe, chat_reply, chat_list). The
+/// sentinel `claudebase_daemon_status` is plugin-side only and does NOT
+/// appear in the daemon-up listing.
+///
+/// Maps to: TC-1.7 (happy path, daemon up) + TC-3.8 (daemon-up surface).
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(unix)]
-async fn test_tools_list_daemon_up_returns_empty_list() {
+async fn test_tools_list_daemon_up_returns_chat_tools() {
     let tmpdir = tempfile::tempdir().expect("tempdir created");
     let runtime_dir = tmpdir.path();
     let socket_path = runtime_dir.join("claudebase").join("daemon.sock");
@@ -195,10 +199,21 @@ async fn test_tools_list_daemon_up_returns_empty_list() {
         .as_array()
         .expect("tools should be an array");
 
+    let names: Vec<&str> = tools
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+        .collect();
+
+    for required in &["chat_post", "chat_subscribe", "chat_reply", "chat_list"] {
+        assert!(
+            names.contains(required),
+            "daemon-up tools/list should include {required}; got {names:?}"
+        );
+    }
     assert_eq!(
         tools.len(),
-        0,
-        "with daemon up and no chat tools (Slice 3 not landed), tools/list should return empty array"
+        4,
+        "Slice 3 daemon-up tools/list should expose exactly 4 chat tools; got {names:?}"
     );
 
     // Clean up

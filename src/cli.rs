@@ -379,6 +379,58 @@ pub enum Command {
     /// Claude Code MCP plugin entry point. Slice 1b implements the
     /// STDIO↔daemon bridge; Slice 1a ships a stub that errors out.
     Plugin(PluginArgs),
+    /// Chat introspection (Slice 3 of agent-chat-daemon). Reads
+    /// `~/.claude/knowledge/chat.db` directly — daemon NOT required.
+    /// Subcommands:
+    ///   `chat list --thread X` — list messages in a thread (chronological)
+    ///   `chat threads`         — list all known threads with counts
+    Chat(ChatArgs),
+}
+
+/// `claudebase chat ...` — chat introspection subcommands (Slice 3).
+#[derive(Args, Debug)]
+pub struct ChatArgs {
+    #[command(subcommand)]
+    pub sub: ChatSubcommand,
+    /// `--project-root` is accepted for argument-shape parity with
+    /// sibling subcommands; chat.db is user-level so the resolved root
+    /// is unused.
+    #[arg(long, global = true)]
+    pub project_root: Option<PathBuf>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ChatSubcommand {
+    /// List messages in a thread (chronological order). Reads chat.db
+    /// directly — daemon is NOT required.
+    List(ChatListArgs),
+    /// List all known threads with their message counts. Reads chat.db
+    /// directly — daemon is NOT required.
+    Threads(ChatThreadsArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ChatListArgs {
+    /// Thread identifier (e.g. `telegram:12345`).
+    #[arg(long)]
+    pub thread: String,
+    /// Cap the number of returned messages.
+    #[arg(long)]
+    pub limit: Option<i64>,
+    /// Only return messages with `created_at > <since>` (millis since
+    /// UNIX epoch).
+    #[arg(long)]
+    pub since: Option<i64>,
+    /// Emit JSON `{messages: [...]}` instead of human-readable text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ChatThreadsArgs {
+    /// Emit JSON `{threads: [...]}` instead of human-readable text.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// `claudebase daemon ...` — daemon lifecycle subcommands. Slice 1a

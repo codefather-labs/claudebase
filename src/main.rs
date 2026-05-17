@@ -82,6 +82,10 @@ fn main() -> std::process::ExitCode {
         // by the daemon/plugin dispatch.
         Command::Daemon(_) => None,
         Command::Plugin(_) => None,
+        // Chat reads `~/.claude/knowledge/chat.db` directly — user-level,
+        // not per-project — so the project root is unused. The gate still
+        // runs to keep the security backbone uniform.
+        Command::Chat(_) => None,
     };
 
     let root = match cli::resolve_project_root(project_root_arg) {
@@ -119,7 +123,116 @@ fn main() -> std::process::ExitCode {
         Command::Plugin(args) => match &args.sub {
             cli::PluginSubcommand::Serve(serve_args) => run_plugin_serve(serve_args),
         },
+        Command::Chat(args) => match &args.sub {
+            cli::ChatSubcommand::List(a) => run_chat_list(a),
+            cli::ChatSubcommand::Threads(a) => run_chat_threads(a),
+        },
     }
+}
+
+/// `claudebase chat list --thread X` — Slice 3 CLI introspection.
+/// Reads chat.db directly without contacting the daemon. The schema is
+/// ensured on open so a fresh box without a daemon ever running still
+/// works (prints empty when no rows exist).
+fn run_chat_list(args: &cli::ChatListArgs) -> std::process::ExitCode {
+    use claudebase::daemon::chat;
+    let path = claudebase::store::user_level_chat_db_path();
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("error: failed to create chat.db parent: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    }
+    let conn = match rusqlite::Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_CREATE | rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: open chat.db: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = chat::ensure_chat_db_schema(&conn) {
+        eprintln!("error: chat schema: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
+    let messages = match chat::list_messages(&conn, &args.thread, args.since, args.limit) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: list messages: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    if args.json {
+        let payload = serde_json::json!({
+            "messages": messages.iter().map(|m| m.to_json()).collect::<Vec<_>>(),
+        });
+        println!("{}", payload);
+    } else {
+        for m in &messages {
+            println!(
+                "[{}] {} <{}> {}",
+                m.created_at, m.id, m.from_agent, m.content
+            );
+        }
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+/// `claudebase chat threads` — list all known chat threads.
+fn run_chat_threads(args: &cli::ChatThreadsArgs) -> std::process::ExitCode {
+    use claudebase::daemon::chat;
+    let path = claudebase::store::user_level_chat_db_path();
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("error: failed to create chat.db parent: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    }
+    let conn = match rusqlite::Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_CREATE | rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: open chat.db: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = chat::ensure_chat_db_schema(&conn) {
+        eprintln!("error: chat schema: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
+    let threads = match chat::list_threads(&conn) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: list threads: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    if args.json {
+        let entries: Vec<_> = threads
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "id": t.id,
+                    "message_count": t.message_count,
+                    "last_created_at": t.last_created_at,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::json!({ "threads": entries }));
+    } else {
+        for t in &threads {
+            let last = t
+                .last_created_at
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            println!("{}\t{}\t{}", t.id, t.message_count, last);
+        }
+    }
+    std::process::ExitCode::SUCCESS
 }
 
 /// Initialise the structured-logging subscriber for daemon/plugin arms.

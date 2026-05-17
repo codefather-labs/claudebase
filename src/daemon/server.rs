@@ -26,10 +26,11 @@ use std::sync::Arc;
 use anyhow::Context;
 use interprocess::local_socket::tokio::{prelude::*, Stream};
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, ToFsName};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 use crate::cli::DaemonServeArgs;
+use crate::daemon::chat::{self, ChatBus, SharedBus};
 use crate::daemon::ipc::{read_frame, write_frame};
 
 /// Max concurrent in-flight connections. Hitting this cap back-pressures
@@ -148,6 +149,17 @@ fn reap_on_boot_stub() -> anyhow::Result<()> {
             return Ok(());
         }
     };
+
+    // Slice 3: apply chat schema v5 BEFORE the agent_registry probe so
+    // the chat tools have their tables on first daemon startup. The
+    // schema is idempotent (CREATE TABLE IF NOT EXISTS + INSERT OR
+    // IGNORE) so re-runs across daemon restarts are safe.
+    if let Err(e) = chat::ensure_chat_db_schema(&conn) {
+        tracing::warn!(error = %e, "chat schema v5 migration failed (non-fatal)");
+        // Don't return — the agent_registry probe is independent and may
+        // still succeed; the daemon as a whole should not refuse to start
+        // because schema-application hiccupped.
+    }
 
     // Probe sqlite_master rather than catching a "no such table" error —
     // architect directive: explicit existence check, not error-catch.
@@ -313,6 +325,10 @@ pub async fn serve(_args: &DaemonServeArgs) -> anyhow::Result<()> {
 
     let semaphore = Arc::new(Semaphore::new(ACCEPT_STORM_LIMIT));
 
+    // Slice 3: per-thread broadcast bus shared between every connection
+    // handler. Lives for the daemon's entire lifetime.
+    let bus: SharedBus = Arc::new(ChatBus::new());
+
     // Accept loop. We never return Ok(()) from here in Slice 1a — the
     // daemon runs until killed. Slice 1d will wire a SIGTERM cancel
     // signal that breaks out of this loop.
@@ -341,29 +357,88 @@ pub async fn serve(_args: &DaemonServeArgs) -> anyhow::Result<()> {
         let connection_id = Uuid::new_v4();
         tracing::info!(%connection_id, "accepted connection");
 
+        let bus_clone = bus.clone();
         tokio::spawn(async move {
             // Rule 3 / Rule 5 from ASYNC_INVARIANTS.md: panic-safe spawned
             // task body — propagate via Result, surface via tracing::error.
-            if let Err(e) = handle_connection(stream, connection_id, permit).await {
+            if let Err(e) = handle_connection(stream, connection_id, permit, bus_clone).await {
                 tracing::error!(%connection_id, error = %e, "connection handler error");
             }
         });
     }
 }
 
-/// Handle one accepted connection: loop reading frames, echo each as
-/// `{"pong": <ping>}`. Returns cleanly on EOF or read error.
+/// Per-connection outbound message. Used by both the request-dispatch
+/// task (writes responses) and the broadcast-subscriber tasks
+/// (writes notifications). A single writer task serialises them onto
+/// the UDS so we never interleave two `write_frame` calls on the same
+/// stream concurrently.
+type OutboundTx = mpsc::UnboundedSender<serde_json::Value>;
+type OutboundRx = mpsc::UnboundedReceiver<serde_json::Value>;
+
+/// Handle one accepted connection: loop reading frames, dispatch each
+/// to the appropriate handler, push responses + chat notifications to
+/// the per-connection outbound mpsc. A single writer task drains the
+/// mpsc and serialises frames onto the UDS.
 ///
 /// `_permit` owns the semaphore slot for this connection — it is held
 /// for the entire task lifetime and released on Drop, freeing the slot
 /// for the next accept.
 async fn handle_connection(
-    mut stream: Stream,
+    stream: Stream,
     connection_id: Uuid,
     _permit: OwnedSemaphorePermit,
+    bus: SharedBus,
 ) -> anyhow::Result<()> {
+    // Split read / write halves so the writer task can run independently.
+    let (mut read_half, mut write_half) = tokio::io::split(stream);
+
+    // Outbound mpsc — unbounded because all senders are local processes
+    // we own (the read loop + per-thread forwarder tasks). Bounded
+    // semantics would risk deadlock if the writer task lags briefly.
+    let (outbound_tx, mut outbound_rx): (OutboundTx, OutboundRx) = mpsc::unbounded_channel();
+
+    // Writer task: drain `outbound_rx`, write_frame each value. When
+    // outbound_tx and all clones drop, this loop exits cleanly.
+    let writer_task = tokio::spawn(async move {
+        while let Some(frame) = outbound_rx.recv().await {
+            let bytes = match serde_json::to_vec(&frame) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!(error = %e, "serialize outbound frame failed");
+                    continue;
+                }
+            };
+            if let Err(e) = write_frame(&mut write_half, &bytes).await {
+                tracing::info!(error = %e, "outbound write failed; closing connection");
+                break;
+            }
+        }
+    });
+
+    let outcome = run_request_loop(&mut read_half, outbound_tx, bus, connection_id).await;
+    // Dropping outbound_tx (and every clone held by forwarder tasks
+    // is owned by tokio::spawned bodies that wake up on bus closure or
+    // EOF; in practice they exit when this function returns) closes the
+    // outbound mpsc, which lets writer_task exit.
+    drop(read_half);
+    let _ = writer_task.await;
+    outcome
+}
+
+/// Inner read loop — pulls inbound frames from `read_half`, dispatches,
+/// pushes outbound on `outbound_tx`. Returns Ok(()) on clean EOF.
+async fn run_request_loop<R>(
+    read_half: &mut R,
+    outbound_tx: OutboundTx,
+    bus: SharedBus,
+    connection_id: Uuid,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncReadExt + Unpin,
+{
     loop {
-        let body = match read_frame(&mut stream).await {
+        let body = match read_frame(read_half).await {
             Ok(b) => b,
             Err(e) => {
                 // Distinguish clean EOF from a real I/O error. Clean
@@ -381,17 +456,10 @@ async fn handle_connection(
         };
 
         // Parse the inbound frame. Slice 1b: emit JSON-RPC 2.0 Parse
-        // Error envelope on malformed input (SEC-3 from Vault pre-review)
-        // — the prior Slice 1a `{"error": "malformed JSON: ..."}` shape
-        // leaked `serde_json::Error::to_string()` and was NOT JSON-RPC
-        // compliant. The new shape uses `id: null` and a generic
-        // "Parse error" string per the JSON-RPC 2.0 spec.
+        // Error envelope on malformed input (SEC-3 from Vault pre-review).
         let inbound: serde_json::Value = match serde_json::from_slice(&body) {
             Ok(v) => v,
             Err(_) => {
-                // Note: do NOT include the serde error in the response —
-                // leaking parse-error internals is a data-leak risk and
-                // breaks the spec's "generic Parse error" guidance.
                 tracing::warn!(%connection_id, "malformed JSON frame (sending Parse Error)");
                 let err_resp = serde_json::json!({
                     "jsonrpc": "2.0",
@@ -401,17 +469,11 @@ async fn handle_connection(
                         "message": "Parse error"
                     }
                 });
-                let err_bytes = serde_json::to_vec(&err_resp)?;
-                write_frame(&mut stream, &err_bytes).await?;
+                let _ = outbound_tx.send(err_resp);
                 continue;
             }
         };
 
-        // Slice 1b: minimal MCP-shaped dispatch added so the plugin
-        // bridge can proxy `tools/list` and `tools/call
-        // claudebase_daemon_status` to the daemon when up. Everything
-        // else still falls through to the legacy ping/pong echo so
-        // existing Slice 1a smoke tests continue to pass.
         let echo_id = inbound.get("id").cloned().unwrap_or(serde_json::Value::Null);
         let method = inbound
             .get("method")
@@ -419,54 +481,79 @@ async fn handle_connection(
             .unwrap_or("");
 
         if method == "tools/list" {
-            // Daemon-up `tools/list` is empty until Slice 3 lands the
-            // chat tools. The plugin's daemon-down code path returns
-            // the sentinel tool independently.
-            let resp = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": echo_id,
-                "result": { "tools": [] }
-            });
-            let resp_bytes = serde_json::to_vec(&resp)?;
-            write_frame(&mut stream, &resp_bytes).await?;
+            // Slice 3: daemon-up `tools/list` returns the 4 chat tools.
+            let resp = build_tools_list_response(echo_id);
+            let _ = outbound_tx.send(resp);
             continue;
         }
 
         if method == "tools/call" {
-            let tool_name = inbound
-                .get("params")
-                .and_then(|p| p.get("name"))
+            let params = inbound.get("params").cloned().unwrap_or(serde_json::Value::Null);
+            let tool_name = params
+                .get("name")
                 .and_then(|n| n.as_str())
-                .unwrap_or("");
-            if tool_name == "claudebase_daemon_status" {
-                // Daemon-up status: report "up" with a short message.
-                // The verbatim daemon-down literal lives in the plugin
-                // (SEC-8); daemon-up has freedom.
-                let resp = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": echo_id,
-                    "result": {
-                        "content": [{
-                            "type": "text",
-                            "text": "{\"status\":\"up\"}"
-                        }]
-                    }
-                });
-                let resp_bytes = serde_json::to_vec(&resp)?;
-                write_frame(&mut stream, &resp_bytes).await?;
-                continue;
-            }
-            // Unknown tool — JSON-RPC Method not found.
-            let resp = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": echo_id,
-                "error": {
-                    "code": -32601,
-                    "message": "Method not found"
+                .unwrap_or("")
+                .to_string();
+            let args = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+
+            match tool_name.as_str() {
+                "claudebase_daemon_status" => {
+                    let resp = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": echo_id,
+                        "result": {
+                            "content": [{
+                                "type": "text",
+                                "text": "{\"status\":\"up\"}"
+                            }]
+                        }
+                    });
+                    let _ = outbound_tx.send(resp);
                 }
-            });
-            let resp_bytes = serde_json::to_vec(&resp)?;
-            write_frame(&mut stream, &resp_bytes).await?;
+                "chat_post" | "chat_reply" => {
+                    // Persist first, queue response, THEN broadcast — this
+                    // ordering guarantees the response lands in the
+                    // outbound mpsc before the broadcast notification so
+                    // the test pattern "read response, then read
+                    // notification" is preserved regardless of how the
+                    // tokio scheduler interleaves the forwarder task.
+                    let (resp, notif) =
+                        handle_chat_post(&tool_name, echo_id, &args).await;
+                    let _ = outbound_tx.send(resp);
+                    if let Some((thread, frame)) = notif {
+                        let _ = bus.publish(&thread, frame).await;
+                    }
+                }
+                "chat_subscribe" => {
+                    let resp = handle_chat_subscribe(
+                        echo_id,
+                        &args,
+                        &bus,
+                        outbound_tx.clone(),
+                        connection_id,
+                    )
+                    .await;
+                    let _ = outbound_tx.send(resp);
+                }
+                "chat_list" => {
+                    let resp = handle_chat_list(echo_id, &args).await;
+                    let _ = outbound_tx.send(resp);
+                }
+                _ => {
+                    let resp = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": echo_id,
+                        "error": {
+                            "code": -32601,
+                            "message": "Method not found"
+                        }
+                    });
+                    let _ = outbound_tx.send(resp);
+                }
+            }
             continue;
         }
 
@@ -478,7 +565,302 @@ async fn handle_connection(
             .unwrap_or(0);
 
         let response = serde_json::json!({ "pong": ping_value });
-        let response_bytes = serde_json::to_vec(&response)?;
-        write_frame(&mut stream, &response_bytes).await?;
+        let _ = outbound_tx.send(response);
+    }
+}
+
+/// Build the `tools/list` response with the four chat tools.
+fn build_tools_list_response(id: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "tools": [
+                {
+                    "name": "chat_post",
+                    "description": "Post a message to a chat thread",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "thread": {"type": "string"},
+                            "content": {"type": "string"},
+                            "from": {"type": "string"}
+                        },
+                        "required": ["thread", "content", "from"]
+                    }
+                },
+                {
+                    "name": "chat_subscribe",
+                    "description": "Subscribe to a chat thread; returns undelivered backlog",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "thread": {"type": "string"}
+                        },
+                        "required": ["thread"]
+                    }
+                },
+                {
+                    "name": "chat_reply",
+                    "description": "Reply to a message in a chat thread",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "thread": {"type": "string"},
+                            "content": {"type": "string"},
+                            "reply_to": {"type": ["string", "null"]}
+                        },
+                        "required": ["thread", "content"]
+                    }
+                },
+                {
+                    "name": "chat_list",
+                    "description": "List messages in a chat thread",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "thread": {"type": "string"},
+                            "since": {"type": ["integer", "null"]},
+                            "limit": {"type": ["integer", "null"]}
+                        },
+                        "required": ["thread"]
+                    }
+                }
+            ]
+        }
+    })
+}
+
+/// Build a tools/call error response.
+fn tool_error_response(id: serde_json::Value, code: i64, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message,
+        }
+    })
+}
+
+/// Build a tools/call success response with a text-content payload that
+/// is itself a JSON string (MCP envelope shape).
+fn tool_text_response(id: serde_json::Value, payload: &serde_json::Value) -> serde_json::Value {
+    let text = payload.to_string();
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "content": [{
+                "type": "text",
+                "text": text
+            }]
+        }
+    })
+}
+
+/// Handle `chat_post` or `chat_reply` (same code path; `chat_reply`
+/// additionally accepts a `reply_to` argument and silently downgrades
+/// stale references to NULL per TC-3.5).
+///
+/// Returns `(response, Option<(thread_id, notification_frame)>)`. The
+/// caller queues the response onto the connection's outbound mpsc
+/// FIRST, then publishes the broadcast notification — this ordering
+/// guarantees subscriber-side observers see the response before any
+/// post-induced notification, satisfying the test pattern in
+/// `tests/chat_tools_e2e_test.rs:230-253`.
+async fn handle_chat_post(
+    tool_name: &str,
+    id: serde_json::Value,
+    args: &serde_json::Value,
+) -> (serde_json::Value, Option<(String, serde_json::Value)>) {
+    let thread = args
+        .get("thread")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let content = args
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let from_agent = args
+        .get("from")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let reply_to_raw = args
+        .get("reply_to")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    if thread.is_empty() {
+        return (tool_error_response(id, -32602, "thread is required"), None);
+    }
+
+    let persisted = tokio::task::spawn_blocking(move || -> anyhow::Result<chat::ChatMessage> {
+        let conn = chat::open_chat_db()?;
+        let resolved_reply_to = chat::resolve_reply_to(&conn, reply_to_raw.as_deref())?;
+        let msg = chat::insert_message(
+            &conn,
+            &thread,
+            &from_agent,
+            &content,
+            resolved_reply_to.as_deref(),
+        )?;
+        Ok(msg)
+    })
+    .await;
+
+    let msg = match persisted {
+        Ok(Ok(m)) => m,
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, tool = tool_name, "chat persist failed");
+            return (tool_error_response(id, -32603, "persist failed"), None);
+        }
+        Err(e) => {
+            tracing::error!(error = %e, tool = tool_name, "chat persist task panicked");
+            return (tool_error_response(id, -32603, "internal error"), None);
+        }
+    };
+
+    let response_payload = if tool_name == "chat_post" {
+        serde_json::json!({
+            "id": msg.id,
+            "thread": msg.thread_id,
+            "created_at": msg.created_at,
+        })
+    } else {
+        serde_json::json!({
+            "id": msg.id,
+            "reply_to_resolved": msg.reply_to.is_some(),
+        })
+    };
+
+    let notif = chat::build_channel_notification(&msg);
+    let thread_id = msg.thread_id.clone();
+    (
+        tool_text_response(id, &response_payload),
+        Some((thread_id, notif)),
+    )
+}
+
+/// Handle `chat_subscribe`. Spawns a forwarding task that pumps the
+/// per-thread broadcast::Receiver into the connection's outbound mpsc.
+/// The forwarding task exits naturally when either the connection
+/// closes (outbound_tx is dropped → send fails) or the broadcast bus
+/// is dropped at daemon shutdown.
+async fn handle_chat_subscribe(
+    id: serde_json::Value,
+    args: &serde_json::Value,
+    bus: &SharedBus,
+    outbound_tx: OutboundTx,
+    connection_id: Uuid,
+) -> serde_json::Value {
+    let thread = args
+        .get("thread")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if thread.is_empty() {
+        return tool_error_response(id, -32602, "thread is required");
+    }
+
+    // Subscribe BEFORE draining backlog so we don't miss a message
+    // posted in the gap between drain and subscribe.
+    let mut rx = bus.subscribe(&thread).await;
+
+    let thread_for_drain = thread.clone();
+    let backlog: Vec<chat::ChatMessage> =
+        match tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<chat::ChatMessage>> {
+            let mut conn = chat::open_chat_db()?;
+            let msgs = chat::drain_backlog(&mut conn, &thread_for_drain)?;
+            Ok(msgs)
+        })
+        .await
+        {
+            Ok(Ok(msgs)) => msgs,
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, "chat backlog drain failed");
+                return tool_error_response(id, -32603, "backlog drain failed");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "chat backlog drain panicked");
+                return tool_error_response(id, -32603, "internal error");
+            }
+        };
+
+    let messages_json: Vec<serde_json::Value> = backlog.iter().map(|m| m.to_json()).collect();
+
+    // Spawn the forwarding task that pumps broadcast → outbound mpsc.
+    // Rule 3 / Rule 5: panic-safe + no .unwrap on runtime values.
+    let outbound_clone = outbound_tx.clone();
+    let thread_for_log = thread.clone();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(frame) => {
+                    if outbound_clone.send(frame).is_err() {
+                        // outbound mpsc closed — connection is gone.
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(
+                        %connection_id,
+                        thread = %thread_for_log,
+                        lagged = n,
+                        "broadcast subscriber lagged; resuming"
+                    );
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    break;
+                }
+            }
+        }
+    });
+
+    let payload = serde_json::json!({
+        "thread": thread,
+        "messages": messages_json,
+    });
+    tool_text_response(id, &payload)
+}
+
+/// Handle `chat_list` — SELECT messages from chat.db for a given
+/// thread, optionally bounded by `since` (created_at >) and `limit`.
+async fn handle_chat_list(id: serde_json::Value, args: &serde_json::Value) -> serde_json::Value {
+    let thread = args
+        .get("thread")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if thread.is_empty() {
+        return tool_error_response(id, -32602, "thread is required");
+    }
+    let since = args.get("since").and_then(|v| v.as_i64());
+    let limit = args.get("limit").and_then(|v| v.as_i64());
+
+    let result: Result<Vec<chat::ChatMessage>, anyhow::Error> =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<chat::ChatMessage>> {
+            let conn = chat::open_chat_db()?;
+            let msgs = chat::list_messages(&conn, &thread, since, limit)?;
+            Ok(msgs)
+        })
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("join error: {e}")));
+
+    match result {
+        Ok(messages) => {
+            let messages_json: Vec<serde_json::Value> =
+                messages.iter().map(|m| m.to_json()).collect();
+            let payload = serde_json::json!({ "messages": messages_json });
+            tool_text_response(id, &payload)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "chat_list failed");
+            tool_error_response(id, -32603, "list failed")
+        }
     }
 }

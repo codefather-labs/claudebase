@@ -18,26 +18,30 @@
 //! meet — calling `ipc::read_frame` on stdin OR doing newline-framing
 //! on the UDS socket is a wire-format violation.
 //!
-//! ## State machine
+//! ## Slice 3 — UDS reader task + notification relay
 //!
-//! Each plugin invocation runs ONE bridge loop:
-//!
-//! 1. Try to connect to the daemon UDS. If the first connection fails,
-//!    we enter daemon-down mode and serve `tools/list` sentinel +
-//!    `claudebase_daemon_status` locally.
-//! 2. `tokio::select!` over (stdin line, optional daemon read, optional
-//!    reconnect timer). Each branch dispatches to the appropriate
-//!    handler.
-//! 3. On stdin EOF: drop pending requests, close UDS, exit 0 within
-//!    100 ms (SEC-6).
+//! Daemon-pushed `notifications/claude/channel` frames are
+//! asynchronous: they can arrive at any time while the plugin is
+//! waiting on stdin. To relay them without blocking on stdin, we split
+//! the UDS stream into read/write halves:
+//!   - The read half is owned by a spawned task that pumps every UDS
+//!     frame to an `mpsc::UnboundedSender<Value>`.
+//!   - The write half stays with the bridge main loop and is used for
+//!     outbound requests.
+//! The main loop's `tokio::select!` polls stdin AND the uds-mpsc; any
+//! notification observed while idle is relayed to stdout immediately.
+//! When the bridge is mid-request (after `write_frame` to UDS), it
+//! drains the same uds-mpsc until the response is observed — relaying
+//! notifications encountered along the way.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::daemon::ipc::{read_frame, write_frame};
 use crate::daemon::server::socket_path;
@@ -59,6 +63,15 @@ const MAX_PENDING_REQUESTS: usize = 1024;
 const INITIAL_RETRY_COUNT: u32 = 3;
 const INITIAL_RETRY_DELAY_MS: u64 = 250;
 
+/// Handle to the daemon side of the bridge: the write half of the
+/// split UDS stream + the mpsc::Receiver carrying inbound UDS frames
+/// (responses + notifications). When `None`, the daemon is down.
+struct DaemonChannel {
+    write_half: Arc<Mutex<tokio::io::WriteHalf<interprocess::local_socket::tokio::Stream>>>,
+    inbound_rx: mpsc::UnboundedReceiver<Value>,
+    _reader_task: tokio::task::JoinHandle<()>,
+}
+
 /// Entry point for the plugin bridge — runs until stdin EOF or fatal
 /// I/O failure on stdout. Daemon UDS failures are non-fatal and drop
 /// us into daemon-down mode.
@@ -67,14 +80,13 @@ pub async fn run() -> anyhow::Result<()> {
 
     // Attempt initial connection. We do 3 quick retries (FR-ACD-3.3)
     // before falling back to daemon-down mode.
-    let mut uds = connect_with_retries(&socket, INITIAL_RETRY_COUNT, INITIAL_RETRY_DELAY_MS).await;
+    let mut daemon = connect_with_retries(&socket, INITIAL_RETRY_COUNT, INITIAL_RETRY_DELAY_MS).await;
 
     // Pending requests map: id → oneshot::Sender for the response.
-    // Slice 1b: we don't actually use the oneshot channel — each
-    // request blocks the bridge loop until reply arrives because we
-    // multiplex stdin and daemon reads in `tokio::select!`. The map is
-    // kept for shape parity with the SEC-4 cap discipline and Slice 5
-    // routing.
+    // Held only for SEC-4 cap discipline — Slice 3 still uses the
+    // drain-until-id-match pattern inside `forward_to_daemon`, so the
+    // map is structurally present but never populated. Keep the cap
+    // gate in `tools/call` so we can refuse oversubscription cleanly.
     let pending: HashMap<Value, oneshot::Sender<Value>> = HashMap::new();
 
     // stdin: newline-delimited per STRUCTURAL-A1.
@@ -85,30 +97,72 @@ pub async fn run() -> anyhow::Result<()> {
 
     // Track whether we believe the daemon is reachable. Used to gate
     // tools/list_changed emission on down → up transition.
-    let mut daemon_down = uds.is_none();
+    let mut daemon_down = daemon.is_none();
 
     loop {
-        // Branch 1: read a line from stdin (newline-delimited).
-        // Branch 2: in deliberate future revisions we'd also select over
-        // a daemon UDS read for unsolicited notifications (Slice 3).
-        // Slice 1b keeps the loop stdin-driven — every daemon read is
-        // immediately after a daemon write (request/response pairing).
-        let line_result = stdin_reader.next_line().await;
+        // tokio::select! across (stdin, idle UDS notification drain).
+        // Slice 3: when the daemon pushes a notification while we're
+        // idle (between requests), we relay it onto stdout via the
+        // uds-mpsc branch.
+        //
+        // Both branches use cancellation-safe futures (Rule 4 from
+        // ASYNC_INVARIANTS.md):
+        //   - stdin_reader.next_line() — documented cancellation-safe
+        //   - mpsc::Receiver::recv()   — documented cancellation-safe
+        let line_opt = if let Some(d) = daemon.as_mut() {
+            tokio::select! {
+                line = stdin_reader.next_line() => Some(line),
+                frame = d.inbound_rx.recv() => {
+                    match frame {
+                        Some(f) => {
+                            if f.get("id").is_none() {
+                                // Notification — relay to stdout.
+                                write_mcp_line(&mut stdout, &f).await?;
+                            } else {
+                                // Unexpected response while idle —
+                                // log and drop. This shouldn't happen
+                                // with the current request/response
+                                // pairing.
+                                let resp_id = f.get("id").cloned().unwrap_or(Value::Null);
+                                tracing::warn!(
+                                    response_id = %resp_id,
+                                    "unexpected daemon response while idle (dropping)"
+                                );
+                            }
+                            None
+                        }
+                        None => {
+                            // UDS reader task ended — daemon link is gone.
+                            daemon = None;
+                            daemon_down = true;
+                            None
+                        }
+                    }
+                }
+            }
+        } else {
+            Some(stdin_reader.next_line().await)
+        };
+
+        let line_result = match line_opt {
+            Some(r) => r,
+            None => continue,
+        };
 
         let line = match line_result {
             Ok(Some(l)) => l,
             Ok(None) => {
                 // Stdin EOF — clean shutdown (SEC-6). Drop pending map
-                // to close all oneshot senders. UDS drops when `uds`
+                // to close all oneshot senders. UDS drops when `daemon`
                 // goes out of scope.
                 drop(pending);
-                drop(uds);
+                drop(daemon);
                 return Ok(());
             }
             Err(e) => {
                 tracing::error!(error = %e, "stdin read error");
                 drop(pending);
-                drop(uds);
+                drop(daemon);
                 return Ok(());
             }
         };
@@ -176,11 +230,6 @@ pub async fn run() -> anyhow::Result<()> {
                         }
 
                         // SEC-5: log only clientInfo.name (≤64) + version (≤32).
-                        // No capabilities / no other fields. Keeps PII /
-                        // fingerprint surface minimal. Routed through
-                        // structured tracing (Slice 1c) so the two
-                        // truncated fields land as JSON attributes, not
-                        // a free-form line.
                         let client_name = params
                             .get("clientInfo")
                             .and_then(|c| c.get("name"))
@@ -202,9 +251,9 @@ pub async fn run() -> anyhow::Result<()> {
                         write_mcp_line(&mut stdout, &initialize_response(id)).await?;
                     }
                     "tools/list" => {
-                        if let Some(stream) = uds.as_mut() {
+                        if let Some(d) = daemon.as_mut() {
                             // Daemon-up: forward.
-                            match forward_to_daemon(stream, &parsed).await {
+                            match forward_to_daemon(d, &parsed, &mut stdout).await {
                                 Ok(response) => {
                                     write_mcp_line(&mut stdout, &response).await?;
                                 }
@@ -212,7 +261,7 @@ pub async fn run() -> anyhow::Result<()> {
                                     // UDS failure mid-flight — drop the
                                     // socket, fall back to daemon-down,
                                     // and serve the sentinel locally.
-                                    uds = None;
+                                    daemon = None;
                                     daemon_down = true;
                                     write_mcp_line(
                                         &mut stdout,
@@ -223,10 +272,9 @@ pub async fn run() -> anyhow::Result<()> {
                             }
                         } else {
                             // Daemon-down: try a quick reconnect first.
-                            uds = try_reconnect(&socket).await;
-                            if let Some(stream) = uds.as_mut() {
-                                // Came back up. Per mcp-protocol-expert
-                                // invariant #5: emit notifications/tools/list_changed
+                            daemon = try_reconnect(&socket).await;
+                            if let Some(d) = daemon.as_mut() {
+                                // Came back up. Emit notifications/tools/list_changed
                                 // BEFORE sending the new tools/list response so
                                 // Claude Code re-fetches.
                                 if daemon_down {
@@ -237,12 +285,12 @@ pub async fn run() -> anyhow::Result<()> {
                                     .await?;
                                     daemon_down = false;
                                 }
-                                match forward_to_daemon(stream, &parsed).await {
+                                match forward_to_daemon(d, &parsed, &mut stdout).await {
                                     Ok(response) => {
                                         write_mcp_line(&mut stdout, &response).await?;
                                     }
                                     Err(_) => {
-                                        uds = None;
+                                        daemon = None;
                                         daemon_down = true;
                                         write_mcp_line(
                                             &mut stdout,
@@ -280,10 +328,10 @@ pub async fn run() -> anyhow::Result<()> {
 
                         // Daemon-down: only claudebase_daemon_status is
                         // valid; everything else → -32601.
-                        if uds.is_none() {
+                        if daemon.is_none() {
                             // Try a quick reconnect.
-                            uds = try_reconnect(&socket).await;
-                            if uds.is_some() && daemon_down {
+                            daemon = try_reconnect(&socket).await;
+                            if daemon.is_some() && daemon_down {
                                 write_mcp_line(
                                     &mut stdout,
                                     &tools_list_changed_notification(),
@@ -293,7 +341,7 @@ pub async fn run() -> anyhow::Result<()> {
                             }
                         }
 
-                        if uds.is_none() {
+                        if daemon.is_none() {
                             if tool_name == "claudebase_daemon_status" {
                                 // Verbatim FR-ACD-10.1 message (SEC-8).
                                 write_mcp_line(
@@ -328,13 +376,13 @@ pub async fn run() -> anyhow::Result<()> {
                             .await?;
                             continue;
                         }
-                        let stream = uds.as_mut().expect("uds checked Some above");
-                        match forward_to_daemon(stream, &parsed).await {
+                        let d = daemon.as_mut().expect("daemon checked Some above");
+                        match forward_to_daemon(d, &parsed, &mut stdout).await {
                             Ok(response) => {
                                 write_mcp_line(&mut stdout, &response).await?;
                             }
                             Err(_) => {
-                                uds = None;
+                                daemon = None;
                                 daemon_down = true;
                                 if tool_name == "claudebase_daemon_status" {
                                     write_mcp_line(
@@ -377,10 +425,10 @@ async fn connect_with_retries(
     socket: &std::path::Path,
     retries: u32,
     delay_ms: u64,
-) -> Option<interprocess::local_socket::tokio::Stream> {
+) -> Option<DaemonChannel> {
     for attempt in 0..retries {
         if let Some(stream) = try_connect(socket).await {
-            return Some(stream);
+            return Some(spawn_daemon_channel(stream));
         }
         if attempt + 1 < retries {
             tracing::warn!(
@@ -405,7 +453,8 @@ async fn connect_with_retries(
 async fn try_connect(
     socket: &std::path::Path,
 ) -> Option<interprocess::local_socket::tokio::Stream> {
-    use interprocess::local_socket::tokio::{prelude::*, Stream};
+    use interprocess::local_socket::tokio::prelude::*;
+    use interprocess::local_socket::tokio::Stream;
     use interprocess::local_socket::{GenericFilePath, ToFsName};
 
     let path_name = socket.to_path_buf().to_fs_name::<GenericFilePath>().ok()?;
@@ -415,33 +464,92 @@ async fn try_connect(
 /// Re-attempt connection (single try, fast). Used opportunistically
 /// when we're in daemon-down mode and a request arrives — gives the
 /// daemon a chance to have come back up.
-async fn try_reconnect(
-    socket: &std::path::Path,
-) -> Option<interprocess::local_socket::tokio::Stream> {
-    try_connect(socket).await
+async fn try_reconnect(socket: &std::path::Path) -> Option<DaemonChannel> {
+    let stream = try_connect(socket).await?;
+    Some(spawn_daemon_channel(stream))
 }
 
-/// Forward one MCP request to the daemon via UDS and read the response.
-/// Returns Err on UDS I/O failure so the caller can drop the socket and
-/// fall back to daemon-down. SEC-1 frame cap applies to the daemon
-/// response body.
+/// Split the UDS stream, spawn the inbound reader task, return the
+/// composite handle the main loop uses.
+fn spawn_daemon_channel(stream: interprocess::local_socket::tokio::Stream) -> DaemonChannel {
+    let (mut read_half, write_half) = tokio::io::split(stream);
+    let (tx, rx) = mpsc::unbounded_channel::<Value>();
+    // Reader task: read length-prefixed frames forever; forward each
+    // parsed JSON Value to the mpsc. Exits on EOF or parse failure.
+    let reader_task = tokio::spawn(async move {
+        loop {
+            let body = match read_frame(&mut read_half).await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::info!(error = %e, "daemon UDS read ended");
+                    return;
+                }
+            };
+            if body.len() > MAX_MCP_FRAME_SIZE {
+                tracing::warn!(len = body.len(), "daemon frame exceeds MCP cap; dropping");
+                continue;
+            }
+            let parsed: Value = match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "daemon frame JSON parse failed; dropping");
+                    continue;
+                }
+            };
+            if tx.send(parsed).is_err() {
+                // Main loop dropped the receiver — bridge is shutting down.
+                return;
+            }
+        }
+    });
+    DaemonChannel {
+        write_half: Arc::new(Mutex::new(write_half)),
+        inbound_rx: rx,
+        _reader_task: reader_task,
+    }
+}
+
+/// Forward one MCP request to the daemon via UDS and read the response,
+/// relaying any notifications encountered along the way to stdout.
+///
+/// Returns Err on UDS write failure OR when the inbound_rx is closed
+/// (daemon link gone) so the caller can drop the socket and fall back
+/// to daemon-down. SEC-1 frame cap applies to the daemon response body.
 async fn forward_to_daemon(
-    stream: &mut interprocess::local_socket::tokio::Stream,
+    daemon: &mut DaemonChannel,
     request: &Value,
+    stdout: &mut tokio::io::Stdout,
 ) -> anyhow::Result<Value> {
     let body = serde_json::to_vec(request).context("serialize MCP request")?;
-    write_frame(stream, &body).await.context("write daemon frame")?;
-    let response_body = read_frame(stream).await.context("read daemon frame")?;
-    if response_body.len() > MAX_MCP_FRAME_SIZE {
-        anyhow::bail!(
-            "daemon response exceeds MCP cap: {} > {}",
-            response_body.len(),
-            MAX_MCP_FRAME_SIZE
-        );
+    {
+        let mut wh = daemon.write_half.lock().await;
+        write_frame(&mut *wh, &body)
+            .await
+            .context("write daemon frame")?;
     }
-    let parsed: Value =
-        serde_json::from_slice(&response_body).context("parse daemon response JSON")?;
-    Ok(parsed)
+    let expected_id = request.get("id").cloned();
+    loop {
+        let frame = match daemon.inbound_rx.recv().await {
+            Some(v) => v,
+            None => anyhow::bail!("daemon inbound channel closed"),
+        };
+        // Notifications (no `id`) → relay to stdout, keep reading.
+        if frame.get("id").is_none() {
+            write_mcp_line(stdout, &frame).await?;
+            continue;
+        }
+        if let Some(exp) = expected_id.as_ref() {
+            if frame.get("id") != Some(exp) {
+                let got = frame.get("id").cloned().unwrap_or(Value::Null);
+                tracing::warn!(
+                    expected = %exp,
+                    got = %got,
+                    "daemon response id mismatch (returning anyway)"
+                );
+            }
+        }
+        return Ok(frame);
+    }
 }
 
 /// Write one JSON value as a newline-terminated UTF-8 line to stdout

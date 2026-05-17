@@ -1,0 +1,68 @@
+name: spike-ipc
+
+# Slice 0a spike (agent-chat-daemon feature). Validates that the
+# `interprocess` v2 crate handles 2 concurrent accept-loop connections
+# correctly on Unix domain sockets (Linux + macOS) AND Windows named
+# pipes WITHOUT `#[cfg]` branches.
+#
+# The result of this CI run GATES Slice 1a dispatch:
+#   - green on all 3 platforms → Slice 1a uses `interprocess`
+#   - red on Windows           → Slice 1a uses platform-arms
+#                                (tokio::net::UnixListener on Unix +
+#                                 tokio::net::windows::named_pipe::ServerOptions on Windows)
+#
+# Triggered by:
+#   - pull_request touching the spike example or this workflow file
+#   - workflow_dispatch (manual re-run from the Actions UI)
+
+on:
+  pull_request:
+    paths:
+      - 'examples/ipc_concurrent_accept.rs'
+      - '.github/workflows/spike-ipc.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: spike-ipc-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  spike:
+    name: spike (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: spike-ipc-${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            spike-ipc-${{ runner.os }}-cargo-
+
+      - name: Run interprocess concurrent-accept spike
+        shell: bash
+        timeout-minutes: 2
+        run: |
+          # 60 s hard wallclock cap on the spike binary itself; cargo
+          # compile time is excluded. The spike's internal timeout is
+          # 30 s (see examples/ipc_concurrent_accept.rs main()).
+          cargo run --example ipc_concurrent_accept

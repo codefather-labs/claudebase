@@ -59,6 +59,15 @@ assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
 
+# Slice 0a spike (agent-chat-daemon feature) — `interprocess` v2 with the
+# `tokio` feature exposes a cross-platform local-socket abstraction over
+# Unix domain sockets and Windows named pipes. `tokio` runtime is needed
+# to drive the spike's async accept/connect tasks. Both are dev-only —
+# the spike example lives under `examples/` and ships nothing into the
+# production binary.
+interprocess = { version = "2", features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync"] }
+
 [[bin]]
 name = "claudebase-bench"
 path = "bench/runner.rs"

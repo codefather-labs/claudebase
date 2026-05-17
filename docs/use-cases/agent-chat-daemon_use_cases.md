@@ -161,6 +161,24 @@
 - **UC-3-E1: Telegram bot token revoked mid-conversation** — teloxide long-poll returns a 401 Unauthorized response. Daemon logs: `[ERROR] Telegram auth failure: 401 Unauthorized. Bot token may have been revoked. tg_bot_state set to "disconnected".` The daemon does NOT crash. Inbound messages from this point are not received. `claudebase daemon status --json` returns `tg_bot_state: "disconnected"`. User must update `secrets.toml` with a new token and run `claudebase daemon restart`. (AC-ACD-2)
 - **UC-3-E2: Telegram rate-limit on outbound send (HTTP 429)** — daemon calls Telegram bot API to send reply, receives 429 with `retry_after` header. Daemon backs off per `retry_after` seconds and retries once. If the retry also fails, logs WARN and reports failure to Mira via tool response: `{ "error": "telegram_rate_limited", "retry_after": N }`. Does not crash.
 
+### UC-3-E3 — Daemon restart preserves Telegram message backlog
+
+**Actor:** Human user via Telegram.
+
+**Preconditions:** Daemon running. User sends Telegram text message at time T0, daemon processes it (writes to chat.db, broadcasts). `daemon_state.telegram.last_update_id` is updated to N1 atomically with the batch.
+
+**Main flow:**
+1. User invokes `claudebase daemon restart` at time T1 (or daemon crashes — same effect).
+2. While daemon is down (T1..T2), user sends another Telegram text message. Telegram retains this message; teloxide's long-poll is the only consumer that has not acknowledged it.
+3. Daemon process restarts at T2.
+4. On boot, Slice 4 worker reads `telegram.last_update_id` from `daemon_state` → returns N1.
+5. Worker calls teloxide `Bot::get_updates(offset=N1+1)` — Telegram returns the message sent during the restart window with `update_id = N1+1`.
+6. Worker processes the message normally: writes to chat.db thread `telegram:<id>`, broadcasts to subscribers, atomically updates `daemon_state.telegram.last_update_id = N1+1`.
+
+**Postconditions:** The message sent during the restart window appears in `chat.db` with no duplicate and no loss. Connected Claude Code sessions receive the `notifications/claude/channel` event on reconnect.
+
+**Maps to:** FR-ACD-6.10
+
 ### Edge Cases
 
 - **UC-3-EC1**: Message content is an empty string (user sends a sticker or GIF with no caption). Daemon stores `content = ""` and broadcasts. Mira receives the event; the handling of stickers is a Mira-level concern. Daemon does not reject empty-content messages.
@@ -274,6 +292,23 @@
 
 - **UC-5-EC1**: User sends `@PLANNER` in all caps. Case-insensitive lookup finds `planner` agent. Routing proceeds. (FR-ACD-11.4)
 - **UC-5-EC2**: Mira calls `agent_register` for the same `agent_id` twice (idempotent re-registration). Daemon performs `INSERT OR REPLACE` semantics; the row is updated with the new `spawned_at` and `last_pinged_at`. No error returned.
+
+### UC-5-EC-3 — Concurrent same-name agent registration
+
+**Actor:** Two Claude Code sessions running on the same machine, each spawning a `planner` agent for the same Telegram thread `telegram:12345`.
+
+**Preconditions:** Daemon running. Session A spawned `planner` agent with `agent_id=A1`, called `agent_register {agent_id: 'A1', name: 'planner', chat_thread_id: 'telegram:12345', state: 'alive'}` — succeeded.
+
+**Main flow:**
+1. Session B independently spawns its own `planner` agent with `agent_id=B1`.
+2. Session B's Mira calls `agent_register {agent_id: 'B1', name: 'planner', chat_thread_id: 'telegram:12345', state: 'alive'}`.
+3. Daemon enforces the partial UNIQUE INDEX `agent_registry_thread_name_alive_idx` and rejects the insert with error `UNIQUE constraint failed: agent_registry.chat_thread_id, agent_registry.agent_name`.
+4. Session B's plugin propagates the error back to Mira as a `tools/call` error response.
+5. Mira logs the conflict and treats B1 as un-registered; subsequent `@planner` mentions in the Telegram thread route to A1 (the alive registered planner). B1 is reachable only via direct SendMessage from within Session B.
+
+**Postconditions:** Exactly one `planner` row in `agent_registry` for thread `telegram:12345` with state='alive'. Routing for `@planner` is deterministic.
+
+**Maps to:** FR-ACD-5.7
 
 ---
 
@@ -503,6 +538,7 @@
 - Prior prd-writer insight (OQ-ACD-4): `chat.db` location ambiguity — the plan places `chat.db` at `<project>/.claude/knowledge/chat.db` (project-scoped) but the daemon is a user-level OS service (`$HOME`-scoped). Architecturally, a user-level service writing to a project-specific path is inconsistent. PRD §17.7 says `<project>/.claude/knowledge/chat.db` per the plan, but this may be resolved to `~/.claude/knowledge/chat.db` by the architect at Slice 3. Source: `claudebase insight get 1` this session — salience: high.
 - `daemon status --json` field names verified against PRD §17.3 FR-ACD-1.6 this session: `state` (enum: `"running"`, `"stopped"`, `"not-installed"`), `pid` (integer|null), `uptime` (seconds|null), `socket_path` (string|null), `subscriber_count` (integer), `tg_bot_state` (`"connected"`, `"disconnected"`, `"not-configured"`), `asr_backend` (`"whisper"`, `"sherpa-nemo"`, `"nim"`, `"none"`). — salience: high.
 - `agent_registry` schema: SQL block verified against PRD §17.7 (lines 611–628) and plan Slice 5 (lines 169–183). `state` CHECK constraint: `('alive','orphaned','dead')`. — salience: high.
+- OQ-ACD-4 RESOLVED — `chat.db` lives at `~/.claude/knowledge/chat.db` (user-level singleton; not per-project). Resolution: architect [STRUCTURAL] #1 at bootstrap Step 3. PRD §17.7 comment block (`docs/PRD.md` line 586) and migration code use `user_level_chat_db_path()`. All UC steps referencing `chat.db` (UC-3, UC-4, UC-5, UC-8, UC-9, UC-10, UC-3-E3) point to this user-level path. — salience: high.
 - UDS socket path: `$XDG_RUNTIME_DIR/claudebase/daemon.sock` (Unix) / `\\.\pipe\claudebase-daemon` (Windows). Source: PRD FR-ACD-2.1 (line 443) — salience: high.
 - Whisper auto-download URL: `https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-<size>.bin`. Source: PRD FR-ACD-7.3 (line 493) — salience: medium.
 - NVIDIA NIM assumed endpoint: `https://integrate.api.nvidia.com/v1/audio/transcriptions`. Source: plan line 230 + PRD FR-ACD-7.5 (line 495). Marked as assumed in plan risk 3 (line 288). — salience: high (marked assumption).
@@ -522,14 +558,14 @@
 
 ### Assumptions
 
-- `chat.db` location is `<project>/.claude/knowledge/chat.db` per the plan and PRD §17.7. However, given OQ-ACD-4 (prior prd-writer insight), the architect may relocate this to `~/.claude/knowledge/chat.db` at Slice 3 pre-review. Use-case steps that reference `chat.db` path use the PRD-specified location. If the architect changes the path, affected use cases are UC-3, UC-4, UC-5, UC-8, UC-9, UC-10, and UC-EC-3. — risk: test DB path assertions will fail if path changes — how to verify: architect Slice 3 pre-review decision.
+- (OQ-ACD-4 chat.db location — RESOLVED, see ### Verified facts above. No longer an assumption; left here as a deliberate redirect for readers who skim assumptions first.)
 - The pairing code window is 1 hour. Source: inferred from plan line 154 `access.json` pending model; PRD §17.8 UI section (line 638). Not explicitly stated in FR-ACD-6.5. — risk: implementation may choose a different window — how to verify: QA planner should add an explicit test case for the expiry window.
 - `daemon stop` sends SIGTERM and waits up to 10 seconds before SIGKILL (systemd `TimeoutStopSec=10` in the unit). Plan risk 9 (line 302) specifies systemd unit hardening directives but does not specify `TimeoutStopSec`. — risk: longer-than-expected shutdown if daemon is stuck — how to verify: Slice 2 implementation.
 - The `daemon install` idempotency check is based on file-content checksum comparison (not just existence). This is inferred from plan AC 1 (line 66) which says "re-running is no-op". The exact idempotency mechanism is assumed. — risk: if idempotency is existence-only, config changes won't be updated without `uninstall` + `reinstall`. — how to verify: Slice 2 test case.
 
 ### Open questions
 
-- **OQ-ACD-4 (chat.db location)** — inherited from prd-writer insight (doc#1): plan specifies `<project>/.claude/knowledge/chat.db` but daemon is user-scoped. Architect decision required at Slice 3 pre-review. Needs: architect call — salience: high.
+- **OQ-ACD-4 (chat.db location) — RESOLVED**: architect [STRUCTURAL] #1 pinned `chat.db` at `~/.claude/knowledge/chat.db` (user-level singleton). PRD §17.7 schema comment carries the resolution. Closed; entry retained for audit-trail continuity. — salience: high.
 - **OQ-ACD-UC-1 (daemon stop timeout)** — `TimeoutStopSec` value for systemd unit not specified in PRD. Needs: architect or security-auditor decision at Slice 2 — salience: medium.
 - **OQ-ACD-UC-2 (chat.db > 1GB growth)** — UC-EC-3 mentions a `claudebase chat purge --older-than 30d` subcommand as a plan item. This subcommand does NOT appear in FR-ACD-13 as implemented. It may be deferred. QA planner should flag if DB size management is in scope for v1. Needs: user decision — salience: medium.
 - **OQ-ACD-UC-3 (NIM endpoint reachability check in `daemon doctor`)** — UC-11 step 6 describes an HTTP HEAD probe. The actual NIM endpoint behavior on HEAD requests (vs. POST) is unknown. Needs: verification at Slice 6 implementation time — salience: low.

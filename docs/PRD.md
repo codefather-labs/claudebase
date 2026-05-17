@@ -473,6 +473,7 @@ As the SDLC pipeline operator, I want a persistent Telegram bot backed by a loca
 4. **FR-ACD-5.4:** `agent_reap { older_than: integer }` MUST bulk-update rows where `last_pinged_at < (now - older_than seconds)` and `state = 'alive'` to `state = 'dead'`. Returns count of reaped rows.
 5. **FR-ACD-5.5:** On connection EOF, the daemon MUST bulk-UPDATE all rows with `connection_id = <closed_connection_id>` and `state = 'alive'` to `state = 'orphaned'`.
 6. **FR-ACD-5.6:** The `agent_registry` table MUST have an index on `(chat_thread_id, state) WHERE state = 'alive'` for efficient alive-agent lookup during routing (plan Slice 5, SQL schema block, lines 169–183).
+7. **FR-ACD-5.7 (Agent-name uniqueness within thread):** When `agent_register` is called with `(chat_thread_id, agent_name, state='alive')` and a row already exists with the SAME `chat_thread_id` AND `agent_name` AND `state='alive'`, the second registration MUST fail with a clear error (e.g., `UNIQUE constraint failed: agent_registry.chat_thread_id, agent_registry.agent_name`). This ensures `@<agent_name>` mentions in a Telegram thread route deterministically. Second-session agents of the same name fall through to fresh-spawn with stitched backlog at mention time rather than registry-resolved SendMessage. Enforced via a partial unique index in §17.7. Source: plan directive 5 / F-5.1 (`.claude/plan.md` line 386).
 
 #### FR-ACD-6: Telegram Bot Integration + Permission / Pairing Model (Slice 4, plan lines 145–158)
 
@@ -485,6 +486,7 @@ As the SDLC pipeline operator, I want a persistent Telegram bot backed by a loca
 7. **FR-ACD-6.7:** `claudebase daemon access list` MUST print the current access list with user ids, Telegram usernames, and authorization dates.
 8. **FR-ACD-6.8:** `claudebase daemon config edit` MUST open `~/.config/claudebase/daemon.toml` in `$EDITOR` (default `vi`).
 9. **FR-ACD-6.9:** `claudebase daemon config show` MUST print the parsed effective config as JSON, masking resolved secret values (e.g., the bot token appears as `"***"`).
+10. **FR-ACD-6.10 (Restart-window resume):** On daemon start, the Telegram long-poll worker MUST read `telegram.last_update_id` from `daemon_state` and resume polling from that offset. The worker MUST update this row after every successful long-poll batch (atomic INSERT OR REPLACE). This guarantees no Telegram message sent during a daemon-restart window is lost or duplicated. Verified by TC-4.16. Source: plan directive 7 / F-4.3 (`.claude/plan.md` line 388).
 
 #### FR-ACD-7: ASR Pipeline — Three Backends Behind a Single `Asr` Trait (Slice 6, plan lines 190–238)
 
@@ -607,6 +609,23 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 
 CREATE INDEX chat_messages_thread_time_idx
     ON chat_messages(thread_id, created_at);
+
+-- daemon_state: small KV store for daemon-process metadata that must
+-- survive restart. Specifically used by Slice 4 to checkpoint the last
+-- Telegram update_id processed, so on daemon restart teloxide's long-poll
+-- resumes from the persisted offset without losing or duplicating messages
+-- delivered during the restart window. Reserved for future scalar daemon
+-- state; NOT a general-purpose KV (use chat.db or a future settings table
+-- for user-configurable values).
+CREATE TABLE IF NOT EXISTS daemon_state (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+-- Slice 4 writes: INSERT OR REPLACE INTO daemon_state(key, value)
+--                 VALUES ('telegram.last_update_id', <id>)
+-- Slice 4 reads at boot: SELECT value FROM daemon_state
+--                        WHERE key = 'telegram.last_update_id'
 ```
 
 #### `agent_registry` table — Schema v6 (Slice 5, plan lines 160–188)
@@ -630,6 +649,14 @@ CREATE TABLE IF NOT EXISTS agent_registry (
 CREATE INDEX agent_registry_thread_alive_idx
     ON agent_registry(chat_thread_id, state)
     WHERE state = 'alive';
+
+-- Per FR-ACD-5.7 (agent-name uniqueness within thread).
+-- Partial unique index allows N>1 dead/orphaned rows for the same
+-- (chat_thread_id, agent_name) pair while enforcing at-most-one alive
+-- row at any moment. Required by Slice 5 + verified by TC-5.9.
+CREATE UNIQUE INDEX IF NOT EXISTS agent_registry_thread_name_alive_idx
+    ON agent_registry(chat_thread_id, agent_name)
+    WHERE state = 'alive' AND chat_thread_id IS NOT NULL;
 ```
 
 Both migrations are registered via `src/migrations.rs` following the existing `apply_v2`, `apply_v3`, `apply_v4` pattern. Both are additive — they do NOT modify `index.db` or `insights.db`.

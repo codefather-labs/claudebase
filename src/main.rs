@@ -117,8 +117,16 @@ fn main() -> std::process::ExitCode {
             cli::InsightSubcommand::Gc(a) => run_insight_gc(&root, &a),
             cli::InsightSubcommand::Delete(a) => run_insight_delete(&root, &a),
         },
-        Command::Daemon(args) => match &args.sub {
-            cli::DaemonSubcommand::Serve(serve_args) => run_daemon_serve(serve_args),
+        Command::Daemon(args) => match args.sub {
+            cli::DaemonSubcommand::Serve(serve_args) => run_daemon_serve(&serve_args),
+            cli::DaemonSubcommand::Config(config_args) => match config_args.sub {
+                cli::DaemonConfigSubcommand::Edit(a) => run_daemon_config_edit(&a),
+                cli::DaemonConfigSubcommand::Show(a) => run_daemon_config_show(&a),
+            },
+            cli::DaemonSubcommand::Access(access_args) => match access_args.sub {
+                cli::DaemonAccessSubcommand::Pair(a) => run_daemon_access_pair(&a),
+                cli::DaemonAccessSubcommand::List(a) => run_daemon_access_list(&a),
+            },
         },
         Command::Plugin(args) => match &args.sub {
             cli::PluginSubcommand::Serve(serve_args) => run_plugin_serve(serve_args),
@@ -259,6 +267,39 @@ fn init_tracing() {
 /// remain on the sync dispatch path) and runs the accept loop until
 /// fatal error or graceful shutdown.
 fn run_daemon_serve(args: &cli::DaemonServeArgs) -> std::process::ExitCode {
+    // Slice 4 SEC-9 / SEC-15 FAST EXIT — perform the secrets.toml +
+    // daemon.toml validation BEFORE init_tracing and run_tokio. The
+    // tokio multi-thread runtime build is the slowest step in startup
+    // (~200ms+ on macOS); the test harness's TC-4.14 only allows 1
+    // second of wall-clock before checking try_wait(). By moving the
+    // check ahead of runtime build the bad-perm/symlink/forbidden-field
+    // exit lands well inside the budget on every supported OS.
+    use claudebase::daemon::config;
+    let secrets_path = config::user_level_secrets_toml_path();
+    match std::fs::symlink_metadata(&secrets_path) {
+        Ok(_) => {
+            if let Err(e) = config::load_secrets_toml(&secrets_path) {
+                eprintln!("error: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // No secrets.toml — daemon runs chat-only. No-op here; the
+            // long-poll spawn in server::serve() also short-circuits.
+        }
+        Err(e) => {
+            eprintln!("error: failed to stat secrets.toml: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    }
+    let daemon_toml_path = config::user_level_daemon_toml_path();
+    if daemon_toml_path.exists() {
+        if let Err(e) = config::load_daemon_toml(&daemon_toml_path) {
+            eprintln!("error: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    }
+
     init_tracing();
     match claudebase::daemon::run_tokio(claudebase::daemon::server::serve(args)) {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -282,6 +323,254 @@ fn run_plugin_serve(args: &cli::PluginServeArgs) -> std::process::ExitCode {
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Slice 4 — daemon config + daemon access subcommand runners.
+// ---------------------------------------------------------------------------
+
+/// `claudebase daemon config edit` (Slice 4).
+///
+/// 1. Resolve daemon.toml path.
+/// 2. Symlink refuse (SEC-15).
+/// 3. Open `$EDITOR` (defaults to `vi`) via arg-vector form (SEC-16).
+/// 4. Re-parse on editor exit. Refuse and exit 1 if parse fails. The
+///    file is NOT reverted — the operator can re-edit. This mirrors what
+///    `visudo` does on a broken sudoers file: keep the broken content
+///    visible so the operator can see what they typed.
+fn run_daemon_config_edit(_args: &cli::DaemonConfigEditArgs) -> std::process::ExitCode {
+    use claudebase::daemon::config;
+
+    let path = config::user_level_daemon_toml_path();
+
+    // Ensure the parent dir + file exist so the editor has something to
+    // open. Missing daemon.toml is NOT an error — create an empty one
+    // and let the operator fill it in.
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("error: failed to create config dir: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    }
+    if !path.exists() {
+        if let Err(e) = std::fs::write(&path, "") {
+            eprintln!("error: failed to create daemon.toml: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    }
+
+    // SEC-15 step 1: symlink refuse via lstat (pre-edit).
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            eprintln!("error: refuse to read symlink: {}", path.display());
+            return std::process::ExitCode::FAILURE;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("error: failed to stat daemon.toml: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    }
+
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+
+    // SEC-16: arg-vector form. NEVER `sh -c "$editor $path"`.
+    let status = std::process::Command::new(&editor).arg(&path).status();
+    let status = match status {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: failed to spawn editor `{editor}`: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    if !status.success() {
+        eprintln!("error: editor `{editor}` exited non-zero: {status}");
+        return std::process::ExitCode::FAILURE;
+    }
+
+    // Re-parse to catch malformed TOML / forbidden bot_token field.
+    match config::load_daemon_toml(&path) {
+        Ok(_) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: TOML parse failed after edit: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// `claudebase daemon config show` (Slice 4).
+///
+/// Loads daemon.toml + secrets.toml; merges into a single view; prints
+/// either TOML (default) or JSON (`--json`). The bot token is ALWAYS
+/// masked to `"***"` (SEC-10 — `RedactedToken::Display` + serde impls).
+fn run_daemon_config_show(args: &cli::DaemonConfigShowArgs) -> std::process::ExitCode {
+    use claudebase::daemon::config;
+
+    let daemon_path = config::user_level_daemon_toml_path();
+    let secrets_path = config::user_level_secrets_toml_path();
+
+    // daemon.toml is mandatory once it exists; if it doesn't exist, print
+    // a minimal default and return 0 (so config show works on a fresh box).
+    let daemon_cfg = if daemon_path.exists() {
+        match config::load_daemon_toml(&daemon_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("error: failed to load daemon.toml: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+    } else {
+        config::Config::default()
+    };
+
+    let token_mask = "***"; // SEC-10 literal mask required by TC-4.12.
+    let token_present = match config::load_secrets_toml(&secrets_path) {
+        Ok(_) => true,
+        Err(e) => {
+            // We tolerate missing secrets.toml here — `config show`
+            // should still work for fresh installs without bot tokens.
+            // BUT if the file exists and FAILED to parse / is symlinked
+            // / has wrong perms, that's a real error: surface it.
+            if secrets_path.exists() {
+                eprintln!("error: failed to load secrets.toml: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+            false
+        }
+    };
+
+    if args.json {
+        let mut payload = serde_json::json!({
+            "asr": {
+                "backend": daemon_cfg.asr.backend,
+            },
+            "telegram": {
+                "enabled": daemon_cfg.telegram.enabled,
+                "poll_interval_secs": daemon_cfg.telegram.poll_interval_secs,
+                "dmPolicy": daemon_cfg.telegram.dm_policy,
+            },
+            "daemon": {
+                "log_level": daemon_cfg.daemon.log_level,
+                "port": daemon_cfg.daemon.port,
+            },
+        });
+        if token_present {
+            payload["telegram"]["bot_token"] = serde_json::json!(token_mask);
+        }
+        println!("{}", payload);
+    } else {
+        // Plain TOML view. We hand-format so the bot_token mask appears
+        // even when the secrets.toml file would normally be a different
+        // file. The format is intentionally simple — operators read this
+        // to confirm configuration.
+        println!("[asr]");
+        if let Some(b) = &daemon_cfg.asr.backend {
+            println!("backend = \"{b}\"");
+        }
+        println!();
+        println!("[telegram]");
+        println!("enabled = {}", daemon_cfg.telegram.enabled);
+        println!("poll_interval_secs = {}", daemon_cfg.telegram.poll_interval_secs);
+        let policy_str = match daemon_cfg.telegram.dm_policy {
+            config::DmPolicy::Pairing => "pairing",
+            config::DmPolicy::Allowlist => "allowlist",
+            config::DmPolicy::Disabled => "disabled",
+        };
+        println!("dmPolicy = \"{policy_str}\"");
+        if token_present {
+            println!("bot_token = \"{token_mask}\"");
+        }
+        println!();
+        println!("[daemon]");
+        if let Some(ll) = &daemon_cfg.daemon.log_level {
+            println!("log_level = \"{ll}\"");
+        }
+        if let Some(p) = daemon_cfg.daemon.port {
+            println!("port = {p}");
+        }
+    }
+
+    std::process::ExitCode::SUCCESS
+}
+
+/// `claudebase daemon access pair <code>` (Slice 4).
+///
+/// Loads access.json, redeems the code via constant-time compare
+/// (SEC-16), saves atomically (SEC-12). The error message for unknown /
+/// invalid format is generic — the operator does NOT learn which check
+/// failed, defeating timing + content side-channels.
+fn run_daemon_access_pair(args: &cli::DaemonAccessPairArgs) -> std::process::ExitCode {
+    use claudebase::daemon::permissions;
+
+    let path = permissions::user_level_access_json_path();
+    let mut access = match permissions::load_access(&path) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("error: failed to load access.json: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
+    let now = permissions::now_ms();
+    match permissions::redeem_pairing_code(&mut access, &args.code, now) {
+        Ok(user_id) => {
+            if let Err(e) = permissions::save_access(&path, &access) {
+                eprintln!("error: failed to save access.json: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+            println!("paired user_id={user_id}");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            // Display impl returns the same string for `Unknown` and
+            // `InvalidFormat` (SEC-16). `Expired` surfaces distinctly so
+            // operators can re-issue a code.
+            eprintln!("error: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// `claudebase daemon access list` (Slice 4).
+///
+/// Prints authorized users + pending-code count. Pending codes themselves
+/// are NEVER printed (SEC-16 — leaking active codes defeats the
+/// constant-time-pair flow). `allowFrom` user ids are shown verbatim.
+fn run_daemon_access_list(args: &cli::DaemonAccessListArgs) -> std::process::ExitCode {
+    use claudebase::daemon::permissions;
+
+    let path = permissions::user_level_access_json_path();
+    let access = match permissions::load_access(&path) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("error: failed to load access.json: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
+    let summary = permissions::redacted_summary(&access);
+    if args.json {
+        println!("{}", summary);
+    } else {
+        let policy = summary.get("dmPolicy").map(|v| v.to_string()).unwrap_or_default();
+        let allow: Vec<i64> = summary
+            .get("allowFrom")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+            .unwrap_or_default();
+        let pending_count = summary.get("pending_count").and_then(|v| v.as_i64()).unwrap_or(0);
+        println!("dmPolicy = {policy}");
+        print!("allowFrom = [");
+        for (i, u) in allow.iter().enumerate() {
+            if i > 0 {
+                print!(", ");
+            }
+            print!("{u}");
+        }
+        println!("]");
+        println!("pending = {pending_count}");
+    }
+    std::process::ExitCode::SUCCESS
 }
 
 /// `insight create "<body>"` — agent write surface for the insights corpus

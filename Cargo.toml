@@ -75,6 +75,25 @@ uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
+# Slice 4 — agent-chat-daemon Telegram bot integration.
+# teloxide 0.17 is the current stable release (task spec said "0.13" but the
+# latest published version on crates.io as of this commit is 0.17.0 —
+# verified via `cargo search teloxide`). default-features=false to avoid
+# pulling sqlx + dialogue + macros we don't need; we only consume the bare
+# Bot client + getUpdates long-poll surface.
+teloxide = { version = "0.17", default-features = false, features = ["ctrlc_handler"] }
+
+# Slice 4 — daemon.toml + secrets.toml loaders.
+toml = "0.8"
+
+# Slice 4 — OS-CSPRNG seed for pairing codes (SEC-11). getrandom 0.2 is the
+# stable line; 0.3 exists but propagates breaking-API churn we don't need.
+getrandom = "0.2"
+
+# Slice 4 — Url::parse for TELOXIDE_API_URL override (test/mock hook).
+# Same version teloxide → reqwest transitively pin so cargo unifies on one.
+url = "2"
+
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
@@ -85,6 +104,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "ne
 interprocess = { version = "2", features = ["tokio"] }
 serde_json = "1"
 anyhow = "1"
+
+# Slice 4 TDD integration tests: Telegram mock + e2e roundtrip
+httpmock = "0.7"
 
 # Unix-specific signal handling (SIGTERM in daemon_single_instance tests)
 [target.'cfg(unix)'.dev-dependencies]

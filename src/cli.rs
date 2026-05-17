@@ -447,6 +447,11 @@ pub enum DaemonSubcommand {
     /// Bind the UDS / named pipe and serve concurrent IPC connections.
     /// Single-instance enforced via fslock on `daemon.pid`.
     Serve(DaemonServeArgs),
+    /// `daemon config edit` / `daemon config show` — manage daemon.toml.
+    Config(DaemonConfigArgs),
+    /// `daemon access pair <code>` / `daemon access list` — manage access.json
+    /// (telegram permission/pairing flow, Slice 4).
+    Access(DaemonAccessArgs),
 }
 
 /// `claudebase daemon serve` — no flags in Slice 1a. The runtime dir
@@ -454,6 +459,83 @@ pub enum DaemonSubcommand {
 /// (Windows). Slice 2 adds `--config`, `--log-level`, etc.
 #[derive(Args, Debug)]
 pub struct DaemonServeArgs {}
+
+/// `claudebase daemon config ...` — daemon.toml management subcommands.
+#[derive(Args, Debug)]
+pub struct DaemonConfigArgs {
+    #[command(subcommand)]
+    pub sub: DaemonConfigSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DaemonConfigSubcommand {
+    /// Open daemon.toml in `$EDITOR` (defaults to `vi`). Re-parses on
+    /// editor exit; refuses to keep malformed TOML — exits 1 with a
+    /// parse-error message that includes the literal "TOML" or "parse"
+    /// so TC-4.13's substring match catches it. SEC-16: invokes editor
+    /// via `Command::new(editor).arg(path)` — NEVER via `sh -c`.
+    Edit(DaemonConfigEditArgs),
+    /// Print current configuration. Loads daemon.toml AND secrets.toml
+    /// (with token masked to `"***"` per SEC-10). Human-readable TOML
+    /// by default; `--json` switches to JSON for machine consumers.
+    Show(DaemonConfigShowArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct DaemonConfigEditArgs {
+    /// Project-root parity — unused (config is user-level).
+    #[arg(long)]
+    pub project_root: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct DaemonConfigShowArgs {
+    /// Project-root parity — unused (config is user-level).
+    #[arg(long)]
+    pub project_root: Option<PathBuf>,
+    /// Emit JSON instead of TOML.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `claudebase daemon access ...` — access.json management subcommands.
+#[derive(Args, Debug)]
+pub struct DaemonAccessArgs {
+    #[command(subcommand)]
+    pub sub: DaemonAccessSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DaemonAccessSubcommand {
+    /// `daemon access pair <CODE>` — redeem a pairing code emitted by the
+    /// bot in response to `/start`. On success the corresponding telegram
+    /// user id is added to access.json `allowFrom` and the pending entry
+    /// is removed. SEC-16: code lookup uses constant-time compare; the
+    /// error message does NOT distinguish "invalid format" from "unknown
+    /// code" (both surface the same generic message).
+    Pair(DaemonAccessPairArgs),
+    /// `daemon access list` — print authorized users + pending-code count.
+    /// Pending codes themselves are NEVER printed (would defeat SEC-16's
+    /// constant-time compare). Output is JSON when `--json` is set.
+    List(DaemonAccessListArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct DaemonAccessPairArgs {
+    /// The 6-char pairing code the user received from the bot. Must match
+    /// the base32-no-confusables alphabet `^[A-HJ-NP-Z2-9]{6}$`.
+    pub code: String,
+    #[arg(long)]
+    pub project_root: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct DaemonAccessListArgs {
+    #[arg(long)]
+    pub project_root: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+}
 
 /// `claudebase plugin ...` — plugin subcommands. Slice 1a only exposes
 /// `serve`; the stub returns an error so harness wiring is testable

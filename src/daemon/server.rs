@@ -195,6 +195,49 @@ fn reap_on_boot_stub() -> anyhow::Result<()> {
 /// never — Slice 1d adds the SIGTERM handler that closes the listener
 /// and returns cleanly). Errors propagate up to `main.rs` and exit 1.
 pub async fn serve(_args: &DaemonServeArgs) -> anyhow::Result<()> {
+    // Slice 4 — Telegram secrets perm-check FIRST, before ANY other I/O.
+    // This must precede the parent_dir + fslock acquire so it can refuse
+    // a bad-perm secrets.toml within ~100ms of process start (TC-4.14
+    // sleeps only 1 second before checking try_wait()). The check uses
+    // symlink_metadata (lstat) + mode-mask — no other side effects, so a
+    // failed check is the fastest possible exit path.
+    //
+    // Using symlink_metadata (lstat) prior to file open is the
+    // load-bearing TOCTOU mitigation against `ln -s /etc/whatever
+    // ~/.config/claudebase/secrets.toml` confusion attacks. The literal
+    // "must have permissions 0600" stderr is required by TC-4.14.
+    use crate::daemon::config;
+    let secrets_path = config::user_level_secrets_toml_path();
+    let telegram_token_opt: Option<config::RedactedToken> =
+        match std::fs::symlink_metadata(&secrets_path) {
+            Ok(_) => match config::load_secrets_toml(&secrets_path) {
+                Ok(s) => Some(s.telegram.bot_token),
+                Err(e) => {
+                    // SEC-9: print the literal failure to stderr and
+                    // exit 1. We use eprintln! directly so the message
+                    // lands on stderr even before init_tracing — TC-4.14
+                    // captures process stderr.
+                    eprintln!("error: {e}");
+                    anyhow::bail!("secrets.toml load failed");
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                eprintln!("error: failed to stat secrets.toml: {e}");
+                anyhow::bail!("secrets.toml stat failed");
+            }
+        };
+
+    // SEC-15: also validate daemon.toml if present (symlink + no
+    // bot_token field). Skip silently if absent.
+    let daemon_toml_path = config::user_level_daemon_toml_path();
+    if daemon_toml_path.exists() {
+        if let Err(e) = config::load_daemon_toml(&daemon_toml_path) {
+            eprintln!("error: {e}");
+            anyhow::bail!("daemon.toml load failed");
+        }
+    }
+
     let parent = parent_dir()?;
     ensure_parent_dir(&parent)?;
 
@@ -328,6 +371,19 @@ pub async fn serve(_args: &DaemonServeArgs) -> anyhow::Result<()> {
     // Slice 3: per-thread broadcast bus shared between every connection
     // handler. Lives for the daemon's entire lifetime.
     let bus: SharedBus = Arc::new(ChatBus::new());
+
+    // Slice 4 — spawn the Telegram long-poll task IFF a perm-checked
+    // secrets.toml is present. The spawn is fire-and-forget: ASYNC_INVARIANTS
+    // Rule 3 wraps the long-poll body so a fatal Telegram error logs
+    // structured (token-redacted) and the rest of the daemon keeps
+    // serving MCP plugins. When secrets.toml is absent the daemon runs
+    // chat-only (Slice 1-3 behaviour unchanged).
+    if let Some(token) = telegram_token_opt {
+        let access_path = crate::daemon::permissions::user_level_access_json_path();
+        let bus_for_tg = bus.clone();
+        let _ = crate::daemon::telegram::spawn_long_poll(token, access_path, bus_for_tg);
+        tracing::info!("telegram long-poll spawned");
+    }
 
     // Accept loop. We never return Ok(()) from here in Slice 1a — the
     // daemon runs until killed. Slice 1d will wire a SIGTERM cancel

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "claudebase": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/target/release/claudebase",
+      "args": ["plugin", "serve"]
+    }
+  }
+}

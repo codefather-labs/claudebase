@@ -95,6 +95,12 @@ getrandom = "0.2"
 # no transitive deps beyond core.
 hex = "0.4"
 
+# Slice 7.x — ISO 8601 timestamp formatting in the channel notification
+# `meta.ts` field (server.ts:1271
+# `new Date(date*1000).toISOString()`). Default features pulled in
+# transitively via teloxide already — explicit dep avoids divergence.
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
 # Slice 4 — Url::parse for TELOXIDE_API_URL override (test/mock hook).
 # Same version teloxide → reqwest transitively pin so cargo unifies on one.
 url = "2"

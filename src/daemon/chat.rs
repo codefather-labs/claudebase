@@ -183,6 +183,74 @@ pub fn build_channel_notification_routed(
     })
 }
 
+/// Telegram-specific meta fields populated by `process_batch_with_pairing`
+/// for the channel-notification builder. Mirrors the official Anthropic
+/// telegram plugin's meta shape (server.ts:1264-1280) so Claude Code's
+/// channel surface parses `chat_id` / `user` / `user_id` / `ts` and emits
+/// the `<channel source="claudebase" chat_id="..." user="..." user_id="..."
+/// ts="..." message_id="...">` tag correctly. Live-test 2026-05-18:
+/// the flat-shape `{thread, from_agent, message_id, ts (number)}` we used
+/// pre-fix delivered to the plugin via UDS bus but Claude Code's surface
+/// silently dropped it because the surface parser expects these exact
+/// field names + types.
+#[derive(Debug, Clone)]
+pub struct TelegramMessageMeta {
+    /// `msg.chat.id` — i64 number, serialised as JSON number (not string).
+    pub chat_id: i64,
+    /// `msg.message_id` — i64 number, serialised as STRING per
+    /// server.ts:1268 `String(msgId)`.
+    pub message_id_str: String,
+    /// `msg.from.username` OR `String(msg.from.id)` fallback when no
+    /// username — per server.ts:1269.
+    pub user: String,
+    /// `String(msg.from.id)` — numeric Telegram user ID as string per
+    /// server.ts:1270.
+    pub user_id: String,
+    /// ISO 8601 UTC string derived from `msg.date * 1000` per
+    /// server.ts:1271 `new Date((ctx.message?.date ?? 0) * 1000).toISOString()`.
+    pub ts_iso8601: String,
+}
+
+/// Build the `notifications/claude/channel` frame with the official
+/// telegram-plugin meta shape. Used by `daemon::telegram::process_batch_
+/// with_pairing` — the Telegram inbound surface.
+///
+/// `target_agent_id` is the optional @-mention routing hint
+/// (`meta.target_agent_id` per claudebase Slice 7). When `None`, the
+/// key is OMITTED from the meta object — NOT set to `null`.
+pub fn build_channel_notification_telegram(
+    content: &str,
+    tg_meta: &TelegramMessageMeta,
+    target_agent_id: Option<&str>,
+) -> Value {
+    let mut params = serde_json::Map::new();
+    params.insert("content".into(), Value::String(content.to_string()));
+
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "chat_id".into(),
+        Value::Number(serde_json::Number::from(tg_meta.chat_id)),
+    );
+    meta.insert(
+        "message_id".into(),
+        Value::String(tg_meta.message_id_str.clone()),
+    );
+    meta.insert("user".into(), Value::String(tg_meta.user.clone()));
+    meta.insert("user_id".into(), Value::String(tg_meta.user_id.clone()));
+    meta.insert("ts".into(), Value::String(tg_meta.ts_iso8601.clone()));
+
+    if let Some(id) = target_agent_id {
+        meta.insert("target_agent_id".into(), Value::String(id.to_string()));
+    }
+    params.insert("meta".into(), Value::Object(meta));
+
+    json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/claude/channel",
+        "params": Value::Object(params),
+    })
+}
+
 /// Apply schema v5 + v6 to a chat.db connection. Idempotent — all
 /// statements use `IF NOT EXISTS` / `INSERT OR IGNORE`. Wrapped in a
 /// BEGIN/COMMIT transaction so partial-failure recovery is clean.

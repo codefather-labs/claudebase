@@ -776,6 +776,7 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "async-trait",
+ "chrono",
  "clap",
  "fastembed",
  "fslock",

@@ -109,6 +109,12 @@ pub struct Message {
     #[serde(default)]
     pub from: Option<User>,
     pub chat: Chat,
+    /// Unix epoch seconds when the sender's client posted the message.
+    /// Used to build the `meta.ts` ISO 8601 string in the channel
+    /// notification — matches the official telegram plugin
+    /// (server.ts:1271 `new Date((ctx.message?.date ?? 0) * 1000).toISOString()`).
+    #[serde(default)]
+    pub date: i64,
     #[serde(default)]
     pub text: Option<String>,
     /// When `voice` is present and `text` is absent, the bot received a
@@ -527,17 +533,33 @@ pub fn process_batch_with_pairing(
                 None
             };
 
-        let msg_for_notif = chat::ChatMessage {
-            id: id.clone(),
-            thread_id: thread_id.clone(),
-            from_agent: from_agent.clone(),
-            content: content.clone(),
-            reply_to: None,
-            created_at: row_now,
+        // Slice 7.x — build the official-telegram-plugin-shaped meta so
+        // Claude Code's channel surface parses chat_id / user / user_id /
+        // ts and emits a usable <channel ...> tag. The legacy
+        // build_channel_notification_routed (thread + from_agent +
+        // numeric ts) delivers via UDS but Claude Code surface silently
+        // drops it.
+        let user_display = msg
+            .from
+            .as_ref()
+            .and_then(|u| u.username.as_ref())
+            .cloned()
+            .unwrap_or_else(|| user_id.to_string());
+        let ts_iso = ts_seconds_to_iso8601(msg.date);
+        let tg_meta = chat::TelegramMessageMeta {
+            chat_id,
+            message_id_str: msg.message_id.to_string(),
+            user: user_display,
+            user_id: user_id.to_string(),
+            ts_iso8601: ts_iso,
         };
         notifications.push((
             thread_id.clone(),
-            chat::build_channel_notification_routed(&msg_for_notif, target_agent_id.as_deref()),
+            chat::build_channel_notification_telegram(
+                &content,
+                &tg_meta,
+                target_agent_id.as_deref(),
+            ),
         ));
     }
 
@@ -565,6 +587,18 @@ fn chrono_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Convert Telegram's `msg.date` (epoch SECONDS, not millis) to an
+/// ISO 8601 UTC string matching JS `new Date(seconds*1000).toISOString()`
+/// (server.ts:1271). Format: `2026-05-18T20:13:13.000Z`. Returns a
+/// safe fallback (`1970-01-01T00:00:00.000Z`) on out-of-range seconds.
+fn ts_seconds_to_iso8601(date_seconds: i64) -> String {
+    use chrono::{DateTime, SecondsFormat, Utc};
+    match DateTime::<Utc>::from_timestamp(date_seconds, 0) {
+        Some(dt) => dt.to_rfc3339_opts(SecondsFormat::Millis, true),
+        None => "1970-01-01T00:00:00.000Z".to_string(),
+    }
 }
 
 /// Read the persisted offset from daemon_state. Returns 0 when the row
@@ -1319,6 +1353,7 @@ mod tests {
         let batch = vec![Update {
             update_id: 1,
             message: Some(Message {
+                date: 0,
                 message_id: 1,
                 from: Some(User { id: 7, username: Some("u".into()) }),
                 chat: Chat { id: 42 },
@@ -1360,6 +1395,7 @@ mod tests {
         let batch = vec![Update {
             update_id: 1,
             message: Some(Message {
+                date: 0,
                 message_id: 1,
                 from: Some(User { id: 7, username: None }),
                 chat: Chat { id: 42 },
@@ -1393,6 +1429,7 @@ mod tests {
         let batch = vec![Update {
             update_id: 1,
             message: Some(Message {
+                date: 0,
                 message_id: 1,
                 from: Some(User { id: 7, username: None }),
                 chat: Chat { id: 42 },
@@ -1467,6 +1504,7 @@ mod tests {
         let batch = vec![Update {
             update_id: 1,
             message: Some(Message {
+                date: 0,
                 message_id: 1,
                 from: Some(User { id: 7, username: None }),
                 chat: Chat { id: 42 },
@@ -1509,6 +1547,7 @@ mod tests {
         let batch = vec![Update {
             update_id: 7,
             message: Some(Message {
+                date: 0,
                 message_id: 100,
                 from: Some(User {
                     id: 1001,
@@ -1538,6 +1577,7 @@ mod tests {
         let batch = vec![Update {
             update_id: 9,
             message: Some(Message {
+                date: 0,
                 message_id: 100,
                 from: Some(User {
                     id: 1001,
@@ -1567,6 +1607,7 @@ mod tests {
         let batch = vec![Update {
             update_id: 3,
             message: Some(Message {
+                date: 0,
                 message_id: 200,
                 from: Some(User {
                     id: 1001,

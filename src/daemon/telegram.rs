@@ -573,7 +573,15 @@ async fn run_long_poll(
         let updates_result = bot
             .get_updates()
             .offset(offset.saturating_add(1) as i32)
-            .timeout(25u32)
+            // Long-poll timeout MUST be strictly less than teloxide's default
+            // reqwest client timeout (17 seconds — see teloxide-core/src/net.rs
+            // doc comment "If you are using the polling mechanism to get updates,
+            // the timeout configured in the client should be bigger than the
+            // polling timeout"). 10s leaves comfortable margin for TLS handshake
+            // + first-byte. Fix surfaced on live test: 25s caused
+            // `reqwest::Error::request` after 17s client-side cutoff before
+            // server long-poll resolved.
+            .timeout(10u32)
             .await;
 
         let raw_updates = match updates_result {

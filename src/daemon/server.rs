@@ -206,9 +206,25 @@ pub async fn serve(_args: &DaemonServeArgs) -> anyhow::Result<()> {
     // load-bearing TOCTOU mitigation against `ln -s /etc/whatever
     // ~/.config/claudebase/secrets.toml` confusion attacks. The literal
     // "must have permissions 0600" stderr is required by TC-4.14.
-    use crate::daemon::config;
+    use crate::daemon::{channel_state, config};
+    // Slice 7.x — 1:1 port of the official Anthropic telegram plugin's
+    // token source: `~/.claude/channels/claudebase/.env` with
+    // `TELEGRAM_BOT_TOKEN=...`. This is what the `/claudebase:configure
+    // <token>` skill writes, so making it the primary source unifies the
+    // skill UX with the daemon load path. The legacy
+    // `~/.config/claudebase/secrets.toml` source remains the FALLBACK so
+    // existing installs keep working without re-configuration.
+    let env_path = channel_state::env_file_path();
+    let env_token = match channel_state::load_bot_token_from_env(&env_path) {
+        Ok(opt) => opt.map(config::RedactedToken::new),
+        Err(e) => {
+            eprintln!("error: {e}");
+            anyhow::bail!(".env load failed");
+        }
+    };
+
     let secrets_path = config::user_level_secrets_toml_path();
-    let telegram_token_opt: Option<config::RedactedToken> =
+    let secrets_token_opt: Option<config::RedactedToken> =
         match std::fs::symlink_metadata(&secrets_path) {
             Ok(_) => match config::load_secrets_toml(&secrets_path) {
                 Ok(s) => Some(s.telegram.bot_token),
@@ -227,6 +243,10 @@ pub async fn serve(_args: &DaemonServeArgs) -> anyhow::Result<()> {
                 anyhow::bail!("secrets.toml stat failed");
             }
         };
+
+    // .env takes precedence over secrets.toml — `/claudebase:configure`
+    // skill is the canonical setup path going forward.
+    let telegram_token_opt: Option<config::RedactedToken> = env_token.or(secrets_token_opt);
 
     // SEC-15: also validate daemon.toml if present (symlink + no
     // bot_token field). Skip silently if absent.

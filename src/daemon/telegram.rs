@@ -62,6 +62,7 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use crate::daemon::asr::Asr;
+use crate::daemon::channel_state::{self, GateAction};
 use crate::daemon::chat::{self, SharedBus};
 use crate::daemon::config::RedactedToken;
 use crate::daemon::permissions::{self, Access};
@@ -208,6 +209,17 @@ pub struct BatchOutcome {
     /// `(thread_id, channel_notification_frame)`. The async long-poll
     /// caller iterates these and calls `bus.publish(thread, frame).await`.
     pub notifications: Vec<(String, serde_json::Value)>,
+    /// Pair-action replies pending bot.send_message. Each tuple is
+    /// `(chat_id, formatted_text)` matching the official telegram plugin's
+    /// `gate(ctx)` Pair branch (server.ts:910-915). The async long-poll
+    /// caller iterates these and sends via teloxide AFTER the DB
+    /// transaction commits.
+    pub pair_replies: Vec<(i64, String)>,
+    /// True when the gate code mutated `channel_state::Access.pending`
+    /// (a new code was issued OR a `replies` counter incremented). The
+    /// async caller MUST save access.json when set; otherwise the next
+    /// inbound DM from the same sender re-issues a different code.
+    pub access_dirty: bool,
 }
 
 /// Strip occurrences of the bot token from any error string before it
@@ -250,6 +262,8 @@ pub fn process_batch(
             new_offset: None,
             messages_inserted: 0,
             notifications: Vec::new(),
+            pair_replies: Vec::new(),
+            access_dirty: false,
         });
     }
 
@@ -392,6 +406,154 @@ pub fn process_batch(
         new_offset: Some(max_id),
         messages_inserted: inserted,
         notifications,
+        pair_replies: Vec::new(),
+        access_dirty: false,
+    })
+}
+
+/// Process one batch with full official-telegram-plugin gating semantics
+/// (channel_state::Access — DmPolicy{Pairing,Allowlist,Disabled}, pending
+/// codes, replies counter, format_pair_reply). Mirrors server.ts:900-916
+/// for the per-update gate decision; the post-gate insert/broadcast path
+/// reuses the SEC-13 transactional invariants from `process_batch`.
+///
+/// The function mutates `access` in-place when a new pairing code is
+/// issued OR an existing entry's `replies` counter increments. The caller
+/// inspects `BatchOutcome.access_dirty` and saves access.json when true.
+///
+/// `pair_replies` is populated with `(chat_id, formatted_text)` tuples
+/// for the async caller to send via `bot.send_message`. Pair-action
+/// inbound DMs do NOT advance into chat.db and do NOT broadcast — the
+/// pairing-code reply is the entire visible side-effect.
+pub fn process_batch_with_pairing(
+    conn: &mut Connection,
+    access: &mut channel_state::Access,
+    batch: &[Update],
+) -> Result<BatchOutcome> {
+    if batch.is_empty() {
+        return Ok(BatchOutcome {
+            new_offset: None,
+            messages_inserted: 0,
+            notifications: Vec::new(),
+            pair_replies: Vec::new(),
+            access_dirty: false,
+        });
+    }
+
+    // Drop expired entries before any gate decision (server.ts:229).
+    let now = channel_state::now_ms();
+    let pruned = channel_state::prune_expired(access, now);
+    let mut dirty = pruned;
+
+    let tx = conn.transaction()?;
+    let mut max_id: i64 = 0;
+    let mut inserted: usize = 0;
+    let mut notifications: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut pair_replies: Vec<(i64, String)> = Vec::new();
+
+    for update in batch {
+        if update.update_id > max_id {
+            max_id = update.update_id;
+        }
+        let Some(msg) = &update.message else {
+            continue;
+        };
+
+        let chat_id = msg.chat.id;
+        let user_id = msg.from.as_ref().map(|u| u.id).unwrap_or(0);
+        // Telegram numeric IDs serialised as strings — matches the
+        // official plugin's access.json schema and the user-facing skill.
+        let sender_id_str = user_id.to_string();
+        let chat_id_str = chat_id.to_string();
+
+        // Run the gate. server.ts:225-267 semantics — Disabled drops all,
+        // allowFrom hit delivers, Pairing+unknown emits a code, Allowlist+
+        // unknown drops, pending cap drops, MAX_PAIRING_REPLIES drops.
+        let action = channel_state::gate_dm(access, &sender_id_str, &chat_id_str, now);
+
+        match action {
+            GateAction::Drop => continue,
+            GateAction::Pair { code, is_resend } => {
+                dirty = true;
+                let text = channel_state::format_pair_reply(&code, is_resend);
+                pair_replies.push((chat_id, text));
+                // Pair-action does NOT insert into chat.db and does NOT
+                // broadcast to subscribers — matches server.ts:910-915.
+                continue;
+            }
+            GateAction::Deliver => {
+                // fall through to insert + broadcast
+            }
+        }
+
+        let thread_id = format!("telegram:{}", chat_id);
+        let from_agent = match &msg.from.as_ref().and_then(|u| u.username.as_ref()) {
+            Some(name) => format!("telegram:{name}"),
+            None => format!("telegram:{user_id}"),
+        };
+
+        let content = match (&msg.text, &msg.voice) {
+            (Some(text), _) => text.clone(),
+            (None, Some(_)) => VOICE_SHIM_TEXT.to_string(),
+            (None, None) => continue,
+        };
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let row_now = chrono_millis();
+        tx.execute(
+            "INSERT OR IGNORE INTO chat_threads (id, created_at) VALUES (?1, ?2)",
+            params![thread_id, row_now],
+        )?;
+        tx.execute(
+            "INSERT INTO chat_messages \
+             (id, thread_id, from_agent, content, reply_to, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, thread_id, from_agent, content, Option::<String>::None, row_now],
+        )?;
+        inserted += 1;
+
+        // Slice 7 — @-mention routing (same as process_batch).
+        let target_agent_id: Option<String> =
+            if let Some(mention) = extract_first_mention(&content) {
+                let alive = crate::daemon::agent_registry::list_alive(&tx, Some(&thread_id))
+                    .unwrap_or_default();
+                let mention_lower = mention.to_ascii_lowercase();
+                let target = alive
+                    .into_iter()
+                    .filter(|r| r.agent_name.to_ascii_lowercase() == mention_lower)
+                    .max_by_key(|r| r.spawned_at);
+                target.map(|row| row.agent_id)
+            } else {
+                None
+            };
+
+        let msg_for_notif = chat::ChatMessage {
+            id: id.clone(),
+            thread_id: thread_id.clone(),
+            from_agent: from_agent.clone(),
+            content: content.clone(),
+            reply_to: None,
+            created_at: row_now,
+        };
+        notifications.push((
+            thread_id.clone(),
+            chat::build_channel_notification_routed(&msg_for_notif, target_agent_id.as_deref()),
+        ));
+    }
+
+    tx.execute(
+        "UPDATE daemon_state SET value = ?1 WHERE key = 'telegram.last_update_id'",
+        params![max_id.to_string()],
+    )?;
+
+    tx.commit()?;
+
+    Ok(BatchOutcome {
+        new_offset: Some(max_id),
+        messages_inserted: inserted,
+        notifications,
+        pair_replies,
+        access_dirty: dirty,
     })
 }
 
@@ -465,6 +627,17 @@ pub fn spawn_long_poll(
         );
     }
 
+    // Slice 7.x — spawn the approved-dir polling task alongside the
+    // long-poll. The official telegram plugin server.ts:351 starts the
+    // same `setInterval(checkApprovals, 5000)` so the bot can confirm
+    // pairings out-of-band. Rust port: a separate tokio task with the
+    // same 5s cadence, sharing only the bot token (constructs its own
+    // teloxide::Bot).
+    let approved_token = token.clone();
+    tokio::spawn(async move {
+        run_approved_polling(approved_token).await;
+    });
+
     tokio::spawn(async move {
         // ASYNC_INVARIANTS Rule 3 — wrap the long-poll body so any
         // unhandled error logs structured (without leaking the token) and
@@ -477,6 +650,84 @@ pub fn spawn_long_poll(
             );
         }
     })
+}
+
+/// Approved-dir polling — 1:1 port of `checkApprovals` (server.ts:331-349)
+/// + `setInterval(checkApprovals, 5000)` (server.ts:351).
+///
+/// Every 5 seconds, scans `~/.claude/channels/claudebase/approved/`. For
+/// each file `<senderId>`, reads the file contents as the `chatId`, sends
+/// `"Paired! Say hi to Claude."` to that chat via teloxide, then unlinks
+/// the file regardless of send success (matches server.ts:344 — remove
+/// anyway so a broken-send doesn't loop).
+///
+/// The polling task runs forever; cancellation happens when the parent
+/// task drops the JoinHandle (daemon shutdown).
+async fn run_approved_polling(token: RedactedToken) {
+    use std::fs;
+
+    let bot = teloxide::Bot::new(token.as_str());
+    let token_for_redaction = token.as_str().to_string();
+    let dir = channel_state::approved_dir();
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        interval.tick().await;
+        // Read the dir entries. Missing dir = silent no-op (matches
+        // server.ts:336 `try { readdirSync } catch { return }`).
+        let entries = match fs::read_dir(&dir) {
+            Ok(it) => it,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            // The filename IS the senderId; for Telegram DMs chatId == senderId,
+            // but server.ts:340-344 deliberately uses the file contents (chatId)
+            // so this still works for group chats added later.
+            let chat_id_str = match fs::read_to_string(&path) {
+                Ok(s) => s.trim().to_string(),
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %path.display(), "approved file unreadable; removing");
+                    let _ = fs::remove_file(&path);
+                    continue;
+                }
+            };
+            let chat_id_int: i64 = match chat_id_str.parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    tracing::warn!(
+                        chat_id_str = %chat_id_str,
+                        path = %path.display(),
+                        "approved file chatId not parseable as i64; removing"
+                    );
+                    let _ = fs::remove_file(&path);
+                    continue;
+                }
+            };
+            // server.ts:341 — "Paired! Say hi to Claude." verbatim.
+            use teloxide::requests::Requester;
+            let send_res = bot
+                .send_message(
+                    teloxide::types::ChatId(chat_id_int),
+                    "Paired! Say hi to Claude.",
+                )
+                .await;
+            match send_res {
+                Ok(_) => tracing::info!(chat_id = chat_id_int, "paired-confirm sent"),
+                Err(e) => tracing::warn!(
+                    chat_id = chat_id_int,
+                    error = %redact_error_string(&format!("{e}"), &token_for_redaction),
+                    "paired-confirm send failed (file removed anyway)"
+                ),
+            }
+            // server.ts:344 — remove anyway, don't loop on a broken send.
+            let _ = fs::remove_file(&path);
+        }
+    }
 }
 
 /// Inner long-poll loop. Reads `getUpdates`, processes each batch
@@ -544,25 +795,36 @@ async fn run_long_poll(
     let mut consecutive_429_retries: u32 = 0;
     let token_for_error_redaction = token.as_str().to_string();
 
+    // Slice 7.x — 1:1 port of the official Anthropic telegram plugin.
+    // The skill-managed channel state lives at the path documented in
+    // `src/daemon/channel_state.rs` (`~/.claude/channels/claudebase/`),
+    // NOT the legacy `~/.config/claudebase/` location. The legacy
+    // `access_path` parameter is retained so existing CLI shims continue
+    // to compile but the long-poll body ignores it — channel_state owns
+    // state from here onward.
+    let _ = &access_path; // suppress unused-var lint without changing the API
+    let channel_access_path = channel_state::access_json_path();
+
     loop {
-        // Load access state fresh each poll. Slow change detection is
-        // acceptable for Slice 4 — operator-mediated `access pair` runs
-        // are infrequent.
-        let access = match permissions::load_access(&access_path) {
+        // Load channel state fresh each poll (Slice 7.x — operator
+        // mutations via `/claudebase:access pair <code>` and the bot's
+        // pair-action mutations happen out-of-band; one-poll lag is
+        // acceptable).
+        let mut cs_access = match channel_state::load_access(&channel_access_path) {
             Ok(a) => a,
             Err(e) => {
                 tracing::warn!(
                     error = %redact_error_string(&format!("{e}"), &token_for_error_redaction),
-                    "failed to load access.json (using defaults)"
+                    path = %channel_access_path.display(),
+                    "failed to load channel_state access.json (using defaults)"
                 );
-                Access::default()
+                channel_state::Access::default()
             }
         };
 
         // Open a fresh connection for this poll cycle so the long-running
         // task doesn't hold a Connection across .await. spawn_blocking
         // wraps the rusqlite work per Rule 2.
-        let access_clone = access.clone();
         let process_result = tokio::task::spawn_blocking(move || -> Result<(i64, BatchOutcome)> {
             let conn = chat::open_chat_db()
                 .context("open chat.db for telegram poll")?;
@@ -579,6 +841,8 @@ async fn run_long_poll(
                     new_offset: None,
                     messages_inserted: 0,
                     notifications: Vec::new(),
+                    pair_replies: Vec::new(),
+                    access_dirty: false,
                 },
             ))
         })
@@ -758,20 +1022,20 @@ async fn run_long_poll(
             }
         }
 
-        let access_clone = access_clone;
         let batch = decoded;
-        let process_outcome = tokio::task::spawn_blocking(move || -> Result<BatchOutcome> {
-            let mut conn = chat::open_chat_db()?;
-            // Pass `None` for the bus argument — process_batch returns the
-            // notification queue in `BatchOutcome.notifications` and we
-            // publish from the async side below (bus.publish is async and
-            // would deadlock spawn_blocking).
-            process_batch(&mut conn, &access_clone, None, &batch)
-        })
+        let access_for_spawn = cs_access.clone();
+        let process_outcome = tokio::task::spawn_blocking(
+            move || -> Result<(BatchOutcome, channel_state::Access)> {
+                let mut conn = chat::open_chat_db()?;
+                let mut access_local = access_for_spawn;
+                let outcome = process_batch_with_pairing(&mut conn, &mut access_local, &batch)?;
+                Ok((outcome, access_local))
+            },
+        )
         .await;
 
         match process_outcome {
-            Ok(Ok(outcome)) => {
+            Ok(Ok((outcome, mutated_access))) => {
                 if outcome.messages_inserted > 0 {
                     tracing::info!(
                         inserted = outcome.messages_inserted,
@@ -779,11 +1043,55 @@ async fn run_long_poll(
                         "telegram batch persisted"
                     );
                 }
+                // Persist any access.json mutation BEFORE sending pair
+                // replies — if the bot.send_message fails midway we want
+                // the pending entry on disk so the next inbound DM resends
+                // (or hits the existing-code branch in gate_dm).
+                if outcome.access_dirty {
+                    let path_clone = channel_access_path.clone();
+                    let access_to_save = mutated_access.clone();
+                    let save_res = tokio::task::spawn_blocking(move || {
+                        channel_state::save_access(&path_clone, &access_to_save)
+                    })
+                    .await;
+                    match save_res {
+                        Ok(Ok(())) => {
+                            cs_access = mutated_access;
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                error = %e,
+                                path = %channel_access_path.display(),
+                                "failed to persist channel_state access.json — code may resend"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "channel_state save spawn_blocking panicked");
+                        }
+                    }
+                }
+
+                // Send pair-action replies via teloxide (server.ts:910-915).
+                for (chat_id, text) in outcome.pair_replies {
+                    match bot
+                        .send_message(teloxide::types::ChatId(chat_id), &text)
+                        .await
+                    {
+                        Ok(_) => tracing::info!(
+                            chat_id,
+                            "telegram pair reply sent"
+                        ),
+                        Err(e) => tracing::warn!(
+                            chat_id,
+                            error = %redact_error_string(&format!("{e}"), &token_for_error_redaction),
+                            "telegram pair reply send failed"
+                        ),
+                    }
+                }
+
                 // Publish post-commit notifications from the async side
                 // (Rule 4 cancellation-safety: bus.publish drops a
                 // broadcast send result, no held lock across the await).
-                // A subscriber count of 0 is the silent-no-op case
-                // documented in ChatBus::publish.
                 for (thread, frame) in outcome.notifications {
                     let n = bus.publish(&thread, frame).await;
                     tracing::debug!(

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "claudebase-marketplace",
+  "description": "Local development marketplace for claudebase — persistent agent-chat daemon with Telegram pairing, voice transcription, and agent_registry routing.",
+  "owner": {
+    "name": "codefather-labs"
+  },
+  "plugins": [
+    {
+      "name": "claudebase",
+      "description": "Persistent claudebase daemon: Telegram bot + Whisper voice transcription + agent_registry routing. Channel events surface directly into Claude Code's session.",
+      "category": "communication",
+      "source": "./",
+      "homepage": "https://github.com/codefather-labs/claudebase"
+    }
+  ]
+}

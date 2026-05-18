@@ -18,6 +18,7 @@
 
 pub mod agent_registry;
 pub mod asr;
+pub mod channel_state;
 pub mod chat;
 pub mod config;
 pub mod ipc;

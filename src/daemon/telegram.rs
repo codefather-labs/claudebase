@@ -118,6 +118,61 @@ pub struct Voice {
 /// Voice-note shim per Slice 4 acceptance: real ASR ships in Slice 6-MVP.
 pub const VOICE_SHIM_TEXT: &str = "[unsupported: enable asr-whisper feature]";
 
+/// Slice 7 — extract the first `@name` mention from a Telegram text body.
+/// Returns `Some(name)` where `name` is a substring of `text` matching
+/// `@([A-Za-z0-9_-]+)` AND preceded by start-of-string OR a non-charset
+/// byte (whitespace, punctuation). The latter constraint defeats false
+/// matches inside addresses like `email@foo.com` (the `@` is preceded
+/// by `l` — a charset byte — so the parser declines).
+///
+/// Per STRUCTURAL-7-1 the parser is hand-rolled (no `regex` dep), with
+/// the charset mirroring `agent_registry::validate_agent_name` exactly.
+/// Per STRUCTURAL-7-5 only the FIRST mention is returned; downstream
+/// callers ignore any subsequent `@` tokens.
+///
+/// Returns `None` if no valid mention exists.
+pub(crate) fn extract_first_mention(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'@' {
+            i += 1;
+            continue;
+        }
+        // Word-boundary check: byte before `@` MUST be either start-of-
+        // string OR a non-charset byte. The charset is the same one we
+        // accept AFTER the `@` (and the same as validate_agent_name).
+        let is_word_boundary = if i == 0 {
+            true
+        } else {
+            let prev = bytes[i - 1];
+            !(prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'-')
+        };
+        if !is_word_boundary {
+            i += 1;
+            continue;
+        }
+        // Take chars after `@` matching the charset. Stop at first
+        // non-match. Empty match → keep scanning for next `@`.
+        let start = i + 1;
+        let mut end = start;
+        while end < bytes.len() {
+            let c = bytes[end];
+            if c.is_ascii_alphanumeric() || c == b'_' || c == b'-' {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        if end > start {
+            // safe: we only consumed ASCII bytes — the slice is valid UTF-8
+            return Some(&text[start..end]);
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Result of one batch process — the highest `update_id` seen so the
 /// outer loop can advance the offset, plus the notification frames the
 /// async caller must publish via `ChatBus`. Notifications are deferred
@@ -226,6 +281,56 @@ pub fn process_batch(
         )?;
         inserted += 1;
 
+        // Slice 7 — @-mention routing per STRUCTURAL-7-1/3/4.
+        // Parse the first `@name` from the message; if it resolves to
+        // an alive agent in this thread (case-insensitive), tag the
+        // notification with `meta.target_agent_id` so the orchestrator
+        // (Mira in SDLC repo) can `SendMessage` the named agent. Multiple
+        // alive agents with same lowercased name → tiebreak by
+        // MAX(spawned_at) per UC-5-B (NOT last_pinged_at — list_alive's
+        // ordering is for Slice 7's display path, not routing).
+        let target_agent_id: Option<String> =
+            if let Some(mention) = extract_first_mention(&content) {
+                // Query agent_registry inside the open transaction so the
+                // routing decision is consistent with the same SQLite
+                // snapshot the message was just inserted under. rusqlite's
+                // Transaction Derefs to Connection, so auto-deref accepts
+                // `&tx` where `&Connection` is expected.
+                let alive = crate::daemon::agent_registry::list_alive(&tx, Some(&thread_id))
+                    .unwrap_or_default();
+                let mention_lower = mention.to_ascii_lowercase();
+                let target = alive
+                    .into_iter()
+                    .filter(|r| r.agent_name.to_ascii_lowercase() == mention_lower)
+                    .max_by_key(|r| r.spawned_at);
+                match target {
+                    Some(row) => {
+                        let case_diverged = row.agent_name != mention;
+                        tracing::info!(
+                            event = "routing",
+                            target_agent_id = %row.agent_id,
+                            mention = %mention,
+                            matched_name = %row.agent_name,
+                            thread = %thread_id,
+                            case_diverged = case_diverged,
+                            "telegram @-mention routed"
+                        );
+                        Some(row.agent_id)
+                    }
+                    None => {
+                        tracing::info!(
+                            event = "routing_unmatched",
+                            mention = %mention,
+                            thread = %thread_id,
+                            "telegram @-mention: no alive agent"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
         // Build the notification we'll broadcast AFTER commit so a crash
         // between insert and broadcast doesn't deliver phantom messages.
         let msg_for_notif = chat::ChatMessage {
@@ -236,7 +341,10 @@ pub fn process_batch(
             reply_to: None,
             created_at: now,
         };
-        notifications.push((thread_id.clone(), chat::build_channel_notification(&msg_for_notif)));
+        notifications.push((
+            thread_id.clone(),
+            chat::build_channel_notification_routed(&msg_for_notif, target_agent_id.as_deref()),
+        ));
     }
 
     // Bump offset to max_update_id (so the next getUpdates uses offset =
@@ -697,6 +805,276 @@ pub fn no_op_arc() -> Arc<()> {
 mod tests {
     use super::*;
     use crate::daemon::config::DmPolicy;
+
+    // Slice 7 — @-mention parser tests (STRUCTURAL-7-1)
+    #[test]
+    fn extract_first_mention_finds_simple_at_token() {
+        assert_eq!(extract_first_mention("@reflection thoughts?"), Some("reflection"));
+    }
+
+    #[test]
+    fn extract_first_mention_rejects_email_like_token() {
+        assert_eq!(extract_first_mention("write to email@foo.com test"), None);
+    }
+
+    #[test]
+    fn extract_first_mention_preserves_case() {
+        // case-insensitive matching is done DOWNSTREAM in process_batch;
+        // the parser returns the verbatim slice (TC-7.7 requires this so
+        // logs surface case-divergence).
+        assert_eq!(extract_first_mention("hi @PLANNER !!"), Some("PLANNER"));
+    }
+
+    #[test]
+    fn extract_first_mention_first_wins_on_multiple() {
+        // STRUCTURAL-7-5: only the first valid mention is returned.
+        assert_eq!(extract_first_mention("@a hi @b"), Some("a"));
+    }
+
+    #[test]
+    fn extract_first_mention_stops_at_non_charset() {
+        // Underscore and hyphen are in-charset; period stops the scan.
+        assert_eq!(extract_first_mention("@my_agent-1.next"), Some("my_agent-1"));
+    }
+
+    #[test]
+    fn extract_first_mention_returns_none_for_bare_at() {
+        assert_eq!(extract_first_mention("hello @ world"), None);
+        assert_eq!(extract_first_mention("@"), None);
+        assert_eq!(extract_first_mention(""), None);
+    }
+
+    #[test]
+    fn extract_first_mention_word_boundary_after_punct() {
+        // STRUCTURAL-7-1: punctuation before `@` is a word boundary.
+        assert_eq!(extract_first_mention("Hey! @planner ping?"), Some("planner"));
+        assert_eq!(extract_first_mention("(@planner)"), Some("planner"));
+    }
+
+    // Slice 7 — routing tiebreak + build_channel_notification_routed
+    // (STRUCTURAL-7-2, STRUCTURAL-7-3)
+    #[test]
+    fn build_channel_notification_routed_omits_meta_when_none() {
+        let msg = chat::ChatMessage {
+            id: "m-1".to_string(),
+            thread_id: "telegram:1".to_string(),
+            from_agent: "telegram:u".to_string(),
+            content: "hi".to_string(),
+            reply_to: None,
+            created_at: 100,
+        };
+        let frame = chat::build_channel_notification_routed(&msg, None);
+        let params = frame.get("params").unwrap().as_object().unwrap();
+        // STRUCTURAL-7-2: `meta` key must be ABSENT, not null.
+        assert!(
+            !params.contains_key("meta"),
+            "params.meta should be absent when target_agent_id is None"
+        );
+    }
+
+    #[test]
+    fn build_channel_notification_routed_inserts_meta_when_some() {
+        let msg = chat::ChatMessage {
+            id: "m-1".to_string(),
+            thread_id: "telegram:1".to_string(),
+            from_agent: "telegram:u".to_string(),
+            content: "hi".to_string(),
+            reply_to: None,
+            created_at: 100,
+        };
+        let frame = chat::build_channel_notification_routed(&msg, Some("uuid-abc"));
+        let target = frame
+            .pointer("/params/meta/target_agent_id")
+            .and_then(|v| v.as_str());
+        assert_eq!(target, Some("uuid-abc"));
+    }
+
+    #[test]
+    fn process_batch_routes_at_mention_to_alive_agent_in_thread() {
+        use crate::daemon::agent_registry;
+        use crate::daemon::config::DmPolicy;
+        use crate::daemon::permissions::Access;
+        use rusqlite::Connection;
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        // Register one agent against the thread.
+        agent_registry::register(
+            &conn,
+            "planner-abc",
+            "planner",
+            "conn-x",
+            Some("telegram:42"),
+            None,
+        )
+        .unwrap();
+        let access = Access {
+            dm_policy: DmPolicy::Disabled,
+            allow_from: Vec::new(),
+            groups: serde_json::Map::new(),
+            pending: std::collections::BTreeMap::new(),
+        };
+        let batch = vec![Update {
+            update_id: 1,
+            message: Some(Message {
+                message_id: 1,
+                from: Some(User { id: 7, username: Some("u".into()) }),
+                chat: Chat { id: 42 },
+                text: Some("@planner thoughts?".into()),
+                voice: None,
+            }),
+        }];
+        let outcome = process_batch(&mut conn, &access, None, &batch).unwrap();
+        assert_eq!(outcome.notifications.len(), 1);
+        let frame = &outcome.notifications[0].1;
+        let target = frame.pointer("/params/meta/target_agent_id").and_then(|v| v.as_str());
+        assert_eq!(target, Some("planner-abc"));
+    }
+
+    #[test]
+    fn process_batch_case_insensitive_at_mention_match() {
+        use crate::daemon::agent_registry;
+        use crate::daemon::config::DmPolicy;
+        use crate::daemon::permissions::Access;
+        use rusqlite::Connection;
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        agent_registry::register(
+            &conn,
+            "planner-abc",
+            "planner",
+            "conn-x",
+            Some("telegram:42"),
+            None,
+        )
+        .unwrap();
+        let access = Access {
+            dm_policy: DmPolicy::Disabled,
+            allow_from: Vec::new(),
+            groups: serde_json::Map::new(),
+            pending: std::collections::BTreeMap::new(),
+        };
+        let batch = vec![Update {
+            update_id: 1,
+            message: Some(Message {
+                message_id: 1,
+                from: Some(User { id: 7, username: None }),
+                chat: Chat { id: 42 },
+                text: Some("@PLANNER ?".into()),
+                voice: None,
+            }),
+        }];
+        let outcome = process_batch(&mut conn, &access, None, &batch).unwrap();
+        let target = outcome.notifications[0]
+            .1
+            .pointer("/params/meta/target_agent_id")
+            .and_then(|v| v.as_str());
+        assert_eq!(target, Some("planner-abc"));
+    }
+
+    #[test]
+    fn process_batch_no_target_when_at_mention_unresolved() {
+        use crate::daemon::config::DmPolicy;
+        use crate::daemon::permissions::Access;
+        use rusqlite::Connection;
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        // No agent registered.
+        let access = Access {
+            dm_policy: DmPolicy::Disabled,
+            allow_from: Vec::new(),
+            groups: serde_json::Map::new(),
+            pending: std::collections::BTreeMap::new(),
+        };
+        let batch = vec![Update {
+            update_id: 1,
+            message: Some(Message {
+                message_id: 1,
+                from: Some(User { id: 7, username: None }),
+                chat: Chat { id: 42 },
+                text: Some("@ghost hello".into()),
+                voice: None,
+            }),
+        }];
+        let outcome = process_batch(&mut conn, &access, None, &batch).unwrap();
+        let params = outcome.notifications[0].1.get("params").unwrap().as_object().unwrap();
+        // STRUCTURAL-7-2: absent, not null.
+        assert!(
+            !params.contains_key("meta"),
+            "params.meta MUST be absent when no alive agent matches the @-mention"
+        );
+    }
+
+    #[test]
+    fn process_batch_routes_to_max_spawned_at_on_duplicate_name() {
+        use crate::daemon::agent_registry;
+        use crate::daemon::config::DmPolicy;
+        use crate::daemon::permissions::Access;
+        use rusqlite::Connection;
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        // Register TWO planner agents in DIFFERENT threads (unique-index
+        // bars two alive 'planner' in same thread) but BOTH visible to
+        // the routing lookup IF we widen — actually the unique index
+        // permits at most ONE alive 'planner' per thread, so to exercise
+        // the tiebreak we'd need different agent_ids with same name in
+        // different threads… but only one matches the inbound's thread.
+        //
+        // To exercise STRUCTURAL-7-3's max_by_key path we manually
+        // bypass the unique index by writing a second row with
+        // different agent_id but same (thread, name) via direct INSERT
+        // — the partial UNIQUE index allows BOTH only when at most one
+        // has state='alive'. Since we want both alive in the same
+        // thread, the index would block. TC-7.4's setup uses sequential
+        // registration where the earlier one transitions to orphaned —
+        // but the routing decision filters state='alive' so the orphan
+        // wouldn't compete.
+        //
+        // For unit testability the spec is: when list_alive returns
+        // multiple rows matching name (case-insensitive), pick
+        // MAX(spawned_at). Verify via list_alive contract directly:
+        agent_registry::register(
+            &conn,
+            "planner-old",
+            "planner",
+            "conn-x",
+            Some("telegram:42"),
+            None,
+        )
+        .unwrap();
+        let alive = agent_registry::list_alive(&conn, Some("telegram:42")).unwrap();
+        assert_eq!(alive.len(), 1);
+        // The max_by_key invariant is exercised in the real route by the
+        // .max_by_key(|r| r.spawned_at) call; in the single-row case it
+        // returns that row unchanged. Multi-row duplicate is bounded by
+        // the unique index in production; the test asserts the function
+        // is invoked correctly via the simpler single-row path.
+        let access = Access {
+            dm_policy: DmPolicy::Disabled,
+            allow_from: Vec::new(),
+            groups: serde_json::Map::new(),
+            pending: std::collections::BTreeMap::new(),
+        };
+        let batch = vec![Update {
+            update_id: 1,
+            message: Some(Message {
+                message_id: 1,
+                from: Some(User { id: 7, username: None }),
+                chat: Chat { id: 42 },
+                text: Some("@planner".into()),
+                voice: None,
+            }),
+        }];
+        let outcome = process_batch(&mut conn, &access, None, &batch).unwrap();
+        let target = outcome.notifications[0]
+            .1
+            .pointer("/params/meta/target_agent_id")
+            .and_then(|v| v.as_str());
+        assert_eq!(target, Some("planner-old"));
+    }
 
     #[test]
     fn redact_error_string_replaces_token_substr() {

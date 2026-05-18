@@ -126,6 +126,48 @@ impl Default for ChatBus {
     }
 }
 
+/// Slice 7 — build the `notifications/claude/channel` frame with an
+/// optional `meta.target_agent_id` routing hint. When `target_agent_id`
+/// is `Some`, the `params.meta` object is inserted with that field; when
+/// `None`, the `meta` key is OMITTED entirely from `params` (NOT set to
+/// `null`) per the architect's STRUCTURAL-7-2 reading of TC-7.5 (which
+/// accepts both shapes; we choose `absent` as the idiomatic JSON form).
+///
+/// Kept as a SEPARATE function from `build_channel_notification` per
+/// STRUCTURAL-7-6: server.rs:916 (agent-to-agent `chat_post`/`chat_reply`)
+/// has no @-mention semantics and continues calling the original 1-arg
+/// builder. Only the Telegram inbound path in `daemon/telegram.rs`
+/// invokes the routed variant.
+pub fn build_channel_notification_routed(
+    msg: &ChatMessage,
+    target_agent_id: Option<&str>,
+) -> Value {
+    let mut params = serde_json::Map::new();
+    params.insert("thread".into(), Value::String(msg.thread_id.clone()));
+    params.insert(
+        "message".into(),
+        serde_json::json!({
+            "id": msg.id,
+            "thread_id": msg.thread_id,
+            "from_agent": msg.from_agent,
+            "content": msg.content,
+            "reply_to": msg.reply_to,
+            "created_at": msg.created_at,
+        }),
+    );
+    if let Some(id) = target_agent_id {
+        params.insert(
+            "meta".into(),
+            serde_json::json!({ "target_agent_id": id }),
+        );
+    }
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/claude/channel",
+        "params": Value::Object(params),
+    })
+}
+
 /// Apply schema v5 + v6 to a chat.db connection. Idempotent — all
 /// statements use `IF NOT EXISTS` / `INSERT OR IGNORE`. Wrapped in a
 /// BEGIN/COMMIT transaction so partial-failure recovery is clean.

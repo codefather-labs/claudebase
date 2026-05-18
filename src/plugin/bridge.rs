@@ -211,22 +211,29 @@ pub async fn run() -> anyhow::Result<()> {
             Inbound::Request { id, method, params } => {
                 match method.as_str() {
                     "initialize" => {
-                        // Validate protocolVersion.
+                        // MCP spec version negotiation: client sends its
+                        // preferred protocolVersion; server responds with
+                        // ITS preferred version (may differ). Client
+                        // decides whether it can downgrade. So we MUST
+                        // NOT reject on mismatch — just log and respond
+                        // with our supported version.
+                        //
+                        // Live-test discovery (2026-05-18): real Claude
+                        // Code sends a newer protocolVersion (e.g.
+                        // "2025-03-26" or "2025-06-18"); the original
+                        // Slice 1b strict-equality check returned
+                        // -32602 Invalid Params and the plugin failed
+                        // to connect. Relaxed to log-only.
                         let client_version = params
                             .get("protocolVersion")
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
                         if client_version != SUPPORTED_PROTOCOL_VERSION {
-                            let msg = format!(
-                                "unsupported protocolVersion: client requested '{}', server supports '{}'",
-                                client_version, SUPPORTED_PROTOCOL_VERSION
+                            tracing::info!(
+                                client_version = %client_version,
+                                server_version = SUPPORTED_PROTOCOL_VERSION,
+                                "protocolVersion mismatch; responding with server's version per MCP negotiation contract"
                             );
-                            write_mcp_line(
-                                &mut stdout,
-                                &error_response(id, ERROR_INVALID_PARAMS, &msg),
-                            )
-                            .await?;
-                            continue;
                         }
 
                         // SEC-5: log only clientInfo.name (≤64) + version (≤32).

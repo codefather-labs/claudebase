@@ -247,11 +247,14 @@ async fn test_plugin_initialize_returns_valid_mcp_response() {
     let _ = daemon.kill();
 }
 
-/// Test: unsupported protocol version is rejected with JSON-RPC error.
-/// Maps to: TC-1.5 — error case
+/// Test: a client sending a different protocolVersion is NOT rejected;
+/// the server echoes its own supported version per MCP negotiation
+/// contract. (Original Slice 1b strict-equality rejection was relaxed
+/// after live-test discovered real Claude Code uses newer versions.)
+/// Maps to: TC-1.5 — version negotiation
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(unix)]
-async fn test_plugin_initialize_rejects_unsupported_version() {
+async fn test_plugin_initialize_accepts_other_version_and_echoes_server() {
     let tmpdir = tempfile::tempdir().expect("tempdir created");
     let runtime_dir = tmpdir.path();
     let socket_path = runtime_dir.join("claudebase").join("daemon.sock");
@@ -283,27 +286,18 @@ async fn test_plugin_initialize_rejects_unsupported_version() {
         .await
         .expect("request succeeded");
 
-    // Should have error field, not result
+    // Per MCP negotiation: server returns SUCCESS with its own
+    // supported protocolVersion. Client decides if it can downgrade.
     assert!(
-        response.get("error").is_some(),
-        "response should contain error for unsupported version"
+        response.get("error").is_none(),
+        "version mismatch should NOT error; server echoes its version. got: {:?}",
+        response.get("error")
     );
-
-    let error = response.get("error").unwrap();
+    let result = response.get("result").expect("initialize succeeded");
     assert_eq!(
-        error.get("code"),
-        Some(&json!(-32602)),
-        "error code should be -32602 (Invalid params)"
-    );
-
-    // Message should mention supported versions
-    let message = error
-        .get("message")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    assert!(
-        message.len() > 0,
-        "error message should explain the version mismatch"
+        result.get("protocolVersion"),
+        Some(&json!("2024-11-05")),
+        "server should echo its supported version (2024-11-05) even when client requested a newer one"
     );
 
     // Kill processes

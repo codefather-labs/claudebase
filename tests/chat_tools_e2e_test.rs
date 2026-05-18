@@ -242,14 +242,14 @@ async fn test_chat_post_subscribe_happy_path() {
         .get("params")
         .expect("notification should have params");
     assert_eq!(
-        params.get("thread"),
+        params.get("meta").and_then(|m| m.get("thread")),
         Some(&json!("telegram:99999")),
-        "notification thread should match posted thread"
+        "notification meta.thread should match posted thread"
     );
     assert_eq!(
-        params.get("message").and_then(|m| m.get("content")),
+        params.get("content"),
         Some(&json!("hello world")),
-        "notification content should match posted content"
+        "notification top-level content should match posted content"
     );
 
     // Verify database row

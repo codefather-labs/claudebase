@@ -484,14 +484,35 @@ pub fn list_threads(conn: &Connection) -> rusqlite::Result<Vec<ThreadSummary>> {
 }
 
 /// Build the `notifications/claude/channel` frame for a posted message.
-pub fn build_channel_notification(message: &ChatMessage) -> Value {
+///
+/// Wire shape MUST match `build_channel_notification_routed` for parity with
+/// the Telegram inbound path: top-level `params.content` carries the message
+/// text; `params.meta` carries thread + from_agent + message_id + ts (+
+/// reply_to when present). Claude Code's MCP client silently DISCARDS any
+/// frame whose shape differs (live-tested 2026-05-18) — without this
+/// alignment, agent-to-agent `chat_post` / `chat_reply` notifications never
+/// reach the peer LLM's input stream even though daemon broadcast succeeds.
+pub fn build_channel_notification(msg: &ChatMessage) -> Value {
+    let mut params = serde_json::Map::new();
+    params.insert("content".into(), Value::String(msg.content.clone()));
+
+    let mut meta = serde_json::Map::new();
+    meta.insert("thread".into(), Value::String(msg.thread_id.clone()));
+    meta.insert("from_agent".into(), Value::String(msg.from_agent.clone()));
+    meta.insert("message_id".into(), Value::String(msg.id.clone()));
+    meta.insert(
+        "ts".into(),
+        Value::Number(serde_json::Number::from(msg.created_at)),
+    );
+    if let Some(rt) = &msg.reply_to {
+        meta.insert("reply_to".into(), Value::String(rt.clone()));
+    }
+    params.insert("meta".into(), Value::Object(meta));
+
     json!({
         "jsonrpc": "2.0",
         "method": "notifications/claude/channel",
-        "params": {
-            "thread": message.thread_id,
-            "message": message.to_json(),
-        }
+        "params": Value::Object(params),
     })
 }
 

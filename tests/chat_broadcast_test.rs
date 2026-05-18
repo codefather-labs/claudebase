@@ -243,7 +243,7 @@ async fn test_chat_broadcast_to_two_subscribers() {
 
     let params_a = notif_a.get("params").expect("plugin A notification params");
     assert_eq!(
-        params_a.get("message").and_then(|m| m.get("content")),
+        params_a.get("content"),
         Some(&json!("broadcast-test-message")),
         "plugin A notification content should match"
     );
@@ -263,7 +263,7 @@ async fn test_chat_broadcast_to_two_subscribers() {
 
     let params_b = notif_b.get("params").expect("plugin B notification params");
     assert_eq!(
-        params_b.get("message").and_then(|m| m.get("content")),
+        params_b.get("content"),
         Some(&json!("broadcast-test-message")),
         "plugin B notification content should match"
     );

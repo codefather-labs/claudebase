@@ -53,17 +53,38 @@
 //!   a future iteration when the test harness is fleshed out.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use serde::Deserialize;
+use tokio::sync::mpsc;
 
 use crate::daemon::asr::Asr;
 use crate::daemon::chat::{self, SharedBus};
 use crate::daemon::config::RedactedToken;
 use crate::daemon::permissions::{self, Access};
+
+/// Outbound channel from MCP `chat_reply` (server.rs::handle_chat_post)
+/// to the telegram long-poll task. Set ONCE at spawn_long_poll time;
+/// reads happen in run_long_poll's select! loop.
+///
+/// Tuple shape: `(chat_id, text)` — chat_id is the integer parsed from
+/// the `telegram:<N>` thread prefix used by chat_reply tool callers.
+static OUTBOUND_TG: OnceLock<mpsc::UnboundedSender<(i64, String)>> = OnceLock::new();
+
+/// Push an outbound Telegram message from any task. Returns Ok(()) on
+/// successful enqueue (does NOT wait for HTTP send completion). Returns
+/// Err if telegram long-poll is not running OR the channel is closed.
+pub fn enqueue_outbound_tg(chat_id: i64, text: String) -> Result<()> {
+    let tx = OUTBOUND_TG
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("telegram outbound channel not initialised (long-poll task not spawned)"))?;
+    tx.send((chat_id, text))
+        .map_err(|e| anyhow::anyhow!("outbound channel closed: {e}"))?;
+    Ok(())
+}
 
 /// One Telegram update as decoded from `getUpdates`. We deliberately
 /// hand-decode a SMALL subset of the rich teloxide types because the
@@ -433,12 +454,23 @@ pub fn spawn_long_poll(
     bus: SharedBus,
     asr: Option<Arc<dyn Asr>>,
 ) -> tokio::task::JoinHandle<()> {
+    // Initialise the outbound bridge BEFORE spawning so server.rs's MCP
+    // chat_reply handler can enqueue immediately (race-free: any push
+    // before the spawn is queued; the receiver picks it up on the first
+    // select! tick).
+    let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<(i64, String)>();
+    if OUTBOUND_TG.set(outbound_tx).is_err() {
+        tracing::warn!(
+            "OUTBOUND_TG already initialised — second spawn_long_poll call ignored (daemon should spawn only once per process)"
+        );
+    }
+
     tokio::spawn(async move {
         // ASYNC_INVARIANTS Rule 3 — wrap the long-poll body so any
         // unhandled error logs structured (without leaking the token) and
         // the daemon's other tasks keep running.
         let token_str = token.as_str().to_string();
-        if let Err(e) = run_long_poll(token, access_path, bus, asr).await {
+        if let Err(e) = run_long_poll(token, access_path, bus, asr, outbound_rx).await {
             tracing::error!(
                 error = %redact_error_string(&format!("{e:#}"), &token_str),
                 "telegram long-poll fatal"
@@ -460,6 +492,7 @@ async fn run_long_poll(
     access_path: PathBuf,
     bus: SharedBus,
     asr: Option<Arc<dyn Asr>>,
+    mut outbound_rx: mpsc::UnboundedReceiver<(i64, String)>,
 ) -> Result<()> {
     // Allow tests / local dev to point at a mock Telegram endpoint via
     // TELOXIDE_API_URL. teloxide 0.17 reads this env var directly via
@@ -567,6 +600,39 @@ async fn run_long_poll(
                 continue;
             }
         };
+
+        // Drain any pending outbound messages BEFORE making the next
+        // long-poll request. This means an MCP chat_reply call that
+        // enqueues outbound has a snappy delivery path: it fires
+        // immediately on the next loop iteration, not after waiting for
+        // the long-poll to time out. Each iteration drains up to 16
+        // queued messages so a burst doesn't starve getUpdates.
+        for _ in 0..16 {
+            match outbound_rx.try_recv() {
+                Ok((chat_id, text)) => {
+                    let send_result = bot
+                        .send_message(teloxide::types::ChatId(chat_id), &text)
+                        .await;
+                    match send_result {
+                        Ok(_) => tracing::info!(
+                            chat_id,
+                            bytes = text.len(),
+                            "telegram outbound sent"
+                        ),
+                        Err(e) => tracing::warn!(
+                            chat_id,
+                            error = %redact_error_string(&format!("{e}"), &token_for_error_redaction),
+                            "telegram outbound send failed"
+                        ),
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    tracing::warn!("outbound channel disconnected (no more chat_reply traffic)");
+                    break;
+                }
+            }
+        }
 
         // Make the getUpdates HTTP call. teloxide's `Requester::get_updates`
         // returns a builder; we set offset and timeout, then await.

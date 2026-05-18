@@ -913,6 +913,40 @@ async fn handle_chat_post(
         })
     };
 
+    // Outbound TG bridge: when chat_reply targets a `telegram:<chat_id>`
+    // thread, push the content into the telegram long-poll task's
+    // outbound queue. The send happens asynchronously inside the
+    // telegram task's loop (drained at the top of every iteration).
+    // Persist + chat.db broadcast above are independent of this — if
+    // outbound enqueue fails (telegram task not running, channel
+    // closed) the chat.db record still exists and other subscribers
+    // still see the broadcast.
+    if tool_name == "chat_reply" {
+        if let Some(rest) = msg.thread_id.strip_prefix("telegram:") {
+            match rest.parse::<i64>() {
+                Ok(chat_id) => {
+                    match crate::daemon::telegram::enqueue_outbound_tg(chat_id, msg.content.clone()) {
+                        Ok(_) => tracing::info!(
+                            chat_id,
+                            thread = %msg.thread_id,
+                            "chat_reply queued for telegram outbound"
+                        ),
+                        Err(e) => tracing::warn!(
+                            chat_id,
+                            error = %e,
+                            "chat_reply telegram outbound enqueue failed (chat.db row still persisted)"
+                        ),
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    thread = %msg.thread_id,
+                    error = %e,
+                    "chat_reply telegram:<chat_id> has unparsable id; outbound skipped"
+                ),
+            }
+        }
+    }
+
     let notif = chat::build_channel_notification(&msg);
     let thread_id = msg.thread_id.clone();
     (

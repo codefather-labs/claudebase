@@ -117,6 +117,37 @@ pub async fn run() -> anyhow::Result<()> {
                         Some(f) => {
                             if f.get("id").is_none() {
                                 // Notification — relay to stdout.
+                                // Slice 7.x diagnostic — when env var
+                                // CLAUDEBASE_PLUGIN_TRACE=1 is set, ALSO
+                                // append a one-line marker to
+                                // /tmp/claudebase-plugin-trace.log so the
+                                // operator can verify the plugin→stdout
+                                // step from outside Claude Code's MCP log
+                                // sandbox. Best-effort; ignore errors.
+                                if std::env::var("CLAUDEBASE_PLUGIN_TRACE").as_deref() == Ok("1") {
+                                    use std::io::Write;
+                                    if let Ok(mut log) = std::fs::OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open("/tmp/claudebase-plugin-trace.log")
+                                    {
+                                        let method = f.get("method")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("?");
+                                        let body = f.to_string();
+                                        let _ = writeln!(
+                                            log,
+                                            "[{}] FWD notif method={} body_bytes={} body={}",
+                                            std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .map(|d| d.as_millis())
+                                                .unwrap_or(0),
+                                            method,
+                                            body.len(),
+                                            body
+                                        );
+                                    }
+                                }
                                 write_mcp_line(&mut stdout, &f).await?;
                             } else {
                                 // Unexpected response while idle —

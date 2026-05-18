@@ -1,6 +1,6 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "claudebase-marketplace",
+  "name": "claudebase-dev",
   "description": "Local development marketplace for claudebase — persistent agent-chat daemon with Telegram pairing, voice transcription, and agent_registry routing.",
   "owner": {
     "name": "codefather-labs"

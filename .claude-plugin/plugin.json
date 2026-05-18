@@ -8,5 +8,7 @@
   },
   "homepage": "https://github.com/codefather-labs/claudebase",
   "repository": "https://github.com/codefather-labs/claudebase",
-  "license": "MIT"
+  "license": "MIT",
+  "commands": [],
+  "agents": []
 }

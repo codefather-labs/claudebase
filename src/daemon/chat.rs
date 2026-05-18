@@ -126,10 +126,17 @@ impl Default for ChatBus {
     }
 }
 
-/// Apply schema v5 (chat_threads, chat_messages, chat_messages_thread_time_idx,
-/// daemon_state + bootstrap row) to a chat.db connection. Idempotent — all
+/// Apply schema v5 + v6 to a chat.db connection. Idempotent — all
 /// statements use `IF NOT EXISTS` / `INSERT OR IGNORE`. Wrapped in a
 /// BEGIN/COMMIT transaction so partial-failure recovery is clean.
+///
+/// v5 tables: chat_threads, chat_messages, chat_messages_thread_time_idx,
+///            daemon_state + bootstrap row.
+/// v6 tables (Slice 5): agent_registry + 2 indexes (1 partial UNIQUE per
+///            F-5.1 red-team finding + 1 routing index for Slice 7
+///            target_agent_id lookups). The CHECK constraint on `state`
+///            is enforced at the DB layer per STRUCTURAL-5-2 — a buggy
+///            Rust caller or a sqlite3 CLI edit cannot corrupt state.
 pub fn ensure_chat_db_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         r#"
@@ -155,6 +162,23 @@ CREATE TABLE IF NOT EXISTS daemon_state (
 );
 INSERT OR IGNORE INTO daemon_state(key, value)
   VALUES ('telegram.last_update_id', '0');
+CREATE TABLE IF NOT EXISTS agent_registry (
+  agent_id           TEXT PRIMARY KEY,
+  agent_name         TEXT NOT NULL,
+  connection_id      TEXT NOT NULL,
+  chat_thread_id     TEXT,
+  permission_relayer TEXT,
+  spawned_at         INTEGER NOT NULL,
+  last_pinged_at     INTEGER NOT NULL,
+  state              TEXT NOT NULL CHECK (state IN ('alive','orphaned','dead')),
+  metadata           TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS agent_registry_thread_name_alive_idx
+    ON agent_registry(chat_thread_id, agent_name)
+    WHERE state = 'alive' AND chat_thread_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS agent_registry_thread_alive_idx
+    ON agent_registry(chat_thread_id, state)
+    WHERE state = 'alive';
 COMMIT;
 "#,
     )?;
@@ -179,7 +203,7 @@ pub fn open_chat_db() -> anyhow::Result<Connection> {
 }
 
 /// Current wall-clock milliseconds since the UNIX epoch.
-fn now_millis() -> i64 {
+pub(crate) fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)

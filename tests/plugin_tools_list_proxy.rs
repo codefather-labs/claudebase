@@ -204,7 +204,13 @@ async fn test_tools_list_daemon_up_returns_chat_tools() {
         .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
         .collect();
 
-    for required in &["chat_post", "chat_subscribe", "chat_reply", "chat_list"] {
+    // Slice 3 chat tools + Slice 5 agent_registry tools — daemon-up
+    // tools/list MUST include all 8 (the sentinel daemon-down tool
+    // `claudebase_daemon_status` is plugin-side only).
+    for required in &[
+        "chat_post", "chat_subscribe", "chat_reply", "chat_list",
+        "agent_register", "agent_unregister", "agent_list_alive", "agent_reap",
+    ] {
         assert!(
             names.contains(required),
             "daemon-up tools/list should include {required}; got {names:?}"
@@ -212,8 +218,8 @@ async fn test_tools_list_daemon_up_returns_chat_tools() {
     }
     assert_eq!(
         tools.len(),
-        4,
-        "Slice 3 daemon-up tools/list should expose exactly 4 chat tools; got {names:?}"
+        8,
+        "post-Slice-5 daemon-up tools/list should expose exactly 8 tools (4 chat + 4 agent_registry); got {names:?}"
     );
 
     // Clean up

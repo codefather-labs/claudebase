@@ -535,6 +535,33 @@ where
                 // disconnect, log at "info" not "error".
                 if let Some(io_err) = e.downcast_ref::<io::Error>() {
                     if io_err.kind() == io::ErrorKind::UnexpectedEof {
+                        // Slice 5: bulk-UPDATE agent_registry rows for this
+                        // connection_id from 'alive' to 'orphaned' before
+                        // tearing down. rusqlite is !Send across .await
+                        // (ASYNC_INVARIANTS Rule 2) — wrap in spawn_blocking.
+                        let cid_str = connection_id.to_string();
+                        let orphan_result = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+                            let conn = crate::daemon::chat::open_chat_db()?;
+                            crate::daemon::agent_registry::mark_connection_orphaned(&conn, &cid_str)
+                        }).await;
+                        match orphan_result {
+                            Ok(Ok(n)) if n > 0 => tracing::info!(
+                                %connection_id,
+                                orphaned = n,
+                                "connection EOF — marked alive agents orphaned"
+                            ),
+                            Ok(Ok(_)) => {}  // no rows — silent
+                            Ok(Err(e)) => tracing::warn!(
+                                %connection_id,
+                                error = %e,
+                                "agent_registry orphan-on-EOF UPDATE failed (non-fatal)"
+                            ),
+                            Err(e) => tracing::warn!(
+                                %connection_id,
+                                error = %e,
+                                "agent_registry orphan-on-EOF spawn_blocking panicked"
+                            ),
+                        }
                         tracing::info!(%connection_id, "connection EOF");
                         return Ok(());
                     }
@@ -630,6 +657,22 @@ where
                     let resp = handle_chat_list(echo_id, &args).await;
                     let _ = outbound_tx.send(resp);
                 }
+                "agent_register" => {
+                    let resp = handle_agent_register(echo_id, &args, connection_id).await;
+                    let _ = outbound_tx.send(resp);
+                }
+                "agent_unregister" => {
+                    let resp = handle_agent_unregister(echo_id, &args).await;
+                    let _ = outbound_tx.send(resp);
+                }
+                "agent_list_alive" => {
+                    let resp = handle_agent_list_alive(echo_id, &args).await;
+                    let _ = outbound_tx.send(resp);
+                }
+                "agent_reap" => {
+                    let resp = handle_agent_reap(echo_id, &args).await;
+                    let _ = outbound_tx.send(resp);
+                }
                 _ => {
                     let resp = serde_json::json!({
                         "jsonrpc": "2.0",
@@ -712,6 +755,51 @@ fn build_tools_list_response(id: serde_json::Value) -> serde_json::Value {
                             "limit": {"type": ["integer", "null"]}
                         },
                         "required": ["thread"]
+                    }
+                },
+                {
+                    "name": "agent_register",
+                    "description": "Register an agent with the daemon's agent_registry",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "agent_id": {"type": "string"},
+                            "name": {"type": "string"},
+                            "thread": {"type": ["string", "null"]},
+                            "metadata": {"type": ["object", "null"]}
+                        },
+                        "required": ["agent_id", "name"]
+                    }
+                },
+                {
+                    "name": "agent_unregister",
+                    "description": "Mark an agent as dead",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "agent_id": {"type": "string"}
+                        },
+                        "required": ["agent_id"]
+                    }
+                },
+                {
+                    "name": "agent_list_alive",
+                    "description": "List alive agents (optionally filtered by thread)",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "thread": {"type": ["string", "null"]}
+                        }
+                    }
+                },
+                {
+                    "name": "agent_reap",
+                    "description": "Reap orphaned agents older than threshold (seconds)",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "older_than_secs": {"type": ["integer", "null"]}
+                        }
                     }
                 }
             ]
@@ -949,6 +1037,163 @@ async fn handle_chat_list(id: serde_json::Value, args: &serde_json::Value) -> se
         Err(e) => {
             tracing::error!(error = %e, "chat_list failed");
             tool_error_response(id, -32603, "list failed")
+        }
+    }
+}
+
+/// Slice 5 — `agent_register` MCP tool handler. Caller provides
+/// `agent_id`, `name`, optionally `thread` and `metadata`. The daemon
+/// binds the registration to the current connection_id (server-side
+/// trust boundary — clients don't get to pick that).
+async fn handle_agent_register(
+    id: serde_json::Value,
+    args: &serde_json::Value,
+    connection_id: Uuid,
+) -> serde_json::Value {
+    let agent_id = match args.get("agent_id").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_error_response(id, -32602, "agent_id required (non-empty string)"),
+    };
+    let name = match args.get("name").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => return tool_error_response(id, -32602, "name required"),
+    };
+    let thread = args
+        .get("thread")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let metadata = args.get("metadata").cloned();
+    let cid_str = connection_id.to_string();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
+        let conn = crate::daemon::chat::open_chat_db()?;
+        let outcome = crate::daemon::agent_registry::register(
+            &conn,
+            &agent_id,
+            &name,
+            &cid_str,
+            thread.as_deref(),
+            metadata.as_ref(),
+        )?;
+        Ok(outcome.spawned_at)
+    })
+    .await;
+    match result {
+        Ok(Ok(spawned_at)) => {
+            let payload = serde_json::json!({"registered": true, "spawned_at": spawned_at});
+            tool_text_response(id, &payload)
+        }
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            tool_error_response(id, -32603, &msg)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "agent_register spawn_blocking panicked");
+            tool_error_response(id, -32603, "internal error")
+        }
+    }
+}
+
+/// Slice 5 — `agent_unregister` MCP tool handler. Idempotent — missing
+/// rows return `previous_state="absent"` without error per UC-5-A.
+async fn handle_agent_unregister(
+    id: serde_json::Value,
+    args: &serde_json::Value,
+) -> serde_json::Value {
+    let agent_id = match args.get("agent_id").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_error_response(id, -32602, "agent_id required (non-empty string)"),
+    };
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+        let conn = crate::daemon::chat::open_chat_db()?;
+        let outcome = crate::daemon::agent_registry::unregister(&conn, &agent_id)?;
+        Ok(outcome.previous_state)
+    })
+    .await;
+    match result {
+        Ok(Ok(prev)) => {
+            let payload = serde_json::json!({"unregistered": true, "previous_state": prev});
+            tool_text_response(id, &payload)
+        }
+        Ok(Err(e)) => tool_error_response(id, -32603, &e.to_string()),
+        Err(e) => {
+            tracing::error!(error = %e, "agent_unregister spawn_blocking panicked");
+            tool_error_response(id, -32603, "internal error")
+        }
+    }
+}
+
+/// Slice 5 — `agent_list_alive` MCP tool handler. Returns agents in
+/// state='alive', optionally filtered by thread.
+async fn handle_agent_list_alive(
+    id: serde_json::Value,
+    args: &serde_json::Value,
+) -> serde_json::Value {
+    let thread = args
+        .get("thread")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let result = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<Vec<crate::daemon::agent_registry::AgentRow>> {
+            let conn = crate::daemon::chat::open_chat_db()?;
+            crate::daemon::agent_registry::list_alive(&conn, thread.as_deref())
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(rows)) => {
+            let agents: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "agent_id": r.agent_id,
+                        "agent_name": r.agent_name,
+                        "thread": r.chat_thread_id,
+                        "spawned_at": r.spawned_at,
+                        "last_pinged_at": r.last_pinged_at,
+                    })
+                })
+                .collect();
+            let payload = serde_json::json!({"agents": agents});
+            tool_text_response(id, &payload)
+        }
+        Ok(Err(e)) => tool_error_response(id, -32603, &e.to_string()),
+        Err(e) => {
+            tracing::error!(error = %e, "agent_list_alive spawn_blocking panicked");
+            tool_error_response(id, -32603, "internal error")
+        }
+    }
+}
+
+/// Slice 5 — `agent_reap` MCP tool handler. `older_than_secs` parameter
+/// is in seconds (per FR-ACD-5.4); internal arithmetic converts to
+/// milliseconds to match `last_pinged_at` column units.
+///
+/// Wire shape per insight #12: `{"reaped_count": N, "remaining_orphaned": N}` —
+/// `reaped_count` (NOT `reaped`) is the field name TC-5.4 jq path expects.
+async fn handle_agent_reap(
+    id: serde_json::Value,
+    args: &serde_json::Value,
+) -> serde_json::Value {
+    let older_than_secs = args.get("older_than_secs").and_then(|v| v.as_i64());
+    let result = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<crate::daemon::agent_registry::ReapOutcome> {
+            let conn = crate::daemon::chat::open_chat_db()?;
+            crate::daemon::agent_registry::reap(&conn, older_than_secs)
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(outcome)) => {
+            let payload = serde_json::json!({
+                "reaped_count": outcome.reaped_count,
+                "remaining_orphaned": outcome.remaining_orphaned,
+            });
+            tool_text_response(id, &payload)
+        }
+        Ok(Err(e)) => tool_error_response(id, -32603, &e.to_string()),
+        Err(e) => {
+            tracing::error!(error = %e, "agent_reap spawn_blocking panicked");
+            tool_error_response(id, -32603, "internal error")
         }
     }
 }

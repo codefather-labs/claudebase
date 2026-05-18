@@ -49,6 +49,11 @@ pub const TOOL_WHITELIST: &[&str] = &[
     "chat_reply",
     "chat_list",
     "claudebase_daemon_status",
+    // Slice 5 — agent_registry tools (SEC-7 whitelist parity with daemon dispatch)
+    "agent_register",
+    "agent_unregister",
+    "agent_list_alive",
+    "agent_reap",
 ];
 
 /// Build the Parse Error response per JSON-RPC 2.0 (SEC-3).

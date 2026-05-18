@@ -322,6 +322,44 @@ function Preload-Encoder {
 }
 
 # ============================================================================
+# Register the claudebase plugin with Claude Code (marketplace + install)
+# ============================================================================
+# Mirrors install.sh's `register_claude_plugin` — idempotent registration of
+# the github-sourced marketplace + plugin install. Skipped when `claude` is
+# not on PATH (user can run the two commands manually).
+function Register-ClaudePlugin {
+    if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
+        Write-Info "claude CLI not on PATH; skipping plugin registration"
+        Write-Info "  to install manually later:"
+        Write-Info "    claude plugin marketplace add codefather-labs/claudebase"
+        Write-Info "    claude plugin install claudebase@claudebase-dev"
+        return
+    }
+
+    Write-Info "Registering claudebase-dev marketplace (github: codefather-labs/claudebase)..."
+    try {
+        & claude plugin marketplace add codefather-labs/claudebase 2>&1 | Out-Null
+        Write-Ok "marketplace registered (or already present)"
+    } catch {
+        Write-Warn "marketplace add failed: $($_.Exception.Message); skipping plugin install"
+        return
+    }
+
+    Write-Info "Installing claudebase@claudebase-dev plugin..."
+    try {
+        & claude plugin install claudebase@claudebase-dev 2>&1 | Select-Object -Last 3
+        if ($LASTEXITCODE -eq 0) {
+            Write-Ok "plugin installed"
+        } else {
+            Write-Warn "plugin install returned exit $LASTEXITCODE; retry manually:"
+            Write-Warn "  claude plugin install claudebase@claudebase-dev"
+        }
+    } catch {
+        Write-Warn "plugin install failed: $($_.Exception.Message)"
+    }
+}
+
+# ============================================================================
 # Main
 # ============================================================================
 if ($Help) { Show-Help; exit 0 }
@@ -350,6 +388,7 @@ Register-Alias
 Register-BashAllowlist
 Install-Pdfium
 Preload-Encoder
+Register-ClaudePlugin
 
 # Optional post-install daemon hook (Slice 2 — STRUCTURAL-2-3)
 # Opt-in via `$env:CLAUDEBASE_INSTALL_DAEMON=1`. Fails soft.

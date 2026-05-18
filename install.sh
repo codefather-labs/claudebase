@@ -397,6 +397,52 @@ install_pdfium() {
 }
 
 # ============================================================================
+# Register the claudebase plugin with Claude Code (marketplace + install)
+# ============================================================================
+# Idempotent — no-op when:
+#   - `claude` CLI is not on PATH (skip with INFO; user can run by hand)
+#   - marketplace 'claudebase-dev' is already registered
+#   - plugin 'claudebase@claudebase-dev' is already installed
+#
+# This mirrors the official Anthropic telegram plugin's install UX:
+# `bash install.sh` ends with the plugin ready to use after a single
+# `claude --channels plugin:claudebase@claudebase-dev` launch.
+#
+# The marketplace source is the public github repo (codefather-labs/
+# claudebase). install.sh used to be the only way users got the plugin;
+# now the github marketplace path is the canonical install method and
+# install.sh just bootstraps it.
+register_claude_plugin() {
+  if ! command -v claude >/dev/null 2>&1; then
+    log_info "claude CLI not on PATH; skipping plugin registration"
+    log_info "  to install manually later:"
+    log_info "    claude plugin marketplace add codefather-labs/claudebase"
+    log_info "    claude plugin install claudebase@claudebase-dev"
+    return 0
+  fi
+
+  # marketplace add — idempotent at the claude CLI level (already-present
+  # returns success without re-cloning).
+  log_info "Registering claudebase-dev marketplace (github: codefather-labs/claudebase)..."
+  if claude plugin marketplace add codefather-labs/claudebase 2>&1 | grep -qE "already|registered|added"; then
+    log_ok "marketplace registered (or already present)"
+  else
+    # Even on warning output, claude returns 0 if marketplace works. Don't bail.
+    log_ok "marketplace add invoked"
+  fi
+
+  # Install the plugin. `claude plugin install` is idempotent — re-run is
+  # safe and refreshes from the marketplace source.
+  log_info "Installing claudebase@claudebase-dev plugin..."
+  if claude plugin install claudebase@claudebase-dev 2>&1 | tail -3; then
+    log_ok "plugin installed"
+  else
+    log_warn "plugin install failed; you can retry manually:"
+    log_warn "  claude plugin install claudebase@claudebase-dev"
+  fi
+}
+
+# ============================================================================
 # Pre-warm e5 encoder so first `claudebase ingest` doesn't pay ~30s cold start
 # ============================================================================
 preload_encoder() {
@@ -440,6 +486,7 @@ register_alias
 register_bash_allowlist
 install_pdfium
 preload_encoder
+register_claude_plugin
 
 # ============================================================================
 # Optional post-install daemon hook (Slice 2 — STRUCTURAL-2-3)

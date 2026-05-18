@@ -677,6 +677,10 @@ where
                     let resp = handle_chat_list(echo_id, &args).await;
                     let _ = outbound_tx.send(resp);
                 }
+                "chat_list_threads" => {
+                    let resp = handle_chat_list_threads(echo_id).await;
+                    let _ = outbound_tx.send(resp);
+                }
                 "agent_register" => {
                     let resp = handle_agent_register(echo_id, &args, connection_id).await;
                     let _ = outbound_tx.send(resp);
@@ -775,6 +779,14 @@ fn build_tools_list_response(id: serde_json::Value) -> serde_json::Value {
                             "limit": {"type": ["integer", "null"]}
                         },
                         "required": ["thread"]
+                    }
+                },
+                {
+                    "name": "chat_list_threads",
+                    "description": "List all known chat threads in the claudebase chat.db with message counts and last-message timestamps. Use when the user says something like 'subscribe to active claudebase channels', 'what telegram chats does the bot reach', or 'show me known channels' — then call chat_subscribe for each thread the user cares about. Threads starting with 'telegram:<chat_id>' are Telegram DMs/groups; other prefixes are agent-to-agent threads.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
                     }
                 },
                 {
@@ -1091,6 +1103,53 @@ async fn handle_chat_list(id: serde_json::Value, args: &serde_json::Value) -> se
         Err(e) => {
             tracing::error!(error = %e, "chat_list failed");
             tool_error_response(id, -32603, "list failed")
+        }
+    }
+}
+
+/// Discovery helper for the orchestrator (Mira) — list every known
+/// thread in chat.db with message count + last-message timestamp.
+///
+/// Lets the user say "subscribe to active claudebase channels" instead
+/// of having to type out the literal `telegram:<chat_id>` string. The
+/// orchestrator calls this tool first, surfaces the list, then issues
+/// `chat_subscribe` against each thread.
+async fn handle_chat_list_threads(id: serde_json::Value) -> serde_json::Value {
+    let result: Result<Vec<chat::ThreadSummary>, anyhow::Error> =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<chat::ThreadSummary>> {
+            let conn = chat::open_chat_db()?;
+            let threads = chat::list_threads(&conn)?;
+            Ok(threads)
+        })
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("join error: {e}")));
+
+    match result {
+        Ok(threads) => {
+            let threads_json: Vec<serde_json::Value> = threads
+                .iter()
+                .map(|t| {
+                    let kind = if t.id.starts_with("telegram:") {
+                        "telegram"
+                    } else if t.id.starts_with("agent:") {
+                        "agent"
+                    } else {
+                        "other"
+                    };
+                    serde_json::json!({
+                        "thread": t.id,
+                        "kind": kind,
+                        "message_count": t.message_count,
+                        "last_created_at": t.last_created_at,
+                    })
+                })
+                .collect();
+            let payload = serde_json::json!({ "threads": threads_json });
+            tool_text_response(id, &payload)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "chat_list_threads failed");
+            tool_error_response(id, -32603, "list-threads failed")
         }
     }
 }

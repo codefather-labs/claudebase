@@ -142,25 +142,40 @@ pub fn build_channel_notification_routed(
     msg: &ChatMessage,
     target_agent_id: Option<&str>,
 ) -> Value {
+    // Wire shape MUST match `claude-telegram-voice-control` server.ts:1262-1284
+    // verbatim: top-level `params.content` carries the inbound text;
+    // `params.meta` carries the routing/identity hints (thread + from_agent
+    // + message_id + ts + target_agent_id when set). Claude Code's MCP
+    // client (live-tested 2026-05-18) silently DISCARDS any frame whose
+    // shape differs from this — the original Slice 7 implementation
+    // nested content under `params.message.content` and never reached
+    // the LLM's input stream.
+    //
+    // Slice 7's `meta.target_agent_id` field stays optional: present only
+    // when the @-mention resolved to an alive agent. STRUCTURAL-7-2's
+    // "absent, not null" rule holds.
     let mut params = serde_json::Map::new();
-    params.insert("thread".into(), Value::String(msg.thread_id.clone()));
-    params.insert(
-        "message".into(),
-        serde_json::json!({
-            "id": msg.id,
-            "thread_id": msg.thread_id,
-            "from_agent": msg.from_agent,
-            "content": msg.content,
-            "reply_to": msg.reply_to,
-            "created_at": msg.created_at,
-        }),
+    params.insert("content".into(), Value::String(msg.content.clone()));
+
+    let mut meta = serde_json::Map::new();
+    meta.insert("thread".into(), Value::String(msg.thread_id.clone()));
+    meta.insert(
+        "from_agent".into(),
+        Value::String(msg.from_agent.clone()),
     );
-    if let Some(id) = target_agent_id {
-        params.insert(
-            "meta".into(),
-            serde_json::json!({ "target_agent_id": id }),
-        );
+    meta.insert("message_id".into(), Value::String(msg.id.clone()));
+    meta.insert(
+        "ts".into(),
+        Value::Number(serde_json::Number::from(msg.created_at)),
+    );
+    if let Some(rt) = &msg.reply_to {
+        meta.insert("reply_to".into(), Value::String(rt.clone()));
     }
+    if let Some(id) = target_agent_id {
+        meta.insert("target_agent_id".into(), Value::String(id.to_string()));
+    }
+    params.insert("meta".into(), Value::Object(meta));
+
     serde_json::json!({
         "jsonrpc": "2.0",
         "method": "notifications/claude/channel",

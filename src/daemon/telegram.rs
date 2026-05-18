@@ -860,9 +860,12 @@ mod tests {
     }
 
     // Slice 7 — routing tiebreak + build_channel_notification_routed
-    // (STRUCTURAL-7-2, STRUCTURAL-7-3)
+    // (STRUCTURAL-7-2, STRUCTURAL-7-3). Wire shape rewritten 2026-05-18
+    // to match claude-telegram-voice-control: `params.content` flat at
+    // top level, `params.meta` carries thread/from_agent/message_id/ts
+    // and optionally `target_agent_id`.
     #[test]
-    fn build_channel_notification_routed_omits_meta_when_none() {
+    fn build_channel_notification_routed_omits_target_when_none() {
         let msg = chat::ChatMessage {
             id: "m-1".to_string(),
             thread_id: "telegram:1".to_string(),
@@ -872,16 +875,33 @@ mod tests {
             created_at: 100,
         };
         let frame = chat::build_channel_notification_routed(&msg, None);
-        let params = frame.get("params").unwrap().as_object().unwrap();
-        // STRUCTURAL-7-2: `meta` key must be ABSENT, not null.
+        // params.content is the inbound text (voice-control wire shape).
+        assert_eq!(
+            frame.pointer("/params/content").and_then(|v| v.as_str()),
+            Some("hi")
+        );
+        // params.meta exists and carries channel routing info.
+        let meta = frame
+            .pointer("/params/meta")
+            .and_then(|v| v.as_object())
+            .expect("params.meta must be present");
+        assert_eq!(
+            meta.get("thread").and_then(|v| v.as_str()),
+            Some("telegram:1")
+        );
+        assert_eq!(
+            meta.get("from_agent").and_then(|v| v.as_str()),
+            Some("telegram:u")
+        );
+        // STRUCTURAL-7-2: target_agent_id must be ABSENT when caller passed None.
         assert!(
-            !params.contains_key("meta"),
-            "params.meta should be absent when target_agent_id is None"
+            !meta.contains_key("target_agent_id"),
+            "meta.target_agent_id should be absent when None passed; got: {meta:?}"
         );
     }
 
     #[test]
-    fn build_channel_notification_routed_inserts_meta_when_some() {
+    fn build_channel_notification_routed_inserts_target_when_some() {
         let msg = chat::ChatMessage {
             id: "m-1".to_string(),
             thread_id: "telegram:1".to_string(),
@@ -1007,11 +1027,15 @@ mod tests {
             }),
         }];
         let outcome = process_batch(&mut conn, &access, None, &batch).unwrap();
-        let params = outcome.notifications[0].1.get("params").unwrap().as_object().unwrap();
-        // STRUCTURAL-7-2: absent, not null.
+        let frame = &outcome.notifications[0].1;
+        // STRUCTURAL-7-2: target_agent_id must be ABSENT inside meta when no alive agent matches.
+        let meta = frame
+            .pointer("/params/meta")
+            .and_then(|v| v.as_object())
+            .expect("params.meta must be present");
         assert!(
-            !params.contains_key("meta"),
-            "params.meta MUST be absent when no alive agent matches the @-mention"
+            !meta.contains_key("target_agent_id"),
+            "meta.target_agent_id MUST be absent when no alive agent matches the @-mention; got: {meta:?}"
         );
     }
 

@@ -129,6 +129,13 @@ fn main() -> std::process::ExitCode {
             },
             cli::DaemonSubcommand::Doctor(a) => run_daemon_doctor(&a),
             cli::DaemonSubcommand::Warmup(a) => run_daemon_warmup(&a),
+            cli::DaemonSubcommand::Install(a) => run_daemon_install(&a),
+            cli::DaemonSubcommand::Uninstall(a) => run_daemon_uninstall(&a),
+            cli::DaemonSubcommand::Start => run_daemon_start(),
+            cli::DaemonSubcommand::Stop => run_daemon_stop(),
+            cli::DaemonSubcommand::Restart => run_daemon_restart(),
+            cli::DaemonSubcommand::Status(a) => run_daemon_status(&a),
+            cli::DaemonSubcommand::Logs(a) => run_daemon_logs(&a),
         },
         Command::Plugin(args) => match &args.sub {
             cli::PluginSubcommand::Serve(serve_args) => run_plugin_serve(serve_args),
@@ -689,6 +696,105 @@ fn run_daemon_warmup(_args: &cli::DaemonWarmupArgs) -> std::process::ExitCode {
             "warmup: asr-whisper feature not compiled in — rebuild with `cargo build --features asr-whisper`"
         );
         std::process::ExitCode::FAILURE
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Slice 2 — daemon service-installer runners. All synchronous (no tokio).
+// ---------------------------------------------------------------------------
+
+fn run_daemon_install(args: &cli::DaemonInstallArgs) -> std::process::ExitCode {
+    use claudebase::daemon::service;
+    let install_args = service::InstallArgs {
+        yes: args.yes,
+        no_start: args.no_start,
+    };
+    match service::install(&install_args) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_daemon_uninstall(args: &cli::DaemonUninstallArgs) -> std::process::ExitCode {
+    use claudebase::daemon::service;
+    let u = service::UninstallArgs {
+        yes: args.yes,
+        keep_data: args.keep_data,
+    };
+    match service::uninstall(&u) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_daemon_start() -> std::process::ExitCode {
+    use claudebase::daemon::service;
+    match service::start() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_daemon_stop() -> std::process::ExitCode {
+    use claudebase::daemon::service;
+    match service::stop() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_daemon_restart() -> std::process::ExitCode {
+    use claudebase::daemon::service;
+    match service::restart() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_daemon_status(args: &cli::DaemonStatusArgs) -> std::process::ExitCode {
+    use claudebase::daemon::service;
+    match service::status() {
+        Ok(s) => {
+            if args.json {
+                println!("{}", serde_json::to_string(&s).unwrap_or_else(|_| "{}".to_string()));
+            } else {
+                println!("state: {}", s.state);
+                if let Some(pid) = s.pid {
+                    println!("pid: {pid}");
+                }
+            }
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_daemon_logs(args: &cli::DaemonLogsArgs) -> std::process::ExitCode {
+    use claudebase::daemon::service;
+    match service::logs(args.lines, args.follow) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 

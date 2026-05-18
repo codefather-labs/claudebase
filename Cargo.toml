@@ -138,6 +138,14 @@ whisper-rs = { version = "0.16", optional = true }
 # without depending on teloxide internals.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "stream"] }
 
+# Slice 2 — Windows Service install/uninstall/lifecycle via the
+# `windows-service` crate. Gated behind `cfg(windows)` so the build graph
+# stays clean on Linux / macOS — the dep is not even resolved on
+# non-Windows targets. Version `0.8` is the latest stable as of slice
+# authoring (verified via `cargo search windows-service` 2026-05-18).
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+
 [features]
 # Slice 6-MVP — ASR backend features. `asr-whisper` enables the local
 # whisper-rs backend; `asr-sherpa` and `asr-nim` are reserved for future

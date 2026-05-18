@@ -461,6 +461,65 @@ pub enum DaemonSubcommand {
     /// so the first user-facing operation doesn't pay a cold-start
     /// stall. Slice 6-MVP wires the whisper model download.
     Warmup(DaemonWarmupArgs),
+    /// Install the platform service unit (systemd user unit on Linux,
+    /// launchd LaunchAgent on macOS, Windows Service on Windows).
+    Install(DaemonInstallArgs),
+    /// Remove the installed service unit. Preserves user data unless
+    /// `--keep-data` is omitted (in which case chat.db / secrets.toml /
+    /// daemon.toml / access.json are deleted; the books and insights
+    /// corpora under `~/.claude/knowledge/` are preserved regardless).
+    Uninstall(DaemonUninstallArgs),
+    /// Start the installed daemon service.
+    Start,
+    /// Stop the daemon service.
+    Stop,
+    /// Restart the daemon service.
+    Restart,
+    /// Print daemon status. `--json` emits a stable JSON document.
+    Status(DaemonStatusArgs),
+    /// Tail / stream platform-appropriate daemon logs (journalctl /
+    /// `log show` / `Get-WinEvent`). Slice 2 supports `--lines` and
+    /// `--follow`; no `--grep` flag.
+    Logs(DaemonLogsArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct DaemonInstallArgs {
+    /// Skip the "existing unit differs; overwrite?" guard.
+    #[arg(long)]
+    pub yes: bool,
+    /// Install the unit but do not start the service immediately.
+    #[arg(long)]
+    pub no_start: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct DaemonUninstallArgs {
+    /// Skip the destructive-delete confirmation prompt.
+    #[arg(long)]
+    pub yes: bool,
+    /// Preserve user data (chat.db, secrets.toml, daemon.toml,
+    /// access.json). The books corpus and insights corpus under
+    /// `~/.claude/knowledge/` are preserved regardless.
+    #[arg(long)]
+    pub keep_data: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct DaemonStatusArgs {
+    /// Emit JSON instead of human-readable text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct DaemonLogsArgs {
+    /// How many lines of recent log history to print.
+    #[arg(long, default_value_t = 50)]
+    pub lines: u32,
+    /// Follow new log entries until interrupted.
+    #[arg(long)]
+    pub follow: bool,
 }
 
 #[derive(Args, Debug)]

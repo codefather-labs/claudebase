@@ -441,6 +441,22 @@ register_bash_allowlist
 install_pdfium
 preload_encoder
 
+# ============================================================================
+# Optional post-install daemon hook (Slice 2 — STRUCTURAL-2-3)
+# ============================================================================
+# Opt-in via `CLAUDEBASE_INSTALL_DAEMON=1`. Fails soft: the post-install
+# step never aborts the installer when it errors. `--no-start` keeps the
+# install pre-reboot — the service comes up on the next login (systemd
+# user unit + WantedBy=default.target).
+if [ "${CLAUDEBASE_INSTALL_DAEMON:-0}" = "1" ]; then
+  log_info "CLAUDEBASE_INSTALL_DAEMON=1 detected; installing daemon service unit..."
+  if claudebase daemon install --no-start --yes; then
+    log_ok "Daemon service unit installed (start at next login or via 'claudebase daemon start')"
+  else
+    log_warn "Daemon install failed; continuing without daemon (re-run later with 'claudebase daemon install')"
+  fi
+fi
+
 # Cleanup the temp clone (only when we made one).
 if [ "$LOCAL_MODE" = false ] && [ -n "$SCRIPT_DIR" ] && [ -d "$SCRIPT_DIR" ] && [ "$SCRIPT_DIR" != "/" ]; then
   rm -rf "$SCRIPT_DIR"

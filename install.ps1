@@ -351,6 +351,18 @@ Register-BashAllowlist
 Install-Pdfium
 Preload-Encoder
 
+# Optional post-install daemon hook (Slice 2 — STRUCTURAL-2-3)
+# Opt-in via `$env:CLAUDEBASE_INSTALL_DAEMON=1`. Fails soft.
+if ($env:CLAUDEBASE_INSTALL_DAEMON -eq "1") {
+    Write-Info "CLAUDEBASE_INSTALL_DAEMON=1 detected; installing daemon service unit..."
+    & claudebase daemon install --no-start --yes
+    if ($LASTEXITCODE -eq 0) {
+        Write-Ok "Daemon service unit installed (start with 'claudebase daemon start')"
+    } else {
+        Write-Warn "Daemon install failed (exit $LASTEXITCODE); continuing without daemon"
+    }
+}
+
 # Cleanup the temp clone (only when we made one).
 if (-not $Local -and $Script:ScriptDir -and (Test-Path $Script:ScriptDir) -and $Script:ScriptDir -like "$env:TEMP\*") {
     Remove-Item -Recurse -Force $Script:ScriptDir -ErrorAction SilentlyContinue

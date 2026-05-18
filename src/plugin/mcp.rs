@@ -48,6 +48,10 @@ pub const TOOL_WHITELIST: &[&str] = &[
     "chat_subscribe",
     "chat_reply",
     "chat_list",
+    // Slice 7.x — thread-discovery helper (parity with server.rs dispatch
+    // case + tools/list descriptor); without this entry the plugin gates
+    // on SEC-7 and returns -32601 BEFORE the daemon ever sees the call.
+    "chat_list_threads",
     "claudebase_daemon_status",
     // Slice 5 — agent_registry tools (SEC-7 whitelist parity with daemon dispatch)
     "agent_register",

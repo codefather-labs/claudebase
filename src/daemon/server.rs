@@ -517,10 +517,24 @@ async fn handle_connection(
                     continue;
                 }
             };
+            let method = frame
+                .get("method")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let id = frame.get("id").cloned();
             if let Err(e) = write_frame(&mut write_half, &bytes).await {
                 tracing::info!(error = %e, "outbound write failed; closing connection");
                 break;
             }
+            // Slice 7.x diagnostic — log every successful UDS write so we
+            // can see frame egress at the daemon→plugin boundary.
+            tracing::debug!(
+                %connection_id,
+                bytes = bytes.len(),
+                method = ?method,
+                id = ?id,
+                "writer: wrote frame to UDS"
+            );
         }
     });
 
@@ -1034,18 +1048,47 @@ async fn handle_chat_subscribe(
 
     let messages_json: Vec<serde_json::Value> = backlog.iter().map(|m| m.to_json()).collect();
 
+    // Slice 7.x diagnostic — log the subscribe registration so we can
+    // verify subscribers count when a TG broadcast fires.
+    tracing::info!(
+        %connection_id,
+        thread = %thread,
+        backlog_count = backlog.len(),
+        "chat_subscribe registered"
+    );
+
     // Spawn the forwarding task that pumps broadcast → outbound mpsc.
     // Rule 3 / Rule 5: panic-safe + no .unwrap on runtime values.
     let outbound_clone = outbound_tx.clone();
     let thread_for_log = thread.clone();
+    let connection_id_for_log = connection_id;
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
                 Ok(frame) => {
+                    // Slice 7.x diagnostic — every forwarder delivery
+                    // through the bus → connection mpsc bridge. DEBUG
+                    // level so it doesn't drown info logs in production
+                    // (RUST_LOG=info,claudebase=debug surfaces it).
+                    let method = frame
+                        .get("method")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
                     if outbound_clone.send(frame).is_err() {
+                        tracing::info!(
+                            %connection_id_for_log,
+                            thread = %thread_for_log,
+                            "forwarder: outbound mpsc closed; subscriber gone"
+                        );
                         // outbound mpsc closed — connection is gone.
                         break;
                     }
+                    tracing::debug!(
+                        %connection_id_for_log,
+                        thread = %thread_for_log,
+                        method = %method,
+                        "forwarder: delivered frame to connection mpsc"
+                    );
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     tracing::warn!(

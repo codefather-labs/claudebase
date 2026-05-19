@@ -99,6 +99,37 @@ pub async fn run() -> anyhow::Result<()> {
     // tools/list_changed emission on down → up transition.
     let mut daemon_down = daemon.is_none();
 
+    // Slice 7.x diagnostic helper — appends a one-line entry to
+    // /tmp/claudebase-plugin-trace.log when CLAUDEBASE_PLUGIN_TRACE=1.
+    // Best-effort: file open / write errors are swallowed so the
+    // diagnostic NEVER affects production semantics. The marker is a
+    // simple compact line that captures direction (IN/OUT) + body so
+    // the operator can grep the wire shape from outside Claude Code's
+    // MCP log sandbox.
+    fn trace_line(tag: &str, body: &str) {
+        if std::env::var("CLAUDEBASE_PLUGIN_TRACE").as_deref() != Ok("1") {
+            return;
+        }
+        use std::io::Write;
+        if let Ok(mut log) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/claudebase-plugin-trace.log")
+        {
+            let _ = writeln!(
+                log,
+                "[{}] {} bytes={} body={}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0),
+                tag,
+                body.len(),
+                body
+            );
+        }
+    }
+
     loop {
         // tokio::select! across (stdin, idle UDS notification drain).
         // Slice 3: when the daemon pushes a notification while we're
@@ -117,37 +148,7 @@ pub async fn run() -> anyhow::Result<()> {
                         Some(f) => {
                             if f.get("id").is_none() {
                                 // Notification — relay to stdout.
-                                // Slice 7.x diagnostic — when env var
-                                // CLAUDEBASE_PLUGIN_TRACE=1 is set, ALSO
-                                // append a one-line marker to
-                                // /tmp/claudebase-plugin-trace.log so the
-                                // operator can verify the plugin→stdout
-                                // step from outside Claude Code's MCP log
-                                // sandbox. Best-effort; ignore errors.
-                                if std::env::var("CLAUDEBASE_PLUGIN_TRACE").as_deref() == Ok("1") {
-                                    use std::io::Write;
-                                    if let Ok(mut log) = std::fs::OpenOptions::new()
-                                        .create(true)
-                                        .append(true)
-                                        .open("/tmp/claudebase-plugin-trace.log")
-                                    {
-                                        let method = f.get("method")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("?");
-                                        let body = f.to_string();
-                                        let _ = writeln!(
-                                            log,
-                                            "[{}] FWD notif method={} body_bytes={} body={}",
-                                            std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .map(|d| d.as_millis())
-                                                .unwrap_or(0),
-                                            method,
-                                            body.len(),
-                                            body
-                                        );
-                                    }
-                                }
+                                trace_line("UDS→STDOUT notif", &f.to_string());
                                 write_mcp_line(&mut stdout, &f).await?;
                             } else {
                                 // Unexpected response while idle —
@@ -186,6 +187,7 @@ pub async fn run() -> anyhow::Result<()> {
                 // Stdin EOF — clean shutdown (SEC-6). Drop pending map
                 // to close all oneshot senders. UDS drops when `daemon`
                 // goes out of scope.
+                trace_line("STDIN→PLUGIN EOF", "<eof>");
                 drop(pending);
                 drop(daemon);
                 return Ok(());
@@ -197,6 +199,9 @@ pub async fn run() -> anyhow::Result<()> {
                 return Ok(());
             }
         };
+
+        // Slice 7.x diagnostic — every stdin line from Claude Code.
+        trace_line("STDIN→PLUGIN", &line);
 
         // SEC-1 frame-size cap on stdin line.
         if line.len() > MAX_MCP_FRAME_SIZE {
@@ -594,6 +599,30 @@ async fn forward_to_daemon(
 /// and flush. The newline is the wire-format delimiter on the MCP leg.
 async fn write_mcp_line(stdout: &mut tokio::io::Stdout, value: &Value) -> anyhow::Result<()> {
     let mut line = serde_json::to_vec(value).context("serialize MCP response")?;
+    // Slice 7.x diagnostic — every stdout line plugin sends to Claude Code.
+    // Env-gated via CLAUDEBASE_PLUGIN_TRACE=1. trace_line is defined locally
+    // in run_bridge; we inline a minimal copy here since this helper is
+    // module-level and doesn't have access to the closure.
+    if std::env::var("CLAUDEBASE_PLUGIN_TRACE").as_deref() == Ok("1") {
+        use std::io::Write as _;
+        if let Ok(mut log) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/claudebase-plugin-trace.log")
+        {
+            let body = String::from_utf8_lossy(&line);
+            let _ = writeln!(
+                log,
+                "[{}] PLUGIN→STDOUT bytes={} body={}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0),
+                line.len(),
+                body
+            );
+        }
+    }
     line.push(b'\n');
     stdout.write_all(&line).await.context("write stdout")?;
     stdout.flush().await.context("flush stdout")?;

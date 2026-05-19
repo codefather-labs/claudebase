@@ -26,11 +26,21 @@ use serde_json::{json, Value};
 /// production traffic includes embeddings).
 pub const MAX_MCP_FRAME_SIZE: usize = 1 * 1024 * 1024;
 
-/// Single supported MCP protocol version. Mismatches raise `-32602
-/// Invalid params` per JSON-RPC 2.0. We pin one version explicitly so
-/// the architect soft-concern (silent client-version drift) surfaces as
-/// an explicit error instead of an opaque handshake failure.
-pub const SUPPORTED_PROTOCOL_VERSION: &str = "2024-11-05";
+/// Single supported MCP protocol version that the plugin negotiates with
+/// Claude Code on `initialize`. Per MCP spec, server responds with its
+/// supported version regardless of what the client asks for; the live
+/// trace confirms Claude Code 2.1.144 sends `"2025-11-25"` and accepts
+/// the negotiation outcome without error.
+///
+/// Slice 7.x update (2026-05-19): bumped from `"2024-11-05"` to
+/// `"2025-11-25"` to match Claude Code 2.1.144's client advertisement.
+/// H2 hypothesis: the channel-surface code path may downgrade features
+/// (notifications/claude/channel routing to LLM input) when the server's
+/// advertised protocol version is older than the client's. Bumping to
+/// match removes this as a possible cause; if channel callbacks still
+/// fail after this change, H1 (process-asymmetry — separate tools vs
+/// channel-listener subprocesses) is the next hypothesis to test.
+pub const SUPPORTED_PROTOCOL_VERSION: &str = "2025-11-25";
 
 // JSON-RPC 2.0 error codes (from the spec).
 pub const ERROR_PARSE: i64 = -32700;

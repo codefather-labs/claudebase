@@ -140,6 +140,21 @@ pub fn initialize_response(id: Value) -> Value {
                 "tools": {
                     "listChanged": true
                 },
+                // H3 — Claude Code 2.1.144 advertises `roots` and
+                // `elicitation` client capabilities in its initialize
+                // request. We declare the corresponding SERVER capabilities
+                // so the surface negotiation completes cleanly. Empty
+                // objects mean "supported but no specific sub-features".
+                // Best practice per MCP spec is to declare what the
+                // server can speak; unilateral declarations are safe.
+                "logging": {},
+                "prompts": {
+                    "listChanged": false
+                },
+                "resources": {
+                    "listChanged": false,
+                    "subscribe": false
+                },
                 "experimental": {
                     "claude/channel": {},
                     "claude/channel/permission": {}

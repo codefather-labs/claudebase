@@ -448,6 +448,52 @@ pub async fn run() -> anyhow::Result<()> {
                             }
                         }
                     }
+                    "prompts/list" => {
+                        // H3 — Claude Code 2.1.144 may probe prompts/list
+                        // after init. We don't ship prompts; return empty.
+                        let resp = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": { "prompts": [] }
+                        });
+                        write_mcp_line(&mut stdout, &resp).await?;
+                    }
+                    "resources/list" => {
+                        // H3 — same idea, return empty resources list.
+                        let resp = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": { "resources": [] }
+                        });
+                        write_mcp_line(&mut stdout, &resp).await?;
+                    }
+                    "resources/templates/list" => {
+                        let resp = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": { "resourceTemplates": [] }
+                        });
+                        write_mcp_line(&mut stdout, &resp).await?;
+                    }
+                    "logging/setLevel" => {
+                        // Accept any level; we don't actually adjust our
+                        // tracing filter based on this. Just ack.
+                        let resp = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {}
+                        });
+                        write_mcp_line(&mut stdout, &resp).await?;
+                    }
+                    "ping" => {
+                        // MCP ping: empty result.
+                        let resp = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {}
+                        });
+                        write_mcp_line(&mut stdout, &resp).await?;
+                    }
                     _ => {
                         // Unknown method.
                         write_mcp_line(

@@ -1068,12 +1068,13 @@ async fn handle_chat_subscribe(
                 Ok(frame) => {
                     // Slice 7.x diagnostic — every forwarder delivery
                     // through the bus → connection mpsc bridge. DEBUG
-                    // level so it doesn't drown info logs in production
-                    // (RUST_LOG=info,claudebase=debug surfaces it).
+                    // level so it doesn't drown info logs in production.
+                    // Capture method as String BEFORE move into send().
                     let method = frame
                         .get("method")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("?");
+                        .unwrap_or("?")
+                        .to_string();
                     if outbound_clone.send(frame).is_err() {
                         tracing::info!(
                             %connection_id_for_log,

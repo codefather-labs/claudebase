@@ -118,11 +118,12 @@ pub async fn run() -> anyhow::Result<()> {
         {
             let _ = writeln!(
                 log,
-                "[{}] {} bytes={} body={}",
+                "[{}] pid={} {} bytes={} body={}",
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis())
                     .unwrap_or(0),
+                std::process::id(),
                 tag,
                 body.len(),
                 body
@@ -613,11 +614,12 @@ async fn write_mcp_line(stdout: &mut tokio::io::Stdout, value: &Value) -> anyhow
             let body = String::from_utf8_lossy(&line);
             let _ = writeln!(
                 log,
-                "[{}] PLUGIN→STDOUT bytes={} body={}",
+                "[{}] pid={} PLUGIN→STDOUT bytes={} body={}",
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis())
                     .unwrap_or(0),
+                std::process::id(),
                 line.len(),
                 body
             );

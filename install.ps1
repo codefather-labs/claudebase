@@ -408,10 +408,11 @@ function Install-WhisperStack {
 
 # ============================================================================
 # Install the Rust port of the official Anthropic Telegram plugin.
-# Mirrors install.sh's install_telegram_plugin — dev strategy per operator brief.
+# Mirrors install.sh's install_telegram_plugin — always downloads server-rs
+# from the matching claudebase release asset; no cargo build fallback.
 # Opt-out: $env:CLAUDEBASE_SKIP_TELEGRAM=1.
-# Requires: `claude` CLI on PATH + `cargo` (Rust toolchain) on PATH.
-# Idempotent. Patches `.mcp.json` with bash toggle (default Rust, fallback bun).
+# Requires: `claude` CLI on PATH.
+# Idempotent. Patches `.mcp.json` with direct exec of server-rs.exe.
 # ============================================================================
 function Install-TelegramPlugin {
     if ($env:CLAUDEBASE_SKIP_TELEGRAM -eq '1') {
@@ -484,34 +485,11 @@ function Install-TelegramPlugin {
         Write-Ok "server-rs.exe downloaded ($((Get-Item $targetBin).Length) bytes) -> $targetBin"
     } else {
         if (Test-Path $tmp.FullName) { Remove-Item -Force $tmp.FullName }
-        Write-Warn "falling back to cargo build"
-        if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-            Write-Warn "  cargo not on PATH either; install Rust (https://rustup.rs/) or wait for a release with telegram-plugin-rs artifacts"
-            return
-        }
-        $pluginSrc = Join-Path $Script:ScriptDir 'plugins\telegram-rs'
-        if (-not (Test-Path $pluginSrc)) {
-            Write-Warn "  plugins\telegram-rs source not present at $Script:ScriptDir — skipping"
-            return
-        }
-        Write-Info "cargo build --release -p telegram-plugin-rs (first build ~5 min, cached after)"
-        Push-Location $Script:ScriptDir
-        try {
-            & cargo build --release -p telegram-plugin-rs 2>&1 | Select-Object -Last 3 | ForEach-Object { Write-Host "    $_" }
-            if ($LASTEXITCODE -ne 0) {
-                Write-Warn "cargo build telegram-plugin-rs failed; upstream TSX plugin will run unchanged"
-                return
-            }
-        } finally {
-            Pop-Location
-        }
-        $builtBin = Join-Path $Script:ScriptDir 'target\release\telegram-plugin-rs.exe'
-        if (-not (Test-Path $builtBin)) {
-            Write-Warn "build succeeded but binary missing — skipping patch"
-            return
-        }
-        Copy-Item -Force $builtBin $targetBin
-        Write-Ok "server-rs.exe built locally ($((Get-Item $targetBin).Length) bytes) -> $targetBin"
+        Write-Warn "telegram-plugin-rs download failed for $platform from $url"
+        Write-Warn "  the upstream TSX plugin will run unchanged via bun"
+        Write-Warn "  to force a build from source locally: cargo build --release -p telegram-plugin-rs"
+        Write-Warn "  then copy target\release\telegram-plugin-rs.exe -> $targetBin"
+        return
     }
 
     # ----- 5. Patch .mcp.json (backup upstream first) -----

@@ -547,9 +547,10 @@ install_whisper_stack() {
 # ============================================================================
 # Install the Rust port of the official Anthropic Telegram plugin.
 # ============================================================================
-# Dev strategy (per operator brief — 2026-05-23):
+# Strategy (per operator brief — always download from GH release):
 #   1. install the OFFICIAL upstream plugin (telegram@claude-plugins-official)
-#   2. cargo-build our Rust binary from plugins/telegram-rs/ in this repo
+#   2. download our pre-built Rust binary from the matching claudebase
+#      release asset (telegram-plugin-rs-<platform>); never cargo-build
 #   3. copy it into the plugin cache as `server-rs` alongside upstream `server.ts`
 #   4. patch `.mcp.json` with a bash toggle that defaults to Rust (server-rs)
 #      and falls back to bun (TSX) if env var TELEGRAM_USE_TSX_SERVER=1 OR
@@ -557,10 +558,12 @@ install_whisper_stack() {
 #
 # Skipped (best-effort):
 #   - `claude` CLI not on PATH → log + return 0 (no plugin to patch into)
-#   - `cargo` not on PATH → log + return 0 (operator can install Rust later)
 #   - CLAUDEBASE_SKIP_TELEGRAM=1 → silent skip (for headless CI)
+#   - download fails → log warn + leave upstream TSX plugin in place; no
+#     cargo-build fallback (operator must wait for a release or build
+#     manually if they want Rust before release artifacts exist)
 #
-# Idempotent: re-running just rebuilds binary (cargo cache), recopies, re-patches.
+# Idempotent: re-running re-downloads, recopies, re-patches.
 # Backup of upstream `.mcp.json` is preserved at `.mcp.json.upstream-backup`.
 # ============================================================================
 install_telegram_plugin() {
@@ -665,28 +668,11 @@ install_telegram_plugin() {
     log_ok "server-rs downloaded ($(wc -c <"$target_bin" | tr -d ' ') bytes) → $target_bin"
   else
     rm -f "$tmp_download"
-    log_warn "telegram-plugin-rs download failed — falling back to cargo build"
-    if ! command -v cargo >/dev/null 2>&1; then
-      log_warn "  cargo not on PATH either; install Rust (https://rustup.rs/) or wait for a release with telegram-plugin-rs artifacts"
-      return 0
-    fi
-    if [ ! -d "$SCRIPT_DIR/plugins/telegram-rs" ]; then
-      log_warn "  plugins/telegram-rs source not present at $SCRIPT_DIR — skipping"
-      return 0
-    fi
-    log_info "cargo build --release -p telegram-plugin-rs (first build ~5 min, cached after)"
-    if ! ( cd "$SCRIPT_DIR" && cargo build --release -p telegram-plugin-rs 2>&1 | tail -3 ); then
-      log_warn "cargo build telegram-plugin-rs failed; the upstream TSX plugin will run unchanged"
-      return 0
-    fi
-    local built_bin="$SCRIPT_DIR/target/release/telegram-plugin-rs${exe_ext}"
-    if [ ! -x "$built_bin" ]; then
-      log_warn "build succeeded but binary missing at $built_bin — skipping patch"
-      return 0
-    fi
-    cp "$built_bin" "$target_bin"
-    chmod 0755 "$target_bin"
-    log_ok "server-rs built locally ($(wc -c <"$built_bin" | tr -d ' ') bytes) → $target_bin"
+    log_warn "telegram-plugin-rs download failed for $platform from $url"
+    log_warn "  the upstream TSX plugin will run unchanged via bun"
+    log_warn "  to force a build from source locally: cargo build --release -p telegram-plugin-rs"
+    log_warn "  then copy target/release/telegram-plugin-rs${exe_ext} → $target_bin"
+    return 0
   fi
 
   # ----- 5. Patch .mcp.json with toggle (backup upstream version first) -----

@@ -322,6 +322,224 @@ function Preload-Encoder {
 }
 
 # ============================================================================
+# Install whisper-cli + ffmpeg (voice transcription dependencies). Mirrors
+# install.sh's install_whisper_stack. Best-effort + idempotent.
+# Opt-out: set $env:CLAUDEBASE_SKIP_WHISPER=1.
+# Model (~1.5 GB ggml-medium.bin) is NOT downloaded here — lazy on first voice.
+# ============================================================================
+function Install-WhisperStack {
+    if ($env:CLAUDEBASE_SKIP_WHISPER -eq '1') {
+        Write-Info "CLAUDEBASE_SKIP_WHISPER=1 — skipping ffmpeg + whisper-cli install"
+        return
+    }
+
+    $needFfmpeg = -not (Get-Command ffmpeg -ErrorAction SilentlyContinue)
+    $needWhisper = -not (Get-Command whisper-cli -ErrorAction SilentlyContinue)
+    if (-not $needFfmpeg -and -not $needWhisper) {
+        Write-Ok "ffmpeg + whisper-cli already on PATH (voice transcription ready)"
+        return
+    }
+
+    # Detect package manager — winget preferred, then choco, then scoop.
+    $pkgMgr = $null
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        $pkgMgr = 'winget'
+    } elseif (Get-Command choco -ErrorAction SilentlyContinue) {
+        $pkgMgr = 'choco'
+    } elseif (Get-Command scoop -ErrorAction SilentlyContinue) {
+        $pkgMgr = 'scoop'
+    } else {
+        Write-Warn "no supported package manager detected (winget/choco/scoop); voice transcription disabled"
+        Write-Warn "  to enable, install manually:"
+        Write-Warn "    winget install ggerganov.whisper-cpp Gyan.FFmpeg"
+        Write-Warn "    OR choco install whisper-cpp ffmpeg"
+        Write-Warn "    OR scoop install whisper-cpp ffmpeg"
+        return
+    }
+
+    $cmds = @{
+        winget = @{
+            ffmpeg  = @('install', '--accept-source-agreements', '-e', 'Gyan.FFmpeg')
+            whisper = @('install', '--accept-source-agreements', '-e', 'ggerganov.whisper-cpp')
+        }
+        choco = @{
+            ffmpeg  = @('install', '-y', 'ffmpeg')
+            whisper = @('install', '-y', 'whisper-cpp')
+        }
+        scoop = @{
+            ffmpeg  = @('install', 'ffmpeg')
+            whisper = @('install', 'whisper-cpp')
+        }
+    }
+
+    if ($needFfmpeg) {
+        Write-Info "installing ffmpeg via $pkgMgr..."
+        try {
+            & $pkgMgr @($cmds[$pkgMgr]['ffmpeg']) | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Ok "ffmpeg installed"
+            } else {
+                Write-Warn "ffmpeg install via $pkgMgr returned exit $LASTEXITCODE; install manually"
+            }
+        } catch {
+            Write-Warn "ffmpeg install via $pkgMgr failed: $($_.Exception.Message)"
+        }
+    }
+
+    if ($needWhisper) {
+        Write-Info "installing whisper-cli via $pkgMgr (this can take a few minutes)..."
+        try {
+            & $pkgMgr @($cmds[$pkgMgr]['whisper']) | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Ok "whisper-cli installed"
+            } else {
+                Write-Warn "whisper-cli install via $pkgMgr returned exit $LASTEXITCODE; install manually"
+            }
+        } catch {
+            Write-Warn "whisper-cli install via $pkgMgr failed: $($_.Exception.Message)"
+        }
+    }
+
+    if ((Get-Command ffmpeg -ErrorAction SilentlyContinue) -and (Get-Command whisper-cli -ErrorAction SilentlyContinue)) {
+        Write-Info "voice transcription stack ready — model auto-downloads on first voice msg"
+        Write-Info "  (or pre-download to ~\AppData\Local\whisper-cpp\models\ggml-medium.bin)"
+    }
+}
+
+# ============================================================================
+# Install the Rust port of the official Anthropic Telegram plugin.
+# Mirrors install.sh's install_telegram_plugin — dev strategy per operator brief.
+# Opt-out: $env:CLAUDEBASE_SKIP_TELEGRAM=1.
+# Requires: `claude` CLI on PATH + `cargo` (Rust toolchain) on PATH.
+# Idempotent. Patches `.mcp.json` with bash toggle (default Rust, fallback bun).
+# ============================================================================
+function Install-TelegramPlugin {
+    if ($env:CLAUDEBASE_SKIP_TELEGRAM -eq '1') {
+        Write-Info "CLAUDEBASE_SKIP_TELEGRAM=1 — skipping telegram plugin install"
+        return
+    }
+    if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
+        Write-Info "claude CLI not on PATH; skipping telegram plugin install"
+        Write-Info "  to install manually after Claude Code is installed:"
+        Write-Info "    claude plugin install telegram@claude-plugins-official"
+        Write-Info "    then re-run this installer to patch the Rust binary"
+        return
+    }
+
+    # ----- 1. Install official plugin if not already -----
+    $marketplaceAlready = $false
+    try {
+        $mpList = & claude plugin marketplace list 2>&1
+        if ($mpList -match "claude-plugins-official") { $marketplaceAlready = $true }
+    } catch {}
+    if (-not $marketplaceAlready) {
+        Write-Info "Adding marketplace anthropics/claude-plugins-official..."
+        try { & claude plugin marketplace add anthropics/claude-plugins-official 2>&1 | Out-Null } catch {}
+    }
+    Write-Info "Installing telegram@claude-plugins-official (idempotent)..."
+    try { & claude plugin install telegram@claude-plugins-official 2>&1 | Out-Null } catch {}
+
+    # ----- 2. Locate installed plugin dir (newest version) -----
+    $pluginRoot = Join-Path $Script:ClaudeDir 'plugins\cache\claude-plugins-official\telegram'
+    if (-not (Test-Path $pluginRoot)) {
+        Write-Warn "official telegram plugin not found at $pluginRoot — skipping Rust patch"
+        return
+    }
+    $versionDir = Get-ChildItem -Path $pluginRoot -Directory -ErrorAction SilentlyContinue `
+        | Sort-Object -Property Name -Descending `
+        | Select-Object -First 1
+    if (-not $versionDir) {
+        Write-Warn "no version subdir found under $pluginRoot — skipping Rust patch"
+        return
+    }
+    $pluginDir = $versionDir.FullName
+    Write-Info "patching plugin v$($versionDir.Name) at $pluginDir"
+
+    # ----- 3. Resolve binary: download from GH release first; cargo build
+    #         fallback only if download fails (no release with this asset
+    #         yet, offline, etc). Mirrors install.sh download-first pattern. -----
+    $platform = $null
+    switch ("$(if ([System.Environment]::Is64BitOperatingSystem) {'x64'} else {'x86'})") {
+        'x64' { $platform = 'windows-x64' }
+        default {
+            Write-Warn "unsupported Windows arch; skipping telegram-plugin-rs"
+            return
+        }
+    }
+    $targetBin = Join-Path $pluginDir 'server-rs.exe'
+    $url = "$($Script:ReleaseBase)/claudebase-v$($Script:ClaudebaseVersion)/telegram-plugin-rs-$platform.exe"
+    $downloaded = $false
+    $tmp = New-TemporaryFile
+
+    Write-Info "downloading telegram-plugin-rs binary from GH release for $platform..."
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $tmp.FullName -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
+        $downloaded = $true
+    } catch {
+        Write-Warn "telegram-plugin-rs download failed: $($_.Exception.Message)"
+    }
+
+    if ($downloaded -and (Test-Path $tmp.FullName) -and ((Get-Item $tmp.FullName).Length -gt 0)) {
+        Move-Item -Force $tmp.FullName $targetBin
+        Write-Ok "server-rs.exe downloaded ($((Get-Item $targetBin).Length) bytes) -> $targetBin"
+    } else {
+        if (Test-Path $tmp.FullName) { Remove-Item -Force $tmp.FullName }
+        Write-Warn "falling back to cargo build"
+        if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+            Write-Warn "  cargo not on PATH either; install Rust (https://rustup.rs/) or wait for a release with telegram-plugin-rs artifacts"
+            return
+        }
+        $pluginSrc = Join-Path $Script:ScriptDir 'plugins\telegram-rs'
+        if (-not (Test-Path $pluginSrc)) {
+            Write-Warn "  plugins\telegram-rs source not present at $Script:ScriptDir — skipping"
+            return
+        }
+        Write-Info "cargo build --release -p telegram-plugin-rs (first build ~5 min, cached after)"
+        Push-Location $Script:ScriptDir
+        try {
+            & cargo build --release -p telegram-plugin-rs 2>&1 | Select-Object -Last 3 | ForEach-Object { Write-Host "    $_" }
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warn "cargo build telegram-plugin-rs failed; upstream TSX plugin will run unchanged"
+                return
+            }
+        } finally {
+            Pop-Location
+        }
+        $builtBin = Join-Path $Script:ScriptDir 'target\release\telegram-plugin-rs.exe'
+        if (-not (Test-Path $builtBin)) {
+            Write-Warn "build succeeded but binary missing — skipping patch"
+            return
+        }
+        Copy-Item -Force $builtBin $targetBin
+        Write-Ok "server-rs.exe built locally ($((Get-Item $targetBin).Length) bytes) -> $targetBin"
+    }
+
+    # ----- 5. Patch .mcp.json (backup upstream first) -----
+    $mcpJson = Join-Path $pluginDir '.mcp.json'
+    $mcpBackup = Join-Path $pluginDir '.mcp.json.upstream-backup'
+    if ((Test-Path $mcpJson) -and (-not (Test-Path $mcpBackup))) {
+        Copy-Item $mcpJson $mcpBackup
+        Write-Ok ".mcp.json.upstream-backup preserved"
+    }
+    # On Windows, cmd.exe is the available shell for the toggle. Simpler:
+    # just exec server-rs.exe directly when present. (The bash-toggle is for
+    # Unix; Windows users opt-out by removing the binary.)
+    $cfg = @{
+        mcpServers = @{
+            telegram = @{
+                command = $targetBin
+                args = @()
+            }
+        }
+    }
+    $cfg | ConvertTo-Json -Depth 6 | Set-Content -Path $mcpJson -Encoding UTF8
+    Write-Ok ".mcp.json patched (Windows: direct exec of server-rs.exe)"
+
+    Write-Info "to enable: launch Claude Code with"
+    Write-Info "  claude --channels plugin:telegram@claude-plugins-official"
+}
+
+# ============================================================================
 # Register the claudebase plugin with Claude Code (marketplace + install)
 # ============================================================================
 # Mirrors install.sh's `register_claude_plugin` — idempotent registration of
@@ -387,8 +605,10 @@ Install-Binary
 Register-Alias
 Register-BashAllowlist
 Install-Pdfium
+Install-WhisperStack
 Preload-Encoder
 Register-ClaudePlugin
+Install-TelegramPlugin
 
 # Optional post-install daemon hook (Slice 2 — STRUCTURAL-2-3)
 # Opt-in via `$env:CLAUDEBASE_INSTALL_DAEMON=1`. Fails soft.

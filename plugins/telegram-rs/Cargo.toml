@@ -1,0 +1,39 @@
+[package]
+name = "telegram-plugin-rs"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Rust port of the official Anthropic Telegram channel plugin for Claude Code."
+repository = "https://github.com/codefather-labs/claudebase"
+publish = false
+
+[[bin]]
+name = "telegram-plugin-rs"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime — required for non-blocking stdio + concurrent message handlers.
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "io-std", "io-util", "process", "time", "sync", "fs"] }
+
+# JSON serialization for MCP wire format + Telegram API + access.json state.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Telegram Bot API client — async via reqwest. Direct 1:1 mapping to Bot
+# API methods; equivalent to grammy on the TSX side.
+frankenstein = { version = "0.49", features = ["client-reqwest"] }
+
+# Cryptographic entropy for pairing-code generation.
+rand = "0.8"
+
+# HTTP client for downloading photo attachments from Telegram's file CDN.
+# frankenstein already pulls reqwest via client-reqwest feature; this just
+# pins our direct use (we can't borrow frankenstein's internal client).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
+
+# Logging to stderr (stdout is reserved for JSON-RPC protocol — NEVER print!() to stdout).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Release profile is inherited from the claudebase workspace root
+# (Cargo ignores [profile.*] in non-root members and warns if present).

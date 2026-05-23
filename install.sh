@@ -460,6 +460,264 @@ preload_encoder() {
 }
 
 # ============================================================================
+# Install whisper-cli + ffmpeg (voice transcription dependencies)
+# ============================================================================
+# Needed by the upcoming Rust port of the official Telegram plugin which
+# transcribes inbound voice messages locally via whisper.cpp before
+# emitting them as channel notifications.
+#
+# Best-effort:
+#   - If both binaries are already on PATH → log + return 0 (idempotent).
+#   - If a package manager is detected → attempt install; warn on failure.
+#   - If no package manager → log clear manual-install hint + return 0.
+# The actual whisper model (~1.5 GB ggml-medium.bin) is NOT downloaded
+# here — too heavy for the install path. The plugin downloads it lazily
+# on first voice message, or the operator drops it at
+# ~/.local/share/whisper-cpp/models/ggml-medium.bin ahead of time.
+#
+# Opt-out: set CLAUDEBASE_SKIP_WHISPER=1 to bypass entirely (no install,
+# no log spam). For headless CI where audio deps would just add minutes
+# to the install for no benefit.
+install_whisper_stack() {
+  if [ "${CLAUDEBASE_SKIP_WHISPER:-0}" = "1" ]; then
+    log_info "CLAUDEBASE_SKIP_WHISPER=1 — skipping ffmpeg + whisper-cli install"
+    return 0
+  fi
+
+  local need_ffmpeg=true
+  local need_whisper=true
+  command -v ffmpeg >/dev/null 2>&1 && need_ffmpeg=false
+  command -v whisper-cli >/dev/null 2>&1 && need_whisper=false
+
+  if ! $need_ffmpeg && ! $need_whisper; then
+    log_ok "ffmpeg + whisper-cli already on PATH (voice transcription ready)"
+    return 0
+  fi
+
+  # Detect package manager (try most reliable first).
+  local pkg_mgr=""
+  local pkg_install=""
+  local pkg_ffmpeg="ffmpeg"
+  local pkg_whisper="whisper-cpp"
+  if command -v brew >/dev/null 2>&1; then
+    pkg_mgr="brew"
+    pkg_install="brew install"
+  elif command -v apt-get >/dev/null 2>&1; then
+    pkg_mgr="apt-get"
+    pkg_install="sudo apt-get install -y"
+  elif command -v dnf >/dev/null 2>&1; then
+    pkg_mgr="dnf"
+    pkg_install="sudo dnf install -y"
+  elif command -v pacman >/dev/null 2>&1; then
+    pkg_mgr="pacman"
+    pkg_install="sudo pacman -S --noconfirm"
+  else
+    log_warn "no supported package manager detected (brew/apt-get/dnf/pacman); voice transcription disabled"
+    log_warn "  to enable, install manually:"
+    log_warn "    macOS:  brew install whisper-cpp ffmpeg"
+    log_warn "    Linux:  apt install whisper-cpp ffmpeg  (or dnf/pacman equivalent)"
+    return 0
+  fi
+
+  if $need_ffmpeg; then
+    log_info "installing ffmpeg via $pkg_mgr..."
+    if $pkg_install $pkg_ffmpeg >/dev/null 2>&1; then
+      log_ok "ffmpeg installed"
+    else
+      log_warn "ffmpeg install via $pkg_mgr failed; install manually: $pkg_install $pkg_ffmpeg"
+    fi
+  fi
+
+  if $need_whisper; then
+    log_info "installing whisper-cli via $pkg_mgr (this can take a few minutes)..."
+    if $pkg_install $pkg_whisper >/dev/null 2>&1; then
+      log_ok "whisper-cli installed"
+    else
+      log_warn "whisper-cli install via $pkg_mgr failed; install manually: $pkg_install $pkg_whisper"
+    fi
+  fi
+
+  if command -v ffmpeg >/dev/null 2>&1 && command -v whisper-cli >/dev/null 2>&1; then
+    log_info "voice transcription stack ready — whisper model auto-downloads on first voice msg"
+    log_info "  (or pre-download to ~/.local/share/whisper-cpp/models/ggml-medium.bin)"
+  fi
+  return 0
+}
+
+# ============================================================================
+# Install the Rust port of the official Anthropic Telegram plugin.
+# ============================================================================
+# Dev strategy (per operator brief — 2026-05-23):
+#   1. install the OFFICIAL upstream plugin (telegram@claude-plugins-official)
+#   2. cargo-build our Rust binary from plugins/telegram-rs/ in this repo
+#   3. copy it into the plugin cache as `server-rs` alongside upstream `server.ts`
+#   4. patch `.mcp.json` with a bash toggle that defaults to Rust (server-rs)
+#      and falls back to bun (TSX) if env var TELEGRAM_USE_TSX_SERVER=1 OR
+#      if the Rust binary is missing
+#
+# Skipped (best-effort):
+#   - `claude` CLI not on PATH → log + return 0 (no plugin to patch into)
+#   - `cargo` not on PATH → log + return 0 (operator can install Rust later)
+#   - CLAUDEBASE_SKIP_TELEGRAM=1 → silent skip (for headless CI)
+#
+# Idempotent: re-running just rebuilds binary (cargo cache), recopies, re-patches.
+# Backup of upstream `.mcp.json` is preserved at `.mcp.json.upstream-backup`.
+# ============================================================================
+install_telegram_plugin() {
+  if [ "${CLAUDEBASE_SKIP_TELEGRAM:-0}" = "1" ]; then
+    log_info "CLAUDEBASE_SKIP_TELEGRAM=1 — skipping telegram plugin install"
+    return 0
+  fi
+
+  if ! command -v claude >/dev/null 2>&1; then
+    log_info "claude CLI not on PATH; skipping telegram plugin install"
+    log_info "  to install manually after Claude Code is installed:"
+    log_info "    claude plugin install telegram@claude-plugins-official"
+    log_info "    then re-run this installer to patch the Rust binary"
+    return 0
+  fi
+
+  # ----- 1. Install official plugin if not already -----
+  local marketplace_already=false
+  if claude plugin marketplace list 2>/dev/null | grep -q "claude-plugins-official"; then
+    marketplace_already=true
+  fi
+  if [ "$marketplace_already" = false ]; then
+    log_info "Adding marketplace anthropics/claude-plugins-official..."
+    claude plugin marketplace add anthropics/claude-plugins-official 2>&1 | tail -2 || true
+  fi
+  log_info "Installing telegram@claude-plugins-official (idempotent)..."
+  claude plugin install telegram@claude-plugins-official 2>&1 | tail -2 || true
+
+  # ----- 2. Locate the installed plugin dir -----
+  # Prefer installed_plugins.json (authoritative — points to the currently
+  # ACTIVE version, not whatever orphan dirs leftover in cache). Fall back
+  # to newest-version glob if jq/python3 absent or manifest unreadable.
+  local plugin_root="$CLAUDE_DIR/plugins/cache/claude-plugins-official/telegram"
+  if [ ! -d "$plugin_root" ]; then
+    log_warn "official telegram plugin not found at $plugin_root after install — skipping Rust patch"
+    return 0
+  fi
+  local plugin_dir=""
+  local installed_manifest="$CLAUDE_DIR/plugins/installed_plugins.json"
+  if [ -f "$installed_manifest" ]; then
+    if command -v jq >/dev/null 2>&1; then
+      plugin_dir=$(jq -r '.plugins["telegram@claude-plugins-official"][0].installPath // empty' "$installed_manifest" 2>/dev/null)
+    elif command -v python3 >/dev/null 2>&1; then
+      plugin_dir=$(python3 -c "import json,sys; d=json.load(open('$installed_manifest')); p=d.get('plugins',{}).get('telegram@claude-plugins-official',[]); print(p[0]['installPath'] if p else '')" 2>/dev/null)
+    fi
+  fi
+  if [ -z "$plugin_dir" ] || [ ! -d "$plugin_dir" ]; then
+    # Fallback: newest version subdir (semver-sortable).
+    local version_dir
+    version_dir=$(ls -1 "$plugin_root" 2>/dev/null | sort -V | tail -1)
+    if [ -z "$version_dir" ] || [ ! -d "$plugin_root/$version_dir" ]; then
+      log_warn "no version subdir found under $plugin_root — skipping Rust patch"
+      return 0
+    fi
+    plugin_dir="$plugin_root/$version_dir"
+    log_info "manifest lookup unavailable; falling back to newest-version glob: $plugin_dir"
+  fi
+  log_info "patching plugin at $plugin_dir"
+
+  # ----- 3. Resolve binary: download from GH release first; fall back to
+  #         cargo build only if download fails (e.g. offline, asset missing
+  #         for this platform, claudebase version with no telegram-plugin-rs
+  #         artifacts yet). Cargo fallback requires `cargo` on PATH AND the
+  #         repo's plugins/telegram-rs/ source tree (present in local-mode
+  #         install or fresh clone). -----
+  local platform=""
+  local exe_ext=""
+  case "$(uname -ms)" in
+    "Darwin arm64")  platform="darwin-arm64"  ;;
+    "Darwin x86_64") platform="darwin-x64"    ;;
+    "Linux x86_64")  platform="linux-x64"     ;;
+    "Linux aarch64") platform="linux-arm64"   ;;
+    MINGW*|MSYS*|CYGWIN*)
+      case "$(uname -m)" in
+        x86_64) platform="windows-x64"; exe_ext=".exe" ;;
+        *)      log_warn "unsupported Windows arch: $(uname -m); skipping telegram-plugin-rs"; return 0 ;;
+      esac
+      ;;
+    *) log_warn "telegram-plugin-rs binary unavailable for $(uname -ms); skipping"; return 0 ;;
+  esac
+
+  local target_bin="$plugin_dir/server-rs${exe_ext}"
+  local url="${RELEASE_BASE}/claudebase-v${CLAUDEBASE_VERSION}/telegram-plugin-rs-${platform}${exe_ext}"
+  local downloaded=false
+  local tmp_download
+  tmp_download="$(mktemp)"
+
+  log_info "downloading telegram-plugin-rs binary from GH release for $platform..."
+  if command -v curl >/dev/null 2>&1; then
+    if curl --proto '=https' --tlsv1.2 -fsSL --max-redirs 5 --max-time 120 "$url" -o "$tmp_download" 2>/dev/null; then
+      downloaded=true
+    fi
+  elif command -v wget >/dev/null 2>&1; then
+    if wget --https-only --secure-protocol=TLSv1_2 --max-redirect=5 --timeout=120 -q -O "$tmp_download" "$url" 2>/dev/null; then
+      downloaded=true
+    fi
+  fi
+
+  if [ "$downloaded" = true ] && [ -s "$tmp_download" ]; then
+    mv "$tmp_download" "$target_bin"
+    chmod 0755 "$target_bin"
+    log_ok "server-rs downloaded ($(wc -c <"$target_bin" | tr -d ' ') bytes) → $target_bin"
+  else
+    rm -f "$tmp_download"
+    log_warn "telegram-plugin-rs download failed — falling back to cargo build"
+    if ! command -v cargo >/dev/null 2>&1; then
+      log_warn "  cargo not on PATH either; install Rust (https://rustup.rs/) or wait for a release with telegram-plugin-rs artifacts"
+      return 0
+    fi
+    if [ ! -d "$SCRIPT_DIR/plugins/telegram-rs" ]; then
+      log_warn "  plugins/telegram-rs source not present at $SCRIPT_DIR — skipping"
+      return 0
+    fi
+    log_info "cargo build --release -p telegram-plugin-rs (first build ~5 min, cached after)"
+    if ! ( cd "$SCRIPT_DIR" && cargo build --release -p telegram-plugin-rs 2>&1 | tail -3 ); then
+      log_warn "cargo build telegram-plugin-rs failed; the upstream TSX plugin will run unchanged"
+      return 0
+    fi
+    local built_bin="$SCRIPT_DIR/target/release/telegram-plugin-rs${exe_ext}"
+    if [ ! -x "$built_bin" ]; then
+      log_warn "build succeeded but binary missing at $built_bin — skipping patch"
+      return 0
+    fi
+    cp "$built_bin" "$target_bin"
+    chmod 0755 "$target_bin"
+    log_ok "server-rs built locally ($(wc -c <"$built_bin" | tr -d ' ') bytes) → $target_bin"
+  fi
+
+  # ----- 5. Patch .mcp.json with toggle (backup upstream version first) -----
+  local mcp_json="$plugin_dir/.mcp.json"
+  local mcp_backup="$plugin_dir/.mcp.json.upstream-backup"
+  if [ -f "$mcp_json" ] && [ ! -f "$mcp_backup" ]; then
+    cp "$mcp_json" "$mcp_backup"
+    log_ok ".mcp.json.upstream-backup preserved"
+  fi
+  cat > "$mcp_json" <<'EOF'
+{
+  "mcpServers": {
+    "telegram": {
+      "command": "bash",
+      "args": [
+        "-c",
+        "if [ -z \"$TELEGRAM_USE_TSX_SERVER\" ] && [ -x \"$CLAUDE_PLUGIN_ROOT/server-rs\" ]; then exec \"$CLAUDE_PLUGIN_ROOT/server-rs\" 2>>/tmp/telegram-rs.log; else exec bun run --cwd \"$CLAUDE_PLUGIN_ROOT\" --shell=bun --silent start; fi"
+      ]
+    }
+  }
+}
+EOF
+  chmod 0644 "$mcp_json"
+  log_ok ".mcp.json patched (Rust by default; TELEGRAM_USE_TSX_SERVER=1 falls back to bun)"
+
+  log_info "to enable: launch Claude Code with"
+  log_info "  claude --channels plugin:telegram@claude-plugins-official"
+  log_info "Rust binary stderr → /tmp/telegram-rs.log"
+}
+
+# ============================================================================
 # Main
 # ============================================================================
 echo ""
@@ -485,8 +743,10 @@ install_binary
 register_alias
 register_bash_allowlist
 install_pdfium
+install_whisper_stack
 preload_encoder
 register_claude_plugin
+install_telegram_plugin
 
 # ============================================================================
 # Optional post-install daemon hook (Slice 2 — STRUCTURAL-2-3)

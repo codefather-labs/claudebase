@@ -234,6 +234,60 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      # -----------------------------------------------------------------------
+      # Sibling build: telegram-plugin-rs (Rust port of the official Anthropic
+      # Telegram channel plugin). Same matrix piggybacks on the existing
+      # checkout + Rust toolchain setup — no separate runner needed. No pdfium
+      # dependency (this binary doesn't need it). No fixture smoke test
+      # (per-binary correctness validated by the plugin's own integration
+      # tests under plugins/telegram-rs/src/*).
+      # -----------------------------------------------------------------------
+      - name: Cargo build telegram-plugin-rs (release)
+        shell: bash
+        run: |
+          cargo build --release \
+            -p telegram-plugin-rs \
+            --manifest-path Cargo.toml \
+            --target ${{ matrix.target }}
+
+      - name: Smoke test telegram-plugin-rs (--initialize handshake)
+        shell: bash
+        run: |
+          EXT=""
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            EXT=".exe"
+          fi
+          BIN="target/${{ matrix.target }}/release/telegram-plugin-rs${EXT}"
+          if [ ! -f "$BIN" ]; then
+            echo "ERROR: telegram-plugin-rs binary not found at $BIN"
+            exit 1
+          fi
+          OUT=$(echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | "$BIN" 2>/dev/null)
+          echo "$OUT"
+          echo "$OUT" | grep -q '"protocolVersion":"2025-11-25"'
+          echo "$OUT" | grep -q '"name":"telegram-plugin-rs"'
+
+      - name: Stage telegram-plugin-rs artifact
+        shell: bash
+        run: |
+          SRC_EXT=""
+          DST_EXT=""
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            SRC_EXT=".exe"
+            DST_EXT=".exe"
+          fi
+          BIN="target/${{ matrix.target }}/release/telegram-plugin-rs${SRC_EXT}"
+          mkdir -p dist
+          cp "$BIN" "dist/telegram-plugin-rs-${{ matrix.platform }}${DST_EXT}"
+
+      - name: Upload telegram-plugin-rs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: telegram-plugin-rs-${{ matrix.platform }}
+          path: dist/telegram-plugin-rs-${{ matrix.platform }}${{ matrix.platform == 'windows-x64' && '.exe' || '' }}
+          if-no-files-found: error
+          retention-days: 14
+
   # ---------------------------------------------------------------------------
   # Job 3 — cut GitHub Release with all 5 binaries + source tarball attached.
   # Runs only when the workflow was triggered by a `claudebase-v*` tag
@@ -298,6 +352,11 @@ jobs:
             dist/claudebase-linux-x64/claudebase-linux-x64
             dist/claudebase-linux-arm64/claudebase-linux-arm64
             dist/claudebase-windows-x64/claudebase-windows-x64.exe
+            dist/telegram-plugin-rs-darwin-arm64/telegram-plugin-rs-darwin-arm64
+            dist/telegram-plugin-rs-darwin-x64/telegram-plugin-rs-darwin-x64
+            dist/telegram-plugin-rs-linux-x64/telegram-plugin-rs-linux-x64
+            dist/telegram-plugin-rs-linux-arm64/telegram-plugin-rs-linux-arm64
+            dist/telegram-plugin-rs-windows-x64/telegram-plugin-rs-windows-x64.exe
             claude-code-sdlc-${{ steps.source-tarball.outputs.version }}-source.tar.gz
           # Windows-x64 build is best-effort (continue-on-error in matrix).
           # When that build fails, the .exe artifact is missing — we still

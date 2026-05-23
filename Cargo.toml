@@ -1,3 +1,9 @@
+# Cargo workspace. The root crate is the `claudebase` CLI; plugins/ holds
+# auxiliary binaries shipped alongside (telegram-rs etc.).
+[workspace]
+members = [".", "plugins/telegram-rs"]
+resolver = "2"
+
 [package]
 name = "claudebase"
 version = "0.5.0"

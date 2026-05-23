@@ -385,6 +385,26 @@ pub enum Command {
     ///   `chat list --thread X` — list messages in a thread (chronological)
     ///   `chat threads`         — list all known threads with counts
     Chat(ChatArgs),
+    /// Launch `claude` with the Telegram plugin preset and any extra args
+    /// forwarded verbatim. Equivalent to:
+    ///   `claude --channels plugin:telegram@claude-plugins-official <args...>`
+    /// The SDLC SessionStart onboarding hook (if installed) auto-fires on
+    /// session boot — nothing extra wired here. Exec replaces this process.
+    Run(RunArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct RunArgs {
+    /// Disable the telegram channel preset (just `claude` with `args`).
+    /// Useful when the official Anthropic plugin isn't installed yet.
+    #[arg(long)]
+    pub no_telegram: bool,
+
+    /// Additional arguments forwarded verbatim to `claude`. Use `--` to
+    /// separate them from claudebase's own flags:
+    ///   `claudebase run -- --debug --add-dir /some/path`
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub args: Vec<String>,
 }
 
 /// `claudebase chat ...` — chat introspection subcommands (Slice 3).

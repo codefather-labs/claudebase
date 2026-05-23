@@ -86,6 +86,9 @@ fn main() -> std::process::ExitCode {
         // not per-project — so the project root is unused. The gate still
         // runs to keep the security backbone uniform.
         Command::Chat(_) => None,
+        // `run` is an exec wrapper around the `claude` CLI — no filesystem
+        // ops on a project root. The path gate still runs uniformly.
+        Command::Run(_) => None,
     };
 
     let root = match cli::resolve_project_root(project_root_arg) {
@@ -144,7 +147,89 @@ fn main() -> std::process::ExitCode {
             cli::ChatSubcommand::List(a) => run_chat_list(a),
             cli::ChatSubcommand::Threads(a) => run_chat_threads(a),
         },
+        Command::Run(args) => run_claude_with_preset(&args),
     }
+}
+
+/// `claudebase run [-- args...]` — exec `claude` with the telegram channel
+/// plugin preset and any extra args forwarded verbatim. Replaces this
+/// process (exec, not spawn) so signals + stdio flow straight to claude.
+///
+/// The SDLC SessionStart onboarding hook (if installed via claude-code-sdlc
+/// install.sh) is wired into `~/.claude/settings.json` and auto-fires on
+/// every session boot — no extra plumbing required here.
+fn run_claude_with_preset(args: &cli::RunArgs) -> std::process::ExitCode {
+    use std::ffi::OsString;
+
+    let claude_path = match which("claude") {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "claudebase run: `claude` CLI not found on PATH.\n\
+                 Install Claude Code from https://claude.com/code, then re-run."
+            );
+            return std::process::ExitCode::from(127);
+        }
+    };
+
+    let mut argv: Vec<OsString> = vec![claude_path.clone().into()];
+    if !args.no_telegram {
+        argv.push("--channels".into());
+        argv.push("plugin:telegram@claude-plugins-official".into());
+    }
+    for a in &args.args {
+        argv.push(OsString::from(a));
+    }
+
+    // Best-effort log so the operator sees what was launched (stderr to
+    // keep stdout clean for any piped use).
+    eprintln!(
+        "claudebase run → exec {} {}",
+        claude_path.display(),
+        argv.iter()
+            .skip(1)
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(&claude_path)
+            .args(&argv[1..])
+            .exec();
+        eprintln!("claudebase run: exec failed: {}", err);
+        std::process::ExitCode::from(126)
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows has no exec — spawn and wait, forwarding exit code.
+        match std::process::Command::new(&claude_path).args(&argv[1..]).status() {
+            Ok(status) => match status.code() {
+                Some(c) if (0..=255).contains(&c) => std::process::ExitCode::from(c as u8),
+                _ => std::process::ExitCode::SUCCESS,
+            },
+            Err(e) => {
+                eprintln!("claudebase run: spawn failed: {}", e);
+                std::process::ExitCode::from(126)
+            }
+        }
+    }
+}
+
+/// Minimal PATH walker for `claude` executable. Avoids adding a `which`
+/// crate dep for a 10-line helper.
+fn which(name: &str) -> Option<std::path::PathBuf> {
+    let path_env = std::env::var_os("PATH")?;
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    for dir in std::env::split_paths(&path_env) {
+        let candidate = dir.join(format!("{}{}", name, ext));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// `claudebase chat list --thread X` — Slice 3 CLI introspection.

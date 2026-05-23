@@ -23,7 +23,7 @@ set -u
 # ============================================================================
 # Constants
 # ============================================================================
-CLAUDEBASE_VERSION="0.5.0"
+CLAUDEBASE_VERSION="0.6.0"
 CLAUDEBASE_PDFIUM_VERSION="chromium/7802"
 REPO_URL="https://github.com/codefather-labs/claudebase.git"
 RELEASE_BASE="https://github.com/codefather-labs/claudebase/releases/download"

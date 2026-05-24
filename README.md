@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src=".github/assets/title.png" alt="claudebase" width="800" />
+
 # `claudebase`
 
 **Local infrastructure for LLM agents.**

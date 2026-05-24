@@ -1,9 +1,8 @@
 //! Channel state model — 1:1 port of the official Anthropic telegram plugin.
 //!
-//! Lives at `~/.claude/channels/claudebase/` so the user-facing skills
-//! (`.claude-plugin/skills/configure/SKILL.md`,
-//! `.claude-plugin/skills/access/SKILL.md`) can read/write it without going
-//! through any daemon API. Schema mirrors
+//! Lives at `~/.claude/channels/claudebase/` so any user-facing tooling
+//! (CLI subcommands, external operators, future skills) can read/write
+//! it without going through a daemon API. Schema mirrors
 //! `claude-plugins-official/external_plugins/telegram/server.ts` verbatim:
 //!
 //! ```json

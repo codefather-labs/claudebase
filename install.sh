@@ -104,8 +104,8 @@ confirm() {
 get_source_dir() {
   if [ "$LOCAL_MODE" = true ]; then
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    if [ ! -d "$SCRIPT_DIR/rules" ] || [ ! -d "$SCRIPT_DIR/commands" ] || [ ! -d "$SCRIPT_DIR/agents" ]; then
-      log_error "--local requires running from a claudebase checkout root (with rules/ commands/ agents/)"
+    if [ ! -d "$SCRIPT_DIR/prompts/rules" ] || [ ! -d "$SCRIPT_DIR/prompts/commands" ] || [ ! -d "$SCRIPT_DIR/prompts/agents" ]; then
+      log_error "--local requires running from a claudebase checkout root (with prompts/{rules,commands,agents}/)"
       exit 1
     fi
   else
@@ -121,24 +121,25 @@ get_source_dir() {
 }
 
 # ============================================================================
-# Install prompts/rules/commands/agents into ~/.claude/
+# Install prompts/{rules,commands,agents}/ into ~/.claude/{rules,commands,agents}/
+# (source layout: prompts/ dir at repo root; install destination: global ~/.claude/)
 # ============================================================================
 install_prompts() {
   mkdir -p "$CLAUDE_DIR/rules" "$CLAUDE_DIR/commands" "$CLAUDE_DIR/agents"
 
-  for f in "$SCRIPT_DIR"/rules/*.md; do
+  for f in "$SCRIPT_DIR"/prompts/rules/*.md; do
     [ -f "$f" ] || continue
     cp "$f" "$CLAUDE_DIR/rules/"
     log_ok "rules/$(basename "$f")"
   done
 
-  for f in "$SCRIPT_DIR"/commands/*.md; do
+  for f in "$SCRIPT_DIR"/prompts/commands/*.md; do
     [ -f "$f" ] || continue
     cp "$f" "$CLAUDE_DIR/commands/"
     log_ok "commands/$(basename "$f")"
   done
 
-  for f in "$SCRIPT_DIR"/agents/*.md; do
+  for f in "$SCRIPT_DIR"/prompts/agents/*.md; do
     [ -f "$f" ] || continue
     cp "$f" "$CLAUDE_DIR/agents/"
     log_ok "agents/$(basename "$f")"
@@ -394,52 +395,6 @@ install_pdfium() {
     return 0
   )
   return 0
-}
-
-# ============================================================================
-# Register the claudebase plugin with Claude Code (marketplace + install)
-# ============================================================================
-# Idempotent — no-op when:
-#   - `claude` CLI is not on PATH (skip with INFO; user can run by hand)
-#   - marketplace 'claudebase-dev' is already registered
-#   - plugin 'claudebase@claudebase-dev' is already installed
-#
-# This mirrors the official Anthropic telegram plugin's install UX:
-# `bash install.sh` ends with the plugin ready to use after a single
-# `claude --channels plugin:claudebase@claudebase-dev` launch.
-#
-# The marketplace source is the public github repo (codefather-labs/
-# claudebase). install.sh used to be the only way users got the plugin;
-# now the github marketplace path is the canonical install method and
-# install.sh just bootstraps it.
-register_claude_plugin() {
-  if ! command -v claude >/dev/null 2>&1; then
-    log_info "claude CLI not on PATH; skipping plugin registration"
-    log_info "  to install manually later:"
-    log_info "    claude plugin marketplace add codefather-labs/claudebase"
-    log_info "    claude plugin install claudebase@claudebase-dev"
-    return 0
-  fi
-
-  # marketplace add — idempotent at the claude CLI level (already-present
-  # returns success without re-cloning).
-  log_info "Registering claudebase-dev marketplace (github: codefather-labs/claudebase)..."
-  if claude plugin marketplace add codefather-labs/claudebase 2>&1 | grep -qE "already|registered|added"; then
-    log_ok "marketplace registered (or already present)"
-  else
-    # Even on warning output, claude returns 0 if marketplace works. Don't bail.
-    log_ok "marketplace add invoked"
-  fi
-
-  # Install the plugin. `claude plugin install` is idempotent — re-run is
-  # safe and refreshes from the marketplace source.
-  log_info "Installing claudebase@claudebase-dev plugin..."
-  if claude plugin install claudebase@claudebase-dev 2>&1 | tail -3; then
-    log_ok "plugin installed"
-  else
-    log_warn "plugin install failed; you can retry manually:"
-    log_warn "  claude plugin install claudebase@claudebase-dev"
-  fi
 }
 
 # ============================================================================
@@ -731,7 +686,6 @@ register_bash_allowlist
 install_pdfium
 install_whisper_stack
 preload_encoder
-register_claude_plugin
 install_telegram_plugin
 
 # ============================================================================

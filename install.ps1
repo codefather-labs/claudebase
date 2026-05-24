@@ -83,11 +83,11 @@ function Confirm-Action {
 function Get-SourceDir {
     if ($Local) {
         $Script:ScriptDir = Split-Path -Parent $PSCommandPath
-        $rulesDir = Join-Path $Script:ScriptDir 'rules'
-        $commandsDir = Join-Path $Script:ScriptDir 'commands'
-        $agentsDir = Join-Path $Script:ScriptDir 'agents'
+        $rulesDir = Join-Path $Script:ScriptDir 'prompts\rules'
+        $commandsDir = Join-Path $Script:ScriptDir 'prompts\commands'
+        $agentsDir = Join-Path $Script:ScriptDir 'prompts\agents'
         if (-not (Test-Path $rulesDir) -or -not (Test-Path $commandsDir) -or -not (Test-Path $agentsDir)) {
-            Write-Err "-Local requires running from a claudebase checkout root (with rules\, commands\, agents\)"
+            Write-Err "-Local requires running from a claudebase checkout root (with prompts\{rules,commands,agents}\)"
             exit 1
         }
     } else {
@@ -111,7 +111,7 @@ function Install-Prompts {
     foreach ($sub in 'rules', 'commands', 'agents') {
         $dest = Join-Path $Script:ClaudeDir $sub
         New-Item -ItemType Directory -Force -Path $dest | Out-Null
-        Get-ChildItem (Join-Path $Script:ScriptDir "$sub\*.md") -ErrorAction SilentlyContinue | ForEach-Object {
+        Get-ChildItem (Join-Path $Script:ScriptDir "prompts\$sub\*.md") -ErrorAction SilentlyContinue | ForEach-Object {
             Copy-Item -Force $_.FullName $dest
             Write-Ok "$sub\$($_.Name)"
         }
@@ -517,43 +517,6 @@ function Install-TelegramPlugin {
     Write-Info "  claude --channels plugin:telegram@claude-plugins-official"
 }
 
-# ============================================================================
-# Register the claudebase plugin with Claude Code (marketplace + install)
-# ============================================================================
-# Mirrors install.sh's `register_claude_plugin` — idempotent registration of
-# the github-sourced marketplace + plugin install. Skipped when `claude` is
-# not on PATH (user can run the two commands manually).
-function Register-ClaudePlugin {
-    if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
-        Write-Info "claude CLI not on PATH; skipping plugin registration"
-        Write-Info "  to install manually later:"
-        Write-Info "    claude plugin marketplace add codefather-labs/claudebase"
-        Write-Info "    claude plugin install claudebase@claudebase-dev"
-        return
-    }
-
-    Write-Info "Registering claudebase-dev marketplace (github: codefather-labs/claudebase)..."
-    try {
-        & claude plugin marketplace add codefather-labs/claudebase 2>&1 | Out-Null
-        Write-Ok "marketplace registered (or already present)"
-    } catch {
-        Write-Warn "marketplace add failed: $($_.Exception.Message); skipping plugin install"
-        return
-    }
-
-    Write-Info "Installing claudebase@claudebase-dev plugin..."
-    try {
-        & claude plugin install claudebase@claudebase-dev 2>&1 | Select-Object -Last 3
-        if ($LASTEXITCODE -eq 0) {
-            Write-Ok "plugin installed"
-        } else {
-            Write-Warn "plugin install returned exit $LASTEXITCODE; retry manually:"
-            Write-Warn "  claude plugin install claudebase@claudebase-dev"
-        }
-    } catch {
-        Write-Warn "plugin install failed: $($_.Exception.Message)"
-    }
-}
 
 # ============================================================================
 # Main
@@ -585,7 +548,6 @@ Register-BashAllowlist
 Install-Pdfium
 Install-WhisperStack
 Preload-Encoder
-Register-ClaudePlugin
 Install-TelegramPlugin
 
 # Optional post-install daemon hook (Slice 2 — STRUCTURAL-2-3)

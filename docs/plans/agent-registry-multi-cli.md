@@ -3,6 +3,14 @@
 **Owner:** Mira (orchestrator, autonomous — no SDLC pipeline)
 **Status:** draft — awaiting operator sign-off
 **Created:** 2026-05-24
+
+**DEPENDS ON (must land first):**
+- [`claudebase-server-foundation.md`](./claudebase-server-foundation.md) —
+  this plan's Phase 1 (server HTTP/WSS + auth + service install) has been
+  EXTRACTED to that foundation plan. Phases 2-8 here ride on top of the
+  running authenticated server. **Do not start Phase 2 of this plan until
+  Phases 1-2 of the foundation plan are landed.**
+
 **Builds on:** [`telegram-rust-port.md`](../../../../claude-code-sdlc/docs/plans/telegram-rust-port.md) (channel-callback infrastructure) + existing `claudebase/src/daemon/{agent_registry,chat,channel_state,server}.rs`
 
 ## Goal
@@ -117,11 +125,23 @@ is different.
 
 ## Phases
 
-### Phase 1 — Server HTTP/WSS surface (foundation)
+### Phase 1 — Server HTTP/WSS surface (foundation) — MOVED OUT
 
-Currently `claudebase server` (a.k.a `claudebase daemon`) only accepts
-UDS connections on the local box. Add network surface + installable
-service mode (per D2).
+This phase has been **extracted** to [`claudebase-server-foundation.md`](./claudebase-server-foundation.md)
+because the server + auth + service-install scope is itself a substantial
+shippable artifact AND a hard prerequisite for the telegram-multi-cli
+orchestration plan (not just this one). The downstream plans all sit on
+top of the same authenticated server.
+
+This plan resumes at **Phase 2** below, assuming Phases 1-2 of the
+foundation plan are landed (server running, auth enforced, `/health`
+returns 200).
+
+*Skip ahead to Phase 2 — Agent auto-registration.*
+
+---
+
+#### Original Phase 1 content (preserved for reference, see foundation plan for the live version)
 
 - `claudebase server --serve [--port N] [--use-ssl] [--data-dir DIR]
    [--foreground]` runs the HTTP/WSS listener.

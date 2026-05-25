@@ -234,6 +234,63 @@ function Register-BashAllowlist {
 }
 
 # ============================================================================
+# Install claudebase Stop hook (insight-capture) into ~/.claude/hooks/ and
+# wire it into settings.json under hooks.Stop. Idempotent — dedup by
+# command-string equality so re-running never duplicates the entry.
+# ============================================================================
+function Install-ClaudebaseHooks {
+    $hooksDir = Join-Path $Script:ClaudeDir 'hooks'
+    $settings = Join-Path $Script:ClaudeDir 'settings.json'
+    New-Item -ItemType Directory -Force -Path $hooksDir | Out-Null
+
+    # Deploy BOTH variants; Windows wires the .ps1, the .sh is harmless on disk.
+    foreach ($hook in 'claudebase-insight-capture.sh', 'claudebase-insight-capture.ps1') {
+        $src = Join-Path $Script:ScriptDir "hooks\$hook"
+        $dst = Join-Path $hooksDir $hook
+        if (-not (Test-Path $src)) { Write-Warn "hooks/$hook missing in source — skipping"; continue }
+        Copy-Item -Force $src $dst
+        Write-Ok "hooks/$hook"
+    }
+
+    $ps1 = Join-Path $hooksDir 'claudebase-insight-capture.ps1'
+    $stopCmd = "powershell -NoProfile -File `"$ps1`""
+
+    if (-not (Test-Path $settings)) {
+        $obj = [ordered]@{ permissions = [ordered]@{ allow = @() } }
+        $obj | ConvertTo-Json -Depth 10 | Set-Content -Path $settings -Encoding UTF8
+    }
+
+    try {
+        $json = Get-Content -Raw $settings | ConvertFrom-Json
+        if (-not ($json.PSObject.Properties.Name -contains 'hooks')) {
+            $json | Add-Member -NotePropertyName 'hooks' -NotePropertyValue ([pscustomobject]@{}) -Force
+        }
+        if (-not ($json.hooks.PSObject.Properties.Name -contains 'Stop')) {
+            $json.hooks | Add-Member -NotePropertyName 'Stop' -NotePropertyValue @() -Force
+        }
+        $existing = @($json.hooks.Stop)
+        $already = $false
+        foreach ($entry in $existing) {
+            if ($entry.hooks) {
+                foreach ($h in $entry.hooks) { if ($h.command -eq $stopCmd) { $already = $true; break } }
+            }
+            if ($already) { break }
+        }
+        if (-not $already) {
+            $newEntry = [pscustomobject]@{ hooks = @([pscustomobject]@{ type = 'command'; command = $stopCmd }) }
+            $json.hooks.Stop = @($existing) + $newEntry
+            $json | ConvertTo-Json -Depth 12 | Set-Content -Path $settings -Encoding UTF8
+            Write-Ok "settings.json (Stop[insight-capture] hook wired)"
+        } else {
+            Write-Ok "settings.json already contains Stop[insight-capture] hook"
+        }
+    } catch {
+        Write-Warn "settings.json Stop-hook merge failed ($($_.Exception.Message)); add manually:"
+        Write-Warn "  hooks.Stop[*].hooks[*].command = $stopCmd"
+    }
+}
+
+# ============================================================================
 # Download + extract pdfium.dll
 # ============================================================================
 function Install-Pdfium {
@@ -545,6 +602,7 @@ Install-Prompts
 Install-Binary
 Register-Alias
 Register-BashAllowlist
+Install-ClaudebaseHooks
 Install-Pdfium
 Install-WhisperStack
 Preload-Encoder

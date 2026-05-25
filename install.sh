@@ -308,6 +308,75 @@ EOF
 }
 
 # ============================================================================
+# Install claudebase Stop hook (insight-capture) into ~/.claude/hooks/ and
+# wire it into ~/.claude/settings.json under hooks.Stop.
+#
+# The hook fires after every agent turn and prompts a reflection: if the agent
+# learned something axis-worthy, it persists an insight via `claudebase insight
+# create`; otherwise it stops silently. Loop-safe via stop_hook_active.
+#
+# Idempotent — jq merge is by command-string equality, so re-running the
+# installer never duplicates the Stop entry.
+# ============================================================================
+install_claudebase_hooks() {
+  local hooks_dir="$CLAUDE_DIR/hooks"
+  local settings="$CLAUDE_DIR/settings.json"
+
+  mkdir -p "$hooks_dir"
+
+  local hook_files=(claudebase-insight-capture.sh claudebase-insight-capture.ps1)
+  for hook in "${hook_files[@]}"; do
+    local src="$SCRIPT_DIR/hooks/$hook"
+    local dst="$hooks_dir/$hook"
+    if [ ! -f "$src" ]; then
+      log_warn "hooks/$hook missing in source — skipping"
+      continue
+    fi
+    cp "$src" "$dst"
+    chmod 0755 "$dst"
+    log_ok "hooks/$hook"
+  done
+
+  if [ ! -f "$settings" ]; then
+    mkdir -p "$CLAUDE_DIR"
+    echo '{"permissions":{"allow":[]}}' > "$settings"
+    chmod 0644 "$settings"
+  fi
+
+  if ! command -v jq >/dev/null 2>&1; then
+    log_warn "jq required for settings.json hook merge — add manually:"
+    log_warn '  hooks.Stop[*].hooks[*].command = ~/.claude/hooks/claudebase-insight-capture.sh'
+    return 0
+  fi
+
+  local stop_cmd="$HOME/.claude/hooks/claudebase-insight-capture.sh"
+  local tmp; tmp="$(mktemp)"
+
+  # Ensure .hooks.Stop contains exactly one matcher block with our command.
+  # Existing foreign Stop matchers are preserved; dedup by command-string.
+  if jq \
+      --arg stop_cmd "$stop_cmd" \
+      '
+      .hooks //= {}
+      | .hooks.Stop //= []
+      | .hooks.Stop |=
+          (if any(.[]?; (.hooks // []) | any(.command == $stop_cmd))
+           then .
+           else . + [{"hooks": [{"type": "command", "command": $stop_cmd}]}]
+           end)
+      ' \
+      "$settings" > "$tmp" 2>/dev/null \
+     && jq -e . "$tmp" >/dev/null 2>&1; then
+    mv "$tmp" "$settings"
+    chmod 0644 "$settings"
+    log_ok "settings.json (Stop[insight-capture] hook wired)"
+  else
+    rm -f "$tmp"
+    log_warn "settings.json Stop-hook merge failed; please add manually"
+  fi
+}
+
+# ============================================================================
 # Install pdfium native library
 # ============================================================================
 install_pdfium() {
@@ -683,6 +752,7 @@ install_prompts
 install_binary
 register_alias
 register_bash_allowlist
+install_claudebase_hooks
 install_pdfium
 install_whisper_stack
 preload_encoder

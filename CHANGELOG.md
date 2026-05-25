@@ -19,6 +19,7 @@ User-facing means changes a developer using claudebase notices in day-to-day wor
 
 ### Added
 - Repository `.github/` scaffolding: issue templates (bug report, feature request, plugin question), PR template, `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, `CHANGELOG.md`.
+- **`Stop` hook — insight-capture nudge.** New `hooks/claudebase-insight-capture.sh` / `.ps1`, deployed by `install.sh` / `install.ps1` into `~/.claude/hooks/` and wired into `~/.claude/settings.json` under `hooks.Stop`. Fires after every agent turn and prompts a reflection: did the agent learn something, catch a mistake, or have an assumption falsified? If yes and genuinely axis-worthy (self-learning / prediction-reality-mismatch / operator-correction), the agent persists exactly one insight via `claudebase insight create`; if not, it stops silently with no insight and no commentary. Loop-safe via the `stop_hook_active` payload flag (the forced reflection turn never re-triggers the hook). Operator-visible `🪝 claudebase insight-capture hook` bubble each fire. Installed as a claudebase hook (not SDLC) because the insights corpus, the `insight` subcommand, and `insights.db` are all claudebase features — the tool that owns insights owns the trigger that fills them. Cost note: blocking every turn adds one reflection turn per agent response (extra output + latency; input largely prompt-cache-warm).
 
 ## [0.6.0] - 2026-05-24
 

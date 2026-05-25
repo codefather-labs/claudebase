@@ -59,24 +59,13 @@ fi
 
 sys_msg="🪝 claudebase insight-capture hook — event=Stop project=${project_label}"
 
-reason='[claudebase insight-capture] Before you stop — reflect on the turn you just finished.
-
-Did you genuinely learn something, catch a mistake, or have an assumption falsified this turn? Map it to the insight-corpus axes:
-  1. SELF-LEARNING (--type agent-learned | self-bias-caught) — a domain concept, a technique, or a blind spot in your own past reasoning you just noticed.
-  2. PREDICTION-REALITY MISMATCH (--type prediction-error | assumption-falsified | plan-reality-gap) — something you predicted, assumed, or planned turned out wrong.
-  3. OPERATOR-CORRECTION (--type operator-correction) — the operator corrected you in a way worth carrying into future sessions.
-
-If YES — and it is genuinely axis-worthy (NOT mechanical execution, NOT a restatement of the task, NOT generic best-practice) — persist exactly ONE insight, then stop:
-
-    claudebase insight create "<one-sentence insight in your own words>" \
-        --type <source-type> --agent <your-agent-name> --salience <high|medium|low> \
-        [--feature "<feature-slug-if-known>"] [--session "'"$session_id"'"]
-
-Salience honestly: high = loss degrades the whole pipeline (rare); medium = slice/decision-level (default); low = ambient.
-
-If NO — nothing genuinely new, or the turn was mechanical — STOP SILENTLY. Write no insight. Print no commentary, no "no insight" line, nothing. Just end the turn. An honest silent skip is the correct and most common outcome; the corpus rejects manufactured or generic insights, so do not invent one to satisfy this hook.'
+# Reason is operator-visible by Claude Code design (block reasons always
+# surface). Keep it to ONE compact line so the operator's collapsed view is a
+# short pointer, not a wall — the agent already knows the full insight protocol
+# from ~/.claude/rules/knowledge-base-tool.md.
+reason="Reflect on the turn you just finished: if it produced a genuine insight (self-learning, a falsified prediction/assumption, or an operator correction worth carrying forward), persist exactly ONE via \`claudebase insight create \"<one sentence>\" --type <agent-learned|self-bias-caught|prediction-error|assumption-falsified|plan-reality-gap|operator-correction> --agent <you> --salience <high|medium|low> --session ${session_id}\`. Otherwise stop silently — no insight, no commentary, do not manufacture one."
 
 jq -n --arg sm "$sys_msg" --arg rs "$reason" \
-  '{ decision: "block", reason: $rs, systemMessage: $sm }'
+  '{ decision: "block", reason: $rs, systemMessage: $sm, suppressOutput: true }'
 
 exit 0

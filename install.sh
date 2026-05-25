@@ -67,9 +67,12 @@ WHAT GETS INSTALLED:
   ~/.claude/tools/claudebase/claudebase     CLI binary (downloaded from releases)
   ~/.claude/tools/claudebase/pdfium/        PDFium dynamic library for PDF extraction
   ~/.claude/tools/claudebase/models/        e5-multilingual-small encoder (pre-cached)
+  ~/.claude/rules/cognitive-self-check.md   3-protocol discipline (Facts / Decisions / Inbound)
   ~/.claude/rules/knowledge-base.md         CLI contract + citation discipline
   ~/.claude/rules/knowledge-base-tool.md    Usage mandate + insights protocol
   ~/.claude/rules/tool-limitations.md       Read/grep/bash truncation gotchas
+  ~/.claude/hooks/claudebase-insight-capture.sh   Stop hook — insight-capture reflection
+  ~/.claude/hooks/claudebase-selfcheck-reminder.sh UserPromptSubmit hook — self-check reminder
   ~/.claude/commands/knowledge-ingest.md    /knowledge-ingest skill
   ~/.claude/commands/reflect.md             /reflect skill (DMN observation)
   ~/.claude/commands/consolidate.md         /consolidate skill (drift detection)
@@ -308,15 +311,20 @@ EOF
 }
 
 # ============================================================================
-# Install claudebase Stop hook (insight-capture) into ~/.claude/hooks/ and
-# wire it into ~/.claude/settings.json under hooks.Stop.
+# Install claudebase hooks into ~/.claude/hooks/ and wire them into
+# ~/.claude/settings.json. Two hooks, both part of the cognitive-infra layer:
 #
-# The hook fires after every agent turn and prompts a reflection: if the agent
-# learned something axis-worthy, it persists an insight via `claudebase insight
-# create`; otherwise it stops silently. Loop-safe via stop_hook_active.
+#   - Stop -> claudebase-insight-capture.sh — fires after every agent turn,
+#     prompts a reflection; if the agent learned something axis-worthy it
+#     persists an insight via `claudebase insight create`, else stops silently.
+#     Loop-safe via stop_hook_active.
+#   - UserPromptSubmit -> claudebase-selfcheck-reminder.sh — fires before the
+#     agent responds, injects a SHORT agent-only reminder of the three
+#     cognitive-self-check protocols (the rule it reminds about,
+#     cognitive-self-check.md, ships from claudebase too).
 #
-# Idempotent — jq merge is by command-string equality, so re-running the
-# installer never duplicates the Stop entry.
+# Idempotent — jq merge is by command-string equality, so re-running never
+# duplicates an entry.
 # ============================================================================
 install_claudebase_hooks() {
   local hooks_dir="$CLAUDE_DIR/hooks"
@@ -324,7 +332,8 @@ install_claudebase_hooks() {
 
   mkdir -p "$hooks_dir"
 
-  local hook_files=(claudebase-insight-capture.sh claudebase-insight-capture.ps1)
+  local hook_files=(claudebase-insight-capture.sh claudebase-insight-capture.ps1 \
+                    claudebase-selfcheck-reminder.sh claudebase-selfcheck-reminder.ps1)
   for hook in "${hook_files[@]}"; do
     local src="$SCRIPT_DIR/hooks/$hook"
     local dst="$hooks_dir/$hook"
@@ -346,33 +355,43 @@ install_claudebase_hooks() {
   if ! command -v jq >/dev/null 2>&1; then
     log_warn "jq required for settings.json hook merge — add manually:"
     log_warn '  hooks.Stop[*].hooks[*].command = ~/.claude/hooks/claudebase-insight-capture.sh'
+    log_warn '  hooks.UserPromptSubmit[*].hooks[*].command = ~/.claude/hooks/claudebase-selfcheck-reminder.sh'
     return 0
   fi
 
   local stop_cmd="$HOME/.claude/hooks/claudebase-insight-capture.sh"
+  local selfcheck_cmd="$HOME/.claude/hooks/claudebase-selfcheck-reminder.sh"
   local tmp; tmp="$(mktemp)"
 
-  # Ensure .hooks.Stop contains exactly one matcher block with our command.
-  # Existing foreign Stop matchers are preserved; dedup by command-string.
+  # Ensure .hooks.Stop and .hooks.UserPromptSubmit each contain exactly one
+  # matcher block with our command. Existing foreign matchers are preserved;
+  # dedup by command-string equality.
   if jq \
       --arg stop_cmd "$stop_cmd" \
+      --arg selfcheck_cmd "$selfcheck_cmd" \
       '
       .hooks //= {}
       | .hooks.Stop //= []
+      | .hooks.UserPromptSubmit //= []
       | .hooks.Stop |=
           (if any(.[]?; (.hooks // []) | any(.command == $stop_cmd))
            then .
            else . + [{"hooks": [{"type": "command", "command": $stop_cmd}]}]
+           end)
+      | .hooks.UserPromptSubmit |=
+          (if any(.[]?; (.hooks // []) | any(.command == $selfcheck_cmd))
+           then .
+           else . + [{"hooks": [{"type": "command", "command": $selfcheck_cmd}]}]
            end)
       ' \
       "$settings" > "$tmp" 2>/dev/null \
      && jq -e . "$tmp" >/dev/null 2>&1; then
     mv "$tmp" "$settings"
     chmod 0644 "$settings"
-    log_ok "settings.json (Stop[insight-capture] hook wired)"
+    log_ok "settings.json (Stop[insight-capture] + UserPromptSubmit[selfcheck] hooks wired)"
   else
     rm -f "$tmp"
-    log_warn "settings.json Stop-hook merge failed; please add manually"
+    log_warn "settings.json hook merge failed; please add manually"
   fi
 }
 
@@ -737,9 +756,10 @@ echo -e "${BOLD}============================================${NC}"
 echo ""
 echo "  This will install to $CLAUDE_DIR:"
 echo "    tools/claudebase/   (binary + pdfium + e5 model)"
-echo "    rules/              (3 files — knowledge-base, knowledge-base-tool, tool-limitations)"
+echo "    rules/              (4 files — cognitive-self-check, knowledge-base, knowledge-base-tool, tool-limitations)"
 echo "    commands/           (3 files — knowledge-ingest, reflect, consolidate)"
 echo "    agents/             (2 files — reflection, consolidator)"
+echo "    hooks/              (2 hooks — Stop[insight-capture] + UserPromptSubmit[self-check])"
 echo ""
 
 if ! confirm "Proceed with installation?"; then

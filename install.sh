@@ -71,8 +71,7 @@ WHAT GETS INSTALLED:
   ~/.claude/rules/knowledge-base.md         CLI contract + citation discipline
   ~/.claude/rules/knowledge-base-tool.md    Usage mandate + insights protocol
   ~/.claude/rules/tool-limitations.md       Read/grep/bash truncation gotchas
-  ~/.claude/hooks/claudebase-insight-capture.sh   Stop hook — insight-capture reflection
-  ~/.claude/hooks/claudebase-selfcheck-reminder.sh UserPromptSubmit hook — self-check reminder
+  ~/.claude/hooks/claudebase-selfcheck-reminder.sh UserPromptSubmit hook — self-check protocols + insight-capture
   ~/.claude/commands/knowledge-ingest.md    /knowledge-ingest skill
   ~/.claude/commands/reflect.md             /reflect skill (DMN observation)
   ~/.claude/commands/consolidate.md         /consolidate skill (drift detection)
@@ -311,17 +310,20 @@ EOF
 }
 
 # ============================================================================
-# Install claudebase hooks into ~/.claude/hooks/ and wire them into
-# ~/.claude/settings.json. Two hooks, both part of the cognitive-infra layer:
+# Install the claudebase UserPromptSubmit hook into ~/.claude/hooks/ and wire
+# it into ~/.claude/settings.json:
 #
-#   - Stop -> claudebase-insight-capture.sh — fires after every agent turn,
-#     prompts a reflection; if the agent learned something axis-worthy it
-#     persists an insight via `claudebase insight create`, else stops silently.
-#     Loop-safe via stop_hook_active.
 #   - UserPromptSubmit -> claudebase-selfcheck-reminder.sh — fires before the
-#     agent responds, injects a SHORT agent-only reminder of the three
-#     cognitive-self-check protocols (the rule it reminds about,
-#     cognitive-self-check.md, ships from claudebase too).
+#     agent responds, injects a SHORT agent-only reminder covering (1) the three
+#     cognitive-self-check protocols and (2) insight-capture: persist any
+#     genuine insight from the PREVIOUS turn via `claudebase insight create`.
+#
+# Migration: a prior version shipped a Stop hook (claudebase-insight-capture)
+# that forced reflection via `decision: block` — Claude Code renders that to the
+# operator as "Stop hook error: ..." (alarming, looks like a failure) and forces
+# an extra turn every response. That approach is RETIRED; insight-capture now
+# folds into the UserPromptSubmit reminder (no operator bubble, no "error", no
+# extra turn). This installer actively removes the stale Stop wiring + files.
 #
 # Idempotent — jq merge is by command-string equality, so re-running never
 # duplicates an entry.
@@ -332,8 +334,11 @@ install_claudebase_hooks() {
 
   mkdir -p "$hooks_dir"
 
-  local hook_files=(claudebase-insight-capture.sh claudebase-insight-capture.ps1 \
-                    claudebase-selfcheck-reminder.sh claudebase-selfcheck-reminder.ps1)
+  # Remove the retired Stop insight-capture hook files (superseded by the
+  # UserPromptSubmit reminder).
+  rm -f "$hooks_dir/claudebase-insight-capture.sh" "$hooks_dir/claudebase-insight-capture.ps1"
+
+  local hook_files=(claudebase-selfcheck-reminder.sh claudebase-selfcheck-reminder.ps1)
   for hook in "${hook_files[@]}"; do
     local src="$SCRIPT_DIR/hooks/$hook"
     local dst="$hooks_dir/$hook"
@@ -354,8 +359,8 @@ install_claudebase_hooks() {
 
   if ! command -v jq >/dev/null 2>&1; then
     log_warn "jq required for settings.json hook merge — add manually:"
-    log_warn '  hooks.Stop[*].hooks[*].command = ~/.claude/hooks/claudebase-insight-capture.sh'
     log_warn '  hooks.UserPromptSubmit[*].hooks[*].command = ~/.claude/hooks/claudebase-selfcheck-reminder.sh'
+    log_warn '  (and remove any hooks.Stop entry pointing at claudebase-insight-capture.sh)'
     return 0
   fi
 
@@ -363,32 +368,34 @@ install_claudebase_hooks() {
   local selfcheck_cmd="$HOME/.claude/hooks/claudebase-selfcheck-reminder.sh"
   local tmp; tmp="$(mktemp)"
 
-  # Ensure .hooks.Stop and .hooks.UserPromptSubmit each contain exactly one
-  # matcher block with our command. Existing foreign matchers are preserved;
-  # dedup by command-string equality.
+  # (1) Ensure .hooks.UserPromptSubmit has exactly one matcher block with our
+  #     command. (2) Actively UNWIRE the retired Stop insight-capture hook:
+  #     drop matcher blocks whose only command was claudebase-insight-capture,
+  #     and remove that command from any shared block. Foreign matchers stay.
   if jq \
       --arg stop_cmd "$stop_cmd" \
       --arg selfcheck_cmd "$selfcheck_cmd" \
       '
       .hooks //= {}
-      | .hooks.Stop //= []
       | .hooks.UserPromptSubmit //= []
-      | .hooks.Stop |=
-          (if any(.[]?; (.hooks // []) | any(.command == $stop_cmd))
-           then .
-           else . + [{"hooks": [{"type": "command", "command": $stop_cmd}]}]
-           end)
       | .hooks.UserPromptSubmit |=
           (if any(.[]?; (.hooks // []) | any(.command == $selfcheck_cmd))
            then .
            else . + [{"hooks": [{"type": "command", "command": $selfcheck_cmd}]}]
            end)
+      | (if (.hooks.Stop // []) | length > 0 then
+           .hooks.Stop |= (
+             map(.hooks |= (map(select(.command != $stop_cmd))))
+             | map(select((.hooks // []) | length > 0))
+           )
+         else . end)
+      | (if (.hooks.Stop // []) | length == 0 then del(.hooks.Stop) else . end)
       ' \
       "$settings" > "$tmp" 2>/dev/null \
      && jq -e . "$tmp" >/dev/null 2>&1; then
     mv "$tmp" "$settings"
     chmod 0644 "$settings"
-    log_ok "settings.json (Stop[insight-capture] + UserPromptSubmit[selfcheck] hooks wired)"
+    log_ok "settings.json (UserPromptSubmit[selfcheck] wired; retired Stop[insight-capture] unwired)"
   else
     rm -f "$tmp"
     log_warn "settings.json hook merge failed; please add manually"
@@ -759,7 +766,7 @@ echo "    tools/claudebase/   (binary + pdfium + e5 model)"
 echo "    rules/              (4 files — cognitive-self-check, knowledge-base, knowledge-base-tool, tool-limitations)"
 echo "    commands/           (4 files — knowledge-ingest, reflect, consolidate, update-claudebase)"
 echo "    agents/             (2 files — reflection, consolidator)"
-echo "    hooks/              (2 hooks — Stop[insight-capture] + UserPromptSubmit[self-check])"
+echo "    hooks/              (1 hook — UserPromptSubmit[self-check + insight-capture])"
 echo ""
 
 if ! confirm "Proceed with installation?"; then

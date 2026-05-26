@@ -1,13 +1,14 @@
-# claudebase UserPromptSubmit hook (Windows PowerShell) - self-check reminder.
+# claudebase UserPromptSubmit hook (Windows PowerShell) - pre-response reminder.
 # ASCII-only source: Windows PowerShell 5.1 parses no-BOM scripts in the local code page, so non-ASCII (em-dash, bullets, emoji) corrupts string literals and breaks the script. Keep this file ASCII.
 #
-# Fires before the agent responds. Injects a SHORT agent-only reminder of the
-# three cognitive-self-check protocols. Channel: additionalContext (no
-# systemMessage - per-prompt operator bubble would be noise).
+# Fires before the agent responds. Injects a SHORT agent-only reminder covering
+# (1) the three cognitive-self-check protocols and (2) insight-capture: if the
+# PREVIOUS turn produced a genuine insight, persist it now.
 #
-# Ships with claudebase because the cognitive-self-check rule it reminds about
-# (~/.claude/rules/cognitive-self-check.md) is part of claudebase's
-# cognitive-infrastructure layer.
+# Insight-capture lives here (not on Stop) because a Stop hook forces reflection
+# only via `decision: block`, which Claude Code renders as "Stop hook error:" -
+# looks like a failure and forces an extra turn. UserPromptSubmit injects
+# agent-only additionalContext with no operator bubble and no "error" framing.
 #
 # Wired via $env:USERPROFILE\.claude\settings.json:
 #   hooks.UserPromptSubmit[*].hooks[*].command =
@@ -18,11 +19,16 @@
 $ErrorActionPreference = 'Continue'
 
 $reminder = @'
-[self-check reminder] Before you respond, confirm you are running the three cognitive-self-check protocols (~/.claude/rules/cognitive-self-check.md):
-  - Protocol 3 (Inbound) - challenge the task BEFORE executing; push-back is not failure.
-  - Protocol 1 (Facts) - cite file:line / source verified THIS session; training-data recall is not evidence.
-  - Protocol 2 (Decisions) - hack? sane? alternatives? symptom-or-cause? root-cause tracked?
-If you have drifted from these over the session, re-read the rule now.
+[pre-response reminder]
+
+1. Run the three cognitive-self-check protocols (~/.claude/rules/cognitive-self-check.md):
+   - Protocol 3 (Inbound) - challenge the task BEFORE executing; push-back is not failure.
+   - Protocol 1 (Facts) - cite file:line / source verified THIS session; training-data recall is not evidence.
+   - Protocol 2 (Decisions) - hack? sane? alternatives? symptom-or-cause? root-cause tracked?
+
+2. Insight-capture: if your PREVIOUS turn produced a genuine insight worth carrying across sessions - self-learning, a falsified prediction/assumption, or an operator correction - persist exactly ONE now, before continuing:
+     claudebase insight create "<one sentence>" --type <agent-learned|self-bias-caught|prediction-error|assumption-falsified|plan-reality-gap|operator-correction> --agent <you> --salience <high|medium|low>
+   If the previous turn was mechanical or produced nothing genuinely new, skip silently - do not manufacture an insight.
 '@
 
 $out = [ordered]@{

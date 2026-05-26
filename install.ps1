@@ -234,19 +234,26 @@ function Register-BashAllowlist {
 }
 
 # ============================================================================
-# Install claudebase hooks into ~/.claude/hooks/ and wire into settings.json:
-#   - Stop -> claudebase-insight-capture.ps1 (insight-capture reflection)
-#   - UserPromptSubmit -> claudebase-selfcheck-reminder.ps1 (self-check nudge)
-# Idempotent — dedup by command-string equality so re-running never duplicates.
+# Install the claudebase UserPromptSubmit hook into ~/.claude/hooks/ and wire
+# into settings.json:
+#   - UserPromptSubmit -> claudebase-selfcheck-reminder.ps1 (self-check + insight-capture)
+# Migration: the retired Stop insight-capture hook (which rendered as
+# "Stop hook error: ..." via decision:block) is actively removed — files
+# deleted + Stop wiring unwired. Idempotent.
 # ============================================================================
 function Install-ClaudebaseHooks {
     $hooksDir = Join-Path $Script:ClaudeDir 'hooks'
     $settings = Join-Path $Script:ClaudeDir 'settings.json'
     New-Item -ItemType Directory -Force -Path $hooksDir | Out-Null
 
-    # Deploy BOTH variants of BOTH hooks; Windows wires the .ps1, the .sh is harmless.
-    foreach ($hook in 'claudebase-insight-capture.sh', 'claudebase-insight-capture.ps1',
-                      'claudebase-selfcheck-reminder.sh', 'claudebase-selfcheck-reminder.ps1') {
+    # Remove the retired Stop insight-capture hook files (superseded).
+    foreach ($old in 'claudebase-insight-capture.sh', 'claudebase-insight-capture.ps1') {
+        $p = Join-Path $hooksDir $old
+        if (Test-Path $p) { Remove-Item -Force $p }
+    }
+
+    # Deploy both variants of the self-check reminder; Windows wires the .ps1.
+    foreach ($hook in 'claudebase-selfcheck-reminder.sh', 'claudebase-selfcheck-reminder.ps1') {
         $src = Join-Path $Script:ScriptDir "hooks\$hook"
         $dst = Join-Path $hooksDir $hook
         if (-not (Test-Path $src)) { Write-Warn "hooks/$hook missing in source — skipping"; continue }
@@ -268,35 +275,41 @@ function Install-ClaudebaseHooks {
             $json | Add-Member -NotePropertyName 'hooks' -NotePropertyValue ([pscustomobject]@{}) -Force
         }
 
-        # Helper — idempotent merge of one event by command-string equality.
-        $mergeEvent = {
-            param($eventName, $command)
-            if (-not ($json.hooks.PSObject.Properties.Name -contains $eventName)) {
-                $json.hooks | Add-Member -NotePropertyName $eventName -NotePropertyValue @() -Force
-            }
-            $existing = @($json.hooks.$eventName)
-            $already = $false
-            foreach ($entry in $existing) {
-                if ($entry.hooks) {
-                    foreach ($h in $entry.hooks) { if ($h.command -eq $command) { $already = $true; break } }
-                }
-                if ($already) { break }
-            }
-            if (-not $already) {
-                $newEntry = [pscustomobject]@{ hooks = @([pscustomobject]@{ type = 'command'; command = $command }) }
-                $json.hooks.$eventName = @($existing) + $newEntry
-            }
+        # Idempotent merge of UserPromptSubmit by command-string equality.
+        if (-not ($json.hooks.PSObject.Properties.Name -contains 'UserPromptSubmit')) {
+            $json.hooks | Add-Member -NotePropertyName 'UserPromptSubmit' -NotePropertyValue @() -Force
+        }
+        $existing = @($json.hooks.UserPromptSubmit)
+        $already = $false
+        foreach ($entry in $existing) {
+            if ($entry.hooks) { foreach ($h in $entry.hooks) { if ($h.command -eq $selfcheckCmd) { $already = $true; break } } }
+            if ($already) { break }
+        }
+        if (-not $already) {
+            $newEntry = [pscustomobject]@{ hooks = @([pscustomobject]@{ type = 'command'; command = $selfcheckCmd }) }
+            $json.hooks.UserPromptSubmit = @($existing) + $newEntry
         }
 
-        & $mergeEvent 'Stop' $stopCmd
-        & $mergeEvent 'UserPromptSubmit' $selfcheckCmd
+        # Unwire the retired Stop insight-capture hook: strip its command from
+        # any Stop matcher block, drop now-empty blocks, drop empty Stop key.
+        if ($json.hooks.PSObject.Properties.Name -contains 'Stop') {
+            $kept = @()
+            foreach ($entry in @($json.hooks.Stop)) {
+                if ($entry.hooks) {
+                    $entry.hooks = @($entry.hooks | Where-Object { $_.command -ne $stopCmd })
+                }
+                if ($entry.hooks -and @($entry.hooks).Count -gt 0) { $kept += $entry }
+            }
+            if ($kept.Count -gt 0) { $json.hooks.Stop = $kept }
+            else { $json.hooks.PSObject.Properties.Remove('Stop') }
+        }
 
         $json | ConvertTo-Json -Depth 12 | Set-Content -Path $settings -Encoding UTF8
-        Write-Ok "settings.json (Stop[insight-capture] + UserPromptSubmit[selfcheck] hooks wired)"
+        Write-Ok "settings.json (UserPromptSubmit[selfcheck] wired; retired Stop[insight-capture] unwired)"
     } catch {
         Write-Warn "settings.json hook merge failed ($($_.Exception.Message)); add manually:"
-        Write-Warn "  hooks.Stop[*].hooks[*].command = $stopCmd"
         Write-Warn "  hooks.UserPromptSubmit[*].hooks[*].command = $selfcheckCmd"
+        Write-Warn "  (and remove any hooks.Stop entry pointing at claudebase-insight-capture.ps1)"
     }
 }
 

@@ -64,7 +64,7 @@ WHAT GETS INSTALLED:
   %USERPROFILE%\.claude\tools\claudebase\pdfium\bin\pdfium.dll
   %USERPROFILE%\.claude\tools\claudebase\models\          e5 encoder cache
   %USERPROFILE%\.claude\rules\        knowledge-base, knowledge-base-tool, tool-limitations
-  %USERPROFILE%\.claude\commands\     knowledge-ingest, reflect, consolidate
+  %USERPROFILE%\.claude\commands\     knowledge-ingest, reflect, consolidate, update-claudebase
   %USERPROFILE%\.claude\agents\       reflection (Drift), consolidator (Mnem)
   %USERPROFILE%\.claude\bin\claudebase.cmd  Global wrapper (User PATH)
 "@ | Write-Host
@@ -649,6 +649,6 @@ Write-Host "    claudebase search '<query>' --json    Hybrid retrieval over the 
 Write-Host "    claudebase insight create '...' \"
 Write-Host "        --type agent-learned --agent <name>      Persist a cognitive insight"
 Write-Host ""
-Write-Host "  Skills installed: /knowledge-ingest /reflect /consolidate"
+Write-Host "  Skills installed: /knowledge-ingest /reflect /consolidate /update-claudebase"
 Write-Host "  Agents installed: reflection (Drift), consolidator (Mnem)"
 Write-Host ""

@@ -285,7 +285,7 @@ claudebase/
 │   └── telegram-rs/        Rust port of the official Anthropic Telegram channel plugin
 ├── prompts/                Claude Code agent toolkit installed into ~/.claude/
 │   ├── rules/              knowledge-base, knowledge-base-tool, tool-limitations
-│   ├── commands/           /knowledge-ingest, /reflect, /consolidate
+│   ├── commands/           /knowledge-ingest, /reflect, /consolidate, /update-claudebase
 │   └── agents/             reflection (Drift), consolidator (Mnem)
 ├── bench/                  Benchmark harness + golden query set
 ├── docs/                   Self-contained product documentation

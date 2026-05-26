@@ -8,6 +8,9 @@ User-facing means changes a developer using claudebase notices in day-to-day wor
 
 ## [Unreleased]
 
+### Fixed
+- **Windows PowerShell hooks broke on parse** (`claudebase-insight-capture.ps1`, `claudebase-selfcheck-reminder.ps1`). The scripts contained non-ASCII characters (`🪝` emoji, em-dashes, bullets); Windows PowerShell 5.1 parses no-BOM scripts in the local code page, not UTF-8, so the multibyte sequences corrupted string literals and aborted the script with `Unexpected token` / `string is missing the terminator`. Both `.ps1` hooks are now ASCII-only (emoji -> `[hook]`, em-dash/bullet -> `-`), which parses identically under any code page. The `.sh` variants keep the `🪝` bubble (Unix is UTF-8 throughout). A convention note at the top of each `.ps1` documents the ASCII-only requirement.
+
 ### Changed
 - Reorganized repository layout: toplevel `agents/`, `commands/`, `rules/` moved into `prompts/{agents,commands,rules}/` to disambiguate from Rust source dirs (`bench/`, `plugins/`, `src/`, `tests/`). `install.sh` / `install.ps1` updated to read from new paths. End-user effect: none — installed files at `~/.claude/{agents,commands,rules}/` unchanged.
 - Repo cleanup: removed `whisper-build-test/` (one-off spike, superseded by `plugins/telegram-rs/src/whisper.rs`), `spikes/ipc_concurrent_accept/` (closed engineering spike), `examples/` (empty), and `.DS_Store`.

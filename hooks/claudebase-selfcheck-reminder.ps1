@@ -1,8 +1,9 @@
-# claudebase UserPromptSubmit hook (Windows PowerShell) — self-check reminder.
+# claudebase UserPromptSubmit hook (Windows PowerShell) - self-check reminder.
+# ASCII-only source: Windows PowerShell 5.1 parses no-BOM scripts in the local code page, so non-ASCII (em-dash, bullets, emoji) corrupts string literals and breaks the script. Keep this file ASCII.
 #
 # Fires before the agent responds. Injects a SHORT agent-only reminder of the
 # three cognitive-self-check protocols. Channel: additionalContext (no
-# systemMessage — per-prompt operator bubble would be noise).
+# systemMessage - per-prompt operator bubble would be noise).
 #
 # Ships with claudebase because the cognitive-self-check rule it reminds about
 # (~/.claude/rules/cognitive-self-check.md) is part of claudebase's
@@ -18,9 +19,9 @@ $ErrorActionPreference = 'Continue'
 
 $reminder = @'
 [self-check reminder] Before you respond, confirm you are running the three cognitive-self-check protocols (~/.claude/rules/cognitive-self-check.md):
-  • Protocol 3 (Inbound) — challenge the task BEFORE executing; push-back is not failure.
-  • Protocol 1 (Facts) — cite file:line / source verified THIS session; training-data recall is not evidence.
-  • Protocol 2 (Decisions) — hack? sane? alternatives? symptom-or-cause? root-cause tracked?
+  - Protocol 3 (Inbound) - challenge the task BEFORE executing; push-back is not failure.
+  - Protocol 1 (Facts) - cite file:line / source verified THIS session; training-data recall is not evidence.
+  - Protocol 2 (Decisions) - hack? sane? alternatives? symptom-or-cause? root-cause tracked?
 If you have drifted from these over the session, re-read the rule now.
 '@
 

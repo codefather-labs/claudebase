@@ -1,4 +1,5 @@
-# claudebase Stop hook (Windows PowerShell) — insight-capture nudge.
+# claudebase Stop hook (Windows PowerShell) - insight-capture nudge.
+# ASCII-only source: Windows PowerShell 5.1 parses no-BOM scripts in the local code page, so non-ASCII (em-dash, bullets, emoji) corrupts string literals and breaks the script. Keep this file ASCII.
 #
 # Fires when the main agent finishes a turn (Stop event). Unconditionally
 # prompts the agent to reflect: did it learn anything, catch a mistake, or
@@ -32,20 +33,20 @@ if ($payload) {
 if (-not $cwd) { $cwd = (Get-Location).Path }
 $projectLabel = Split-Path -Path $cwd -Leaf
 
-# Guard 1 — loop prevention.
+# Guard 1 - loop prevention.
 if ($stopActive) { exit 0 }
 
-# Guard 2 — claudebase must be installed.
+# Guard 2 - claudebase must be installed.
 $cb = Get-Command claudebase -ErrorAction SilentlyContinue
 $cbPath = Join-Path $env:USERPROFILE ".claude\tools\claudebase\claudebase.exe"
 if (-not $cb -and -not (Test-Path $cbPath)) { exit 0 }
 
-$sysMsg = "🪝 claudebase insight-capture hook — event=Stop project=$projectLabel"
+$sysMsg = "[hook] claudebase insight-capture - event=Stop project=$projectLabel"
 
 # Reason is operator-visible by Claude Code design (block reasons always
-# surface). Keep it to ONE compact line — the agent already knows the full
+# surface). Keep it to ONE compact line - the agent already knows the full
 # insight protocol from ~/.claude/rules/knowledge-base-tool.md.
-$reason = "Reflect on the turn you just finished: if it produced a genuine insight (self-learning, a falsified prediction/assumption, or an operator correction worth carrying forward), persist exactly ONE via ``claudebase insight create ""<one sentence>"" --type <agent-learned|self-bias-caught|prediction-error|assumption-falsified|plan-reality-gap|operator-correction> --agent <you> --salience <high|medium|low> --session $sessionId``. Otherwise stop silently — no insight, no commentary, do not manufacture one."
+$reason = "Reflect on the turn you just finished: if it produced a genuine insight (self-learning, a falsified prediction/assumption, or an operator correction worth carrying forward), persist exactly ONE via ``claudebase insight create ""<one sentence>"" --type <agent-learned|self-bias-caught|prediction-error|assumption-falsified|plan-reality-gap|operator-correction> --agent <you> --salience <high|medium|low> --session $sessionId``. Otherwise stop silently - no insight, no commentary, do not manufacture one."
 
 $out = [ordered]@{
     decision      = 'block'

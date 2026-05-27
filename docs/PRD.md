@@ -779,3 +779,330 @@ All new subcommands follow the existing `claudebase` CLI conventions: `--json` f
 ### Symptom-only patches (with root-cause links)
 
 (none) — no symptom-only patches in this PRD section.
+
+---
+
+## §18. Insights Hybrid Corpus — Global General DB, Project Registry, Mandatory Tags, and Read-on-New-Context Hook
+
+**Status:** [PLANNED]
+**Date:** 2026-05-27
+**Priority:** High
+**Related:** §16 (Agent Insights Base — this section extends the `insight` subcommand tree and `insights.db` schema introduced in §16; schema v5 of `insights.db` is additive on top of §16's v4). §17 (Agent Chat Daemon — §17's `chat.db` uses an independent schema versioning scheme; no conflict). §15 (Vector + Multimodal Retrieval Backend — the `--corpus all` RRF fusion machinery at `main.rs:2548-2604` is reused for the local+general insight merge in FR-IHC-5). Plan source: `.claude/plan.md` (199 lines, read in full this session).
+
+Changelog: Agents can now share knowledge across projects — general lessons go to a global pool every project can read, while project-specific insights stay local. Tags make it fast to pull only what's relevant when a new session starts.
+
+### 18.1 Feature Description
+
+The Agent Insights Base (§16) introduced per-project cognitive memory: `insights.db` at `<project>/.claude/knowledge/insights.db` lets SDLC agents write and read cross-session insights. Three structural gaps remain after §16:
+
+1. **No global collection point.** Insights about general tool-level or domain-level lessons (nginx reload signals, Tokio mutex gotchas, cognitive-bias patterns) are trapped in whichever project happened to discover them, invisible to every other project.
+2. **No selective read surface.** Agents filter by `feature_slug` / `agent` / `salience`. There is no topic-tag axis — an agent entering a fresh context either floods its window with all insights or reads none.
+3. **No scope discipline.** An agent working on project X has no mechanism to say "give me X's insights plus general ones, but not project Y's."
+
+This feature delivers a **hybrid corpus**:
+
+- **Project insights** stay in their project's LOCAL db (`<project>/.claude/knowledge/insights.db`). Existing v4 data is untouched; zero content migration.
+- **General insights** (cross-project, tool-level knowledge) live in ONE GLOBAL db at `~/.claude/knowledge/insights.db`.
+- A **project registry** at `~/.claude/knowledge/projects.json` is upserted at every `claudebase run` startup, mapping `project-name → path` so routing resolves the right db.
+- Every `insight create` call requires a **mandatory `--category` (`general` | `project`)** — the routing key — and at least one **mandatory free-form `--tag`**. Missing either causes exit 2.
+- A new **`insight tags` subcommand** lists the tag vocabulary with counts. `search`, `list`, `random`, `gc`, and `delete` gain `--tag`, `--category`, `--project`, `--general-only`, and `--project-only` filters.
+- The default in-project read posture is `merge(local-project + global-general)`. Other projects' insights are walled off unless explicitly named.
+- A **SessionStart hook** (`claudebase-read-insights-reminder.sh` / `.ps1`) reminds agents entering a fresh context window to pull relevant insights by tag and category — once per context, not every message.
+
+This is the first feature that makes `--category` and `--tags` required on `insight create`. Every existing caller (~22 SDLC agent prompt files, the knowledge-base rule docs, and the UserPromptSubmit reminder hook) is updated in this release so no caller breaks. This is a **BREAKING CLI change** — `insight create` without `--category` or without `--tags` returns exit 2.
+
+The release target is claudebase core **v0.7.0**.
+
+### 18.2 User Story
+
+As an SDLC pipeline agent starting a fresh context window, I want to pull relevant insights by tag and category — merging this project's local insights with general cross-project ones — so that I ground decisions in what prior sessions actually learned without flooding my context with unrelated knowledge from other projects.
+
+### 18.3 Functional Requirements
+
+#### FR-IHC-1: Schema v5 Migration for `insights.db` (Slice 1) — SCHEMA CHANGE
+
+1. **FR-IHC-1.1:** A `SCHEMA_V5_DELTA` constant MUST add two nullable columns to the `documents` table: `category TEXT` and `project_slug TEXT`. No existing column may be modified or removed.
+2. **FR-IHC-1.2:** A new normalized tags table MUST be created: `insight_tags(doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, tag TEXT NOT NULL, UNIQUE(doc_id, tag))`.
+3. **FR-IHC-1.3:** Two new indexes MUST be created: `CREATE INDEX idx_insight_tags_tag ON insight_tags(tag)` and `CREATE INDEX idx_documents_category ON documents(category)`.
+4. **FR-IHC-1.4:** The `open_or_init_v2` function in `src/store.rs` MUST be extended with: (a) a fresh-database branch that stamps schema version 5 and applies the V5 delta; (b) a `v4 → 5` upgrade branch that runs the delta transactionally and is additive — books-corpus rows in `index.db` are unaffected because `category` defaults to NULL; (c) a `v5` idempotent re-open branch that probes the two columns and the `insight_tags` table via `pragma_table_info` before proceeding.
+5. **FR-IHC-1.5:** On v4→v5 backfill, ALL existing insight rows (documents rows where `source_path` starts with `agent:`) MUST be updated: `category = 'project'`; `project_slug` derived from the db's project-path basename; one default tag equal to `feature_slug` (or `'untagged'` when `feature_slug` is NULL) inserted into `insight_tags`.
+6. **FR-IHC-1.6:** Books-corpus rows (documents rows where `source_path` does NOT start with `agent:`) MUST retain `category = NULL` and MUST NOT receive any `insight_tags` entries. The V5 migration MUST be verifiable with a test asserting zero `insight_tags` rows for books-corpus doc_ids.
+7. **FR-IHC-1.7:** `cargo test` MUST remain green after the migration: fresh→v5 stamp; v4→v5 adds columns and table; idempotent re-open; the 4 existing SDLC-repo insight rows backfill to `category='project'` with a non-empty tag.
+
+#### FR-IHC-2: Global Insights Resolver (Slice 2) — SECURITY NOTE
+
+1. **FR-IHC-2.1:** A new function `resolve_global_insights_db() -> PathBuf` in `src/store.rs` MUST return the fixed path `$HOME/.claude/knowledge/insights.db` (resolved via `std::env::var("HOME")` on Unix or `USERPROFILE` on Windows).
+2. **FR-IHC-2.2:** The function MUST create the parent directory `~/.claude/knowledge/` if it does not exist, with the same permissions logic used for per-project db directories.
+3. **FR-IHC-2.3:** This function DELIBERATELY bypasses the `resolve_project_root` cwd-containment gate (established in §15 FR-7.3). The bypass is safe and MUST be documented in a code comment: the path is a fixed `$HOME`-rooted constant and contains NO user-input-derived component. The security-auditor MUST confirm this during Slice 2 review.
+4. **FR-IHC-2.4:** A unit test MUST assert the resolved path equals `$HOME/.claude/knowledge/insights.db` and that the parent directory is created.
+
+#### FR-IHC-3: `insight create` — Mandatory Category and Tags, Dual-DB Routing (Slice 3) — BREAKING CLI CHANGE
+
+1. **FR-IHC-3.1 [BREAKING]:** The `--category <general|project>` flag MUST be added to `InsightCreateArgs` in `src/cli.rs` as a `clap value_enum` required argument. Invocations that omit `--category` MUST exit 2 with a clap usage error. This is a breaking change from v0.6.0 where `--category` did not exist.
+2. **FR-IHC-3.2 [BREAKING]:** The `--tags <tag>` flag MUST be added to `InsightCreateArgs` as a repeatable required argument accepting one or more comma-separated or space-separated tag strings. Invocations that supply `--category` but omit `--tags` entirely MUST exit 2 with the literal stderr message `error: insight create requires at least one --tag`. This is a breaking change from v0.6.0 where `--tags` did not exist.
+3. **FR-IHC-3.3:** An optional `--project <slug>` flag MAY be supplied when `--category project`. When omitted with `--category project`, the project slug MUST be auto-derived from the cwd project basename. The `--project` flag MUST be silently ignored when `--category general`.
+4. **FR-IHC-3.4:** `run_insight_create` MUST route the db open by category: `--category general` opens the global db via `resolve_global_insights_db()`; `--category project` opens the cwd-resolved local db via the existing `resolve_project_root` path.
+5. **FR-IHC-3.5:** After the `documents` row insert, `run_insight_create` MUST insert one row per tag into `insight_tags`. Tag strings MUST be lowercased and stripped of leading `#` characters before insertion. Duplicate tags for the same doc MUST be silently dropped (the `UNIQUE(doc_id, tag)` constraint handles this).
+6. **FR-IHC-3.6:** The `category` and `project_slug` columns on the inserted `documents` row MUST be populated from the `--category` and `--project` arguments.
+7. **FR-IHC-3.7:** Existing exact-sha and semantic dedup logic MUST continue to fire per-db — general-category dedup is checked against the global db; project-category dedup is checked against the local db.
+8. **FR-IHC-3.8:** Tests MUST cover: missing `--tags` → exit 2; missing `--category` → clap exit 2; `--category general` writes to global db and NOT to local db (asserted via direct SQL on both files); `--category project` writes to local db; tags are persisted in `insight_tags`; dedup still fires.
+
+#### FR-IHC-4: `insight tags` Subcommand (Slice 4) — NEW COMMAND
+
+1. **FR-IHC-4.1:** A new `InsightCmd::Tags` variant and `InsightTagsArgs` struct MUST be added to `src/cli.rs`. The subcommand is invoked as `claudebase insight tags`.
+2. **FR-IHC-4.2:** `run_insight_tags` MUST execute `SELECT tag, COUNT(*) AS count FROM insight_tags GROUP BY tag ORDER BY count DESC` and return a list of `{tag, count}` objects.
+3. **FR-IHC-4.3:** The `--category <c>` filter MUST restrict to tags for insights matching the given category (via a JOIN to `documents`).
+4. **FR-IHC-4.4:** The `--project <slug>` filter MUST restrict to tags for insights with the given `project_slug`.
+5. **FR-IHC-4.5:** The default posture (no filters) MUST merge tags from BOTH the local-project db and the global db — the same local+general merge posture as the read subcommands.
+6. **FR-IHC-4.6:** `--json` output shape MUST be `[{"tag": "<string>", "count": <integer>}, ...]`.
+7. **FR-IHC-4.7:** Tests MUST cover: returns distinct tags with descending counts; `--category general` lists only global-db tags; merged default includes both; json shape asserted.
+
+#### FR-IHC-5: Dual-DB Reads — `search`, `list`, `random`, `gc`, `delete` (Slice 5)
+
+1. **FR-IHC-5.1:** The following read subcommands MUST gain four new filter flags in `src/cli.rs`: `--tag <tag>` (repeatable; **OR / any-intersection semantics** — an insight carries many tags, and a result is returned if its tag set intersects the requested `--tag` set by AT LEAST ONE; `--tag nginx --tag docker` returns insights carrying nginx OR docker), `--category <c>`, `--project <slug>`, and two narrowing boolean flags `--general-only` / `--project-only`. (Operator decision 2026-05-27: OR, not AND. A future `--all-tags` flag for AND semantics is deferred.)
+2. **FR-IHC-5.2:** The default in-project posture for `insight search`, `insight list`, and `insight random` MUST be `merge(local-project + global-general)`, reusing the RRF fusion machinery at `main.rs:2548-2604` adapted to operate over two insight dbs rather than a books db and an insight db. Cross-project reads are walled off unless `--project <other-slug>` is supplied, in which case the project registry resolves the db path.
+3. **FR-IHC-5.3:** Tag filtering MUST be implemented as a single membership filter over the UNION of requested tags — `WHERE doc_id IN (SELECT doc_id FROM insight_tags WHERE tag IN (?, ?, ...))`, one parameterized placeholder per `--tag` value — applied after retrieval ranking to preserve RRF score ordering. This realizes the OR / any-intersection semantics of FR-IHC-5.1 (a per-tag intersect-all JOIN chain would wrongly implement AND).
+4. **FR-IHC-5.4:** `--general-only` MUST read ONLY the global db and MUST ignore the local-project db entirely.
+5. **FR-IHC-5.5:** `--project-only` MUST read ONLY the local-project db and MUST ignore the global db entirely.
+6. **FR-IHC-5.6:** `insight gc` with `--category general` MUST run GC against the global db. Without `--category`, GC MUST run against BOTH dbs sequentially and report combined `{deleted, freed_bytes}`.
+7. **FR-IHC-5.7:** `insight delete <id>` behavior is unchanged from §16 FR-AIB-8.3 for the local db; with `--category general`, the id is resolved against the global db.
+8. **FR-IHC-5.8:** Tests MUST cover: `--tag nginx` returns rows carrying the `nginx` tag (among possibly many); **`--tag nginx --tag docker` returns a nginx-only insight, a docker-only insight, AND a both-tagged insight (OR / any-intersection, NOT AND)**; `--category general` reads only global; default in-project returns both project and general insights and excludes a planted other-project row; `--general-only` excludes project rows; `--project-only` excludes general rows.
+
+#### FR-IHC-6: Project Registry at `~/.claude/knowledge/projects.json` (Slice 6) — NEW FILE
+
+1. **FR-IHC-6.1:** A new `src/registry.rs` module MUST define a `ProjectRegistry` with entries shaped as `{name: String, path: String, last_seen: u64}` (epoch seconds). The registry is persisted as a JSON array at `~/.claude/knowledge/projects.json`.
+2. **FR-IHC-6.2:** `upsert_project(root: &Path)` MUST: derive `name` from the canonical path basename; find an existing entry by canonical `path`; update `last_seen` if found; append a new entry if not found. The upsert MUST be keyed on canonical path to prevent duplicate entries for the same project under different relative representations.
+3. **FR-IHC-6.3:** The upsert MUST use an atomic write-then-rename pattern: write the updated JSON to a temp file in the same directory, then `rename` (which is atomic on POSIX and near-atomic on Windows) to the final path. This prevents corrupt registry state from concurrent `claudebase run` invocations.
+4. **FR-IHC-6.4:** `resolve_project_path(name: &str) -> Option<PathBuf>` MUST look up a project by name and return its path if found.
+5. **FR-IHC-6.5:** The `upsert_project` call MUST be placed at the TOP of `run_claude_with_preset` in `src/main.rs` (near line 154), BEFORE the `exec()` call on Unix (near line 199). The registry write MUST NOT be placed after `exec()` — `exec()` replaces the process and any code after it never runs.
+6. **FR-IHC-6.6:** Tests MUST cover: running `claudebase run` in a simulated test harness creates/updates the registry with the cwd project; upsert is idempotent on repeated calls with the same path; name→path lookup works; atomic write prevents partial reads.
+
+#### FR-IHC-7: SessionStart "Read Insights on New Context" Hook (Slice 7) — NEW HOOK
+
+1. **FR-IHC-7.1:** Two new hook files MUST be added to the `hooks/` directory: `claudebase-read-insights-reminder.sh` (bash, Unix) and `claudebase-read-insights-reminder.ps1` (PowerShell, Windows). Both are SessionStart hooks that fire on `startup`, `resume`, and `compact` events.
+2. **FR-IHC-7.2:** The hook MUST emit `additionalContext` reminding the agent it is entering a fresh context window and SHOULD pull relevant insights: (a) call `claudebase insight tags --project <cwd-project>` to discover the available tag vocabulary; (b) call `claudebase insight search "<kw>" --tag <t>` (one or two representative calls) to load general and project insights by tag. The reminder MUST phrase the pull as conditional ("if entering fresh context") to avoid re-running on every message.
+3. **FR-IHC-7.3:** The `.ps1` hook MUST be ASCII-only with no BOM. Non-ASCII characters (including PowerShell help comments with non-ASCII) MUST NOT appear. This constraint is established by the failure mode documented in commit `2d5eb8d` (ASCII-only PowerShell hooks — PS 5.1 parse failure).
+4. **FR-IHC-7.4:** `install.sh` MUST wire the `claudebase-read-insights-reminder.sh` hook into `~/.claude/settings.json` under the `hooks.SessionStart` array using `jq`, keyed by the command string. The wiring MUST be idempotent — a second `install.sh` run MUST NOT add a duplicate entry.
+5. **FR-IHC-7.5:** `install.ps1` MUST perform the equivalent wiring using `ConvertFrom-Json` / `ConvertTo-Json`, also idempotent.
+6. **FR-IHC-7.6:** Tests MUST cover: `bash -n hooks/claudebase-read-insights-reminder.sh` exits 0; PowerShell parse of the `.ps1` exits 0; install wiring is idempotent (re-run = no-op); the hook text emits the reminder on a simulated SessionStart event.
+
+#### FR-IHC-8: Update All Callers — SDLC Blast Radius (Slice 8) — BREAKING CHANGE REMEDIATION
+
+1. **FR-IHC-8.1:** Every `insight create` invocation template or example in the SDLC agent prompt files (the ~22 files under `~/.claude/agents/*.md` or `src/agents/*.md`) MUST be updated to include `--category <value>` and `--tags <value>`. After this update, no bare `insight create` example lacking `--category` and `--tags` MUST remain in any agent prompt or rule file.
+2. **FR-IHC-8.2:** `~/.claude/rules/knowledge-base-tool.md` MUST be updated to: document the new `--category` (required) and `--tags` (required, ≥1) flags on `insight create`; document the `insight tags` subcommand and the read-on-new-context flow; document the global/project routing semantics.
+3. **FR-IHC-8.3:** `~/.claude/rules/knowledge-base.md` MUST be updated to reflect the new required flags in its CLI invocation contract section.
+4. **FR-IHC-8.4:** The UserPromptSubmit reminder hook text (in `claudebase-selfcheck-reminder.sh` / `.ps1`) MUST be updated to include `--category` and `--tags` in any `insight create` examples it shows to agents.
+5. **FR-IHC-8.5 (Done-when):** `grep -rE "insight create" ~/.claude/ src/agents/ ~/.claude/rules/` finds zero lines that lack `--category` AND zero lines that lack `--tag`. This grep-check is the acceptance gate for this slice.
+
+#### FR-IHC-9: Docs and Release v0.7.0 (Slice 9)
+
+1. **FR-IHC-9.1:** The claudebase `CHANGELOG.md` `[Unreleased]` section MUST gain entries: `Added` — hybrid corpus (global general-db at `~/.claude/knowledge/insights.db`, project registry at `~/.claude/knowledge/projects.json`, `insight tags` subcommand, tag and category filters on all read subcommands, read-on-new-context SessionStart hook); `Changed / BREAKING` — `insight create` now requires `--category` and `--tags` (missing either causes exit 2).
+2. **FR-IHC-9.2:** `README.md` MUST gain a "Hybrid Insights Corpus" subsection documenting the routing model (`general` → global db, `project` → local db), the `insight tags` discovery flow, the project registry, and the `--category`/`--tags` requirement.
+3. **FR-IHC-9.3:** The `/release` command MUST produce claudebase core release `v0.7.0` after `/merge-ready` reports MERGE READY.
+
+### 18.4 Non-Functional Requirements
+
+1. **NFR-IHC-1 (Backward compatibility — schema):** The v5 migration MUST be additive. No existing column on `documents` may be dropped or renamed. Books-corpus rows MUST remain valid after the migration. Existing v4 insights MUST be backfilled with non-empty `category` and `project_slug` values and at least one `insight_tags` row.
+2. **NFR-IHC-2 (Security backbone preserved):** The `resolve_project_root` cwd-containment gate MUST remain the only path-from-user-input gate for per-project db access. The `resolve_global_insights_db` bypass (FR-IHC-2.3) is explicitly exempt and documented. No other bypass is introduced.
+3. **NFR-IHC-3 (Registry concurrency safety):** Concurrent `claudebase run` invocations on the same machine MUST NOT corrupt `projects.json`. The atomic write-then-rename strategy (FR-IHC-6.3) is the required mechanism.
+4. **NFR-IHC-4 (Hook nag frequency):** The SessionStart hook fires on every `startup`, `resume`, and `compact` event. The hook text MUST be lightweight `additionalContext` (not a blocking prompt) and MUST NOT exceed 200 words of injected reminder text.
+5. **NFR-IHC-5 (Tag storage — normalized):** Tags are stored in a normalized `insight_tags(doc_id, tag)` table rather than a denormalized JSON/CSV column on `documents`. This enables efficient `GROUP BY tag` counts and an indexed `WHERE tag = ?` filter without full-table scans.
+6. **NFR-IHC-6 (CLI breaking change is intentional and fully remediated):** The breaking change to `insight create` (adding required `--category` and `--tags`) is operator-approved. All in-repository callers are updated in Slice 8 before v0.7.0 is released. External callers not maintained in this repository are warned via the `CHANGELOG.md` BREAKING entry.
+7. **NFR-IHC-7 (Single-binary constraint):** All new functionality (global resolver, registry, dual-db reads, hook scripts) MUST compile into the existing `claudebase` binary with no additional runtime dependencies. No Python, no Node.js, no new external binaries.
+
+### 18.5 Acceptance Criteria
+
+1. **AC-IHC-1 (Schema v5 — fresh stamp):** `claudebase status --json` on a fresh post-install database returns `"schema_version": 5`.
+2. **AC-IHC-2 (Schema v5 — v4 migration additive):** On a v4 `insights.db` with existing insight rows and book rows in `index.db`, running any `claudebase insight` subcommand triggers the v4→v5 migration; `pragma_table_info(documents)` shows `category` and `project_slug` columns; the `insight_tags` table exists; book-corpus rows have `category = NULL` and zero `insight_tags` entries.
+3. **AC-IHC-3 (Backfill):** The 4 existing SDLC-repo insight rows (inserted at v4) each have `category = 'project'` and at least one row in `insight_tags` after migration.
+4. **AC-IHC-4 (Mandatory enforcement — tags):** `claudebase insight create "test" --category project` (no `--tags`) exits 2 and writes to neither db.
+5. **AC-IHC-5 (Mandatory enforcement — category):** `claudebase insight create "test" --tags foo` (no `--category`) exits 2 (clap error).
+6. **AC-IHC-6 (Routing — general):** `claudebase insight create "nginx lesson" --category general --tags nginx` inserts a row into `~/.claude/knowledge/insights.db` and NOT into the cwd local `insights.db`. Verified via `sqlite3 ~/.claude/knowledge/insights.db "SELECT count(*) FROM documents WHERE source_type='agent-learned'"` returning ≥ 1, and cwd local db count unchanged.
+7. **AC-IHC-7 (Routing — project):** `claudebase insight create "local lesson" --category project --tags myfeature` inserts a row into the cwd local `insights.db` and NOT into `~/.claude/knowledge/insights.db`.
+8. **AC-IHC-8 (Tags subcommand):** `claudebase insight tags --json` returns a JSON array with at least one element having `tag` and `count` fields after AC-IHC-6 and AC-IHC-7 complete.
+9. **AC-IHC-9 (Search — merged default):** In-project `claudebase insight search "lesson" --json` returns hits from BOTH the local db and the global db and excludes a row planted in a second unrelated project's db.
+10. **AC-IHC-10 (Search — tag filter):** `claudebase insight search "lesson" --tag nginx --json` returns only rows tagged `nginx`.
+11. **AC-IHC-11 (Search — general-only):** `claudebase insight search "lesson" --general-only --json` returns only global-db rows.
+12. **AC-IHC-12 (Registry — created on run):** After `claudebase run` executes (or the registry entry-point is triggered in a test harness), `~/.claude/knowledge/projects.json` exists and contains an entry for the cwd project with a non-null `last_seen` epoch.
+13. **AC-IHC-13 (Registry — idempotent):** Running the registry upsert twice with the same cwd produces exactly one entry for that project in `projects.json`, not two.
+14. **AC-IHC-14 (Hook — parse):** `bash -n hooks/claudebase-read-insights-reminder.sh` exits 0. PowerShell `-Command "& { . 'hooks/claudebase-read-insights-reminder.ps1' }"` exits 0 on a PS 5.1 engine.
+15. **AC-IHC-15 (Hook — install idempotent):** Running `bash install.sh --yes` twice does not produce duplicate entries for `claudebase-read-insights-reminder.sh` in `~/.claude/settings.json`.
+16. **AC-IHC-16 (Callers updated):** `grep -rE "insight create" ~/.claude/ src/agents/ ~/.claude/rules/ | grep -v "\-\-category" | wc -l` returns 0.
+17. **AC-IHC-17 (Release):** After `/merge-ready` reports MERGE READY and `/release` completes, `claudebase --version` returns `0.7.0` and `CHANGELOG.md` contains a versioned `[0.7.0]` section with a `Changed / BREAKING` entry for `insight create`.
+
+### 18.6 Affected CLI Surface
+
+**New flags on `insight create` (BREAKING — required):**
+- `--category <general|project>` — routing key; required; clap `value_enum`
+- `--tags <tag>` — repeatable; at least one required; empty list → exit 2
+- `--project <slug>` — optional; applicable only with `--category project`
+
+**New flags on `insight search`, `list`, `random`, `gc`, `delete`:**
+- `--tag <tag>` — repeatable; AND semantics
+- `--category <c>` — filter by category
+- `--project <slug>` — resolve cross-project db via registry
+- `--general-only` — read global db only
+- `--project-only` — read local db only
+
+**New subcommand:**
+- `claudebase insight tags [--category <c>] [--project <slug>] [--json]`
+
+**Unchanged subcommands (interface):**
+- `insight search`, `insight list`, `insight random`, `insight get`, `insight gc`, `insight delete` — interface additive only (new filter flags); existing flags unchanged.
+
+### 18.7 Schema Changes
+
+All schema changes apply to `insights.db` only. `index.db` (books corpus) and `chat.db` (daemon) are unaffected.
+
+**`insights.db` — Schema v5 (additive on top of §16 v4):**
+
+```sql
+-- New columns on the existing `documents` table:
+ALTER TABLE documents ADD COLUMN category TEXT;       -- 'general' | 'project' | NULL (books rows)
+ALTER TABLE documents ADD COLUMN project_slug TEXT;   -- cwd project basename; NULL for general insights
+
+-- New index for category filtering:
+CREATE INDEX idx_documents_category ON documents(category);
+
+-- New normalized tags table:
+CREATE TABLE IF NOT EXISTS insight_tags (
+    doc_id  INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    tag     TEXT NOT NULL,
+    UNIQUE(doc_id, tag)
+);
+CREATE INDEX idx_insight_tags_tag ON insight_tags(tag);
+```
+
+**Backfill for existing v4 insight rows (rows where `source_path LIKE 'agent:%'`):**
+
+```sql
+UPDATE documents
+SET    category     = 'project',
+       project_slug = '<derived-from-db-path-basename>'
+WHERE  source_path LIKE 'agent:%' AND category IS NULL;
+
+-- One default tag row per existing insight, using feature_slug or 'untagged':
+INSERT OR IGNORE INTO insight_tags (doc_id, tag)
+SELECT id, COALESCE(NULLIF(feature_slug, ''), 'untagged')
+FROM   documents
+WHERE  source_path LIKE 'agent:%' AND category = 'project';
+```
+
+**New file: `~/.claude/knowledge/projects.json`**
+
+```json
+[
+  { "name": "<project-basename>", "path": "<canonical-absolute-path>", "last_seen": 1748376015 }
+]
+```
+
+**New file: `~/.claude/knowledge/insights.db` (global)**
+
+Identical schema to the per-project `insights.db` (v5), but populated only with `category = 'general'` rows.
+
+### 18.8 File and FS Changes
+
+**claudebase Rust binary (new or modified files):**
+- `src/store.rs` — `SCHEMA_V5_DELTA` constant + v4→v5 migration branch + v5 idempotent probe + backfill logic + `resolve_global_insights_db()`
+- `src/cli.rs` — `InsightCreateArgs` extended with `--category`, `--tags`, `--project`; new `InsightTagsArgs` + `InsightCmd::Tags`; read-subcommand filter flags
+- `src/main.rs` — `run_insight_create` dual-db routing (:895); `run_insight_search`, `run_insight_list`, `run_insight_random`, `run_insight_gc`, `run_insight_delete` dual-db + tag/category filters; new `run_insight_tags`; `run_claude_with_preset` registry hook (:154)
+- `src/registry.rs` — **NEW** — `ProjectRegistry`, `upsert_project`, `resolve_project_path`
+- `hooks/claudebase-read-insights-reminder.sh` — **NEW** — bash SessionStart hook
+- `hooks/claudebase-read-insights-reminder.ps1` — **NEW** — PowerShell SessionStart hook (ASCII-only, no BOM)
+- `install.sh` — wire new hook into `~/.claude/settings.json` idempotently
+- `install.ps1` — wire new hook into `~/.claude/settings.json` idempotently (ConvertFrom-Json / ConvertTo-Json)
+- `CHANGELOG.md` — `[Unreleased]` entries (Added + Changed/BREAKING)
+- `README.md` — "Hybrid Insights Corpus" subsection
+
+**SDLC repo (caller blast radius — Slice 8):**
+- `~/.claude/agents/*.md` — ~22 agent prompt files with `insight create` examples updated
+- `~/.claude/rules/knowledge-base-tool.md` — CLI contract + surfacing protocol updated
+- `~/.claude/rules/knowledge-base.md` — CLI invocation contract updated
+- `hooks/claudebase-selfcheck-reminder.sh` / `.ps1` — UserPromptSubmit reminder hook updated
+
+**New persistent FS artifacts (created at runtime, not committed):**
+- `~/.claude/knowledge/insights.db` — global insights database (created on first `--category general` write)
+- `~/.claude/knowledge/projects.json` — project registry (created on first `claudebase run`)
+
+### 18.9 Out of Scope
+
+The following items are explicitly excluded from v0.7.0:
+
+1. **Content migration of existing project insights to the global db.** Hybrid storage keeps existing project insights local by design — zero content migration in v0.7.0.
+2. **Cross-project global search** (reading ALL project dbs). The registry enables this later; not in v0.7.0.
+3. **Category taxonomy beyond `{general, project}`.** The 2-value enum is extensible in a later release.
+4. **Tag synonyms, hierarchical tags, or tag-rename tooling.** Free-form tags are sufficient for v0.7.0; taxonomy features are deferred.
+5. **Auto-classification of category by content.** Agents supply `--category` explicitly; no ML-based routing in v0.7.0.
+6. **`sdlc-knowledge` embedded tag-scheme versioning.** Tag-scheme disambiguation at `/release` (per `auto-release.md`) is a release-engineer concern, not a PRD requirement.
+
+### 18.10 Risks and Dependencies
+
+1. **Shared `documents` table — category/project_slug columns on a books-corpus-shared table.** The v5 delta adds insight-only semantics to a table shared with books-corpus rows. Backfill MUST leave book rows with `category = NULL`. The architect must confirm this column-on-shared-table approach is acceptable vs. a dedicated insight table. Default: columns on shared table (consistent with the v4 metadata pattern). — Risk: medium.
+2. **`exec()` replaces the process — registry write must precede it.** `run_claude_with_preset` at main.rs:154 calls `exec()` at line 199 on Unix. A registry write placed after the `exec()` call never executes. Mitigation: FR-IHC-6.5 mandates placement at the TOP of the function, verified by the done-when test. — Risk: high (correctness); mitigation strong.
+3. **Breaking CLI change blast radius.** Every `insight create` call site breaks if `--category` and `--tags` are not added. Mitigation: Slice 8 updates all in-repository callers before v0.7.0 release; CHANGELOG BREAKING entry warns external callers. — Risk: medium.
+4. **Dual-db RRF fusion generalization.** The existing `--corpus all` machinery at main.rs:2548-2604 was designed for books+insights, not insight+insight. The corpus-label handling may be hardwired. Mitigation: Slice 5 reads `run_one_corpus_for_fusion` fully before reusing; if it does not generalize, a simplified union+re-sort is the fallback. — Risk: medium; must be verified before Slice 5 implementation.
+5. **Global-resolver cwd-gate bypass security.** `resolve_global_insights_db()` bypasses `resolve_project_root`. Safe because the path is a fixed `$HOME`-rooted constant with no user-input-derived component. Security-auditor MUST confirm during Slice 2. — Risk: low (path is fixed); confirmatory review required.
+6. **Registry concurrency.** Multiple concurrent `claudebase run` invocations race on `projects.json`. Mitigation: atomic write-then-rename (FR-IHC-6.3). — Risk: low with mitigation in place.
+7. **SessionStart hook frequency.** Fires on every compact, which may occur frequently during long sessions. Mitigation: hook text is lightweight additionalContext (≤200 words), phrased conditionally. — Risk: low.
+8. **Backfill of 4 existing SDLC-repo insights.** They are v4, tag-less; mandatory tags cannot be retroactive. Mitigation: backfill derives a default tag from `feature_slug` (or `'untagged'` when NULL). — Risk: low.
+
+## Facts
+
+### Verified facts
+
+- `open_or_init_v2` at `src/store.rs:222` is the single insights/books DB-open+migrate entry point; v4→5 is the required new branch — source: `.claude/plan.md` lines 154 (Verified facts block, "open_or_init_v2 (store.rs:222) is the single insights/books DB-open+migrate entry point"), confirmed against the plan read this session. — salience: high
+- Insight metadata (`source_type`, `agent_name`, `session_id`, `feature_slug`, `salience`, `parent_artifact`) is stored as nullable columns on the SHARED `documents` table (SCHEMA_V4_DELTA, store.rs:197-207); books rows keep them NULL — so adding `category`/`project_slug` the same way is consistent with the existing pattern — source: plan.md Verified facts, lines 155-156, read this session. — salience: high
+- There is NO tags table and NO category column in v4; `feature_slug` is the only tag-ish field — source: plan.md Verified facts line 156 ("There is NO tags table and NO category column today"), read this session. — salience: high
+- `run_insight_create` is at main.rs:895; insight read handlers are at: `run_insight_search` (:1148), `run_insight_list` (:1315), `run_insight_random` (:1388), `run_insight_get` (:1417), `run_insight_gc` (:1466), `run_insight_delete` (:1557) — source: plan.md Verified facts line 157, read this session. — salience: high
+- Cross-corpus RRF fusion exists at `main.rs:2548-2604` (`run_one_corpus_for_fusion`) and is reusable for the local+general insight merge — source: plan.md Verified facts line 158, read this session. — salience: high
+- `claudebase run` dispatches to `run_claude_with_preset` at main.rs:154; `exec()` is called at main.rs:199 on Unix — registry write must precede exec — source: plan.md Verified facts line 159, read this session. — salience: high
+- `chat.db` already lives at `$HOME/.claude/knowledge/` (store.rs:1483) — precedent for HOME-rooted global db path — source: plan.md Verified facts line 160, read this session. — salience: medium
+- The `resolve_project_root` gate rejects targets not under cwd, so `--project-root $HOME` fails from a project subdir — global resolver MUST bypass this gate — source: plan.md Verified facts line 162 ("resolve_project_root rejects targets not under cwd ... this FALSIFIED the earlier 'global via --project-root $HOME' hypothesis"), read this session. — salience: high
+- Existing PRD has sections §1 through §17; §18 is the next available number — source: grep output this session showing `§15`, `§16`, `§17` headings; line count = 781. — salience: medium
+- Knowledge base corpus: `doc_count = 0` (empty) — confirmed via `claudebase status --json` this session. Corpus scope verdict: **No overlap** — empty corpus, topical queries skipped. — salience: low
+- Insights corpus query returned 0 hits for "hybrid corpus insights tags category routing" at `--salience high` — no prior session insights on this feature — confirmed via `claudebase insight search` this session. — salience: low
+- Commit `2d5eb8d` ("fix(infra): ASCII-only PowerShell hooks — Windows PS 5.1 parse failure") establishes the ASCII-only `.ps1` constraint — source: git log shown in session context at conversation start. — salience: medium
+
+### External contracts
+
+- **`claudebase` CLI v0.6.0** — symbol: `insight create` flags today: `--type`, `--agent`, `--session`, `--feature`, `--salience`, `--source-artifact`, `--project-root`, `--db-name`; no `--category`, no `--tags` — source: plan.md External contracts block, read this session — verified: yes — salience: high
+- **`clap` derive macros** — symbol: `#[arg(long, value_enum)]` (required), `#[arg(long)]` (repeatable via `Vec<String>`) — used by existing `Salience`/`SearchMode` enums; new `--category` follows same `value_enum` pattern — source: plan.md External contracts, "cli.rs:732,767", read this session — verified: yes — salience: medium
+- **`rusqlite`** — symbol: `Connection::transaction`, `execute_batch`, `pragma_table_info`, `ALTER TABLE … ADD COLUMN` — the exact primitives the v4 migration uses; V5 reuses them — source: plan.md External contracts, "store.rs:234-341", read this session — verified: yes — salience: high
+- **SQLite FTS5 + `sqlite-vec`** — symbol: `chunks_fts`, `chunks_vec USING vec0(embedding float[384])` — both insight dbs share this schema; `insight_tags` is a plain table — source: plan.md External contracts, "store.rs:259-270", read this session — verified: yes — salience: medium
+
+### Assumptions
+
+- Architect will accept `category`/`project_slug` as columns on the shared `documents` table (consistent with v4) rather than mandating a dedicated insight table — risk: a dedicated table would enlarge Slice 1 and ripple into all handlers — how to verify: architect review verdict at bootstrap Step 3. — salience: high
+- The `--corpus all` RRF fusion at main.rs:2548-2604 generalizes from books+insights to insight+insight by swapping the second corpus path/label — risk: corpus-label or schema assumption may be hardwired — how to verify: Slice 5 reads `run_one_corpus_for_fusion` fully before reusing; fallback is simplified union+re-sort. — salience: high
+- The SessionStart hook is the correct surface for read-on-new-context (vs. folding into the existing UserPromptSubmit reminder) — risk: SessionStart fires on every compact and may inject too frequently — how to verify: ba-analyst use-case + manual hook-fire test in Slice 7; hook text is capped at ≤200 words. — salience: medium
+- `main` is in a releasable state to branch from (agent-chat-daemon feature either merged or cleanly independent) — risk: branching off a dirty main — how to verify: `git status` + `git log main` at bootstrap Step 0. — salience: medium
+- Tags stored in normalized `insight_tags(doc_id, tag)` (rather than denormalized JSON on `documents`) provides efficient `GROUP BY tag` counts and indexed filter — architect to confirm — risk: if architect objects, denormalized approach is a fallback. — salience: medium
+
+### Open questions
+
+- Backfill default tag for the 4 existing tag-less v4 insights: `feature_slug` vs literal `'untagged'` — if `feature_slug` is NULL the fallback is `'untagged'`; this is the current plan default — needs: planner/architect confirmation in Slice 1 done-when. — salience: low
+- Whether v0.7.0 also touches the `sdlc-knowledge` embedded tag-scheme or only the claudebase-core scheme — needs: release-engineer at `/release` (tag-scheme disambiguation per auto-release.md). — salience: low
+- knowledge-base: corpus is empty (doc_count=0); task domain is CLI engineering + SQLite schema migration + cross-project insights routing; no overlap. Topical queries skipped per corpus-scope-relevance protocol. Corpus enrichment with Rust/SQLite/CLI engineering reference materials would benefit future similar tasks. — salience: low
+
+## Decisions
+
+### Inbound validation
+
+- Task received: append §18 PRD section to `docs/PRD.md` based on the approved plan at `.claude/plan.md`. Plan read in full (199 lines). The plan's "schema v5" for `insights.db` conflicts in name with §17's "Schema v5" for `chat.db` — investigated: these are independent SQLite files with independent schema version tracking; no actual conflict. Challenged: yes — surfaced the naming overlap; confirmed it is not a semantic conflict. Outcome: proceeded, noting in FR-IHC-1 that this is `insights.db` schema v5 to distinguish from `chat.db`'s own version history. — salience: medium
+- The plan's Deliverables checklist refers to "PRD section in claudebase/docs/PRD.md (prd-writer) — each FR with a Changelog: field". Checked: the Changelog field is a section-level field (not per-FR); the plan's phrasing is imprecise. The correct interpretation per the PRD format convention (visible in §15, §16, §17) is one `Changelog:` field at the top of the section. Proceeded with the section-level field. — challenged: yes — outcome: proceeded with correct placement. — salience: low
+
+### Decisions made
+
+- **Hybrid storage routing is the correct model** over single-global-db or per-project-only. Q1 hack? no — strictly more backward-compatible (zero content migration). Q2 sane? yes — matches operator's stated mental model and data locality. Q3 alternatives? single-global (rejected: forces migration); per-project-only (rejected: no cross-project sharing). Q4 symptom/cause? cause — the gap is structural. Q5 n/a. Source: plan.md Decisions block, read this session. — salience: high
+- **`category`/`project_slug` as columns on the shared `documents` table** (pending architect). Q1 hack? no — mirrors v4 pattern exactly. Q2 sane? yes — proportional. Q3 alternatives? dedicated insight table (cleaner but heavier; deferred to architect). Q4 cause. Q5 tracked in Open questions. Source: plan.md Decisions block, read this session. — salience: high
+- **`insight_tags` as a normalized table** (not denormalized JSON/CSV). Q1 hack? no — normalized enables efficient grouped counts and indexed filter joins. Q2 sane? yes. Q3 alternatives? JSON array on documents (rejected: no efficient GROUP BY, no indexed filter). Q4 cause. Q5 n/a. Architect to confirm. — salience: medium
+- **Registry write at the top of `run_claude_with_preset`, before exec.** Q1 hack? no — only correct placement given exec() semantics. Q2 sane? yes. Q3 alternatives? separate `claudebase register` subcommand (rejected: operator wants automatic at `run` startup). Q4 cause. Q5 n/a. Source: plan.md Decisions block, read this session. — salience: high
+- **Reuse existing `--corpus all` RRF fusion for local+general merge.** Q1 hack? no — reuses proven machinery. Q2 sane? yes. Q3 alternatives? naive union+re-sort (rejected: loses calibrated cross-corpus ranking). Q4 cause. Q5 generalization assumption tracked in Assumptions. Source: plan.md Decisions block, read this session. — salience: medium
+
+### Hacks acknowledged
+
+(none) — PRD authoring only; no implementation hacks introduced.
+
+### Symptom-only patches (with root-cause links)
+
+(none) — no symptom-only patches in this PRD section.

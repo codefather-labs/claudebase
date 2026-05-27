@@ -74,6 +74,7 @@ fn main() -> std::process::ExitCode {
             cli::InsightSubcommand::Get(g) => g.project_root.as_deref(),
             cli::InsightSubcommand::Gc(g) => g.project_root.as_deref(),
             cli::InsightSubcommand::Delete(d) => d.project_root.as_deref(),
+            cli::InsightSubcommand::Tags(t) => t.project_root.as_deref(),
         },
         // Daemon / Plugin do NOT operate on a project filesystem — they
         // own a runtime-dir-scoped socket and chat.db under ~/.claude/.
@@ -119,6 +120,7 @@ fn main() -> std::process::ExitCode {
             cli::InsightSubcommand::Get(a) => run_insight_get(&root, &a),
             cli::InsightSubcommand::Gc(a) => run_insight_gc(&root, &a),
             cli::InsightSubcommand::Delete(a) => run_insight_delete(&root, &a),
+            cli::InsightSubcommand::Tags(a) => run_insight_tags(&root, &a),
         },
         Command::Daemon(args) => match args.sub {
             cli::DaemonSubcommand::Serve(serve_args) => run_daemon_serve(&serve_args),
@@ -1478,6 +1480,185 @@ fn run_insight_list(
         }
     }
     std::process::ExitCode::SUCCESS
+}
+
+/// `insight tags` — aggregate tag frequencies across the insights corpus.
+///
+/// DB selection (mirrors the read-subcommand merge posture):
+///   - default          → cwd-local db + global db (counts summed per tag)
+///   - `--category general` → global db only
+///   - `--category project` → cwd-local db only
+///   - `--project <slug>`   → registered project's db + global db
+///
+/// A db that does not exist / cannot open contributes ZERO tags WITHOUT error
+/// (graceful cold-start tolerance — mirrors the local-fallback posture). Both
+/// legs absent ⇒ `[]` / empty table, exit 0.
+///
+/// SECURITY (insights-base doc#22 caller-trust contract): the `--project` slug
+/// is a registry KEY, never a path. Its resolved db path comes from the trusted
+/// `~/.claude/knowledge/projects.json` file (NOT raw CLI input) and is passed
+/// to `open_and_validate_at` verbatim, without joining any further user input.
+/// The global db path is the fixed `$HOME`-rooted constant from
+/// `resolve_global_insights_db()`, also passed verbatim.
+fn run_insight_tags(
+    root: &std::path::Path,
+    args: &cli::InsightTagsArgs,
+) -> std::process::ExitCode {
+    // Aggregate `tag -> count` over the union of the selected db legs. A leg is
+    // a db path that may or may not exist; a missing/failed-open leg simply
+    // contributes nothing.
+    let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+
+    // Helper: read tag counts from a single db path, summing into `counts`.
+    // Missing file or open/query failure is tolerated (contributes zero) — the
+    // only hard exit in this handler is the registry-miss below.
+    fn accumulate(
+        path: &std::path::Path,
+        counts: &mut std::collections::HashMap<String, i64>,
+    ) {
+        if !path.exists() {
+            return;
+        }
+        let conn = match open_and_validate_at(path) {
+            Ok(c) => c,
+            // open_and_validate_at already emitted a diagnostic on stderr for a
+            // genuinely corrupt db; for tag aggregation we degrade gracefully
+            // rather than abort the whole command.
+            Err(_) => return,
+        };
+        let mut stmt = match conn
+            .prepare("SELECT tag, COUNT(*) AS count FROM insight_tags GROUP BY tag")
+        {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        });
+        if let Ok(rows) = rows {
+            for row in rows.flatten() {
+                *counts.entry(row.0).or_insert(0) += row.1;
+            }
+        }
+    }
+
+    // Resolve the global db path once (fixed $HOME-rooted constant).
+    let global_path = match store::resolve_global_insights_db() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    let local_path = root.join(".claude").join("knowledge").join(&args.db_name);
+
+    // Decide which legs to read.
+    if let Some(slug) = args.project.as_deref() {
+        // --project <slug>: registry lookup drives the local leg; --category is
+        // ignored. A missing registry or unknown slug is a HARD exit 1.
+        let project_db = match resolve_registry_project_db(slug, &args.db_name) {
+            Ok(p) => p,
+            Err(code) => return code,
+        };
+        accumulate(&project_db, &mut counts);
+        accumulate(&global_path, &mut counts);
+    } else {
+        match args.category {
+            Some(cli::InsightCategory::General) => {
+                accumulate(&global_path, &mut counts);
+            }
+            Some(cli::InsightCategory::Project) => {
+                accumulate(&local_path, &mut counts);
+            }
+            None => {
+                // Default: merge cwd-local + global.
+                accumulate(&local_path, &mut counts);
+                accumulate(&global_path, &mut counts);
+            }
+        }
+    }
+
+    // Sort by count descending, tie-break tag ascending for determinism.
+    let mut merged: Vec<(String, i64)> = counts.into_iter().collect();
+    merged.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    if args.json {
+        let payload: Vec<serde_json::Value> = merged
+            .iter()
+            .map(|(tag, count)| serde_json::json!({ "tag": tag, "count": count }))
+            .collect();
+        // Compact form so the both-empty case prints exactly `[]` (TC-IHC-5.7).
+        println!("{}", serde_json::to_string(&payload).unwrap_or_else(|_| "[]".to_string()));
+    } else {
+        for (tag, count) in &merged {
+            println!("{tag}  {count}");
+        }
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+/// Resolve a project slug to its `insights.db` path via the trusted project
+/// registry at `~/.claude/knowledge/projects.json`.
+///
+/// SECURITY: the registry file is written by `claudebase run` (Slice 6) and is
+/// a trusted, machine-local source. The slug is matched against the `name`
+/// field; the returned path comes from the registry's `path` field — it is
+/// NEVER constructed by joining the raw CLI slug into a filesystem path. The
+/// caller passes the result to `open_and_validate_at` verbatim, honoring the
+/// caller-trust contract (insights-base doc#22).
+///
+/// NOTE: Slice 6 owns `src/registry.rs`. This is a MINIMAL inline reader for
+/// the `tags --project` path only; the full registry module (with atomic
+/// upsert) lands in Slice 6.
+///
+/// Returns the project's `<path>/.claude/knowledge/<db_name>` on success; exit
+/// 1 when the registry is absent or the slug is not found.
+fn resolve_registry_project_db(
+    slug: &str,
+    db_name: &str,
+) -> Result<std::path::PathBuf, std::process::ExitCode> {
+    let registry_path = match store::resolve_global_insights_db() {
+        // resolve_global_insights_db returns `<home>/.claude/knowledge/insights.db`;
+        // the registry sits alongside it as `projects.json`.
+        Ok(p) => p.with_file_name("projects.json"),
+        Err(e) => {
+            eprintln!("error: {e}");
+            return Err(std::process::ExitCode::from(1));
+        }
+    };
+    let body = match std::fs::read_to_string(&registry_path) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("error: project '{slug}' not found in registry");
+            return Err(std::process::ExitCode::from(1));
+        }
+    };
+    // Registry shape (FR-IHC-6.1): JSON array of {name, path, last_seen}.
+    let entries: Vec<serde_json::Value> = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("error: project '{slug}' not found in registry");
+            return Err(std::process::ExitCode::from(1));
+        }
+    };
+    let matched = entries.iter().find_map(|e| {
+        let name = e.get("name").and_then(|n| n.as_str())?;
+        if name == slug {
+            e.get("path").and_then(|p| p.as_str()).map(|s| s.to_string())
+        } else {
+            None
+        }
+    });
+    match matched {
+        Some(path) => Ok(std::path::PathBuf::from(path)
+            .join(".claude")
+            .join("knowledge")
+            .join(db_name)),
+        None => {
+            eprintln!("error: project '{slug}' not found in registry");
+            Err(std::process::ExitCode::from(1))
+        }
+    }
 }
 
 /// `insight random` — uniform-random pick, optionally filtered.

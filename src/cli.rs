@@ -712,6 +712,13 @@ pub enum InsightSubcommand {
     /// Delete one insight by integer `documents.id` (with chunks +
     /// chunks_vec cascade). Refuses to delete non-insight rows.
     Delete(InsightDeleteArgs),
+    /// Aggregate tag frequencies across the insights corpus. Default merges
+    /// the cwd-local project db with the global general db (summing counts for
+    /// tags present in both). `--category general` restricts to the global db,
+    /// `--category project` to the cwd-local db, `--project <slug>` to a
+    /// registered project's db (looked up in `~/.claude/knowledge/projects.json`)
+    /// merged with the global db.
+    Tags(InsightTagsArgs),
 }
 
 /// `claudebase insight create "<body>"` — agent write surface for the
@@ -960,6 +967,40 @@ pub struct InsightGetArgs {
     pub ident: String,
     #[arg(long)]
     pub project_root: Option<PathBuf>,
+    #[arg(long, default_value = "insights.db")]
+    pub db_name: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `claudebase insight tags` — tag-frequency aggregation over the insights
+/// corpus (schema v5 `insight_tags` table).
+///
+/// DB selection:
+///   - default (no flags)            → cwd-local db + global db (merged)
+///   - `--category general`          → global db only
+///   - `--category project`          → cwd-local db only
+///   - `--project <slug>`            → registered project's db + global db
+///
+/// `--category` and `--project` are not combined: when `--project` is set the
+/// registry lookup drives the local leg and `--category` is ignored. `--project`
+/// is a registry KEY (data), looked up against the trusted
+/// `~/.claude/knowledge/projects.json` file — its resolved path comes from that
+/// trusted file, never joined from raw CLI input.
+#[derive(Args, Debug)]
+pub struct InsightTagsArgs {
+    /// Restrict to one corpus scope: `general` (global db) or `project`
+    /// (cwd-local db). Absent → merge both. Ignored when `--project` is set.
+    #[arg(long, value_enum)]
+    pub category: Option<InsightCategory>,
+    /// Registry slug of a project whose db to query (merged with the global
+    /// db). Looked up in `~/.claude/knowledge/projects.json`; absent slug →
+    /// exit 1. DATA, never a raw filesystem path.
+    #[arg(long)]
+    pub project: Option<String>,
+    #[arg(long)]
+    pub project_root: Option<PathBuf>,
+    /// Corpus file — `insights.db` by default. Tests/admin may override.
     #[arg(long, default_value = "insights.db")]
     pub db_name: String,
     #[arg(long)]

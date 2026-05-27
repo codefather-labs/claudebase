@@ -235,6 +235,14 @@ Before producing the first paragraph of output for a new task, every in-scope th
 claudebase insight search "<feature-keywords>" --feature "$FEATURE_SLUG" --salience high --top-k 5 --json
 ```
 
+As of v0.7.0 the read subcommands (`search`, `list`, `random`) also accept tag and category narrowing. The default in-project read merges the local-project db with the global-general db; pass `--tag <t>` (repeatable, OR / any-intersection) to scope by the tag vocabulary, `--category general|project` to scope by routing bucket, `--general-only` / `--project-only` to read a single db, or `--project <name>` to read a different registered project's db:
+
+```
+claudebase insight search "<feature-keywords>" --tag <slug> --tag <domain> --salience high --top-k 5 --json
+claudebase insight search "<keywords>" --general-only --json   # global lessons only
+claudebase insight search "<keywords>" --project-only --json   # this-project insights only
+```
+
 Load-bearing hits MUST be cited in `## Facts → ### Verified facts` using the literal format:
 
 ```
@@ -251,11 +259,18 @@ Agents emit an insight ONLY when an observation matches one of the three axes. T
 claudebase insight create "<body>" \
     --type <source-type> \
     --agent <self-agent-name> \
+    --category <general|project> \
+    --tags <tag1,tag2,...> \
     --feature "$FEATURE_SLUG" \
     --salience <high|medium|low> \
     [--session "$CLAUDE_SESSION_ID"] \
     [--source-artifact "<file:line | docs/PRD.md#FR-X.Y>"]
 ```
+
+**`--category` and `--tags` are MANDATORY as of v0.7.0 — omitting either causes exit 2.**
+
+- **`--category <general|project>`** is the routing key. `--category project` writes the insight to the cwd-project's LOCAL db (`<project>/.claude/knowledge/insights.db`) — use it for insights about THIS project's work. `--category general` writes to the GLOBAL db (`~/.claude/knowledge/insights.db`) — use it for cross-tool / cross-project lessons that any future project would benefit from. Most agent self-insights about the current feature are `project`; a reusable prompting technique or a tool gotcha is `general`.
+- **`--tags <tag1,tag2,...>`** requires AT LEAST ONE free-form tag. Tags are the read-time discovery vocabulary — pick the feature slug, a domain (`sqlite`, `auth`, `pdfium`), or both (a single insight carries many tags). Read-time `--tag` filtering is **OR / any-intersection**: an insight carrying ANY of the queried tags is returned, so over-tagging is cheap and under-tagging hides the insight.
 
 The body can also come from stdin (`echo "<body>" | claudebase insight create ...`) — agents that already buffer multi-line content use this form. Empty bodies are rejected with exit 2. A TTY without a body is also rejected (the surface is designed for non-interactive agent use).
 
@@ -263,6 +278,44 @@ The body can also come from stdin (`echo "<body>" | claudebase insight create ..
 
 1. **Exact-sha** — same `(agent_name, sha256(body))` within the last 30 days returns `status: deduped` without writing.
 2. **Semantic (cosine > 0.92)** — paraphrased near-duplicates from the SAME agent within 30 days return `status: near-duplicate` without writing. Cross-agent agreement on the same observation is intentionally NOT deduped — that's load-bearing signal.
+
+### Hybrid routing — global (general) vs local (project)
+
+As of v0.7.0 the insights corpus is **hybrid**: there are two physical SQLite databases and `--category` chooses which one a write lands in.
+
+| `--category` | DB file | Meaning | When to use |
+|---|---|---|---|
+| `project` | `<project>/.claude/knowledge/insights.db` (per-project local) | An insight about THIS project's work. | Default for slice / decision / feature insights — anything scoped to the codebase in front of you. |
+| `general` | `~/.claude/knowledge/insights.db` (global, shared across every project) | A cross-tool / cross-project lesson any future project would benefit from. | Reusable prompting techniques, tool gotchas, domain knowledge not tied to one repo. |
+
+A **project registry** at `~/.claude/knowledge/projects.json` maps `project-name → path` (upserted at `claudebase run` startup) so a read can target another project's local db by name via `--project <name>`. The **default in-project read merges** the local-project db with the global-general db — you see both this project's insights and the cross-project ones in a single RRF-fused ranking; other projects' local dbs are walled off unless you name them explicitly.
+
+Narrowing flags on the read subcommands:
+
+- `--general-only` — read the global db only (cross-project lessons).
+- `--project-only` — read the cwd-project local db only (this project's insights).
+- `--general-only` + `--project-only` together → exit 2 (mutually exclusive).
+- `--category general|project` — filter merged results to one bucket without changing which dbs are opened.
+
+### The `insight tags` subcommand — read-time discovery vocabulary
+
+`claudebase insight tags [--category general|project] [--project <name>] [--json]` lists the tag vocabulary with per-tag counts:
+
+```
+claudebase insight tags --json
+# → [{"tag":"pdfium","count":7},{"tag":"auth","count":3}, ...] sorted by count descending
+```
+
+The merged default sums counts for a tag present in both the local and global db. `--category general` returns only global-db tags; `--general-only` / `--project-only` narrow likewise. Both dbs empty → `[]`; global db absent → local-only tags without error.
+
+### Read-on-new-context flow (SessionStart reminder)
+
+When entering a fresh context window (session start / resume / post-compaction), an agent does NOT yet know what tags the corpus holds. The v0.7.0 `claudebase-read-insights-reminder.sh` SessionStart hook reminds the agent to run the two-step discovery flow before relying on cited insights:
+
+1. `claudebase insight tags --json` — discover the tag vocabulary (which slugs / domains have insights attached).
+2. `claudebase insight search "<keywords>" --tag <relevant-tag> --json` — load the insights under the tags relevant to the current task.
+
+Because read-time `--tag` filtering is OR / any-intersection, step 2 can pass several `--tag` flags and any insight carrying at least one of them is returned.
 
 ### Salience and retention
 
@@ -276,7 +329,7 @@ The `--salience` tag drives TTL per `~/.claude/rules/cognitive-self-check.md` §
 
 ### Admin surface — for the operator, not for agents
 
-The agent uses `insight create` and `insight search`. The operator additionally has:
+The agent uses `insight create`, `insight search`, and `insight tags`. The operator additionally has:
 
 - `claudebase insight list [--offset N] [--page-size N] [filters]` — paginated newest-first, 10/page default.
 - `claudebase insight random [filters]` — uniform-sample one insight.

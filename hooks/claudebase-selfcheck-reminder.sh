@@ -34,7 +34,8 @@ reminder='[pre-response reminder]
    - Protocol 2 (Decisions) - hack? sane? alternatives? symptom-or-cause? root-cause tracked?
 
 2. Insight-capture: if your PREVIOUS turn produced a genuine insight worth carrying across sessions - self-learning, a falsified prediction/assumption, or an operator correction - persist exactly ONE now, before continuing:
-     claudebase insight create "<one sentence>" --type <agent-learned|self-bias-caught|prediction-error|assumption-falsified|plan-reality-gap|operator-correction> --agent <you> --salience <high|medium|low>
+     claudebase insight create "<one sentence>" --type <agent-learned|self-bias-caught|prediction-error|assumption-falsified|plan-reality-gap|operator-correction> --agent <you> --category <general|project> --tags <tag> --salience <high|medium|low>
+   --category (required: general=cross-project lesson -> global db; project=this-project insight -> local db) and --tags (required: at least one free-form tag, e.g. a feature slug or a domain like sqlite) are MANDATORY - omitting either exits 2. Read-time --tag filtering is OR / any-intersection.
    If the previous turn was mechanical or produced nothing genuinely new, skip silently - do not manufacture an insight.'
 
 if command -v jq >/dev/null 2>&1; then

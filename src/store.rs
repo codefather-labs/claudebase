@@ -1639,6 +1639,44 @@ pub fn user_level_chat_db_path() -> std::path::PathBuf {
         .join("chat.db")
 }
 
+/// Pure helper: build the global insights-db path from an explicit `home`
+/// value. Returns `Err` with the exact operator-facing message when `home`
+/// is `None`. Split out from [`resolve_global_insights_db`] so the path
+/// construction and the unset-HOME error are unit-testable without mutating
+/// process environment.
+pub fn global_insights_db_path_from_home(
+    home: Option<std::ffi::OsString>,
+) -> Result<std::path::PathBuf, String> {
+    let home = home.ok_or_else(|| {
+        "$HOME not set; cannot resolve global insights db path".to_string()
+    })?;
+    Ok(std::path::PathBuf::from(home)
+        .join(".claude")
+        .join("knowledge")
+        .join("insights.db"))
+}
+
+/// Resolve the path to the GLOBAL (cross-project) insights database at
+/// `$HOME/.claude/knowledge/insights.db`, creating the parent directory if
+/// it does not yet exist.
+///
+/// SECURITY: this function deliberately bypasses `cli::resolve_project_root`'s
+/// cwd-containment gate. This is safe because the resolved path is a fixed
+/// HOME-rooted constant with NO user-input-derived component — there is no
+/// path segment that an attacker or caller can influence. Precedent:
+/// `user_level_chat_db_path` (chat.db) above resolves under the same fixed
+/// `$HOME/.claude/knowledge/` root. General (cross-project) insights live
+/// here; per-project insights stay in each project's local `insights.db`.
+pub fn resolve_global_insights_db() -> Result<std::path::PathBuf, String> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let path = global_insights_db_path_from_home(home)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create global insights db dir: {e}"))?;
+    }
+    Ok(path)
+}
+
 /// Delete a documents row by exact `source_path` string. Returns rows deleted.
 ///
 /// SECURITY: callers MUST canonicalize-and-prefix-check the `source_path`

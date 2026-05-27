@@ -2324,6 +2324,48 @@ fn open_and_validate(
     Ok((conn, db_path))
 }
 
+/// Like [`open_and_validate`] but opens a database at an absolute `path`
+/// directly, instead of resolving it relative to a project root. Used by the
+/// global-general insights codepath: the global insights db lives at the
+/// fixed `$HOME/.claude/knowledge/insights.db` (see
+/// `store::resolve_global_insights_db`), which is OUTSIDE any project root, so
+/// the root-relative `open_and_validate` cannot reach it. Runs the identical
+/// `open_or_init_v2` -> `run_migrations` -> `validate_schema` chain, so a
+/// freshly-created global db is stamped at the current schema version and
+/// passes the corruption gate.
+///
+/// SECURITY — caller-trust contract (security-auditor D1, insights-base
+/// doc#22): this function performs NO containment check on `path`; it trusts
+/// the caller to supply a safe absolute path. Callers MUST pass the output of
+/// `store::resolve_global_insights_db()` (a fixed `$HOME`-rooted constant)
+/// VERBATIM. Do NOT join user-input / CLI-arg / network-derived components
+/// into the path before passing it here — doing so would turn the deliberate
+/// `resolve_project_root` cwd-gate bypass into a path-traversal hole.
+//
+// `#[allow(dead_code)]`: wired into the insight create/search/list handlers in
+// Slice 3 + Slice 5 of insights-hybrid-corpus. Slice 2 lands the opener alone.
+#[allow(dead_code)]
+fn open_and_validate_at(
+    path: &std::path::Path,
+) -> Result<rusqlite::Connection, std::process::ExitCode> {
+    let mut conn = match store::open_or_init_v2(path) {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("error: index database invalid; re-ingest required");
+            return Err(std::process::ExitCode::from(1));
+        }
+    };
+    if migrations::run_migrations(&mut conn).is_err() {
+        eprintln!("error: index database invalid; re-ingest required");
+        return Err(std::process::ExitCode::from(1));
+    }
+    if store::validate_schema(&conn).is_err() {
+        eprintln!("error: index database invalid; re-ingest required");
+        return Err(std::process::ExitCode::from(1));
+    }
+    Ok(conn)
+}
+
 fn run_ingest(root: &std::path::Path, args: &cli::IngestArgs) -> std::process::ExitCode {
     // The user-supplied path may be relative; resolve against root.
     let target = if args.path.is_absolute() {

@@ -252,8 +252,9 @@ function Install-ClaudebaseHooks {
         if (Test-Path $p) { Remove-Item -Force $p }
     }
 
-    # Deploy both variants of the self-check reminder; Windows wires the .ps1.
-    foreach ($hook in 'claudebase-selfcheck-reminder.sh', 'claudebase-selfcheck-reminder.ps1') {
+    # Deploy both variants of the self-check reminder + read-insights reminder;
+    # Windows wires the .ps1 variants.
+    foreach ($hook in 'claudebase-selfcheck-reminder.sh', 'claudebase-selfcheck-reminder.ps1', 'claudebase-read-insights-reminder.sh', 'claudebase-read-insights-reminder.ps1') {
         $src = Join-Path $Script:ScriptDir "hooks\$hook"
         $dst = Join-Path $hooksDir $hook
         if (-not (Test-Path $src)) { Write-Warn "hooks/$hook missing in source — skipping"; continue }
@@ -263,6 +264,7 @@ function Install-ClaudebaseHooks {
 
     $stopCmd = "powershell -NoProfile -File `"$(Join-Path $hooksDir 'claudebase-insight-capture.ps1')`""
     $selfcheckCmd = "powershell -NoProfile -File `"$(Join-Path $hooksDir 'claudebase-selfcheck-reminder.ps1')`""
+    $readinsCmd = "powershell -NoProfile -File `"$(Join-Path $hooksDir 'claudebase-read-insights-reminder.ps1')`""
 
     if (-not (Test-Path $settings)) {
         $obj = [ordered]@{ permissions = [ordered]@{ allow = @() } }
@@ -290,6 +292,22 @@ function Install-ClaudebaseHooks {
             $json.hooks.UserPromptSubmit = @($existing) + $newEntry
         }
 
+        # Idempotent merge of SessionStart read-insights reminder by command-string
+        # equality. Official SessionStart shape: {matcher, hooks[{type,command}]}.
+        if (-not ($json.hooks.PSObject.Properties.Name -contains 'SessionStart')) {
+            $json.hooks | Add-Member -NotePropertyName 'SessionStart' -NotePropertyValue @() -Force
+        }
+        $ssExisting = @($json.hooks.SessionStart)
+        $ssAlready = $false
+        foreach ($entry in $ssExisting) {
+            if ($entry.hooks) { foreach ($h in $entry.hooks) { if ($h.command -eq $readinsCmd) { $ssAlready = $true; break } } }
+            if ($ssAlready) { break }
+        }
+        if (-not $ssAlready) {
+            $ssNewEntry = [pscustomobject]@{ matcher = 'startup|resume|compact'; hooks = @([pscustomobject]@{ type = 'command'; command = $readinsCmd }) }
+            $json.hooks.SessionStart = @($ssExisting) + $ssNewEntry
+        }
+
         # Unwire the retired Stop insight-capture hook: strip its command from
         # any Stop matcher block, drop now-empty blocks, drop empty Stop key.
         if ($json.hooks.PSObject.Properties.Name -contains 'Stop') {
@@ -305,10 +323,11 @@ function Install-ClaudebaseHooks {
         }
 
         $json | ConvertTo-Json -Depth 12 | Set-Content -Path $settings -Encoding UTF8
-        Write-Ok "settings.json (UserPromptSubmit[selfcheck] wired; retired Stop[insight-capture] unwired)"
+        Write-Ok "settings.json (UserPromptSubmit[selfcheck] + SessionStart[read-insights] wired; retired Stop[insight-capture] unwired)"
     } catch {
         Write-Warn "settings.json hook merge failed ($($_.Exception.Message)); add manually:"
         Write-Warn "  hooks.UserPromptSubmit[*].hooks[*].command = $selfcheckCmd"
+        Write-Warn "  hooks.SessionStart[*].hooks[*].command = $readinsCmd"
         Write-Warn "  (and remove any hooks.Stop entry pointing at claudebase-insight-capture.ps1)"
     }
 }

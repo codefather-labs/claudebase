@@ -56,6 +56,8 @@ fn full_lifecycle_from_create_to_gc_to_delete() {
             "--agent", "reflection",
             "--feature", "payments-v2",
             "--salience", "high",
+            "--category", "project",
+            "--tags", "kafka",
             "--json",
         ])
         .assert()
@@ -69,6 +71,8 @@ fn full_lifecycle_from_create_to_gc_to_delete() {
             "--agent", "verifier",
             "--feature", "payments-v2",
             "--salience", "low",
+            "--category", "project",
+            "--tags", "polygon",
             "--json",
         ])
         .assert()

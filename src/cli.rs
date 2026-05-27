@@ -82,6 +82,29 @@ impl Salience {
     }
 }
 
+/// Corpus-scope category for the insights corpus (schema v5). `general`
+/// routes the insight to the cross-project GLOBAL db at
+/// `$HOME/.claude/knowledge/insights.db`; `project` routes it to the current
+/// project's LOCAL `insights.db`. The value is stored verbatim as TEXT in
+/// `documents.category` and is the SOLE selector of which db a write lands in
+/// — `--project <slug>` is data (a `project_slug` column value), never a path.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InsightCategory {
+    /// Cross-project lesson → GLOBAL `$HOME/.claude/knowledge/insights.db`.
+    General,
+    /// Project-scoped lesson → the current project's LOCAL `insights.db`.
+    Project,
+}
+
+impl InsightCategory {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            InsightCategory::General => "general",
+            InsightCategory::Project => "project",
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ProjectRootError {
     #[error("project-root must resolve under current working directory")]
@@ -736,6 +759,28 @@ pub struct InsightCreateArgs {
     /// (e.g. `.claude/plan.md#slice-3`, `docs/PRD.md#FR-7.2`).
     #[arg(long = "source-artifact")]
     pub source_artifact: Option<String>,
+
+    /// Corpus-scope category — REQUIRED. `general` writes to the global
+    /// cross-project db; `project` writes to the current project's local db.
+    /// No default: clap exits 2 when absent (a category MUST be explicit so an
+    /// agent never silently lands a cross-project lesson in a single project).
+    #[arg(long, value_enum)]
+    pub category: InsightCategory,
+
+    /// Tag(s) for this insight — REPEATABLE, at least one required (the empty
+    /// check is business-logic in `run_insight_create`, not a clap-level
+    /// required-arg, so the operator-facing error names `--tag` explicitly).
+    /// Each tag is normalized: a single leading `#` stripped, lowercased,
+    /// trimmed; empties dropped, duplicates collapsed (stable order).
+    #[arg(long = "tags")]
+    pub tags: Vec<String>,
+
+    /// Explicit project slug stored in `documents.project_slug` (DATA, never a
+    /// path). For `--category project` it overrides the cwd-basename default;
+    /// for `--category general` it is silently ignored (project_slug stays
+    /// NULL). NEVER used to construct a filesystem path.
+    #[arg(long)]
+    pub project: Option<String>,
 
     #[arg(long)]
     pub project_root: Option<PathBuf>,

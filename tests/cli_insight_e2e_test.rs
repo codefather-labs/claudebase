@@ -51,6 +51,17 @@ fn create_insight(
 ) -> assert_cmd::assert::Assert {
     let mut cmd = bin();
     cmd.current_dir(project).args(["insight", "create", body, "--type", kind, "--agent", agent]);
+    // Slice 3 made --category + --tags mandatory. Tests that don't exercise
+    // routing default to a project-scoped insight with a seed tag so they
+    // stay hermetic (cwd-local db only, never the operator's global db).
+    let caller_sets_category = extra.iter().any(|e| *e == "--category");
+    let caller_sets_tags = extra.iter().any(|e| *e == "--tags");
+    if !caller_sets_category {
+        cmd.args(["--category", "project"]);
+    }
+    if !caller_sets_tags {
+        cmd.args(["--tags", "seedtag"]);
+    }
     for e in extra {
         cmd.arg(e);
     }
@@ -99,7 +110,10 @@ fn create_reads_stdin_when_body_arg_omitted() {
     let tmp = fresh_project();
     bin()
         .current_dir(tmp.path())
-        .args(["insight", "create", "--type", "reflection-observation", "--agent", "reflection"])
+        .args([
+            "insight", "create", "--type", "reflection-observation", "--agent", "reflection",
+            "--category", "project", "--tags", "seedtag",
+        ])
         .write_stdin("piped body from stdin")
         .assert()
         .success();
@@ -171,6 +185,7 @@ fn create_rejects_empty_body_with_exit_2() {
         .args([
             "insight", "create", "   \n\t  ",
             "--type", "agent-learned", "--agent", "x",
+            "--category", "project", "--tags", "seedtag",
         ])
         .assert()
         .failure()

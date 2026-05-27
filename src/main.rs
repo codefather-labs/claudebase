@@ -936,6 +936,31 @@ fn run_insight_create(
         return std::process::ExitCode::from(2);
     }
 
+    // 2b) Normalize + validate tags (business-logic gate, NOT clap-level).
+    // Each tag: strip a single leading `#`, lowercase, trim; drop empties;
+    // dedupe preserving first-seen order. At least one tag must survive — the
+    // empty check fires BEFORE any db open (TC-IHC-3.1/3.2/3.3) so a tagless
+    // create never writes.
+    let normalized_tags: Vec<String> = {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for raw in &args.tags {
+            let stripped = raw.strip_prefix('#').unwrap_or(raw);
+            let norm = stripped.trim().to_lowercase();
+            if norm.is_empty() {
+                continue;
+            }
+            if seen.insert(norm.clone()) {
+                out.push(norm);
+            }
+        }
+        out
+    };
+    if normalized_tags.is_empty() {
+        eprintln!("error: insight create requires at least one --tag");
+        return std::process::ExitCode::from(2);
+    }
+
     // 3) Compute sha256(body) for dedup + synthesize the source_path.
     //
     // source_path shape: `agent:{agent}:{session}:{feature}:{sha[..16]}`.
@@ -970,11 +995,53 @@ fn run_insight_create(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    // 4) Open insights.db (default — caller may override via --db-name).
-    let (mut conn, _db_path) = match open_and_validate(root, &args.db_name) {
-        Ok(t) => t,
-        Err(code) => return code,
+    // 4) Resolve category-based routing + the project_slug column value.
+    //
+    // SECURITY (insights-base doc#22, security-auditor caller-trust contract):
+    // `--category` is the SOLE selector of which db the write lands in.
+    // `--project <slug>` is DATA — it only ever becomes the `project_slug`
+    // TEXT column value. It is NEVER `PathBuf::from`'d, never joined into any
+    // path, never used in a filesystem operation. The global db path is the
+    // fixed `$HOME`-rooted constant returned by `resolve_global_insights_db()`
+    // and is passed to `open_and_validate_at` VERBATIM — no user-input
+    // component is joined in before the open.
+    let (mut conn, project_slug): (rusqlite::Connection, Option<String>) = match args.category {
+        cli::InsightCategory::General => {
+            // GLOBAL db — fixed HOME-rooted path, zero user input. `--project`
+            // is silently ignored for general (project_slug stays NULL).
+            let global_path = match store::resolve_global_insights_db() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return std::process::ExitCode::from(1);
+                }
+            };
+            match open_and_validate_at(&global_path) {
+                Ok(c) => (c, None),
+                Err(code) => return code,
+            }
+        }
+        cli::InsightCategory::Project => {
+            // LOCAL (per-project) db — the existing root-relative open path.
+            // project_slug defaults to the cwd-project basename, overridden by
+            // an explicit `--project <slug>` (stored as data, never a path).
+            let (conn, _db_path) = match open_and_validate(root, &args.db_name) {
+                Ok(t) => t,
+                Err(code) => return code,
+            };
+            let slug = args
+                .project
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| {
+                    root.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_string())
+                });
+            (conn, slug)
+        }
     };
+    let category_str = args.category.as_str();
 
     // 5a) Exact-sha dedup probe — same agent, same sha, within last 30d.
     const DEDUP_WINDOW_SECS: i64 = 30 * 86400;
@@ -1086,6 +1153,35 @@ fn run_insight_create(
                 return std::process::ExitCode::from(1);
             }
         };
+        // v5 columns: stamp category + project_slug on the freshly-upserted
+        // row. project_slug is the cwd-basename or `--project` value (Project)
+        // or NULL (General). Both are bound as parameters — never interpolated.
+        if let Err(e) = tx.execute(
+            "UPDATE documents SET category = ?1, project_slug = ?2 WHERE id = ?3",
+            rusqlite::params![category_str, project_slug, id],
+        ) {
+            eprintln!("error: failed to set insight category/project_slug: {e}");
+            return std::process::ExitCode::from(1);
+        }
+        // v5 insight_tags: one row per normalized tag. INSERT OR IGNORE makes
+        // the (doc_id, tag) UNIQUE constraint idempotent across re-upserts.
+        {
+            let mut stmt = match tx
+                .prepare("INSERT OR IGNORE INTO insight_tags (doc_id, tag) VALUES (?1, ?2)")
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: failed to prepare insight_tags insert: {e}");
+                    return std::process::ExitCode::from(1);
+                }
+            };
+            for tag in &normalized_tags {
+                if let Err(e) = stmt.execute(rusqlite::params![id, tag]) {
+                    eprintln!("error: failed to insert insight tag: {e}");
+                    return std::process::ExitCode::from(1);
+                }
+            }
+        }
         let chunk_refs: Vec<(usize, &str, Option<i64>, Option<i64>)> = chunks
             .iter()
             .map(|c| (c.ord, c.text.as_str(), c.page_start, c.page_end))
@@ -2342,9 +2438,8 @@ fn open_and_validate(
 /// into the path before passing it here — doing so would turn the deliberate
 /// `resolve_project_root` cwd-gate bypass into a path-traversal hole.
 //
-// `#[allow(dead_code)]`: wired into the insight create/search/list handlers in
-// Slice 3 + Slice 5 of insights-hybrid-corpus. Slice 2 lands the opener alone.
-#[allow(dead_code)]
+// Wired into `run_insight_create`'s `--category general` route (Slice 3 of
+// insights-hybrid-corpus) and the dual-db insight read path (Slice 5).
 fn open_and_validate_at(
     path: &std::path::Path,
 ) -> Result<rusqlite::Connection, std::process::ExitCode> {

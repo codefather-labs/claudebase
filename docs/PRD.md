@@ -852,7 +852,7 @@ As an SDLC pipeline agent starting a fresh context window, I want to pull releva
 1. **FR-IHC-4.1:** A new `InsightCmd::Tags` variant and `InsightTagsArgs` struct MUST be added to `src/cli.rs`. The subcommand is invoked as `claudebase insight tags`.
 2. **FR-IHC-4.2:** `run_insight_tags` MUST execute `SELECT tag, COUNT(*) AS count FROM insight_tags GROUP BY tag ORDER BY count DESC` and return a list of `{tag, count}` objects.
 3. **FR-IHC-4.3:** The `--category <c>` filter MUST restrict to tags for insights matching the given category (via a JOIN to `documents`).
-4. **FR-IHC-4.4:** The `--project <slug>` filter MUST restrict to tags for insights with the given `project_slug`.
+4. **FR-IHC-4.4:** The `--project <slug>` filter MUST resolve `<slug>` via the project registry (`registry::resolve_project_path` reading `~/.claude/knowledge/projects.json`) and open THAT project's `insights.db` + the global db, merging tag counts across both. A slug not present in the registry MUST exit 1 with the literal stderr `error: project '<slug>' not found in registry`. (Corrected 2026-05-30 from the original "filter by project_slug column" framing to match plan.md:222 + QA TC-IHC-6.3, which are the executable contract.)
 5. **FR-IHC-4.5:** The default posture (no filters) MUST merge tags from BOTH the local-project db and the global db — the same local+general merge posture as the read subcommands.
 6. **FR-IHC-4.6:** `--json` output shape MUST be `[{"tag": "<string>", "count": <integer>}, ...]`.
 7. **FR-IHC-4.7:** Tests MUST cover: returns distinct tags with descending counts; `--category general` lists only global-db tags; merged default includes both; json shape asserted.

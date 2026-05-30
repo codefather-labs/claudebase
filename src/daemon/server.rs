@@ -161,6 +161,13 @@ fn reap_on_boot_stub() -> anyhow::Result<()> {
         // because schema-application hiccupped.
     }
 
+    // telegram-multi-cli Slice 1: evict stale tg_message_map rows
+    // (30-day TTL) and expired pending_questions at startup. Non-fatal —
+    // a failed purge leaves stale rows but must not block daemon boot.
+    if let Err(e) = chat::purge_expired_chat_state(&conn) {
+        tracing::warn!(error = %e, "chat startup TTL purge failed (non-fatal)");
+    }
+
     // Probe sqlite_master rather than catching a "no such table" error —
     // architect directive: explicit existence check, not error-catch.
     let table_exists: i64 = match conn.query_row(

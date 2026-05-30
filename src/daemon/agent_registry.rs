@@ -220,6 +220,104 @@ pub fn list_alive(conn: &Connection, thread: Option<&str>) -> anyhow::Result<Vec
     Ok(rows?)
 }
 
+/// Return `true` iff `agent_id` names an alive (state='alive') row.
+///
+/// Parameterised query — `agent_id` is bound, never interpolated, so an
+/// empty string or a SQL-injection payload (UC-TMC-2-EC1) is matched as
+/// a literal value and simply finds no row (returns `false`) rather than
+/// altering the table. Orphaned and dead rows return `false` because the
+/// WHERE clause pins `state='alive'`.
+pub fn is_alive(conn: &Connection, agent_id: &str) -> anyhow::Result<bool> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM agent_registry WHERE agent_id=?1 AND state='alive' LIMIT 1",
+            params![agent_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
+/// Pick a single alive agent to route to when a chat has no explicit
+/// binding (Slice 2 routing-tree step 4 fallback). Two-pass:
+///
+/// 1. **prefer_role pass** — if `prefer_role` is `Some(role)`, return the
+///    first alive row whose `agent_name` contains `role` as a substring.
+///    The `agent_registry` table has no dedicated `role` column (the
+///    `AgentRow` struct exposes `agent_id, agent_name, chat_thread_id,
+///    spawned_at, last_pinged_at` only); the role is carried in the
+///    `agent_name` by convention (e.g. "orchestrator-main"), which the QA
+///    cases TC-TMC-3.1/3.2/3.4 assert against directly. We therefore match
+///    `prefer_role` against `agent_name` via a parameterised `LIKE
+///    '%'||?||'%'` predicate. The LIKE wildcards `%`/`_` inside `role`
+///    are NOT escaped — `prefer_role` is an internal caller-supplied
+///    constant ("orchestrator"), never user input, so wildcard injection
+///    is not a threat surface here.
+/// 2. **any-alive fallback** — if the prefer_role pass finds nothing (or
+///    `prefer_role` is `None`), return the first alive row regardless of
+///    name.
+///
+/// Both passes order by `agent_id ASC` so the tiebreak between two
+/// equally-eligible agents is **deterministic** (UC-TMC-3-EC1 /
+/// TC-TMC-3.4 require two consecutive calls to return the same row).
+/// `agent_id` is the primary key, hence total-ordered and stable across
+/// calls; `spawned_at` was rejected as the sort key because two agents
+/// can share a millisecond timestamp, reintroducing nondeterminism.
+///
+/// Returns `None` when no alive row exists (UC-TMC-3-A2 / TC-TMC-3.3).
+/// `thread`, when `Some`, scopes both passes to that `chat_thread_id`.
+pub fn first_alive(
+    conn: &Connection,
+    thread: Option<&str>,
+    prefer_role: Option<&str>,
+) -> anyhow::Result<Option<AgentRow>> {
+    let map_row = |row: &rusqlite::Row| -> rusqlite::Result<AgentRow> {
+        Ok(AgentRow {
+            agent_id: row.get(0)?,
+            agent_name: row.get(1)?,
+            chat_thread_id: row.get(2)?,
+            spawned_at: row.get(3)?,
+            last_pinged_at: row.get(4)?,
+        })
+    };
+
+    // Pass 1 — prefer_role substring match on agent_name.
+    if let Some(role) = prefer_role {
+        let like = format!("%{role}%");
+        let hit: Option<AgentRow> = conn
+            .query_row(
+                "SELECT agent_id, agent_name, chat_thread_id, spawned_at, last_pinged_at \
+                 FROM agent_registry \
+                 WHERE state='alive' \
+                   AND (?1 IS NULL OR chat_thread_id = ?1) \
+                   AND agent_name LIKE ?2 \
+                 ORDER BY agent_id ASC \
+                 LIMIT 1",
+                params![thread, like],
+                map_row,
+            )
+            .optional()?;
+        if hit.is_some() {
+            return Ok(hit);
+        }
+    }
+
+    // Pass 2 — any alive row, deterministic by agent_id.
+    let any: Option<AgentRow> = conn
+        .query_row(
+            "SELECT agent_id, agent_name, chat_thread_id, spawned_at, last_pinged_at \
+             FROM agent_registry \
+             WHERE state='alive' \
+               AND (?1 IS NULL OR chat_thread_id = ?1) \
+             ORDER BY agent_id ASC \
+             LIMIT 1",
+            params![thread],
+            map_row,
+        )
+        .optional()?;
+    Ok(any)
+}
+
 /// Reap orphaned rows older than `older_than_secs` seconds. Default
 /// 86400 (24 hours). Returns `reaped_count` (the number of rows
 /// transitioned orphaned→dead) and `remaining_orphaned` (rows still in
@@ -495,5 +593,125 @@ mod tests {
             err.to_string().contains("CHECK constraint failed"),
             "expected DB-layer CHECK rejection, got: {err}"
         );
+    }
+
+    // ---- telegram-multi-cli Slice 1: is_alive + first_alive ----
+
+    /// TC-TMC-2.1: is_alive returns true for a registered (alive) agent.
+    #[test]
+    fn is_alive_returns_true_for_registered() {
+        let conn = open_test_conn();
+        register(&conn, "agent-id-abc", "planner", "c-x", Some("t-1"), None).unwrap();
+        assert!(is_alive(&conn, "agent-id-abc").unwrap());
+    }
+
+    /// TC-TMC-2.2: is_alive returns false for an unknown agent_id.
+    #[test]
+    fn is_alive_returns_false_for_unknown() {
+        let conn = open_test_conn();
+        assert!(!is_alive(&conn, "nonexistent-id").unwrap());
+    }
+
+    /// TC-TMC-2.3: is_alive returns false for an orphaned agent.
+    #[test]
+    fn is_alive_returns_false_for_orphaned() {
+        let conn = open_test_conn();
+        register(&conn, "agent-id-orphaned", "planner", "c-x", Some("t-1"), None).unwrap();
+        mark_connection_orphaned(&conn, "c-x").unwrap();
+        assert!(!is_alive(&conn, "agent-id-orphaned").unwrap());
+    }
+
+    /// TC-TMC-2.4: is_alive on an empty string and a SQL-injection payload
+    /// both return false WITHOUT modifying agent_registry (parameterised
+    /// query). UC-TMC-2-EC1.
+    #[test]
+    fn is_alive_rejects_malformed_ids() {
+        let conn = open_test_conn();
+        register(&conn, "real-agent", "planner", "c-x", Some("t-1"), None).unwrap();
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM agent_registry", [], |r| r.get(0))
+            .unwrap();
+        assert!(!is_alive(&conn, "").unwrap());
+        assert!(!is_alive(&conn, "'; DROP TABLE agent_registry;--").unwrap());
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM agent_registry", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, after, "table must be untouched by malformed ids");
+        // The legitimate row is still alive — table survived.
+        assert!(is_alive(&conn, "real-agent").unwrap());
+    }
+
+    /// TC-TMC-3.1: first_alive prefers the prefer_role substring match.
+    #[test]
+    fn first_alive_prefers_role() {
+        let conn = open_test_conn();
+        register(&conn, "id-orch", "orchestrator-main", "c-x", Some("t-1"), None).unwrap();
+        register(&conn, "id-work", "worker", "c-y", Some("t-2"), None).unwrap();
+        let hit = first_alive(&conn, None, Some("orchestrator")).unwrap().unwrap();
+        assert!(
+            hit.agent_name.contains("orchestrator"),
+            "expected an orchestrator row, got {}",
+            hit.agent_name
+        );
+        assert_eq!(hit.agent_id, "id-orch");
+    }
+
+    /// TC-TMC-3.2: first_alive falls back to any alive agent when no
+    /// prefer_role match exists.
+    #[test]
+    fn first_alive_fallback_no_role_match() {
+        let conn = open_test_conn();
+        register(&conn, "id-work", "worker", "c-y", Some("t-2"), None).unwrap();
+        let hit = first_alive(&conn, None, Some("orchestrator")).unwrap().unwrap();
+        assert_eq!(hit.agent_name, "worker");
+        assert_eq!(hit.agent_id, "id-work");
+    }
+
+    /// TC-TMC-3.3: first_alive returns None when there are zero alive rows.
+    #[test]
+    fn first_alive_returns_none_when_empty() {
+        let conn = open_test_conn();
+        assert!(first_alive(&conn, None, Some("orchestrator")).unwrap().is_none());
+        // Also None when the only rows are orphaned.
+        register(&conn, "id-x", "worker", "c-x", Some("t-1"), None).unwrap();
+        mark_connection_orphaned(&conn, "c-x").unwrap();
+        assert!(first_alive(&conn, None, Some("orchestrator")).unwrap().is_none());
+    }
+
+    /// TC-TMC-3.4: with two equally-preferred agents, two consecutive
+    /// first_alive calls return the SAME row (deterministic agent_id sort).
+    #[test]
+    fn first_alive_deterministic_tiebreak() {
+        let conn = open_test_conn();
+        register(&conn, "id-orch-b", "orchestrator-b", "c-x", Some("t-1"), None).unwrap();
+        register(&conn, "id-orch-a", "orchestrator-a", "c-y", Some("t-2"), None).unwrap();
+        let first = first_alive(&conn, None, Some("orchestrator")).unwrap().unwrap();
+        let second = first_alive(&conn, None, Some("orchestrator")).unwrap().unwrap();
+        assert_eq!(first.agent_id, second.agent_id);
+        // ORDER BY agent_id ASC → "id-orch-a" wins over "id-orch-b".
+        assert_eq!(first.agent_id, "id-orch-a");
+    }
+
+    /// first_alive with prefer_role=None returns the first alive agent by
+    /// deterministic agent_id sort.
+    #[test]
+    fn first_alive_no_prefer_role_returns_first_alive() {
+        let conn = open_test_conn();
+        register(&conn, "id-b", "worker-b", "c-x", Some("t-1"), None).unwrap();
+        register(&conn, "id-a", "worker-a", "c-y", Some("t-2"), None).unwrap();
+        let hit = first_alive(&conn, None, None).unwrap().unwrap();
+        assert_eq!(hit.agent_id, "id-a");
+    }
+
+    /// first_alive scopes to a thread when `thread` is Some.
+    #[test]
+    fn first_alive_scopes_to_thread() {
+        let conn = open_test_conn();
+        register(&conn, "id-t1", "orchestrator-x", "c-x", Some("t-1"), None).unwrap();
+        register(&conn, "id-t2", "orchestrator-y", "c-y", Some("t-2"), None).unwrap();
+        let hit = first_alive(&conn, Some("t-2"), Some("orchestrator"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.agent_id, "id-t2");
     }
 }

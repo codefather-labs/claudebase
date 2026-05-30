@@ -251,7 +251,7 @@ pub fn build_channel_notification_telegram(
     })
 }
 
-/// Apply schema v5 + v6 to a chat.db connection. Idempotent — all
+/// Apply schema v5 + v6 + v7 to a chat.db connection. Idempotent — all
 /// statements use `IF NOT EXISTS` / `INSERT OR IGNORE`. Wrapped in a
 /// BEGIN/COMMIT transaction so partial-failure recovery is clean.
 ///
@@ -262,6 +262,17 @@ pub fn build_channel_notification_telegram(
 ///            target_agent_id lookups). The CHECK constraint on `state`
 ///            is enforced at the DB layer per STRUCTURAL-5-2 — a buggy
 ///            Rust caller or a sqlite3 CLI edit cannot corrupt state.
+/// v7 tables (telegram-multi-cli Slice 1): three additive tables for
+///            chat-as-id routing —
+///            - `active_cli_per_chat` — the active CLI bound to a chat.
+///            - `tg_message_map` — reply-quote tracking (composite PK +
+///              `sent_at` index for the 30-day TTL purge, architect
+///              action item 4).
+///            - `pending_questions` — durable pending `chat_ask` state
+///              that survives daemon restart (F-1 red-team revision;
+///              replaces the in-memory map originally planned for Slice 5).
+///            chat.db has no `user_version` gate — the migration is
+///            additive-by-construction (all `CREATE TABLE IF NOT EXISTS`).
 pub fn ensure_chat_db_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         r#"
@@ -304,8 +315,63 @@ CREATE UNIQUE INDEX IF NOT EXISTS agent_registry_thread_name_alive_idx
 CREATE INDEX IF NOT EXISTS agent_registry_thread_alive_idx
     ON agent_registry(chat_thread_id, state)
     WHERE state = 'alive';
+CREATE TABLE IF NOT EXISTS active_cli_per_chat (
+  chat_id         INTEGER PRIMARY KEY,
+  active_cli_name TEXT NOT NULL,
+  active_agent_id TEXT NOT NULL,
+  set_at          INTEGER NOT NULL,
+  set_by          TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tg_message_map (
+  tg_msg_id       INTEGER NOT NULL,
+  chat_id         INTEGER NOT NULL,
+  sender_agent_id TEXT NOT NULL,
+  sent_at         INTEGER NOT NULL,
+  PRIMARY KEY (chat_id, tg_msg_id)
+);
+CREATE INDEX IF NOT EXISTS tg_message_map_sent_at_idx
+  ON tg_message_map(sent_at);
+CREATE TABLE IF NOT EXISTS pending_questions (
+  question_id        TEXT PRIMARY KEY,
+  chat_id            INTEGER NOT NULL,
+  requesting_agent_id TEXT NOT NULL,
+  options_json       TEXT NOT NULL,
+  created_at         INTEGER NOT NULL,
+  expires_at         INTEGER NOT NULL
+);
 COMMIT;
 "#,
+    )?;
+    Ok(())
+}
+
+/// Startup TTL eviction for the two time-bounded v7 tables. Run once at
+/// daemon boot AFTER `ensure_chat_db_schema` applies (the tables must
+/// exist before the DELETEs run). Separated from `ensure_chat_db_schema`
+/// because schema-application is data-preserving by contract; the purges
+/// intentionally delete stale rows and so are a distinct concern.
+///
+/// - `tg_message_map`: rows older than 30 days (2 592 000 s) are dropped
+///   (FR-TMC-1.3 — reply-quote tracking is only useful while the Telegram
+///   message is recent enough to be replied to).
+/// - `pending_questions`: rows whose `expires_at` is in the past are
+///   evicted (F-1/F-8 — an unanswered `chat_ask` that has expired must not
+///   linger and route a stale callback after daemon restart).
+///
+/// All timestamps in these two tables are UNIX **seconds** (the
+/// `strftime('%s','now')` convention), distinct from the `now_millis()`
+/// convention used by `agent_registry`. The cutoff arithmetic stays in
+/// SQL so the unit is unambiguous and matches whatever the producer wrote.
+pub fn purge_expired_chat_state(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM tg_message_map \
+         WHERE sent_at < (strftime('%s','now') - 2592000)",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM pending_questions \
+         WHERE expires_at < strftime('%s','now')",
+        [],
     )?;
     Ok(())
 }
@@ -671,5 +737,217 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n_undelivered, 0);
+    }
+
+    // ---- telegram-multi-cli Slice 1: schema v7 + startup purges ----
+
+    /// Helper: column names of a table via PRAGMA table_info, in cid order.
+    fn table_cols(conn: &Connection, table: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .map(|c| c.unwrap())
+            .collect();
+        cols
+    }
+
+    /// TC-TMC-1.1(a): active_cli_per_chat has exactly the 5 spec columns.
+    #[test]
+    fn v7_active_cli_per_chat_has_5_columns() {
+        let conn = fresh_db();
+        let cols = table_cols(&conn, "active_cli_per_chat");
+        assert_eq!(
+            cols,
+            vec![
+                "chat_id",
+                "active_cli_name",
+                "active_agent_id",
+                "set_at",
+                "set_by"
+            ]
+        );
+    }
+
+    /// TC-TMC-1.1(b): tg_message_map has exactly the 4 spec columns AND a
+    /// composite PK on (chat_id, tg_msg_id).
+    #[test]
+    fn v7_tg_message_map_has_4_columns_and_composite_pk() {
+        let conn = fresh_db();
+        let cols = table_cols(&conn, "tg_message_map");
+        assert_eq!(
+            cols,
+            vec!["tg_msg_id", "chat_id", "sender_agent_id", "sent_at"]
+        );
+        // Composite PK: the two PK members per PRAGMA (pk column index > 0).
+        let mut stmt = conn.prepare("PRAGMA table_info(tg_message_map)").unwrap();
+        // row: (cid, name, type, notnull, dflt, pk)
+        let pk_members: Vec<(String, i64)> = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(1)?, r.get::<_, i64>(5)?))
+            })
+            .unwrap()
+            .map(|x| x.unwrap())
+            .filter(|(_, pk)| *pk > 0)
+            .collect();
+        assert_eq!(pk_members.len(), 2, "expected composite PK of 2 columns");
+        // PRAGMA reports PK order via the pk index: chat_id=1, tg_msg_id=2.
+        let names: Vec<&str> = pk_members.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"chat_id"));
+        assert!(names.contains(&"tg_msg_id"));
+    }
+
+    /// tg_message_map_sent_at_idx index exists (architect action item 4).
+    #[test]
+    fn v7_tg_message_map_sent_at_index_exists() {
+        let conn = fresh_db();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='index' AND name='tg_message_map_sent_at_idx'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// pending_questions has exactly the 6 spec columns.
+    #[test]
+    fn v7_pending_questions_has_6_columns() {
+        let conn = fresh_db();
+        let cols = table_cols(&conn, "pending_questions");
+        assert_eq!(
+            cols,
+            vec![
+                "question_id",
+                "chat_id",
+                "requesting_agent_id",
+                "options_json",
+                "created_at",
+                "expires_at"
+            ]
+        );
+    }
+
+    /// TC-TMC-1.2: ensure_chat_db_schema is idempotent — a second call on
+    /// an already-v7 db returns Ok and changes no row counts.
+    #[test]
+    fn v7_schema_is_idempotent() {
+        let conn = fresh_db();
+        // Plant one row in each v7 table.
+        conn.execute(
+            "INSERT INTO active_cli_per_chat \
+             (chat_id, active_cli_name, active_agent_id, set_at, set_by) \
+             VALUES (1, 'cli-a', 'agent-a', 100, 'op')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tg_message_map \
+             (tg_msg_id, chat_id, sender_agent_id, sent_at) \
+             VALUES (5, 1, 'agent-a', 9999999999)",
+            [],
+        )
+        .unwrap();
+        // Second schema call must succeed and preserve the planted rows.
+        ensure_chat_db_schema(&conn).expect("second ensure_chat_db_schema call Ok");
+        let n_cli: i64 = conn
+            .query_row("SELECT COUNT(*) FROM active_cli_per_chat", [], |r| r.get(0))
+            .unwrap();
+        let n_map: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tg_message_map", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_cli, 1);
+        assert_eq!(n_map, 1);
+    }
+
+    /// Existing v6 rows survive a re-open: insert a chat_threads row and
+    /// run ensure_chat_db_schema again; the row count is unchanged.
+    #[test]
+    fn v6_rows_survive_schema_reapply() {
+        let conn = fresh_db();
+        insert_message(&conn, "telegram:42", "agent-a", "hello", None).unwrap();
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chat_threads", [], |r| r.get(0))
+            .unwrap();
+        let msg_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chat_messages", [], |r| r.get(0))
+            .unwrap();
+        ensure_chat_db_schema(&conn).unwrap();
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chat_threads", [], |r| r.get(0))
+            .unwrap();
+        let msg_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chat_messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, after);
+        assert_eq!(msg_before, msg_after);
+        assert_eq!(after, 1);
+    }
+
+    /// Startup eviction: an expired pending_questions row (expires_at in
+    /// the past) is deleted by purge_expired_chat_state; a future-expiry
+    /// row survives.
+    #[test]
+    fn purge_evicts_expired_pending_questions() {
+        let conn = fresh_db();
+        conn.execute(
+            "INSERT INTO pending_questions \
+             (question_id, chat_id, requesting_agent_id, options_json, created_at, expires_at) \
+             VALUES ('q-expired', 1, 'agent-a', '[]', 0, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pending_questions \
+             (question_id, chat_id, requesting_agent_id, options_json, created_at, expires_at) \
+             VALUES ('q-future', 1, 'agent-a', '[]', 0, strftime('%s','now') + 3600)",
+            [],
+        )
+        .unwrap();
+        purge_expired_chat_state(&conn).unwrap();
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_questions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 1, "only the future-expiry row should survive");
+        let id: String = conn
+            .query_row("SELECT question_id FROM pending_questions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(id, "q-future");
+    }
+
+    /// Startup eviction: a tg_message_map row older than the 30-day TTL is
+    /// deleted; a recent row survives.
+    #[test]
+    fn purge_evicts_old_tg_message_map_rows() {
+        let conn = fresh_db();
+        // sent_at far in the past (epoch second 1) → older than 30 days.
+        conn.execute(
+            "INSERT INTO tg_message_map \
+             (tg_msg_id, chat_id, sender_agent_id, sent_at) \
+             VALUES (1, 1, 'agent-a', 1)",
+            [],
+        )
+        .unwrap();
+        // Recent row (now) → survives.
+        conn.execute(
+            "INSERT INTO tg_message_map \
+             (tg_msg_id, chat_id, sender_agent_id, sent_at) \
+             VALUES (2, 1, 'agent-a', strftime('%s','now'))",
+            [],
+        )
+        .unwrap();
+        purge_expired_chat_state(&conn).unwrap();
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tg_message_map", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 1, "only the recent row should survive");
+        let id: i64 = conn
+            .query_row("SELECT tg_msg_id FROM tg_message_map", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(id, 2);
     }
 }

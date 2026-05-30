@@ -1427,11 +1427,24 @@ fn tag_filter_doc_ids(
     let mut set = std::collections::HashSet::new();
     let params: Vec<&dyn rusqlite::ToSql> =
         tags.iter().map(|t| t as &dyn rusqlite::ToSql).collect();
-    if let Ok(mut stmt) = conn.prepare(&sql) {
-        if let Ok(rows) = stmt.query_map(params.as_slice(), |r| r.get::<_, i64>(0)) {
-            for id in rows.flatten() {
-                set.insert(id);
+    match conn.prepare(&sql) {
+        Ok(mut stmt) => {
+            if let Ok(rows) = stmt.query_map(params.as_slice(), |r| r.get::<_, i64>(0)) {
+                for id in rows.flatten() {
+                    set.insert(id);
+                }
             }
+        }
+        Err(e) => {
+            // Surface a diagnostic so an operator whose insight_tags table is
+            // absent (partial migration, corrupt db) doesn't see silently empty
+            // results with no indication of why. Returning Some(empty_set) here
+            // would drop every candidate hit at the caller's retain() — that
+            // is the silent-failure mode code-reviewer (Gate 2) flagged.
+            eprintln!(
+                "warning: tag filter SQL prepare failed ({e}); returning no \
+                 tag-matched hits — verify insight_tags table exists"
+            );
         }
     }
     Some(set)
@@ -1754,6 +1767,15 @@ fn run_insight_tags(
     root: &std::path::Path,
     args: &cli::InsightTagsArgs,
 ) -> std::process::ExitCode {
+    // SECURITY (security-auditor Gate-3 MEDIUM finding): same root cause as the
+    // Slice 6 resolve_registry_project_db gap fixed in commit 6fbc7cf — the
+    // local_path / project_db joins below use args.db_name without validation.
+    // Reject path-traversal / separators / hidden-file prefixes up front via
+    // the canonical db-name gate (same gate open_and_validate uses).
+    if let Err(e) = cli::validate_db_name(&args.db_name) {
+        eprintln!("error: {e}");
+        return std::process::ExitCode::from(2);
+    }
     // Aggregate `tag -> count` over the union of the selected db legs. A leg is
     // a db path that may or may not exist; a missing/failed-open leg simply
     // contributes nothing.
@@ -2039,6 +2061,14 @@ fn run_insight_gc(
     root: &std::path::Path,
     args: &cli::InsightGcArgs,
 ) -> std::process::ExitCode {
+    // SECURITY (security-auditor Gate-3 MEDIUM finding): same root cause as
+    // run_insight_tags above — the local_path join below uses args.db_name
+    // without validation. Reject path-traversal up front via the canonical
+    // db-name gate.
+    if let Err(e) = cli::validate_db_name(&args.db_name) {
+        eprintln!("error: {e}");
+        return std::process::ExitCode::from(2);
+    }
     let now: i64 = {
         use std::time::{SystemTime, UNIX_EPOCH};
         SystemTime::now()

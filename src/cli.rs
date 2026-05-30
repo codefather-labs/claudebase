@@ -835,6 +835,28 @@ pub struct InsightSearchArgs {
     /// Examples: `30d`, `12h`, `90m`, `4w`. Rejected if no unit suffix.
     #[arg(long)]
     pub since: Option<String>,
+    /// Tag filter (repeatable). OR / any-intersection semantics: an insight
+    /// is kept if it carries ANY of the listed tags. `--tag nginx --tag docker`
+    /// returns insights tagged nginx, docker, or both. Bound as parameters.
+    #[arg(long)]
+    pub tag: Vec<String>,
+    /// Corpus-scope filter: `general` reads only the global db, `project`
+    /// reads only the cwd-local db. Absent → both legs merged.
+    #[arg(long, value_enum)]
+    pub category: Option<InsightCategory>,
+    /// Registry slug of a project whose db replaces the cwd-local leg (merged
+    /// with the global db). Looked up in `~/.claude/knowledge/projects.json`;
+    /// unknown slug → exit 1. DATA, never a raw filesystem path.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Read only the global db (skip the local/project leg). Mutually
+    /// exclusive with `--project-only` (both set → exit 2).
+    #[arg(long)]
+    pub general_only: bool,
+    /// Read only the local/project db (skip the global leg). Mutually
+    /// exclusive with `--general-only` (both set → exit 2).
+    #[arg(long)]
+    pub project_only: bool,
     #[arg(long)]
     pub project_root: Option<PathBuf>,
     #[arg(long, default_value = "insights.db")]
@@ -902,6 +924,21 @@ pub struct InsightListArgs {
     /// Optional filter on `documents.feature_slug` (exact match).
     #[arg(long)]
     pub feature: Option<String>,
+    /// Tag filter (repeatable, OR / any-intersection). See `InsightSearchArgs`.
+    #[arg(long)]
+    pub tag: Vec<String>,
+    /// Corpus-scope filter: `general` (global db) or `project` (cwd-local db).
+    #[arg(long, value_enum)]
+    pub category: Option<InsightCategory>,
+    /// Registry slug of a project whose db replaces the cwd-local leg.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Read only the global db. Mutually exclusive with `--project-only`.
+    #[arg(long)]
+    pub general_only: bool,
+    /// Read only the local/project db. Mutually exclusive with `--general-only`.
+    #[arg(long)]
+    pub project_only: bool,
     #[arg(long)]
     pub project_root: Option<PathBuf>,
     #[arg(long, default_value = "insights.db")]
@@ -924,6 +961,21 @@ pub struct InsightRandomArgs {
     /// Optional filter on `documents.feature_slug` (exact match).
     #[arg(long)]
     pub feature: Option<String>,
+    /// Tag filter (repeatable, OR / any-intersection). See `InsightSearchArgs`.
+    #[arg(long)]
+    pub tag: Vec<String>,
+    /// Corpus-scope filter: `general` (global db) or `project` (cwd-local db).
+    #[arg(long, value_enum)]
+    pub category: Option<InsightCategory>,
+    /// Registry slug of a project whose db replaces the cwd-local leg.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Read only the global db. Mutually exclusive with `--project-only`.
+    #[arg(long)]
+    pub general_only: bool,
+    /// Read only the local/project db. Mutually exclusive with `--general-only`.
+    #[arg(long)]
+    pub project_only: bool,
     #[arg(long)]
     pub project_root: Option<PathBuf>,
     #[arg(long, default_value = "insights.db")]
@@ -938,6 +990,10 @@ pub struct InsightGcArgs {
     /// surfaces `{would_delete_medium: N, would_delete_low: N}`.
     #[arg(long)]
     pub dry_run: bool,
+    /// Corpus scope: `general` gc's only the global db. Absent → gc BOTH the
+    /// cwd-local db and the global db sequentially, combining their reports.
+    #[arg(long, value_enum)]
+    pub category: Option<InsightCategory>,
     #[arg(long)]
     pub project_root: Option<PathBuf>,
     #[arg(long, default_value = "insights.db")]
@@ -952,6 +1008,10 @@ pub struct InsightDeleteArgs {
     /// targeting is not supported here — use `insight get <prefix>` to
     /// confirm the id first, then `insight delete <id>`.)
     pub id: i64,
+    /// Corpus scope: `general` resolves the id against the global db. Absent
+    /// (or `project`) → the cwd-local db (existing behavior).
+    #[arg(long, value_enum)]
+    pub category: Option<InsightCategory>,
     #[arg(long)]
     pub project_root: Option<PathBuf>,
     #[arg(long, default_value = "insights.db")]

@@ -24,6 +24,19 @@ fn bin() -> Command {
     Command::cargo_bin("claudebase").expect("binary built")
 }
 
+/// Pin `$HOME` / `USERPROFILE` to a per-project sandbox so the GLOBAL insights
+/// db resolves under the tempdir. Slice 5 made the default read/gc path merge
+/// the cwd-local db with the global db; without this pin, `insight gc` would
+/// VACUUM/delete the operator's REAL `~/.claude/knowledge/insights.db` and the
+/// exact-count assertions below would be non-deterministic.
+fn pin(project: &Path) -> Command {
+    let home = project.join(".testhome");
+    let _ = fs::create_dir_all(&home);
+    let mut c = bin();
+    c.current_dir(project).env("HOME", &home).env("USERPROFILE", &home);
+    c
+}
+
 fn fresh_project() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().expect("tempdir");
     fs::create_dir_all(tmp.path().join(".claude/knowledge")).expect("mkdir");
@@ -47,8 +60,7 @@ fn full_lifecycle_from_create_to_gc_to_delete() {
     // Step 1: create two insights, different salience tiers, different
     // agents (cross-agent so semantic dedup never collides).
     // ─────────────────────────────────────────────────────────────────
-    bin()
-        .current_dir(proj)
+    pin(proj)
         .args([
             "insight", "create",
             "kafka exactly-once delivery requires careful rebalance handling during transaction commit",
@@ -62,8 +74,7 @@ fn full_lifecycle_from_create_to_gc_to_delete() {
         ])
         .assert()
         .success();
-    bin()
-        .current_dir(proj)
+    pin(proj)
         .args([
             "insight", "create",
             "polygon CTF balanceOf returns wei units not human-readable amounts",
@@ -81,8 +92,7 @@ fn full_lifecycle_from_create_to_gc_to_delete() {
     // ─────────────────────────────────────────────────────────────────
     // Step 2: list — both visible, page_size default 10.
     // ─────────────────────────────────────────────────────────────────
-    let assert = bin()
-        .current_dir(proj)
+    let assert = pin(proj)
         .args(["insight", "list", "--json"])
         .assert()
         .success();
@@ -94,8 +104,7 @@ fn full_lifecycle_from_create_to_gc_to_delete() {
     // ─────────────────────────────────────────────────────────────────
     // Step 3: random — returns one row from the corpus.
     // ─────────────────────────────────────────────────────────────────
-    let assert = bin()
-        .current_dir(proj)
+    let assert = pin(proj)
         .args(["insight", "random", "--json"])
         .assert()
         .success();
@@ -123,8 +132,7 @@ fn full_lifecycle_from_create_to_gc_to_delete() {
         )
         .unwrap();
     drop(conn);
-    let assert = bin()
-        .current_dir(proj)
+    let assert = pin(proj)
         .args(["insight", "get", &high_id.to_string(), "--json"])
         .assert()
         .success();
@@ -140,8 +148,7 @@ fn full_lifecycle_from_create_to_gc_to_delete() {
     // ─────────────────────────────────────────────────────────────────
     // Step 5: insight search — lexical mode, find by keyword.
     // ─────────────────────────────────────────────────────────────────
-    let assert = bin()
-        .current_dir(proj)
+    let assert = pin(proj)
         .args([
             "insight", "search", "kafka",
             "--mode", "lexical",
@@ -160,8 +167,7 @@ fn full_lifecycle_from_create_to_gc_to_delete() {
     // Step 6: search --corpus all — hits labeled source_corpus.
     // books index.db doesn't exist; only insights row should appear.
     // ─────────────────────────────────────────────────────────────────
-    let assert = bin()
-        .current_dir(proj)
+    let assert = pin(proj)
         .args([
             "search", "kafka",
             "--corpus", "all",
@@ -198,8 +204,7 @@ fn full_lifecycle_from_create_to_gc_to_delete() {
     // ─────────────────────────────────────────────────────────────────
     // Step 8: gc --dry-run — reports low_deleted=1 but DOES NOT delete.
     // ─────────────────────────────────────────────────────────────────
-    let assert = bin()
-        .current_dir(proj)
+    let assert = pin(proj)
         .args(["insight", "gc", "--dry-run", "--json"])
         .assert()
         .success();
@@ -217,8 +222,7 @@ fn full_lifecycle_from_create_to_gc_to_delete() {
     // ─────────────────────────────────────────────────────────────────
     // Step 9: gc — actually purges. High survives, low is gone.
     // ─────────────────────────────────────────────────────────────────
-    let assert = bin()
-        .current_dir(proj)
+    let assert = pin(proj)
         .args(["insight", "gc", "--json"])
         .assert()
         .success();
@@ -240,8 +244,7 @@ fn full_lifecycle_from_create_to_gc_to_delete() {
     // ─────────────────────────────────────────────────────────────────
     // Step 10: delete — explicit cleanup. Corpus now empty.
     // ─────────────────────────────────────────────────────────────────
-    bin()
-        .current_dir(proj)
+    pin(proj)
         .args(["insight", "delete", &high_id.to_string()])
         .assert()
         .success();

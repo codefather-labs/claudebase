@@ -23,10 +23,48 @@ set -u
 # ============================================================================
 # Constants
 # ============================================================================
-CLAUDEBASE_VERSION="0.7.0"
 CLAUDEBASE_PDFIUM_VERSION="chromium/7802"
 REPO_URL="https://github.com/codefather-labs/claudebase.git"
 RELEASE_BASE="https://github.com/codefather-labs/claudebase/releases/download"
+
+# Fallback version used only when the remote tag lookup below fails
+# (air-gapped machine, GitHub unreachable, etc). NOT authoritative —
+# the actual version installed is whatever `detect_claudebase_version`
+# resolves at runtime. Bump on each release as a courtesy for cold-start
+# installs without network, but absence of bump no longer breaks anything.
+CLAUDEBASE_FALLBACK_VERSION="0.7.1"
+
+# Authoritative version resolution (v0.7.1+): authoritative source is
+# the latest `claudebase-v*` tag on origin, fetched via `git ls-remote`.
+# Eliminates the chronic "bump install.sh manually on every release"
+# trap that caused v0.7.0 to silently no-op for upgrading users.
+#
+# Priority order:
+#   1. Operator override: CLAUDEBASE_VERSION=0.7.0 bash install.sh
+#      (for pinning / downgrade / repeatable CI installs).
+#   2. Latest claudebase-v* tag from origin via `git ls-remote`
+#      (no GitHub API rate limit, no jq dep, semver-sorted via sort -V).
+#   3. CLAUDEBASE_FALLBACK_VERSION baked above (offline / GH down).
+detect_claudebase_version() {
+  if [ -n "${CLAUDEBASE_VERSION:-}" ]; then
+    echo "$CLAUDEBASE_VERSION"
+    return 0
+  fi
+  if command -v git >/dev/null 2>&1; then
+    local latest
+    latest=$(git ls-remote --tags --refs "$REPO_URL" 'refs/tags/claudebase-v*' 2>/dev/null \
+      | awk -F/ '{print $NF}' \
+      | sed 's/^claudebase-v//' \
+      | sort -V \
+      | tail -1)
+    if [ -n "$latest" ]; then
+      echo "$latest"
+      return 0
+    fi
+  fi
+  echo "$CLAUDEBASE_FALLBACK_VERSION"
+}
+CLAUDEBASE_VERSION="$(detect_claudebase_version)"
 
 CLAUDE_DIR="$HOME/.claude"
 SCRIPT_DIR=""
@@ -438,7 +476,10 @@ install_pdfium() {
     local platform asset
     case "$(uname -s)/$(uname -m)" in
       Darwin/arm64)   platform=darwin-arm64;  asset=pdfium-mac-arm64.tgz   ;;
-      Darwin/x86_64)  platform=darwin-x64;    asset=pdfium-mac-x64.tgz     ;;
+      # Darwin/x86_64 dropped as of v0.7.1 — falls through to the catch-all
+      # warning below; the upstream pdfium binary release still has it, but
+      # since we don't ship the claudebase binary for Intel Mac there's no
+      # consumer.
       Linux/x86_64)   platform=linux-x64;     asset=pdfium-linux-x64.tgz   ;;
       Linux/aarch64)  platform=linux-arm64;   asset=pdfium-linux-arm64.tgz ;;
       *)
@@ -696,7 +737,13 @@ install_telegram_plugin() {
   local exe_ext=""
   case "$(uname -ms)" in
     "Darwin arm64")  platform="darwin-arm64"  ;;
-    "Darwin x86_64") platform="darwin-x64"    ;;
+    "Darwin x86_64")
+      # Intel Mac dropped as of v0.7.1 — see the matching note in
+      # download_claudebase_binary above. No telegram-plugin-rs binary
+      # for x86_64-apple-darwin in the release matrix either.
+      log_warn "telegram-plugin-rs binary unavailable for Intel Mac (deprecated v0.7.1); skipping"
+      return 0
+      ;;
     "Linux x86_64")  platform="linux-x64"     ;;
     "Linux aarch64") platform="linux-arm64"   ;;
     MINGW*|MSYS*|CYGWIN*)

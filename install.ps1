@@ -28,9 +28,39 @@ $ErrorActionPreference = 'Stop'
 # ============================================================================
 # Constants
 # ============================================================================
-$Script:ClaudebaseVersion       = '0.7.0'
 $Script:ClaudebasePdfiumVersion = 'chromium/7802'
 $Script:RepoUrl                 = 'https://github.com/codefather-labs/claudebase.git'
+
+# Fallback used only when the remote tag lookup below fails (air-gapped,
+# GitHub unreachable). NOT authoritative — the actual version installed
+# is whatever Get-ClaudebaseVersion resolves at runtime. Bump on each
+# release as a courtesy for cold-start installs without network.
+$Script:ClaudebaseFallbackVersion = '0.7.1'
+
+# Authoritative version resolution (v0.7.1+) — mirrors install.sh.
+# Priority: 1) env override $env:CLAUDEBASE_VERSION; 2) latest
+# claudebase-v* tag from origin via `git ls-remote`; 3) fallback.
+function Get-ClaudebaseVersion {
+  if ($env:CLAUDEBASE_VERSION) { return $env:CLAUDEBASE_VERSION }
+  $git = Get-Command git -ErrorAction SilentlyContinue
+  if ($git) {
+    try {
+      $tags = & git ls-remote --tags --refs $Script:RepoUrl 'refs/tags/claudebase-v*' 2>$null
+      if ($LASTEXITCODE -eq 0 -and $tags) {
+        $latest = $tags |
+          ForEach-Object {
+            $leaf = ($_ -split "`t")[-1]
+            ($leaf -split '/')[-1] -replace '^claudebase-v', ''
+          } |
+          Sort-Object { [version]$_ } |
+          Select-Object -Last 1
+        if ($latest) { return [string]$latest }
+      }
+    } catch { }
+  }
+  return $Script:ClaudebaseFallbackVersion
+}
+$Script:ClaudebaseVersion = Get-ClaudebaseVersion
 $Script:ReleaseBase             = 'https://github.com/codefather-labs/claudebase/releases/download'
 
 $Script:ClaudeDir = Join-Path $env:USERPROFILE '.claude'

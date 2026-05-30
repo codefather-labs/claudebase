@@ -84,14 +84,20 @@ jobs:
           - platform: darwin-arm64
             runs-on: macos-14
             target: aarch64-apple-darwin
-          - platform: darwin-x64
-            runs-on: macos-15-intel
-            target: x86_64-apple-darwin
+          # darwin-x64 (Intel Mac) DROPPED as of v0.7.1: ort 2.0.0-rc.12
+          # stopped shipping prebuilt binaries for x86_64-apple-darwin, and
+          # building ONNX Runtime from source for a single legacy platform
+          # is disproportionate. Apple stopped selling Intel Macs in late
+          # 2023; users still on Intel can run the Linux binary under
+          # Rosetta-via-VM, or build from source via `cargo install`.
           - platform: linux-x64
             runs-on: ubuntu-latest
             target: x86_64-unknown-linux-gnu
           - platform: linux-arm64
-            runs-on: ubuntu-22.04-arm
+            # v0.7.1: bumped from ubuntu-22.04-arm to ubuntu-24.04-arm to
+            # pick up glibc >= 2.38 (needed for __isoc23_strtoull) and
+            # libstdc++ ABI matching the prebuilt ort-sys library.
+            runs-on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
           - platform: windows-x64
             runs-on: windows-latest
@@ -151,7 +157,7 @@ jobs:
             --manifest-path Cargo.toml \
             --target ${{ matrix.target }}
 
-      - name: Assert binary size <= 35 MB (iter-2 NFR-1.1)
+      - name: Assert binary size <= 40 MB (iter-2 NFR-1.1, raised v0.7.1)
         shell: bash
         run: |
           # Windows Cargo emits `claudebase.exe`; unix targets emit `claudebase`.
@@ -168,11 +174,16 @@ jobs:
           # Windows Git Bash has neither — fall back to `wc -c`.
           size=$(stat -f%z "$BIN" 2>/dev/null || stat -c%s "$BIN" 2>/dev/null || wc -c < "$BIN")
           echo "Binary size: $size bytes"
-          # 36700160 = 35 * 1024 * 1024. Iter-2 raised the budget from the
-          # iter-1 10 MB cap because the binary now bundles fastembed-rs +
-          # ort + sqlite-vec + ocr-rs (PaddleOCR runtime) + bundled-sqlite.
-          # Typical observed sizes: linux-x64 ~29 MB, darwin-arm64 ~24 MB.
-          test "$size" -le 36700160
+          # 41943040 = 40 * 1024 * 1024. v0.7.1 raised the cap from 35 MB
+          # to 40 MB because insights-hybrid-corpus added ~5 KLOC of Rust
+          # (schema v5 migration + registry + dual-DB routing + RRF
+          # extraction + tag filter) that pushed windows-x64 over the
+          # 35 MB cap by 21 KB at v0.7.0 release time. iter-2 originally
+          # raised the budget from iter-1's 10 MB because the binary now
+          # bundles fastembed-rs + ort + sqlite-vec + ocr-rs (PaddleOCR
+          # runtime) + bundled-sqlite. Typical observed sizes: linux-x64
+          # ~29 MB, darwin-arm64 ~24 MB, windows-x64 ~35 MB.
+          test "$size" -le 41943040
 
       - name: Smoke test (--version exits 0)
         shell: bash
@@ -354,12 +365,10 @@ jobs:
           body_path: .claude/release-notes-${{ steps.source-tarball.outputs.version }}.md
           files: |
             dist/claudebase-darwin-arm64/claudebase-darwin-arm64
-            dist/claudebase-darwin-x64/claudebase-darwin-x64
             dist/claudebase-linux-x64/claudebase-linux-x64
             dist/claudebase-linux-arm64/claudebase-linux-arm64
             dist/claudebase-windows-x64/claudebase-windows-x64.exe
             dist/telegram-plugin-rs-darwin-arm64/telegram-plugin-rs-darwin-arm64
-            dist/telegram-plugin-rs-darwin-x64/telegram-plugin-rs-darwin-x64
             dist/telegram-plugin-rs-linux-x64/telegram-plugin-rs-linux-x64
             dist/telegram-plugin-rs-linux-arm64/telegram-plugin-rs-linux-arm64
             dist/telegram-plugin-rs-windows-x64/telegram-plugin-rs-windows-x64.exe

@@ -122,6 +122,21 @@ pub struct Message {
     /// wires the ASR pipeline.
     #[serde(default)]
     pub voice: Option<Voice>,
+    /// Slice 2 (telegram-multi-cli) — the message this one replies to, when
+    /// the operator used Telegram's reply-quote UI. Routing-tree step 2
+    /// looks up `reply_to_message.message_id` in `tg_message_map` to route
+    /// back to the original sender CLI. Absent for non-reply messages.
+    #[serde(default)]
+    pub reply_to_message: Option<ReplyToMessage>,
+}
+
+/// Minimal decode of the `reply_to_message` sub-object — routing-tree
+/// step 2 only needs the original message's `message_id` to look up the
+/// `tg_message_map` row. The rest of the Telegram Message fields on the
+/// quoted message are irrelevant to routing and deliberately not decoded.
+#[derive(Debug, Deserialize)]
+pub struct ReplyToMessage {
+    pub message_id: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -159,6 +174,13 @@ pub const VOICE_SHIM_TEXT: &str = "[unsupported: enable asr-whisper feature]";
 /// callers ignore any subsequent `@` tokens.
 ///
 /// Returns `None` if no valid mention exists.
+///
+/// NOTE (telegram-multi-cli Slice 2): chat-as-id routing no longer calls
+/// this parser — `@-mentions` are ignored as a routing key (the chat
+/// binding and reply-quote link are the only keys). The function and its
+/// unit tests are retained for a potential future per-mention feature, so
+/// it is `#[allow(dead_code)]` in non-test builds.
+#[allow(dead_code)]
 pub(crate) fn extract_first_mention(text: &str) -> Option<&str> {
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -200,6 +222,224 @@ pub(crate) fn extract_first_mention(text: &str) -> Option<&str> {
     }
     None
 }
+
+/// Exact bot-command tokens recognised by the routing tree's Step 1.
+/// A message whose first whitespace-delimited token (after stripping an
+/// optional `@botname` suffix, e.g. `/help@my_bot`) matches one of these
+/// is a bot command and is NOT routed to any CLI — it is dispatched to
+/// `handle_bot_command` (a Slice 3 stub for now) and processing returns
+/// early. Source: plan.md Slice 2 Step 1 / Slice 3 (the 7 commands).
+const BOT_COMMANDS: [&str; 7] = [
+    "/agents", "/switch", "/whoami", "/here", "/start", "/help", "/status",
+];
+
+/// Return `Some(canonical_command)` when `text` begins with a recognised
+/// bot command. Handles the Telegram group-chat form `/cmd@botname` by
+/// stripping the `@…` suffix before matching (UC-TMC-12-EC1). Trailing
+/// arguments (`/switch mira`) are ignored for the match — only the first
+/// token is inspected. Returns `None` for free text, unknown `/slash`
+/// tokens, or empty input.
+pub(crate) fn match_bot_command(text: &str) -> Option<&'static str> {
+    let first = text.split_whitespace().next()?;
+    if !first.starts_with('/') {
+        return None;
+    }
+    // Strip an optional `@botname` suffix (group-chat addressing form).
+    let cmd = match first.split_once('@') {
+        Some((head, _bot)) => head,
+        None => first,
+    };
+    BOT_COMMANDS.iter().copied().find(|&c| c == cmd)
+}
+
+/// Slice 3 stub for bot-command handling. Slice 2 only needs Step 1 of the
+/// routing tree to (a) detect that a message is a bot command and (b)
+/// short-circuit CLI routing. The real `/agents` / `/switch` / `/whoami` /
+/// `/here` handlers — which query SQLite and enqueue Telegram replies —
+/// land in Slice 3. This stub deliberately performs NO side effects and
+/// produces NO channel notification; it exists so the routing tree's
+/// Step-1 branch has a concrete dispatch target whose only Slice-2
+/// contract is "message recognised as a command, do not route to a CLI".
+///
+/// `_command` / `_chat_id` / `_text` are accepted (and ignored) so the
+/// Slice-3 signature can grow without churning the call site.
+pub(crate) fn handle_bot_command(_command: &str, _chat_id: i64, _text: &str) {
+    // intentionally empty — Slice 3 implements the handlers.
+}
+
+/// The outcome of running the 5-step routing decision tree over one
+/// inbound Telegram message (telegram-multi-cli Slice 2, chat-as-id).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RoutingDecision {
+    /// Step 1 — the message is a recognised bot command. Caller dispatches
+    /// to `handle_bot_command` and does NOT publish a channel notification
+    /// or route to any CLI.
+    BotCommand(&'static str),
+    /// Steps 2/4 — the message routes to the CLI whose `agent_id` is held
+    /// here. Caller tags `meta.target_agent_id` with this value.
+    Route(String),
+    /// Step 5 — no alive CLI could be resolved. Caller sends the operator
+    /// the literal "No CLIs online…" reply and routes nothing.
+    NoTarget,
+}
+
+/// Run the 5-step chat-as-id routing decision tree for one inbound
+/// message inside the caller's open transaction `tx`. Returns a
+/// `RoutingDecision` the caller acts on. The tree is shared by both
+/// `process_batch` and `process_batch_with_pairing` so production and the
+/// test surface route identically (telegram-multi-cli Slice 2 replaces the
+/// prior `@-mention` precursor in BOTH).
+///
+/// Steps (plan.md Slice 2 / PRD §19 FR-TMC-2.1):
+///   1. Bot command (`/agents` …) → short-circuit, no CLI routing.
+///   2. Reply-quote → `tg_message_map(chat_id, reply_to.message_id)`; if
+///      the original sender CLI is alive, route to it; if dead, fall
+///      through to step 4 (logged).
+///   3. (omitted — chat-as-id has no per-user state.)
+///   4. Active binding → `active_cli_per_chat[chat_id]`; if the bound CLI
+///      is alive, route to it; otherwise (dead / empty / missing) fall
+///      back to `first_alive(None, Some("orchestrator"))`.
+///   5. No alive CLI anywhere → `NoTarget`.
+///
+/// Under chat-as-id the `@-mention` text is deliberately IGNORED — the
+/// only routing keys are the reply-quote link and the chat binding
+/// (UC-TMC-4-EC3 / TC-TMC-4.4).
+///
+/// `tx` Derefs to `&Connection`, so the `agent_registry` helpers
+/// (`is_alive`, `first_alive`) and the `tg_message_map` /
+/// `active_cli_per_chat` lookups all read the SAME SQLite snapshot the
+/// message was inserted under — keeping the SEC-13 transactional
+/// invariant intact (no DB read outside the transaction, no Connection
+/// held across an `.await`: this function is fully synchronous and runs
+/// inside the caller's `spawn_blocking` body).
+pub(crate) fn resolve_routing_target(
+    tx: &Connection,
+    chat_id: i64,
+    // `_thread_id` is retained in the signature for call-site clarity and a
+    // possible future per-thread scoping mode, but chat-as-id routing keys
+    // on `chat_id` alone (thread=None on the registry lookups), so it is
+    // intentionally unused here.
+    _thread_id: &str,
+    text: &str,
+    reply_to_message_id: Option<i64>,
+) -> RoutingDecision {
+    use crate::daemon::agent_registry::{first_alive, is_alive};
+
+    // ---- Step 1: bot command ------------------------------------------
+    if let Some(cmd) = match_bot_command(text) {
+        return RoutingDecision::BotCommand(cmd);
+    }
+
+    // ---- Step 2: reply-quote ------------------------------------------
+    if let Some(reply_id) = reply_to_message_id {
+        let sender: Option<String> = tx
+            .query_row(
+                "SELECT sender_agent_id FROM tg_message_map \
+                 WHERE chat_id = ?1 AND tg_msg_id = ?2",
+                params![chat_id, reply_id],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(sender_agent_id) = sender {
+            match is_alive(tx, &sender_agent_id) {
+                Ok(true) => {
+                    tracing::info!(
+                        event = "routing_reply_quote",
+                        target_agent_id = %sender_agent_id,
+                        chat_id,
+                        reply_to = reply_id,
+                        "telegram reply-quote routed to original sender CLI"
+                    );
+                    return RoutingDecision::Route(sender_agent_id);
+                }
+                _ => {
+                    // Original sender CLI is no longer alive — fall through
+                    // to the active-binding step (TC-TMC-5.2).
+                    tracing::info!(
+                        event = "routing_reply_quote_dead",
+                        dead_agent_id = %sender_agent_id,
+                        chat_id,
+                        reply_to = reply_id,
+                        "reply-quote original sender CLI no longer alive; falling through to active binding"
+                    );
+                }
+            }
+        }
+        // No tg_message_map row for this reply → treat as free text and
+        // fall through to step 4 (TC-TMC-5.3).
+    }
+
+    // ---- Step 4: active binding, else first_alive ---------------------
+    let binding: Option<String> = tx
+        .query_row(
+            "SELECT active_agent_id FROM active_cli_per_chat WHERE chat_id = ?1",
+            params![chat_id],
+            |row| row.get(0),
+        )
+        .ok();
+
+    if let Some(active_agent_id) = binding {
+        if active_agent_id.is_empty() {
+            // Corrupt binding row (TC-TMC-4.6) — empty agent_id never
+            // matches an alive row. Warn and fall through to first_alive.
+            tracing::warn!(
+                event = "routing_malformed_binding",
+                chat_id,
+                "active_cli_per_chat row has empty active_agent_id (malformed); falling through to first_alive"
+            );
+        } else {
+            match is_alive(tx, &active_agent_id) {
+                Ok(true) => {
+                    tracing::info!(
+                        event = "routing_active_binding",
+                        target_agent_id = %active_agent_id,
+                        chat_id,
+                        "telegram free-text routed to active chat binding"
+                    );
+                    return RoutingDecision::Route(active_agent_id);
+                }
+                _ => {
+                    tracing::info!(
+                        event = "routing_dead_binding",
+                        dead_agent_id = %active_agent_id,
+                        chat_id,
+                        "active binding CLI is dead; falling through to first_alive"
+                    );
+                }
+            }
+        }
+    }
+
+    // No binding (or dead/malformed binding) → first alive orchestrator,
+    // else any alive CLI. `thread`=None: chat-as-id routes across the
+    // whole registry, not just the per-thread subscribers.
+    match first_alive(tx, None, Some("orchestrator")) {
+        Ok(Some(row)) => {
+            tracing::info!(
+                event = "routing_first_alive",
+                target_agent_id = %row.agent_id,
+                matched_name = %row.agent_name,
+                chat_id,
+                "telegram free-text fell back to first_alive"
+            );
+            RoutingDecision::Route(row.agent_id)
+        }
+        _ => {
+            // ---- Step 5: no alive CLI anywhere ------------------------
+            tracing::info!(
+                event = "routing_no_target",
+                chat_id,
+                "no alive CLI to route to; replying with spawn hint"
+            );
+            RoutingDecision::NoTarget
+        }
+    }
+}
+
+/// The exact operator-facing reply when the routing tree resolves to
+/// `NoTarget` (Step 5). Byte-for-byte per PRD §19 FR-TMC-2.1 / TC-TMC-21.1
+/// — the backticks around `claudebase run` are literal.
+pub const NO_CLIS_ONLINE_REPLY: &str = "No CLIs online. Spawn one with `claudebase run`.";
 
 /// Result of one batch process — the highest `update_id` seen so the
 /// outer loop can advance the offset, plus the notification frames the
@@ -277,6 +517,12 @@ pub fn process_batch(
     let mut max_id: i64 = 0;
     let mut inserted: usize = 0;
     let mut notifications: Vec<(String, serde_json::Value)> = Vec::new();
+    // Step-5 "No CLIs online" replies accumulate here and are sent via the
+    // same post-commit teloxide path as pairing replies (telegram-multi-cli
+    // Slice 2 — routes through pair_replies because the long-poll loop
+    // already drains it with `bot.send_message`, and the OUTBOUND_TG global
+    // is not initialised in the sync test harness).
+    let mut pair_replies: Vec<(i64, String)> = Vec::new();
 
     for update in batch {
         if update.update_id > max_id {
@@ -292,6 +538,7 @@ pub fn process_batch(
             continue;
         }
 
+        let chat_id = msg.chat.id;
         let thread_id = format!("telegram:{}", msg.chat.id);
         let from_agent = match &msg.from.as_ref().and_then(|u| u.username.as_ref()) {
             Some(name) => format!("telegram:{name}"),
@@ -302,6 +549,30 @@ pub fn process_batch(
             (Some(text), _) => text.clone(),
             (None, Some(_)) => VOICE_SHIM_TEXT.to_string(),
             (None, None) => continue, // unsupported message type — skip but still advance offset
+        };
+
+        // telegram-multi-cli Slice 2 — run the 5-step chat-as-id routing
+        // tree (replaces the prior @-mention precursor). The decision is
+        // made against the open transaction snapshot so the tg_message_map
+        // / active_cli_per_chat / agent_registry reads are consistent with
+        // the same DB state this batch sees.
+        let reply_to_id = msg.reply_to_message.as_ref().map(|r| r.message_id);
+        let decision = resolve_routing_target(&tx, chat_id, &thread_id, &content, reply_to_id);
+
+        // Step 1: bot command — do NOT insert a chat row and do NOT notify
+        // any CLI. Dispatch to the Slice-3 stub and move on (offset still
+        // advanced above).
+        let target_agent_id: Option<String> = match decision {
+            RoutingDecision::BotCommand(cmd) => {
+                handle_bot_command(cmd, chat_id, &content);
+                continue;
+            }
+            RoutingDecision::Route(agent_id) => Some(agent_id),
+            RoutingDecision::NoTarget => {
+                // Step 5 — reply to the operator, route nothing.
+                pair_replies.push((chat_id, NO_CLIS_ONLINE_REPLY.to_string()));
+                continue;
+            }
         };
 
         // chat::insert_message but inside this transaction. We replicate
@@ -321,56 +592,6 @@ pub fn process_batch(
             params![id, thread_id, from_agent, content, Option::<String>::None, now],
         )?;
         inserted += 1;
-
-        // Slice 7 — @-mention routing per STRUCTURAL-7-1/3/4.
-        // Parse the first `@name` from the message; if it resolves to
-        // an alive agent in this thread (case-insensitive), tag the
-        // notification with `meta.target_agent_id` so the orchestrator
-        // (Mira in SDLC repo) can `SendMessage` the named agent. Multiple
-        // alive agents with same lowercased name → tiebreak by
-        // MAX(spawned_at) per UC-5-B (NOT last_pinged_at — list_alive's
-        // ordering is for Slice 7's display path, not routing).
-        let target_agent_id: Option<String> =
-            if let Some(mention) = extract_first_mention(&content) {
-                // Query agent_registry inside the open transaction so the
-                // routing decision is consistent with the same SQLite
-                // snapshot the message was just inserted under. rusqlite's
-                // Transaction Derefs to Connection, so auto-deref accepts
-                // `&tx` where `&Connection` is expected.
-                let alive = crate::daemon::agent_registry::list_alive(&tx, Some(&thread_id))
-                    .unwrap_or_default();
-                let mention_lower = mention.to_ascii_lowercase();
-                let target = alive
-                    .into_iter()
-                    .filter(|r| r.agent_name.to_ascii_lowercase() == mention_lower)
-                    .max_by_key(|r| r.spawned_at);
-                match target {
-                    Some(row) => {
-                        let case_diverged = row.agent_name != mention;
-                        tracing::info!(
-                            event = "routing",
-                            target_agent_id = %row.agent_id,
-                            mention = %mention,
-                            matched_name = %row.agent_name,
-                            thread = %thread_id,
-                            case_diverged = case_diverged,
-                            "telegram @-mention routed"
-                        );
-                        Some(row.agent_id)
-                    }
-                    None => {
-                        tracing::info!(
-                            event = "routing_unmatched",
-                            mention = %mention,
-                            thread = %thread_id,
-                            "telegram @-mention: no alive agent"
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
 
         // Build the notification we'll broadcast AFTER commit so a crash
         // between insert and broadcast doesn't deliver phantom messages.
@@ -412,7 +633,7 @@ pub fn process_batch(
         new_offset: Some(max_id),
         messages_inserted: inserted,
         notifications,
-        pair_replies: Vec::new(),
+        pair_replies,
         access_dirty: false,
     })
 }
@@ -504,6 +725,27 @@ pub fn process_batch_with_pairing(
             (None, None) => continue,
         };
 
+        // telegram-multi-cli Slice 2 — run the 5-step chat-as-id routing
+        // tree (replaces the prior @-mention precursor) BEFORE inserting,
+        // so bot commands and no-target messages short-circuit cleanly.
+        let reply_to_id = msg.reply_to_message.as_ref().map(|r| r.message_id);
+        let decision = resolve_routing_target(&tx, chat_id, &thread_id, &content, reply_to_id);
+        let target_agent_id: Option<String> = match decision {
+            RoutingDecision::BotCommand(cmd) => {
+                // Step 1 — dispatch to the Slice-3 stub; no chat row, no
+                // CLI notification (TC-TMC-8.4 / TC-TMC-12.3 leak guard).
+                handle_bot_command(cmd, chat_id, &content);
+                continue;
+            }
+            RoutingDecision::Route(agent_id) => Some(agent_id),
+            RoutingDecision::NoTarget => {
+                // Step 5 — reply with the spawn hint via the same teloxide
+                // send path as pairing replies; route nothing (TC-TMC-21.1).
+                pair_replies.push((chat_id, NO_CLIS_ONLINE_REPLY.to_string()));
+                continue;
+            }
+        };
+
         let id = uuid::Uuid::new_v4().to_string();
         let row_now = chrono_millis();
         tx.execute(
@@ -517,21 +759,6 @@ pub fn process_batch_with_pairing(
             params![id, thread_id, from_agent, content, Option::<String>::None, row_now],
         )?;
         inserted += 1;
-
-        // Slice 7 — @-mention routing (same as process_batch).
-        let target_agent_id: Option<String> =
-            if let Some(mention) = extract_first_mention(&content) {
-                let alive = crate::daemon::agent_registry::list_alive(&tx, Some(&thread_id))
-                    .unwrap_or_default();
-                let mention_lower = mention.to_ascii_lowercase();
-                let target = alive
-                    .into_iter()
-                    .filter(|r| r.agent_name.to_ascii_lowercase() == mention_lower)
-                    .max_by_key(|r| r.spawned_at);
-                target.map(|row| row.agent_id)
-            } else {
-                None
-            };
 
         // Slice 7.x — build the official-telegram-plugin-shaped meta so
         // Claude Code's channel surface parses chat_id / user / user_id /
@@ -1325,200 +1552,15 @@ mod tests {
         assert_eq!(target, Some("uuid-abc"));
     }
 
-    #[test]
-    fn process_batch_routes_at_mention_to_alive_agent_in_thread() {
-        use crate::daemon::agent_registry;
-        use crate::daemon::config::DmPolicy;
-        use crate::daemon::permissions::Access;
-        use rusqlite::Connection;
-
-        let mut conn = Connection::open_in_memory().unwrap();
-        chat::ensure_chat_db_schema(&conn).unwrap();
-        // Register one agent against the thread.
-        agent_registry::register(
-            &conn,
-            "planner-abc",
-            "planner",
-            "conn-x",
-            Some("telegram:42"),
-            None,
-        )
-        .unwrap();
-        let access = Access {
-            dm_policy: DmPolicy::Disabled,
-            allow_from: Vec::new(),
-            groups: serde_json::Map::new(),
-            pending: std::collections::BTreeMap::new(),
-        };
-        let batch = vec![Update {
-            update_id: 1,
-            message: Some(Message {
-                date: 0,
-                message_id: 1,
-                from: Some(User { id: 7, username: Some("u".into()) }),
-                chat: Chat { id: 42 },
-                text: Some("@planner thoughts?".into()),
-                voice: None,
-            }),
-        }];
-        let outcome = process_batch(&mut conn, &access, None, &batch).unwrap();
-        assert_eq!(outcome.notifications.len(), 1);
-        let frame = &outcome.notifications[0].1;
-        let target = frame.pointer("/params/meta/target_agent_id").and_then(|v| v.as_str());
-        assert_eq!(target, Some("planner-abc"));
-    }
-
-    #[test]
-    fn process_batch_case_insensitive_at_mention_match() {
-        use crate::daemon::agent_registry;
-        use crate::daemon::config::DmPolicy;
-        use crate::daemon::permissions::Access;
-        use rusqlite::Connection;
-
-        let mut conn = Connection::open_in_memory().unwrap();
-        chat::ensure_chat_db_schema(&conn).unwrap();
-        agent_registry::register(
-            &conn,
-            "planner-abc",
-            "planner",
-            "conn-x",
-            Some("telegram:42"),
-            None,
-        )
-        .unwrap();
-        let access = Access {
-            dm_policy: DmPolicy::Disabled,
-            allow_from: Vec::new(),
-            groups: serde_json::Map::new(),
-            pending: std::collections::BTreeMap::new(),
-        };
-        let batch = vec![Update {
-            update_id: 1,
-            message: Some(Message {
-                date: 0,
-                message_id: 1,
-                from: Some(User { id: 7, username: None }),
-                chat: Chat { id: 42 },
-                text: Some("@PLANNER ?".into()),
-                voice: None,
-            }),
-        }];
-        let outcome = process_batch(&mut conn, &access, None, &batch).unwrap();
-        let target = outcome.notifications[0]
-            .1
-            .pointer("/params/meta/target_agent_id")
-            .and_then(|v| v.as_str());
-        assert_eq!(target, Some("planner-abc"));
-    }
-
-    #[test]
-    fn process_batch_no_target_when_at_mention_unresolved() {
-        use crate::daemon::config::DmPolicy;
-        use crate::daemon::permissions::Access;
-        use rusqlite::Connection;
-
-        let mut conn = Connection::open_in_memory().unwrap();
-        chat::ensure_chat_db_schema(&conn).unwrap();
-        // No agent registered.
-        let access = Access {
-            dm_policy: DmPolicy::Disabled,
-            allow_from: Vec::new(),
-            groups: serde_json::Map::new(),
-            pending: std::collections::BTreeMap::new(),
-        };
-        let batch = vec![Update {
-            update_id: 1,
-            message: Some(Message {
-                date: 0,
-                message_id: 1,
-                from: Some(User { id: 7, username: None }),
-                chat: Chat { id: 42 },
-                text: Some("@ghost hello".into()),
-                voice: None,
-            }),
-        }];
-        let outcome = process_batch(&mut conn, &access, None, &batch).unwrap();
-        let frame = &outcome.notifications[0].1;
-        // STRUCTURAL-7-2: target_agent_id must be ABSENT inside meta when no alive agent matches.
-        let meta = frame
-            .pointer("/params/meta")
-            .and_then(|v| v.as_object())
-            .expect("params.meta must be present");
-        assert!(
-            !meta.contains_key("target_agent_id"),
-            "meta.target_agent_id MUST be absent when no alive agent matches the @-mention; got: {meta:?}"
-        );
-    }
-
-    #[test]
-    fn process_batch_routes_to_max_spawned_at_on_duplicate_name() {
-        use crate::daemon::agent_registry;
-        use crate::daemon::config::DmPolicy;
-        use crate::daemon::permissions::Access;
-        use rusqlite::Connection;
-
-        let mut conn = Connection::open_in_memory().unwrap();
-        chat::ensure_chat_db_schema(&conn).unwrap();
-        // Register TWO planner agents in DIFFERENT threads (unique-index
-        // bars two alive 'planner' in same thread) but BOTH visible to
-        // the routing lookup IF we widen — actually the unique index
-        // permits at most ONE alive 'planner' per thread, so to exercise
-        // the tiebreak we'd need different agent_ids with same name in
-        // different threads… but only one matches the inbound's thread.
-        //
-        // To exercise STRUCTURAL-7-3's max_by_key path we manually
-        // bypass the unique index by writing a second row with
-        // different agent_id but same (thread, name) via direct INSERT
-        // — the partial UNIQUE index allows BOTH only when at most one
-        // has state='alive'. Since we want both alive in the same
-        // thread, the index would block. TC-7.4's setup uses sequential
-        // registration where the earlier one transitions to orphaned —
-        // but the routing decision filters state='alive' so the orphan
-        // wouldn't compete.
-        //
-        // For unit testability the spec is: when list_alive returns
-        // multiple rows matching name (case-insensitive), pick
-        // MAX(spawned_at). Verify via list_alive contract directly:
-        agent_registry::register(
-            &conn,
-            "planner-old",
-            "planner",
-            "conn-x",
-            Some("telegram:42"),
-            None,
-        )
-        .unwrap();
-        let alive = agent_registry::list_alive(&conn, Some("telegram:42")).unwrap();
-        assert_eq!(alive.len(), 1);
-        // The max_by_key invariant is exercised in the real route by the
-        // .max_by_key(|r| r.spawned_at) call; in the single-row case it
-        // returns that row unchanged. Multi-row duplicate is bounded by
-        // the unique index in production; the test asserts the function
-        // is invoked correctly via the simpler single-row path.
-        let access = Access {
-            dm_policy: DmPolicy::Disabled,
-            allow_from: Vec::new(),
-            groups: serde_json::Map::new(),
-            pending: std::collections::BTreeMap::new(),
-        };
-        let batch = vec![Update {
-            update_id: 1,
-            message: Some(Message {
-                date: 0,
-                message_id: 1,
-                from: Some(User { id: 7, username: None }),
-                chat: Chat { id: 42 },
-                text: Some("@planner".into()),
-                voice: None,
-            }),
-        }];
-        let outcome = process_batch(&mut conn, &access, None, &batch).unwrap();
-        let target = outcome.notifications[0]
-            .1
-            .pointer("/params/meta/target_agent_id")
-            .and_then(|v| v.as_str());
-        assert_eq!(target, Some("planner-old"));
-    }
+    // NOTE: the four `process_batch_*_at_mention_*` tests that previously
+    // lived here (Slice 7 @-mention routing) were removed in
+    // telegram-multi-cli Slice 2. Under chat-as-id routing the @-mention
+    // text is deliberately IGNORED (PRD §19 FR-TMC-2.1 / TC-TMC-4.4) — the
+    // routing tree keys on the reply-quote link and the chat binding only.
+    // The `extract_first_mention` parser and its unit tests are retained
+    // (the function may still be useful for a future per-mention feature),
+    // but `process_batch` no longer calls it. The chat-as-id routing tree
+    // is covered by the `routing_*` tests below.
 
     #[test]
     fn redact_error_string_replaces_token_substr() {
@@ -1539,6 +1581,12 @@ mod tests {
         // In-memory DB so we don't touch the user's chat.db.
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
         chat::ensure_chat_db_schema(&conn).unwrap();
+        // telegram-multi-cli Slice 2: a free-text message only inserts a
+        // chat row when it ROUTES to a CLI. Seed an alive CLI so step 4
+        // resolves a target (without a target the routing tree replies
+        // with the step-5 "No CLIs online" hint and inserts nothing).
+        seed_agent(&conn, "cli-1-id", "mira");
+        seed_binding(&conn, 555, "mira", "cli-1-id");
 
         let mut access = Access::default();
         access.dm_policy = DmPolicy::Allowlist;
@@ -1556,6 +1604,7 @@ mod tests {
                 chat: Chat { id: 555 },
                 text: Some("hello".to_string()),
                 voice: None,
+                reply_to_message: None,
             }),
         }];
 
@@ -1586,6 +1635,7 @@ mod tests {
                 chat: Chat { id: 555 },
                 text: Some("hi".to_string()),
                 voice: None,
+                reply_to_message: None,
             }),
         }];
 
@@ -1599,6 +1649,10 @@ mod tests {
     fn process_batch_voice_uses_shim_text() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
         chat::ensure_chat_db_schema(&conn).unwrap();
+        // A voice note (shim text) still routes through the tree; seed an
+        // alive CLI so it resolves a target and the row is inserted.
+        seed_agent(&conn, "cli-1-id", "mira");
+        seed_binding(&conn, 555, "mira", "cli-1-id");
 
         let mut access = Access::default();
         access.dm_policy = DmPolicy::Allowlist;
@@ -1619,6 +1673,7 @@ mod tests {
                     file_id: "FID".to_string(),
                     duration: 10,
                 }),
+                reply_to_message: None,
             }),
         }];
 
@@ -1632,6 +1687,406 @@ mod tests {
             )
             .unwrap();
         assert_eq!(content, VOICE_SHIM_TEXT);
+    }
+
+    // ===================================================================
+    // telegram-multi-cli Slice 2 — 5-step chat-as-id routing tree.
+    // Covers TC-TMC-4.1..4.6, TC-TMC-5.1..5.6, TC-TMC-21.1.
+    // ===================================================================
+
+    /// Seed an alive agent row directly (bypasses the per-thread unique
+    /// index by leaving chat_thread_id NULL so multiple CLIs coexist —
+    /// chat-as-id routes across the whole registry, not per-thread).
+    fn seed_agent(conn: &Connection, agent_id: &str, name: &str) {
+        crate::daemon::agent_registry::register(conn, agent_id, name, "conn", None, None)
+            .unwrap();
+    }
+
+    /// Seed an `active_cli_per_chat` binding row.
+    fn seed_binding(conn: &Connection, chat_id: i64, name: &str, agent_id: &str) {
+        conn.execute(
+            "INSERT OR REPLACE INTO active_cli_per_chat \
+             (chat_id, active_cli_name, active_agent_id, set_at, set_by) \
+             VALUES (?1, ?2, ?3, 0, 'test')",
+            params![chat_id, name, agent_id],
+        )
+        .unwrap();
+    }
+
+    /// Seed a `tg_message_map` reply-quote row.
+    fn seed_msg_map(conn: &Connection, tg_msg_id: i64, chat_id: i64, sender_agent_id: &str) {
+        conn.execute(
+            "INSERT OR REPLACE INTO tg_message_map \
+             (tg_msg_id, chat_id, sender_agent_id, sent_at) \
+             VALUES (?1, ?2, ?3, 0)",
+            params![tg_msg_id, chat_id, sender_agent_id],
+        )
+        .unwrap();
+    }
+
+    /// Build a free-text inbound update for `chat_id`, optionally a reply.
+    fn text_update(update_id: i64, chat_id: i64, text: &str, reply_to: Option<i64>) -> Update {
+        Update {
+            update_id,
+            message: Some(Message {
+                date: 0,
+                message_id: 1000 + update_id,
+                from: Some(User { id: 7, username: Some("op".into()) }),
+                chat: Chat { id: chat_id },
+                text: Some(text.into()),
+                voice: None,
+                reply_to_message: reply_to.map(|id| ReplyToMessage { message_id: id }),
+            }),
+        }
+    }
+
+    fn allow_all_access() -> Access {
+        let mut a = Access::default();
+        a.dm_policy = DmPolicy::Disabled; // Disabled => check_allowed passes all (no allowlist gate in process_batch)
+        a
+    }
+
+    /// Pull `meta.target_agent_id` from the first notification, if present.
+    fn first_target(outcome: &BatchOutcome) -> Option<String> {
+        outcome
+            .notifications
+            .first()
+            .and_then(|(_t, f)| f.pointer("/params/meta/target_agent_id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }
+
+    // ---- match_bot_command unit coverage ------------------------------
+
+    #[test]
+    fn match_bot_command_recognises_all_seven() {
+        for cmd in ["/agents", "/switch", "/whoami", "/here", "/start", "/help", "/status"] {
+            assert_eq!(match_bot_command(cmd), Some(cmd), "cmd {cmd} not matched");
+        }
+    }
+
+    #[test]
+    fn match_bot_command_strips_botname_suffix() {
+        // UC-TMC-12-EC1 group-chat form.
+        assert_eq!(match_bot_command("/help@my_bot"), Some("/help"));
+        assert_eq!(match_bot_command("/switch@bot mira"), Some("/switch"));
+    }
+
+    #[test]
+    fn match_bot_command_ignores_args_and_free_text() {
+        assert_eq!(match_bot_command("/switch mira"), Some("/switch"));
+        assert_eq!(match_bot_command("hello world"), None);
+        assert_eq!(match_bot_command("/unknown"), None);
+        assert_eq!(match_bot_command(""), None);
+        assert_eq!(match_bot_command("not /agents"), None); // slash not first token
+    }
+
+    // ---- TC-TMC-4.1: bound chat routes to its CLI ---------------------
+
+    #[test]
+    fn routing_bound_chat_reaches_cli1() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+        seed_agent(&conn, "cli-2-id", "worker");
+        seed_binding(&conn, 111, "mira", "cli-1-id");
+
+        let access = allow_all_access();
+        let batch = vec![text_update(1, 111, "hello", None)];
+        let outcome = process_batch(&mut conn, &access, None, &batch).unwrap();
+
+        assert_eq!(first_target(&outcome).as_deref(), Some("cli-1-id"));
+        assert_eq!(outcome.notifications.len(), 1);
+        // The other CLI must NOT be a target.
+        assert_ne!(first_target(&outcome).as_deref(), Some("cli-2-id"));
+    }
+
+    // ---- TC-TMC-4.2: chat A vs chat B isolation -----------------------
+
+    #[test]
+    fn routing_chat_isolation_222_to_cli2() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+        seed_agent(&conn, "cli-2-id", "worker");
+        seed_binding(&conn, 111, "mira", "cli-1-id");
+        seed_binding(&conn, 222, "worker", "cli-2-id");
+
+        let access = allow_all_access();
+        // Message on chat 222 must reach CLI-2 and NEVER chat-A's binding.
+        let outcome =
+            process_batch(&mut conn, &access, None, &[text_update(1, 222, "hi", None)]).unwrap();
+        assert_eq!(first_target(&outcome).as_deref(), Some("cli-2-id"));
+        assert_ne!(first_target(&outcome).as_deref(), Some("cli-1-id"));
+
+        // And a message on chat 111 reaches CLI-1 — planted chat-B binding
+        // never reached from chat-A.
+        let outcome2 =
+            process_batch(&mut conn, &access, None, &[text_update(2, 111, "hi", None)]).unwrap();
+        assert_eq!(first_target(&outcome2).as_deref(), Some("cli-1-id"));
+    }
+
+    // ---- TC-TMC-4.3: unbound chat falls to first_alive ----------------
+
+    #[test]
+    fn routing_unbound_chat_falls_to_first_alive() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+        seed_agent(&conn, "cli-2-id", "worker");
+        seed_agent(&conn, "orch-id", "orchestrator-main");
+        seed_binding(&conn, 111, "mira", "cli-1-id");
+        seed_binding(&conn, 222, "worker", "cli-2-id");
+
+        // chat 333 has NO binding → first_alive(prefer_role="orchestrator").
+        let access = allow_all_access();
+        let outcome =
+            process_batch(&mut conn, &access, None, &[text_update(1, 333, "hey", None)]).unwrap();
+        assert_eq!(first_target(&outcome).as_deref(), Some("orch-id"));
+        // Routing must NOT create a binding row for 333.
+        let cnt: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM active_cli_per_chat WHERE chat_id=333",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cnt, 0);
+    }
+
+    // ---- TC-TMC-4.4: @-mention ignored under chat-as-id ---------------
+
+    #[test]
+    fn routing_at_mention_ignored_under_chat_as_id() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+        // An agent literally named "ghost" exists, but the @ghost mention
+        // must NOT route there — the active binding wins.
+        seed_agent(&conn, "ghost-id", "ghost");
+        seed_binding(&conn, 111, "mira", "cli-1-id");
+
+        let access = allow_all_access();
+        let outcome = process_batch(
+            &mut conn,
+            &access,
+            None,
+            &[text_update(1, 111, "@ghost what's up?", None)],
+        )
+        .unwrap();
+        // Routes to the binding (cli-1-id), NOT to the @-mentioned ghost.
+        assert_eq!(first_target(&outcome).as_deref(), Some("cli-1-id"));
+        assert_ne!(first_target(&outcome).as_deref(), Some("ghost-id"));
+    }
+
+    // ---- TC-TMC-4.5: dead binding falls to first_alive ----------------
+
+    #[test]
+    fn routing_dead_binding_falls_to_first_alive() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        // Binding points at a CLI that is NOT in agent_registry (dead).
+        seed_binding(&conn, 111, "dead", "cli-dead-id");
+        seed_agent(&conn, "cli-2-id", "worker");
+
+        let access = allow_all_access();
+        let outcome =
+            process_batch(&mut conn, &access, None, &[text_update(1, 111, "hi", None)]).unwrap();
+        // is_alive("cli-dead-id") = false → fall through → first_alive →
+        // only alive CLI is cli-2-id.
+        assert_eq!(first_target(&outcome).as_deref(), Some("cli-2-id"));
+    }
+
+    // ---- TC-TMC-4.6: malformed (empty agent_id) binding ---------------
+
+    #[test]
+    fn routing_malformed_empty_agent_id_warning() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_binding(&conn, 111, "corrupt", ""); // empty active_agent_id
+        seed_agent(&conn, "cli-2-id", "worker");
+
+        let access = allow_all_access();
+        let outcome =
+            process_batch(&mut conn, &access, None, &[text_update(1, 111, "hi", None)]).unwrap();
+        // Empty agent_id never matches is_alive → first_alive fallback.
+        assert_eq!(first_target(&outcome).as_deref(), Some("cli-2-id"));
+    }
+
+    // ---- TC-TMC-21.1: step 5 — no alive CLI, exact reply text ---------
+
+    #[test]
+    fn routing_no_alive_cli_step5_reply() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        // agent_registry empty → no alive CLI anywhere.
+
+        let access = allow_all_access();
+        let outcome =
+            process_batch(&mut conn, &access, None, &[text_update(1, 777, "anyone?", None)]).unwrap();
+
+        // No channel notification published.
+        assert_eq!(outcome.notifications.len(), 0);
+        // Exactly one outbound reply with the EXACT spec text.
+        assert_eq!(outcome.pair_replies.len(), 1);
+        assert_eq!(outcome.pair_replies[0].0, 777);
+        assert_eq!(
+            outcome.pair_replies[0].1,
+            "No CLIs online. Spawn one with `claudebase run`."
+        );
+        // No chat_messages row inserted for the step-5 case.
+        assert_eq!(outcome.messages_inserted, 0);
+    }
+
+    // ---- TC-TMC-5.1: reply-quote routes to original sender ------------
+
+    #[test]
+    fn reply_quote_routes_to_originating_cli() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+        seed_agent(&conn, "cli-2-id", "worker");
+        seed_binding(&conn, 111, "worker", "cli-2-id"); // active binding is CLI-2
+        seed_msg_map(&conn, 9001, 111, "cli-1-id"); // but msg 9001 was sent by CLI-1
+
+        let access = allow_all_access();
+        let outcome = process_batch(
+            &mut conn,
+            &access,
+            None,
+            &[text_update(1, 111, "reply text", Some(9001))],
+        )
+        .unwrap();
+        // Reply-quote (step 2) wins over the active binding (step 4).
+        assert_eq!(first_target(&outcome).as_deref(), Some("cli-1-id"));
+    }
+
+    // ---- TC-TMC-5.2: reply-quote to dead CLI → fallback + log ---------
+
+    #[test]
+    fn reply_quote_dead_cli_fallback() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        // msg 9001 was sent by a CLI that is now dead (not in registry).
+        seed_msg_map(&conn, 9001, 111, "cli-dead-id");
+        seed_agent(&conn, "cli-2-id", "worker");
+        seed_binding(&conn, 111, "worker", "cli-2-id");
+
+        let access = allow_all_access();
+        let outcome = process_batch(
+            &mut conn,
+            &access,
+            None,
+            &[text_update(1, 111, "reply", Some(9001))],
+        )
+        .unwrap();
+        // Dead sender → fall through to active binding (cli-2-id).
+        assert_eq!(first_target(&outcome).as_deref(), Some("cli-2-id"));
+    }
+
+    // ---- TC-TMC-5.3: reply-quote unknown msg → falls to binding -------
+
+    #[test]
+    fn reply_quote_unknown_msg_falls_to_binding() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+        seed_binding(&conn, 111, "mira", "cli-1-id");
+        // No tg_message_map row for msg 8000.
+
+        let access = allow_all_access();
+        let outcome = process_batch(
+            &mut conn,
+            &access,
+            None,
+            &[text_update(1, 111, "reply", Some(8000))],
+        )
+        .unwrap();
+        // No map row → behave like free text → active binding.
+        assert_eq!(first_target(&outcome).as_deref(), Some("cli-1-id"));
+    }
+
+    // ---- TC-TMC-5.5: reply-quote chat isolation -----------------------
+
+    #[test]
+    fn reply_quote_chat_isolation() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+        seed_agent(&conn, "cli-2-id", "worker");
+        // msg 9002 sent by CLI-2 in chat 222 only.
+        seed_msg_map(&conn, 9002, 222, "cli-2-id");
+        seed_binding(&conn, 111, "mira", "cli-1-id");
+
+        let access = allow_all_access();
+        // Reply to 9002 on chat 222 routes to CLI-2; CLI-1 (chat 111) untouched.
+        let outcome = process_batch(
+            &mut conn,
+            &access,
+            None,
+            &[text_update(1, 222, "r", Some(9002))],
+        )
+        .unwrap();
+        assert_eq!(first_target(&outcome).as_deref(), Some("cli-2-id"));
+        assert_ne!(first_target(&outcome).as_deref(), Some("cli-1-id"));
+
+        // The SAME reply_to id 9002 but on the WRONG chat (111) must NOT
+        // match the chat-222 map row (composite PK keys on chat_id).
+        let outcome2 = process_batch(
+            &mut conn,
+            &access,
+            None,
+            &[text_update(2, 111, "r", Some(9002))],
+        )
+        .unwrap();
+        // Falls through to chat-111's binding (cli-1-id), not cli-2-id.
+        assert_eq!(first_target(&outcome2).as_deref(), Some("cli-1-id"));
+    }
+
+    // ---- TC-TMC-5.6: reply-quote overrides active binding -------------
+
+    #[test]
+    fn reply_quote_overrides_active_binding() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+        seed_agent(&conn, "cli-2-id", "worker");
+        // CLI-1 is the active binding, but operator reply-quotes CLI-2's msg.
+        seed_binding(&conn, 111, "mira", "cli-1-id");
+        seed_msg_map(&conn, 9002, 111, "cli-2-id");
+
+        let access = allow_all_access();
+        let outcome = process_batch(
+            &mut conn,
+            &access,
+            None,
+            &[text_update(1, 111, "to worker", Some(9002))],
+        )
+        .unwrap();
+        // Routes to CLI-2 (the quoted sender), NOT the active binding CLI-1.
+        assert_eq!(first_target(&outcome).as_deref(), Some("cli-2-id"));
+    }
+
+    // ---- bot command short-circuits routing (no CLI notification) -----
+
+    #[test]
+    fn routing_bot_command_no_cli_notification() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+        seed_binding(&conn, 111, "mira", "cli-1-id");
+
+        let access = allow_all_access();
+        let outcome =
+            process_batch(&mut conn, &access, None, &[text_update(1, 111, "/agents", None)])
+                .unwrap();
+        // Step 1: bot command → no channel notification, no chat row, no
+        // step-5 reply.
+        assert_eq!(outcome.notifications.len(), 0);
+        assert_eq!(outcome.messages_inserted, 0);
+        assert_eq!(outcome.pair_replies.len(), 0);
+        // Offset still advanced.
+        assert_eq!(outcome.new_offset, Some(1));
     }
 
     #[test]

@@ -46,7 +46,7 @@
 use clap::Parser;
 
 use claudebase::cli::{self, Cli, Command};
-use claudebase::{encoder, ingest, migrations, output, pdf, search, store};
+use claudebase::{encoder, ingest, migrations, output, pdf, registry, search, store};
 
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
@@ -74,6 +74,7 @@ fn main() -> std::process::ExitCode {
             cli::InsightSubcommand::Get(g) => g.project_root.as_deref(),
             cli::InsightSubcommand::Gc(g) => g.project_root.as_deref(),
             cli::InsightSubcommand::Delete(d) => d.project_root.as_deref(),
+            cli::InsightSubcommand::Tags(t) => t.project_root.as_deref(),
         },
         // Daemon / Plugin do NOT operate on a project filesystem — they
         // own a runtime-dir-scoped socket and chat.db under ~/.claude/.
@@ -119,6 +120,7 @@ fn main() -> std::process::ExitCode {
             cli::InsightSubcommand::Get(a) => run_insight_get(&root, &a),
             cli::InsightSubcommand::Gc(a) => run_insight_gc(&root, &a),
             cli::InsightSubcommand::Delete(a) => run_insight_delete(&root, &a),
+            cli::InsightSubcommand::Tags(a) => run_insight_tags(&root, &a),
         },
         Command::Daemon(args) => match args.sub {
             cli::DaemonSubcommand::Serve(serve_args) => run_daemon_serve(&serve_args),
@@ -160,6 +162,18 @@ fn main() -> std::process::ExitCode {
 /// every session boot — no extra plumbing required here.
 fn run_claude_with_preset(args: &cli::RunArgs) -> std::process::ExitCode {
     use std::ffi::OsString;
+
+    // FR-IHC-6.1..6.6 — record this project in the registry BEFORE exec.
+    // Must happen BEFORE the unix `exec()` below (exec replaces the process
+    // image; any code after it never runs). Non-fatal: a registry failure
+    // logs to stderr but does NOT block the operator's `claude` session —
+    // the registry is a convenience layer for later `--project <slug>`
+    // lookups, not a correctness requirement for `claudebase run`.
+    let cwd = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    if let Err(e) = registry::upsert_project(&cwd) {
+        eprintln!("claudebase run: registry upsert failed (non-fatal): {e}");
+    }
 
     let claude_path = match which("claude") {
         Some(p) => p,
@@ -936,6 +950,31 @@ fn run_insight_create(
         return std::process::ExitCode::from(2);
     }
 
+    // 2b) Normalize + validate tags (business-logic gate, NOT clap-level).
+    // Each tag: strip a single leading `#`, lowercase, trim; drop empties;
+    // dedupe preserving first-seen order. At least one tag must survive — the
+    // empty check fires BEFORE any db open (TC-IHC-3.1/3.2/3.3) so a tagless
+    // create never writes.
+    let normalized_tags: Vec<String> = {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for raw in &args.tags {
+            let stripped = raw.strip_prefix('#').unwrap_or(raw);
+            let norm = stripped.trim().to_lowercase();
+            if norm.is_empty() {
+                continue;
+            }
+            if seen.insert(norm.clone()) {
+                out.push(norm);
+            }
+        }
+        out
+    };
+    if normalized_tags.is_empty() {
+        eprintln!("error: insight create requires at least one --tag");
+        return std::process::ExitCode::from(2);
+    }
+
     // 3) Compute sha256(body) for dedup + synthesize the source_path.
     //
     // source_path shape: `agent:{agent}:{session}:{feature}:{sha[..16]}`.
@@ -970,11 +1009,53 @@ fn run_insight_create(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    // 4) Open insights.db (default — caller may override via --db-name).
-    let (mut conn, _db_path) = match open_and_validate(root, &args.db_name) {
-        Ok(t) => t,
-        Err(code) => return code,
+    // 4) Resolve category-based routing + the project_slug column value.
+    //
+    // SECURITY (insights-base doc#22, security-auditor caller-trust contract):
+    // `--category` is the SOLE selector of which db the write lands in.
+    // `--project <slug>` is DATA — it only ever becomes the `project_slug`
+    // TEXT column value. It is NEVER `PathBuf::from`'d, never joined into any
+    // path, never used in a filesystem operation. The global db path is the
+    // fixed `$HOME`-rooted constant returned by `resolve_global_insights_db()`
+    // and is passed to `open_and_validate_at` VERBATIM — no user-input
+    // component is joined in before the open.
+    let (mut conn, project_slug): (rusqlite::Connection, Option<String>) = match args.category {
+        cli::InsightCategory::General => {
+            // GLOBAL db — fixed HOME-rooted path, zero user input. `--project`
+            // is silently ignored for general (project_slug stays NULL).
+            let global_path = match store::resolve_global_insights_db() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return std::process::ExitCode::from(1);
+                }
+            };
+            match open_and_validate_at(&global_path) {
+                Ok(c) => (c, None),
+                Err(code) => return code,
+            }
+        }
+        cli::InsightCategory::Project => {
+            // LOCAL (per-project) db — the existing root-relative open path.
+            // project_slug defaults to the cwd-project basename, overridden by
+            // an explicit `--project <slug>` (stored as data, never a path).
+            let (conn, _db_path) = match open_and_validate(root, &args.db_name) {
+                Ok(t) => t,
+                Err(code) => return code,
+            };
+            let slug = args
+                .project
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| {
+                    root.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_string())
+                });
+            (conn, slug)
+        }
     };
+    let category_str = args.category.as_str();
 
     // 5a) Exact-sha dedup probe — same agent, same sha, within last 30d.
     const DEDUP_WINDOW_SECS: i64 = 30 * 86400;
@@ -1086,6 +1167,35 @@ fn run_insight_create(
                 return std::process::ExitCode::from(1);
             }
         };
+        // v5 columns: stamp category + project_slug on the freshly-upserted
+        // row. project_slug is the cwd-basename or `--project` value (Project)
+        // or NULL (General). Both are bound as parameters — never interpolated.
+        if let Err(e) = tx.execute(
+            "UPDATE documents SET category = ?1, project_slug = ?2 WHERE id = ?3",
+            rusqlite::params![category_str, project_slug, id],
+        ) {
+            eprintln!("error: failed to set insight category/project_slug: {e}");
+            return std::process::ExitCode::from(1);
+        }
+        // v5 insight_tags: one row per normalized tag. INSERT OR IGNORE makes
+        // the (doc_id, tag) UNIQUE constraint idempotent across re-upserts.
+        {
+            let mut stmt = match tx
+                .prepare("INSERT OR IGNORE INTO insight_tags (doc_id, tag) VALUES (?1, ?2)")
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: failed to prepare insight_tags insert: {e}");
+                    return std::process::ExitCode::from(1);
+                }
+            };
+            for tag in &normalized_tags {
+                if let Err(e) = stmt.execute(rusqlite::params![id, tag]) {
+                    eprintln!("error: failed to insert insight tag: {e}");
+                    return std::process::ExitCode::from(1);
+                }
+            }
+        }
         let chunk_refs: Vec<(usize, &str, Option<i64>, Option<i64>)> = chunks
             .iter()
             .map(|c| (c.ord, c.text.as_str(), c.page_start, c.page_end))
@@ -1135,6 +1245,211 @@ fn run_insight_create(
     std::process::ExitCode::SUCCESS
 }
 
+/// Which insight-db legs a dual-db read should open. Produced by
+/// [`open_insight_dbs`] after resolving `--general-only` / `--project-only` /
+/// `--project <slug>` / `--category` into a concrete `(local, global)` pair.
+///
+/// Either leg may be `None`:
+///   - `local = None`  → `--general-only` (or `--category general`): global only.
+///   - `global = None` → `--project-only` (or `--category project`): local only.
+///   - both present    → default merge.
+///   - both `None`     → never produced (a flag conflict exits before this).
+struct InsightDbLegs {
+    local: Option<rusqlite::Connection>,
+    global: Option<rusqlite::Connection>,
+}
+
+/// Resolve which insight dbs to open for a dual-db read.
+///
+/// Posture (Slice 5, FR-IHC-5.1..5.6):
+///   - `--general-only` + `--project-only` → exit 2 (mutually exclusive).
+///   - `--general-only` (or `--category general`) → global db only.
+///   - `--project-only` (or `--category project`) → cwd-local db only.
+///   - `--project <slug>` → registry-resolved project db (replaces cwd-local)
+///     + global db. Unknown slug → exit 1. `--project` overrides `--category`.
+///   - default → cwd-local db + global db.
+///
+/// CORRUPT/MISSING GLOBAL DB (TC-IHC-7.6, per F-3 resolution): a failure to
+/// open the global db is NON-FATAL — it emits `warning: global insights db
+/// unavailable: ...; returning local results only` to stderr and continues
+/// with `global = None`. This mirrors the established one-corpus-failure
+/// tolerance of the books+insights `--corpus all` path (main.rs
+/// `run_one_corpus_for_fusion`) and keeps cold-start (global db not yet
+/// created) working. Note: `open_and_validate_at` CREATES a fresh global db on
+/// first touch, so "missing" almost always self-heals; a genuine corruption
+/// is the only real failure path here.
+///
+/// SECURITY (insights-base doc#22 caller-trust contract): the global path is
+/// the fixed `$HOME`-rooted constant from `resolve_global_insights_db()`; the
+/// `--project` path comes from the trusted registry via
+/// `resolve_registry_project_db`. Neither joins raw CLI input into a path
+/// before `open_and_validate_at`. The cwd-local path is `open_and_validate`'s
+/// already-gated root-relative resolution.
+fn open_insight_dbs(
+    root: &std::path::Path,
+    db_name: &str,
+    project_slug: Option<&str>,
+    category: Option<cli::InsightCategory>,
+    general_only: bool,
+    project_only: bool,
+) -> Result<InsightDbLegs, std::process::ExitCode> {
+    if general_only && project_only {
+        eprintln!("error: --general-only and --project-only are mutually exclusive");
+        return Err(std::process::ExitCode::from(2));
+    }
+
+    // `--general-only` / `--category general` collapse to global-only;
+    // `--project-only` / `--category project` collapse to local-only.
+    let want_local =
+        !general_only && category != Some(cli::InsightCategory::General);
+    let want_global =
+        !project_only && category != Some(cli::InsightCategory::Project);
+
+    // Open the global leg first (non-fatal on failure) when wanted.
+    let global = if want_global {
+        match store::resolve_global_insights_db() {
+            Ok(path) => match open_and_validate_at(&path) {
+                Ok(c) => Some(c),
+                Err(_) => {
+                    // open_and_validate_at already printed a diagnostic; add the
+                    // local-fallback note so the operator understands the result
+                    // set is incomplete rather than empty-because-no-data.
+                    eprintln!(
+                        "warning: global insights db unavailable; returning local results only"
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "warning: global insights db unavailable: {e}; returning local results only"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Open the local/project leg when wanted. Unknown --project slug is a HARD
+    // exit 1 (the user named a project that does not exist — not graceful).
+    let local = if want_local {
+        if let Some(slug) = project_slug {
+            let project_db = match resolve_registry_project_db(slug, db_name) {
+                Ok(p) => p,
+                Err(code) => return Err(code),
+            };
+            match open_and_validate_at(&project_db) {
+                Ok(c) => Some(c),
+                Err(code) => return Err(code),
+            }
+        } else {
+            match open_and_validate(root, db_name) {
+                Ok((c, _)) => Some(c),
+                Err(code) => return Err(code),
+            }
+        }
+    } else {
+        None
+    };
+
+    Ok(InsightDbLegs { local, global })
+}
+
+/// Run the configured search mode over one connection and return the raw
+/// `Vec<SearchHit>`. Mirrors the mode-dispatch + encoder-fallback used by the
+/// single-db `run_insight_search`, factored out so each dual-db leg shares it.
+fn search_one_insight_leg(
+    conn: &rusqlite::Connection,
+    query: &str,
+    mode: cli::SearchMode,
+    fetch_top_k: u32,
+    context_radius: u32,
+) -> Result<Vec<search::SearchHit>, std::process::ExitCode> {
+    let hits_result = match mode {
+        cli::SearchMode::Lexical => search::search(conn, query, fetch_top_k, context_radius),
+        cli::SearchMode::Dense | cli::SearchMode::Hybrid => match encoder::encode_query(query) {
+            Ok(emb) => match mode {
+                cli::SearchMode::Dense => search::dense_search(conn, &emb, fetch_top_k),
+                cli::SearchMode::Hybrid => search::hybrid_search(conn, query, &emb, fetch_top_k),
+                cli::SearchMode::Lexical => unreachable!(),
+            },
+            Err(e) => {
+                eprintln!(
+                    "warning: encoder unavailable ({e}); falling back to lexical mode. Run `bash install.sh --yes` to install the e5-multilingual-small model."
+                );
+                search::search(conn, query, fetch_top_k, context_radius)
+            }
+        },
+    };
+    match hits_result {
+        Ok(h) => Ok(h),
+        Err(search::SearchError::FtsSyntax(msg)) => {
+            eprintln!("error: invalid search query: {msg}");
+            Err(std::process::ExitCode::from(1))
+        }
+        Err(search::SearchError::Db(e)) => {
+            eprintln!("warning: vector search failed ({e}); falling back to lexical mode.");
+            match search::search(conn, query, fetch_top_k, context_radius) {
+                Ok(h) => Ok(h),
+                Err(e2) => {
+                    eprintln!("error: search failed: {e2}");
+                    Err(std::process::ExitCode::from(1))
+                }
+            }
+        }
+    }
+}
+
+/// Build the set of `doc_id`s in one db whose `insight_tags` carry ANY of the
+/// requested tags (OR / any-intersection semantics, operator decision
+/// 2026-05-27). Returns `None` when `tags` is empty (no tag filter → keep all).
+///
+/// SQL DISCIPLINE: one bound `?` placeholder per tag value — NO `format!`
+/// interpolation of tag strings into the query. Only the placeholder COUNT is
+/// formatted (it is derived from `tags.len()`, never from user content), so no
+/// user data reaches the SQL text.
+fn tag_filter_doc_ids(
+    conn: &rusqlite::Connection,
+    tags: &[String],
+) -> Option<std::collections::HashSet<i64>> {
+    if tags.is_empty() {
+        return None;
+    }
+    // Build "?,?,?" with exactly tags.len() placeholders — count only, no data.
+    let placeholders = std::iter::repeat("?")
+        .take(tags.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT DISTINCT doc_id FROM insight_tags WHERE tag IN ({placeholders})"
+    );
+    let mut set = std::collections::HashSet::new();
+    let params: Vec<&dyn rusqlite::ToSql> =
+        tags.iter().map(|t| t as &dyn rusqlite::ToSql).collect();
+    match conn.prepare(&sql) {
+        Ok(mut stmt) => {
+            if let Ok(rows) = stmt.query_map(params.as_slice(), |r| r.get::<_, i64>(0)) {
+                for id in rows.flatten() {
+                    set.insert(id);
+                }
+            }
+        }
+        Err(e) => {
+            // Surface a diagnostic so an operator whose insight_tags table is
+            // absent (partial migration, corrupt db) doesn't see silently empty
+            // results with no indication of why. Returning Some(empty_set) here
+            // would drop every candidate hit at the caller's retain() — that
+            // is the silent-failure mode code-reviewer (Gate 2) flagged.
+            eprintln!(
+                "warning: tag filter SQL prepare failed ({e}); returning no \
+                 tag-matched hits — verify insight_tags table exists"
+            );
+        }
+    }
+    Some(set)
+}
+
 /// `insight search "<query>"` — hybrid retrieval against the insights
 /// corpus. Reuses the existing search dispatch (lexical / dense / hybrid +
 /// auto-fallback) but pins `--db-name insights.db` so books-corpus rows
@@ -1145,16 +1460,26 @@ fn run_insight_create(
 /// drop hits whose document doesn't match the filter set. The metadata
 /// lookups are cached per `doc_id` so multi-chunk hits from the same
 /// document share a single SQL query.
+///
+/// Slice 5 (insights-hybrid-corpus): dual-db read path. By default this opens
+/// BOTH the cwd-local insights db and the global db, runs the search on each,
+/// tags hits `source_corpus = "local" | "general"`, and fuses via
+/// [`search::rrf_fuse_hits`] keyed on `(source_corpus, chunk_id)`. The
+/// `--general-only` / `--project-only` / `--project <slug>` / `--category`
+/// flags select which legs participate. The `--tag` filter (repeatable, OR
+/// semantics) is applied per-leg BEFORE fusion to preserve `top_k`.
 fn run_insight_search(
     root: &std::path::Path,
     args: &cli::InsightSearchArgs,
 ) -> std::process::ExitCode {
     let user_top_k = args.top_k.max(1) as u32;
-    let has_filters = args.kind.is_some()
+    let has_metadata_filters = args.kind.is_some()
         || args.agent.is_some()
         || args.salience.is_some()
         || args.feature.is_some()
         || args.since.is_some();
+    let has_tag_filter = !args.tag.is_empty();
+    let has_filters = has_metadata_filters || has_tag_filter;
     // Over-fetch only when filters are present — otherwise the behavior is
     // byte-identical to pre-Slice-4 (user_top_k passed straight through).
     let fetch_top_k = if has_filters {
@@ -1163,13 +1488,8 @@ fn run_insight_search(
         user_top_k
     };
     let context_radius = args.context as u32;
-    let (conn, _db_path) = match open_and_validate(root, &args.db_name) {
-        Ok(t) => t,
-        Err(code) => return code,
-    };
 
-    // Parse --since up-front so a bad value exits 2 before opening the DB
-    // wastes time on a doomed search.
+    // Parse --since up-front so a bad value exits 2 before opening any DB.
     let since_cutoff: Option<i64> = match args.since.as_deref() {
         Some(s) => match cli::parse_since(s) {
             Ok(seconds) => {
@@ -1187,63 +1507,75 @@ fn run_insight_search(
         },
         None => None,
     };
-    let hits_result = match args.mode {
-        cli::SearchMode::Lexical => search::search(&conn, &args.query, fetch_top_k, context_radius),
-        cli::SearchMode::Dense | cli::SearchMode::Hybrid => {
-            match encoder::encode_query(&args.query) {
-                Ok(emb) => match args.mode {
-                    cli::SearchMode::Dense => search::dense_search(&conn, &emb, fetch_top_k),
-                    cli::SearchMode::Hybrid => {
-                        search::hybrid_search(&conn, &args.query, &emb, fetch_top_k)
-                    }
-                    cli::SearchMode::Lexical => unreachable!(),
-                },
-                Err(e) => {
-                    eprintln!(
-                        "warning: encoder unavailable ({e}); falling back to lexical mode. Run `bash install.sh --yes` to install the e5-multilingual-small model."
-                    );
-                    search::search(&conn, &args.query, fetch_top_k, context_radius)
-                }
-            }
-        }
-    };
-    // Vector-search failures fall back to lexical with a stderr warning —
-    // same UX as the standalone `search` subcommand.
-    let raw_hits = match hits_result {
-        Ok(h) => h,
-        Err(search::SearchError::FtsSyntax(msg)) => {
-            eprintln!("error: invalid search query: {msg}");
-            return std::process::ExitCode::from(1);
-        }
-        Err(search::SearchError::Db(e)) => {
-            eprintln!(
-                "warning: vector search failed ({e}); falling back to lexical mode."
-            );
-            match search::search(&conn, &args.query, fetch_top_k, context_radius) {
-                Ok(h) => h,
-                Err(e2) => {
-                    eprintln!("error: search failed: {e2}");
-                    return std::process::ExitCode::from(1);
-                }
-            }
-        }
+
+    // Resolve which db legs participate (default = local + global).
+    let legs = match open_insight_dbs(
+        root,
+        &args.db_name,
+        args.project.as_deref(),
+        args.category,
+        args.general_only,
+        args.project_only,
+    ) {
+        Ok(l) => l,
+        Err(code) => return code,
     };
 
-    // Post-filter via per-doc_id metadata lookup with a tiny cache.
-    let hits = if has_filters {
-        filter_insight_hits(
-            &conn,
-            raw_hits,
-            args.kind.as_deref(),
-            args.agent.as_deref(),
-            args.salience.as_ref().map(|s| s.as_str()),
-            args.feature.as_deref(),
-            since_cutoff,
-            user_top_k as usize,
-        )
-    } else {
-        raw_hits
+    // Run search + per-leg filters on each active connection, tagging hits
+    // with their corpus label so rrf_fuse_hits keys identity correctly.
+    let run_leg =
+        |conn: &rusqlite::Connection, label: &str| -> Result<Vec<search::SearchHit>, std::process::ExitCode> {
+            let raw = search_one_insight_leg(
+                conn,
+                &args.query,
+                args.mode,
+                fetch_top_k,
+                context_radius,
+            )?;
+            // Tag filter (OR semantics) — bound params, no interpolation.
+            let tag_ids = tag_filter_doc_ids(conn, &args.tag);
+            let mut filtered = if has_metadata_filters {
+                filter_insight_hits(
+                    conn,
+                    raw,
+                    args.kind.as_deref(),
+                    args.agent.as_deref(),
+                    args.salience.as_ref().map(|s| s.as_str()),
+                    args.feature.as_deref(),
+                    since_cutoff,
+                    user_top_k as usize,
+                )
+            } else {
+                raw
+            };
+            if let Some(ids) = tag_ids {
+                filtered.retain(|h| ids.contains(&h.doc_id));
+            }
+            // Tag each surviving hit with the leg label.
+            for h in &mut filtered {
+                h.source_corpus = Some(label.to_string());
+            }
+            Ok(filtered)
+        };
+
+    let local_hits = match legs.local.as_ref() {
+        Some(c) => match run_leg(c, "local") {
+            Ok(h) => h,
+            Err(code) => return code,
+        },
+        None => Vec::new(),
     };
+    let global_hits = match legs.global.as_ref() {
+        Some(c) => match run_leg(c, "general") {
+            Ok(h) => h,
+            Err(code) => return code,
+        },
+        None => Vec::new(),
+    };
+
+    // Fuse the two legs keyed on (source_corpus, chunk_id) so a local chunk and
+    // a global chunk with the same chunk_id stay distinct.
+    let hits = search::rrf_fuse_hits(local_hits, global_hits, user_top_k as usize);
 
     if args.json {
         println!("{}", output::render_search_json(&hits));
@@ -1316,38 +1648,67 @@ fn run_insight_list(
     root: &std::path::Path,
     args: &cli::InsightListArgs,
 ) -> std::process::ExitCode {
-    let (conn, _db_path) = match open_and_validate(root, &args.db_name) {
-        Ok(t) => t,
-        Err(code) => return code,
-    };
     let page_size = args.page_size.clamp(1, 100) as i64;
     let offset_rows = (args.offset as i64).saturating_mul(page_size);
     let kind = args.kind.as_deref();
     let agent = args.agent.as_deref();
     let salience = args.salience.as_ref().map(|s| s.as_str());
     let feature = args.feature.as_deref();
-    let total = match store::count_insights(&conn, kind, agent, salience, feature) {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("error: count failed: {e}");
-            return std::process::ExitCode::from(1);
-        }
-    };
-    let rows = match store::list_insights(
-        &conn,
-        kind,
-        agent,
-        salience,
-        feature,
-        page_size,
-        offset_rows,
+
+    let legs = match open_insight_dbs(
+        root,
+        &args.db_name,
+        args.project.as_deref(),
+        args.category,
+        args.general_only,
+        args.project_only,
     ) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: list failed: {e}");
-            return std::process::ExitCode::from(1);
-        }
+        Ok(l) => l,
+        Err(code) => return code,
     };
+
+    // Collect ALL matching rows from each active leg (newest-first), apply the
+    // tag filter per-leg, then merge across legs by ingested_at descending.
+    // Pagination is applied to the merged stream so a page spans both dbs.
+    let mut merged: Vec<store::InsightSummary> = Vec::new();
+    for conn in [legs.local.as_ref(), legs.global.as_ref()].into_iter().flatten() {
+        // page_size = 100 (max) per fetch; loop offset until exhausted so the
+        // merge sees every matching row, not just the first page.
+        let mut leg_rows: Vec<store::InsightSummary> = Vec::new();
+        let mut leg_offset: i64 = 0;
+        loop {
+            let batch = match store::list_insights(
+                conn, kind, agent, salience, feature, 100, leg_offset,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("error: list failed: {e}");
+                    return std::process::ExitCode::from(1);
+                }
+            };
+            let n = batch.len();
+            leg_rows.extend(batch);
+            if n < 100 {
+                break;
+            }
+            leg_offset += 100;
+        }
+        if let Some(ids) = tag_filter_doc_ids(conn, &args.tag) {
+            leg_rows.retain(|r| ids.contains(&r.id));
+        }
+        merged.extend(leg_rows);
+    }
+    // Newest-first across the merged set; tie-break by id descending so the
+    // ordering is deterministic when two legs share an ingested_at second.
+    merged.sort_by(|a, b| b.ingested_at.cmp(&a.ingested_at).then(b.id.cmp(&a.id)));
+    let total = merged.len() as i64;
+    let start = offset_rows.max(0) as usize;
+    let rows: Vec<store::InsightSummary> = merged
+        .into_iter()
+        .skip(start)
+        .take(page_size as usize)
+        .collect();
+
     if args.json {
         let payload = serde_json::json!({
             "total":    total,
@@ -1384,23 +1745,256 @@ fn run_insight_list(
     std::process::ExitCode::SUCCESS
 }
 
-/// `insight random` — uniform-random pick, optionally filtered.
+/// `insight tags` — aggregate tag frequencies across the insights corpus.
+///
+/// DB selection (mirrors the read-subcommand merge posture):
+///   - default          → cwd-local db + global db (counts summed per tag)
+///   - `--category general` → global db only
+///   - `--category project` → cwd-local db only
+///   - `--project <slug>`   → registered project's db + global db
+///
+/// A db that does not exist / cannot open contributes ZERO tags WITHOUT error
+/// (graceful cold-start tolerance — mirrors the local-fallback posture). Both
+/// legs absent ⇒ `[]` / empty table, exit 0.
+///
+/// SECURITY (insights-base doc#22 caller-trust contract): the `--project` slug
+/// is a registry KEY, never a path. Its resolved db path comes from the trusted
+/// `~/.claude/knowledge/projects.json` file (NOT raw CLI input) and is passed
+/// to `open_and_validate_at` verbatim, without joining any further user input.
+/// The global db path is the fixed `$HOME`-rooted constant from
+/// `resolve_global_insights_db()`, also passed verbatim.
+fn run_insight_tags(
+    root: &std::path::Path,
+    args: &cli::InsightTagsArgs,
+) -> std::process::ExitCode {
+    // SECURITY (security-auditor Gate-3 MEDIUM finding): same root cause as the
+    // Slice 6 resolve_registry_project_db gap fixed in commit 6fbc7cf — the
+    // local_path / project_db joins below use args.db_name without validation.
+    // Reject path-traversal / separators / hidden-file prefixes up front via
+    // the canonical db-name gate (same gate open_and_validate uses).
+    if let Err(e) = cli::validate_db_name(&args.db_name) {
+        eprintln!("error: {e}");
+        return std::process::ExitCode::from(2);
+    }
+    // Aggregate `tag -> count` over the union of the selected db legs. A leg is
+    // a db path that may or may not exist; a missing/failed-open leg simply
+    // contributes nothing.
+    let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+
+    // Helper: read tag counts from a single db path, summing into `counts`.
+    // Missing file or open/query failure is tolerated (contributes zero) — the
+    // only hard exit in this handler is the registry-miss below.
+    fn accumulate(
+        path: &std::path::Path,
+        counts: &mut std::collections::HashMap<String, i64>,
+    ) {
+        if !path.exists() {
+            return;
+        }
+        let conn = match open_and_validate_at(path) {
+            Ok(c) => c,
+            // open_and_validate_at already emitted a diagnostic on stderr for a
+            // genuinely corrupt db; for tag aggregation we degrade gracefully
+            // rather than abort the whole command.
+            Err(_) => return,
+        };
+        let mut stmt = match conn
+            .prepare("SELECT tag, COUNT(*) AS count FROM insight_tags GROUP BY tag")
+        {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        });
+        if let Ok(rows) = rows {
+            for row in rows.flatten() {
+                *counts.entry(row.0).or_insert(0) += row.1;
+            }
+        }
+    }
+
+    // Resolve the global db path once (fixed $HOME-rooted constant).
+    let global_path = match store::resolve_global_insights_db() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    let local_path = root.join(".claude").join("knowledge").join(&args.db_name);
+
+    // Decide which legs to read.
+    if let Some(slug) = args.project.as_deref() {
+        // --project <slug>: registry lookup drives the local leg; --category is
+        // ignored. A missing registry or unknown slug is a HARD exit 1.
+        let project_db = match resolve_registry_project_db(slug, &args.db_name) {
+            Ok(p) => p,
+            Err(code) => return code,
+        };
+        accumulate(&project_db, &mut counts);
+        accumulate(&global_path, &mut counts);
+    } else {
+        match args.category {
+            Some(cli::InsightCategory::General) => {
+                accumulate(&global_path, &mut counts);
+            }
+            Some(cli::InsightCategory::Project) => {
+                accumulate(&local_path, &mut counts);
+            }
+            None => {
+                // Default: merge cwd-local + global.
+                accumulate(&local_path, &mut counts);
+                accumulate(&global_path, &mut counts);
+            }
+        }
+    }
+
+    // Sort by count descending, tie-break tag ascending for determinism.
+    let mut merged: Vec<(String, i64)> = counts.into_iter().collect();
+    merged.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    if args.json {
+        let payload: Vec<serde_json::Value> = merged
+            .iter()
+            .map(|(tag, count)| serde_json::json!({ "tag": tag, "count": count }))
+            .collect();
+        // Compact form so the both-empty case prints exactly `[]` (TC-IHC-5.7).
+        println!("{}", serde_json::to_string(&payload).unwrap_or_else(|_| "[]".to_string()));
+    } else {
+        for (tag, count) in &merged {
+            println!("{tag}  {count}");
+        }
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+/// Resolve a project slug to its `insights.db` path via the trusted project
+/// registry at `~/.claude/knowledge/projects.json`.
+///
+/// SECURITY: the registry file is written by `claudebase run` (Slice 6) and is
+/// a trusted, machine-local source. The slug is matched against the `name`
+/// field; the returned path comes from the registry's `path` field — it is
+/// NEVER constructed by joining the raw CLI slug into a filesystem path. The
+/// caller passes the result to `open_and_validate_at` verbatim, honoring the
+/// caller-trust contract (insights-base doc#22).
+///
+/// NOTE: Slice 6 owns `src/registry.rs`. This is a MINIMAL inline reader for
+/// the `tags --project` path only; the full registry module (with atomic
+/// upsert) lands in Slice 6.
+///
+/// Returns the project's `<path>/.claude/knowledge/<db_name>` on success; exit
+/// 1 when the registry is absent or the slug is not found.
+fn resolve_registry_project_db(
+    slug: &str,
+    db_name: &str,
+) -> Result<std::path::PathBuf, std::process::ExitCode> {
+    // SECURITY (security-auditor advisory on Slice 6 — pre-existing gap
+    // inherited from Slice 4's inline read): the `db_name` join below is
+    // on a registry-trusted root, but `db_name` itself is a user-supplied
+    // CLI arg — without validation a caller could pass `../../etc/passwd.db`
+    // and have it joined into the resolved path. Reject path-traversal /
+    // separators / hidden-file prefixes up front via the canonical db-name
+    // gate (same gate `open_and_validate` uses for the root-relative open
+    // path at main.rs:2292).
+    if let Err(e) = cli::validate_db_name(db_name) {
+        eprintln!("error: {e}");
+        return Err(std::process::ExitCode::from(2));
+    }
+    // Slice 6 (FR-IHC-6.1..6.6): registry lookup is now centralised in
+    // `registry::resolve_project_path`. `None` collapses missing-registry,
+    // malformed-json, and unknown-slug into one operator-facing message —
+    // matching the literal stderr `error: project '<slug>' not found in
+    // registry` that the Slice 4 tests already assert against.
+    match registry::resolve_project_path(slug) {
+        Some(project_root) => Ok(project_root
+            .join(".claude")
+            .join("knowledge")
+            .join(db_name)),
+        None => {
+            eprintln!("error: project '{slug}' not found in registry");
+            Err(std::process::ExitCode::from(1))
+        }
+    }
+}
+
+/// `insight random` — uniform-random pick across the active db legs,
+/// optionally filtered. Dual-db (Slice 5): candidate doc_ids are gathered from
+/// each active leg (respecting metadata + tag filters), one is sampled
+/// uniformly across the UNION, then fetched from the leg it belongs to.
 fn run_insight_random(
     root: &std::path::Path,
     args: &cli::InsightRandomArgs,
 ) -> std::process::ExitCode {
-    let (conn, _db_path) = match open_and_validate(root, &args.db_name) {
-        Ok(t) => t,
-        Err(code) => return code,
-    };
     let kind = args.kind.as_deref();
     let agent = args.agent.as_deref();
     let salience = args.salience.as_ref().map(|s| s.as_str());
     let feature = args.feature.as_deref();
-    let rec = match store::random_insight(&conn, kind, agent, salience, feature) {
+
+    let legs = match open_insight_dbs(
+        root,
+        &args.db_name,
+        args.project.as_deref(),
+        args.category,
+        args.general_only,
+        args.project_only,
+    ) {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
+
+    // Gather candidate ids per leg (metadata + tag filtered), tracking which
+    // leg each id came from so the chosen record is fetched from the right db.
+    let active: Vec<&rusqlite::Connection> =
+        [legs.local.as_ref(), legs.global.as_ref()].into_iter().flatten().collect();
+    // (leg_index, doc_id) pairs across the union.
+    let mut candidates: Vec<(usize, i64)> = Vec::new();
+    for (leg_idx, conn) in active.iter().enumerate() {
+        // Enumerate ALL matching ids via paged list (metadata-filtered).
+        let mut offset: i64 = 0;
+        let mut ids: Vec<i64> = Vec::new();
+        loop {
+            let batch = match store::list_insights(conn, kind, agent, salience, feature, 100, offset)
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("error: random fetch failed: {e}");
+                    return std::process::ExitCode::from(1);
+                }
+            };
+            let n = batch.len();
+            ids.extend(batch.into_iter().map(|s| s.id));
+            if n < 100 {
+                break;
+            }
+            offset += 100;
+        }
+        if let Some(tag_ids) = tag_filter_doc_ids(conn, &args.tag) {
+            ids.retain(|id| tag_ids.contains(id));
+        }
+        for id in ids {
+            candidates.push((leg_idx, id));
+        }
+    }
+
+    if candidates.is_empty() {
+        eprintln!("error: no insights match the filters");
+        return std::process::ExitCode::from(1);
+    }
+    // Uniform sample across the union. nanos-based pick avoids a new dependency.
+    let pick = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as usize)
+            .unwrap_or(0);
+        nanos % candidates.len()
+    };
+    let (leg_idx, doc_id) = candidates[pick];
+    let rec = match store::get_insight_by_id(active[leg_idx], doc_id) {
         Ok(Some(r)) => r,
         Ok(None) => {
-            eprintln!("error: no insights match the filters");
+            eprintln!("error: random fetch failed: selected insight vanished");
             return std::process::ExitCode::from(1);
         }
         Err(e) => {
@@ -1467,10 +2061,14 @@ fn run_insight_gc(
     root: &std::path::Path,
     args: &cli::InsightGcArgs,
 ) -> std::process::ExitCode {
-    let (mut conn, db_path) = match open_and_validate(root, &args.db_name) {
-        Ok(t) => t,
-        Err(code) => return code,
-    };
+    // SECURITY (security-auditor Gate-3 MEDIUM finding): same root cause as
+    // run_insight_tags above — the local_path join below uses args.db_name
+    // without validation. Reject path-traversal up front via the canonical
+    // db-name gate.
+    if let Err(e) = cli::validate_db_name(&args.db_name) {
+        eprintln!("error: {e}");
+        return std::process::ExitCode::from(2);
+    }
     let now: i64 = {
         use std::time::{SystemTime, UNIX_EPOCH};
         SystemTime::now()
@@ -1478,74 +2076,123 @@ fn run_insight_gc(
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0)
     };
+
+    // Resolve which db paths to gc.
+    //   --category general → global only
+    //   --category project → cwd-local only
+    //   (none)             → both, sequentially, combined report
+    // Each entry is (path, must_exist_for_count) — a missing local db simply
+    // contributes nothing (cold-start tolerance), matching the read path.
+    let local_path = root.join(".claude").join("knowledge").join(&args.db_name);
+    let global_path = match store::resolve_global_insights_db() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    let mut targets: Vec<std::path::PathBuf> = Vec::new();
+    match args.category {
+        Some(cli::InsightCategory::General) => targets.push(global_path),
+        Some(cli::InsightCategory::Project) => targets.push(local_path),
+        None => {
+            targets.push(local_path);
+            targets.push(global_path);
+        }
+    }
+
+    // DRY-RUN: count past-TTL rows across all targets; no deletes / VACUUM.
     if args.dry_run {
-        let summary = match store::count_insights_past_ttl(&conn, now) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("error: gc dry-run failed: {e}");
-                return std::process::ExitCode::from(1);
+        let mut medium = 0u64;
+        let mut low = 0u64;
+        for path in &targets {
+            if !path.exists() {
+                continue;
             }
-        };
+            let conn = match open_and_validate_at(path) {
+                Ok(c) => c,
+                Err(code) => return code,
+            };
+            match store::count_insights_past_ttl(&conn, now) {
+                Ok(s) => {
+                    medium += s.medium_deleted;
+                    low += s.low_deleted;
+                }
+                Err(e) => {
+                    eprintln!("error: gc dry-run failed: {e}");
+                    return std::process::ExitCode::from(1);
+                }
+            }
+        }
         if args.json {
             let payload = serde_json::json!({
                 "dry_run":            true,
-                "would_delete_medium": summary.medium_deleted,
-                "would_delete_low":    summary.low_deleted,
-                "would_delete_total":  summary.medium_deleted + summary.low_deleted,
+                "would_delete_medium": medium,
+                "would_delete_low":    low,
+                "would_delete_total":  medium + low,
             });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload).unwrap_or_default()
-            );
+            println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
         } else {
             println!(
-                "dry-run: would delete {} medium-salience + {} low-salience = {} total",
-                summary.medium_deleted,
-                summary.low_deleted,
-                summary.medium_deleted + summary.low_deleted
+                "dry-run: would delete {medium} medium-salience + {low} low-salience = {} total",
+                medium + low
             );
         }
         return std::process::ExitCode::SUCCESS;
     }
-    let size_before = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
-    let summary = match store::gc_insights_by_salience(&mut conn, now) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: gc failed: {e}");
-            return std::process::ExitCode::from(1);
+
+    // REAL gc: run per-target, combine the summaries + freed bytes. Cascade of
+    // insight_tags is automatic via `ON DELETE CASCADE` (foreign_keys=ON in
+    // open_or_init); the documents delete inside gc_insights_by_salience drops
+    // the tag rows too.
+    let mut medium = 0u64;
+    let mut low = 0u64;
+    let mut orphans = 0u64;
+    let mut size_before_total = 0u64;
+    let mut size_after_total = 0u64;
+    for path in &targets {
+        if !path.exists() {
+            continue;
         }
-    };
-    // VACUUM cannot run inside a transaction. After gc_insights_by_salience
-    // returns, the tx has committed and the connection is idle, so VACUUM
-    // is safe here. Failures are warnings — the deletes already landed.
-    if let Err(e) = conn.execute_batch("VACUUM") {
-        eprintln!("warning: VACUUM after gc failed: {e}");
+        let mut conn = match open_and_validate_at(path) {
+            Ok(c) => c,
+            Err(code) => return code,
+        };
+        let size_before = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let summary = match store::gc_insights_by_salience(&mut conn, now) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: gc failed: {e}");
+                return std::process::ExitCode::from(1);
+            }
+        };
+        if let Err(e) = conn.execute_batch("VACUUM") {
+            eprintln!("warning: VACUUM after gc failed: {e}");
+        }
+        let size_after = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        medium += summary.medium_deleted;
+        low += summary.low_deleted;
+        orphans += summary.chunks_vec_orphans_cleared;
+        size_before_total += size_before;
+        size_after_total += size_after;
     }
-    let size_after = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
-    let freed_bytes = size_before.saturating_sub(size_after);
+    let freed_bytes = size_before_total.saturating_sub(size_after_total);
     if args.json {
         let payload = serde_json::json!({
             "dry_run":                     false,
-            "medium_deleted":              summary.medium_deleted,
-            "low_deleted":                 summary.low_deleted,
-            "chunks_vec_orphans_cleared":  summary.chunks_vec_orphans_cleared,
-            "deleted_total":               summary.medium_deleted + summary.low_deleted,
-            "size_before_bytes":           size_before,
-            "size_after_bytes":            size_after,
+            "medium_deleted":              medium,
+            "low_deleted":                 low,
+            "chunks_vec_orphans_cleared":  orphans,
+            "deleted_total":               medium + low,
+            "size_before_bytes":           size_before_total,
+            "size_after_bytes":            size_after_total,
             "freed_bytes":                 freed_bytes,
         });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&payload).unwrap_or_default()
-        );
+        println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
     } else {
         println!(
-            "gc: deleted {} medium + {} low = {} insights; cleared {} orphan vectors; freed {} bytes",
-            summary.medium_deleted,
-            summary.low_deleted,
-            summary.medium_deleted + summary.low_deleted,
-            summary.chunks_vec_orphans_cleared,
-            freed_bytes
+            "gc: deleted {medium} medium + {low} low = {} insights; cleared {orphans} orphan vectors; freed {freed_bytes} bytes",
+            medium + low
         );
     }
     std::process::ExitCode::SUCCESS
@@ -1554,13 +2201,32 @@ fn run_insight_gc(
 /// `insight delete <id>` — single-insight delete by integer
 /// `documents.id` with chunks + chunks_vec cascade. Refuses to delete
 /// non-insight rows (source_type IS NULL — books corpus).
+///
+/// Slice 5: `--category general` resolves the id against the GLOBAL db;
+/// absent (or `--category project`) targets the cwd-local db. The
+/// `insight_tags` rows cascade-delete with the document (ON DELETE CASCADE,
+/// foreign_keys=ON).
 fn run_insight_delete(
     root: &std::path::Path,
     args: &cli::InsightDeleteArgs,
 ) -> std::process::ExitCode {
-    let (mut conn, _db_path) = match open_and_validate(root, &args.db_name) {
-        Ok(t) => t,
-        Err(code) => return code,
+    let mut conn = if args.category == Some(cli::InsightCategory::General) {
+        let global_path = match store::resolve_global_insights_db() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return std::process::ExitCode::from(1);
+            }
+        };
+        match open_and_validate_at(&global_path) {
+            Ok(c) => c,
+            Err(code) => return code,
+        }
+    } else {
+        match open_and_validate(root, &args.db_name) {
+            Ok((c, _)) => c,
+            Err(code) => return code,
+        }
     };
     let summary = match store::insight_delete_with_summary(&mut conn, args.id) {
         Ok(Some(s)) => s,
@@ -2324,6 +2990,47 @@ fn open_and_validate(
     Ok((conn, db_path))
 }
 
+/// Like [`open_and_validate`] but opens a database at an absolute `path`
+/// directly, instead of resolving it relative to a project root. Used by the
+/// global-general insights codepath: the global insights db lives at the
+/// fixed `$HOME/.claude/knowledge/insights.db` (see
+/// `store::resolve_global_insights_db`), which is OUTSIDE any project root, so
+/// the root-relative `open_and_validate` cannot reach it. Runs the identical
+/// `open_or_init_v2` -> `run_migrations` -> `validate_schema` chain, so a
+/// freshly-created global db is stamped at the current schema version and
+/// passes the corruption gate.
+///
+/// SECURITY — caller-trust contract (security-auditor D1, insights-base
+/// doc#22): this function performs NO containment check on `path`; it trusts
+/// the caller to supply a safe absolute path. Callers MUST pass the output of
+/// `store::resolve_global_insights_db()` (a fixed `$HOME`-rooted constant)
+/// VERBATIM. Do NOT join user-input / CLI-arg / network-derived components
+/// into the path before passing it here — doing so would turn the deliberate
+/// `resolve_project_root` cwd-gate bypass into a path-traversal hole.
+//
+// Wired into `run_insight_create`'s `--category general` route (Slice 3 of
+// insights-hybrid-corpus) and the dual-db insight read path (Slice 5).
+fn open_and_validate_at(
+    path: &std::path::Path,
+) -> Result<rusqlite::Connection, std::process::ExitCode> {
+    let mut conn = match store::open_or_init_v2(path) {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("error: index database invalid; re-ingest required");
+            return Err(std::process::ExitCode::from(1));
+        }
+    };
+    if migrations::run_migrations(&mut conn).is_err() {
+        eprintln!("error: index database invalid; re-ingest required");
+        return Err(std::process::ExitCode::from(1));
+    }
+    if store::validate_schema(&conn).is_err() {
+        eprintln!("error: index database invalid; re-ingest required");
+        return Err(std::process::ExitCode::from(1));
+    }
+    Ok(conn)
+}
+
 fn run_ingest(root: &std::path::Path, args: &cli::IngestArgs) -> std::process::ExitCode {
     // The user-supplied path may be relative; resolve against root.
     let target = if args.path.is_absolute() {
@@ -2562,9 +3269,10 @@ fn run_search_cross_corpus(
     top_k: u32,
     context_radius: u32,
 ) -> std::process::ExitCode {
-    let books_hits = run_one_corpus_for_fusion(root, args, "index.db", top_k, context_radius);
+    let books_hits =
+        run_one_corpus_for_fusion(root, args, "index.db", "books", top_k, context_radius);
     let insights_hits =
-        run_one_corpus_for_fusion(root, args, "insights.db", top_k, context_radius);
+        run_one_corpus_for_fusion(root, args, "insights.db", "insights", top_k, context_radius);
     let fused = rrf_fuse_corpora(books_hits, insights_hits, top_k as usize);
     if args.json {
         println!("{}", output::render_search_json(&fused));
@@ -2578,10 +3286,19 @@ fn run_search_cross_corpus(
 /// tags every hit with `source_corpus`. Returns an empty vec on any error
 /// (missing DB, search failure) so the cross-corpus pass survives one-
 /// corpus failure.
+///
+/// `corpus_label` is passed EXPLICITLY by the caller rather than derived from
+/// `db_name` (architect blocker 2b, insights-base doc#15). The prior code
+/// inferred the label via `db_name == "insights.db"`, which collides when BOTH
+/// legs are `insights.db` (the dual-insight-db path) — both would label
+/// `"insights"` and collapse RRF identity. An explicit label lets the same
+/// helper serve `("index.db","books")` + `("insights.db","insights")` for the
+/// books-vs-insights path AND any future same-db-name dual path.
 fn run_one_corpus_for_fusion(
     root: &std::path::Path,
     args: &cli::SearchArgs,
     db_name: &str,
+    corpus_label: &str,
     top_k: u32,
     context_radius: u32,
 ) -> Vec<search::SearchHit> {
@@ -2601,14 +3318,9 @@ fn run_one_corpus_for_fusion(
             run_search_with_encoder(&conn, args, top_k, context_radius).unwrap_or_default()
         }
     };
-    let label = if db_name == "insights.db" {
-        "insights"
-    } else {
-        "books"
-    };
     hits.into_iter()
         .map(|mut h| {
-            h.source_corpus = Some(label.to_string());
+            h.source_corpus = Some(corpus_label.to_string());
             h
         })
         .collect()
@@ -2616,55 +3328,22 @@ fn run_one_corpus_for_fusion(
 
 /// Reciprocal Rank Fusion across two corpus-tagged ranked lists.
 ///
-/// Implements the canonical Cormack et al. 2009 formula with k=60 (the
-/// same constant used by the in-corpus hybrid path in `search.rs`):
-///     score(d) = Σ_corpus 1 / (60 + rank_in_corpus(d))
-///
-/// Each hit's identity is `(source_corpus, chunk_id)` — chunk_ids are
-/// scoped per-DB so two hits with `chunk_id=42` but different corpora
-/// are distinct documents.
-///
-/// The returned `score` field is the RRF score; the per-corpus `score`
-/// is preserved in the original `bm25_score` / `dense_score` / `rrf_score`
-/// fields when the source mode populated them.
+/// Thin wrapper over [`search::rrf_fuse_hits`] (architect blocker 2b,
+/// insights-base doc#15). The prior implementation hardcoded the keys
+/// `("books", chunk_id)` and `("insights", chunk_id)` from the POSITION of
+/// each argument, ignoring each hit's actual `source_corpus`. That worked for
+/// the books-vs-insights path but would collide two `insights.db` legs. The
+/// canonical RRF identity `(source_corpus, chunk_id)` now lives in
+/// `rrf_fuse_hits`, which reads the label from each hit's `source_corpus`
+/// field (set explicitly by `run_one_corpus_for_fusion`). The `books` /
+/// `insights` argument NAMES are retained for caller readability — but
+/// identity is driven by the tag carried on each hit, not by argument order.
 fn rrf_fuse_corpora(
     books: Vec<search::SearchHit>,
     insights: Vec<search::SearchHit>,
     top_k: usize,
 ) -> Vec<search::SearchHit> {
-    const RRF_K: f64 = 60.0;
-    use std::collections::HashMap;
-    // Key: (source_corpus, chunk_id) — both needed to disambiguate.
-    let mut score_acc: HashMap<(String, i64), f64> = HashMap::new();
-    let mut by_key: HashMap<(String, i64), search::SearchHit> = HashMap::new();
-    for (rank, hit) in books.into_iter().enumerate() {
-        let key = ("books".to_string(), hit.chunk_id);
-        let inc = 1.0 / (RRF_K + (rank as f64 + 1.0));
-        *score_acc.entry(key.clone()).or_insert(0.0) += inc;
-        by_key.entry(key).or_insert(hit);
-    }
-    for (rank, hit) in insights.into_iter().enumerate() {
-        let key = ("insights".to_string(), hit.chunk_id);
-        let inc = 1.0 / (RRF_K + (rank as f64 + 1.0));
-        *score_acc.entry(key.clone()).or_insert(0.0) += inc;
-        by_key.entry(key).or_insert(hit);
-    }
-    let mut scored: Vec<(f64, (String, i64))> = score_acc
-        .into_iter()
-        .map(|(k, s)| (s, k))
-        .collect();
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    scored
-        .into_iter()
-        .take(top_k)
-        .filter_map(|(rrf_score, key)| {
-            by_key.remove(&key).map(|mut h| {
-                h.score = rrf_score;
-                h.rrf_score = Some(rrf_score);
-                h
-            })
-        })
-        .collect()
+    search::rrf_fuse_hits(books, insights, top_k)
 }
 
 /// `list [--json]` — list ingested documents with chunk counts.

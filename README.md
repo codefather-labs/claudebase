@@ -89,7 +89,8 @@ $ claudebase search "dependency rule" --top-k 3 --mode hybrid
    ...
 
 $ claudebase insight create "RRF k=60 outperforms k=40 on 17-PDF corpus" \
-    --type agent-learned --agent retrieval-tuning --salience high
+    --type agent-learned --agent retrieval-tuning \
+    --category general --tags rrf,retrieval --salience high
 {"status":"stored","sha":"a1b2c3d4..."}
 
 $ claudebase insight search "RRF parameters" --salience high --top-k 5
@@ -174,11 +175,31 @@ claudebase insight create <body>         persist an agent's cognitive observatio
                                          assumption-falsified | plan-reality-gap |
                                          reflection-observation | operator-correction
                           --agent <name> emitting agent (planner, reflection, ...)
+                          --category <general|project>  REQUIRED (v0.7.0+): general
+                                         routes to the global $HOME/.claude/knowledge/
+                                         insights.db; project routes to the per-project
+                                         local insights.db. Missing -> exit 2.
+                          --tags <t,..>  REQUIRED (v0.7.0+, >=1): comma-separated
+                                         free-form tags (e.g. nginx, mistakes, feature
+                                         slug). Normalized (# stripped, lowercased,
+                                         deduped). Missing -> exit 2.
                           [--feature SLUG] [--salience high|medium|low] [--session ID]
                           [--source-artifact REF]
+claudebase insight tags                  list distinct tag vocabulary with counts
+                          [--category C] [--project SLUG] [--json]
+                                         default merges local + global; --category
+                                         narrows; --project does registry lookup
 claudebase insight search <query>        hybrid retrieval over the insights corpus
                           [--mode M] [--top-k N] [--type T] [--agent A]
                           [--salience S] [--feature F] [--since <Nd|Nh|Nm|Nw>]
+                          [--tag T ...]  OR/any-intersection filter (v0.7.0+):
+                                         repeatable; an insight is returned if its
+                                         tag set intersects the requested tags by
+                                         at least one
+                          [--category C] [--project SLUG]
+                          [--general-only|--project-only]
+                                         in-project default = merge(local, global);
+                                         narrowing flags exclude the other leg
 claudebase insight list                  newest-first, 10 per page
                           [--offset N] [--page-size N] [filters]
 claudebase insight random [filters]      uniformly-sampled single insight
@@ -186,6 +207,39 @@ claudebase insight get <id|sha-prefix>   fetch one by integer id or ≥4-hex sha
 claudebase insight gc [--dry-run]        salience-driven TTL purge + VACUUM
 claudebase insight delete <id>           single-row delete with chunks + vec cascade
 ```
+
+**Hybrid Insights Corpus** (v0.7.0+) — every insight is routed by a mandatory `--category`:
+
+- `--category project` writes to the **per-project local** `<project>/.claude/knowledge/insights.db` (this-project insights — feature work, project-specific lessons).
+- `--category general` writes to the **global** `~/.claude/knowledge/insights.db` (cross-project lessons — tools, patterns, anything reusable across projects).
+
+Every `insight create` also requires at least one `--tag` (free-form, e.g. `#nginx`, `#mistakes`, the feature slug). Tags are normalized (`#` stripped, lowercased, deduped) and stored one row per tag in `insight_tags`. Missing `--category` or `--tags` → exit 2. (BREAKING change from v0.6.0 — see CHANGELOG.)
+
+```text
+# create — both flags required
+claudebase insight create "Tokio mutex held across await deadlocks" \
+  --type agent-learned --agent planner --category project --tags tokio,mutex \
+  --feature insights-hybrid-corpus --salience high
+
+# create a general / cross-project lesson
+claudebase insight create "nginx reload signal is HUP not USR1" \
+  --type agent-learned --agent ops --category general --tags nginx,infrastructure --salience medium
+
+# discover the tag vocabulary (merges local + global by default)
+claudebase insight tags --json              # [{"tag":"tokio","count":3},...]
+claudebase insight tags --category general  # only global db
+claudebase insight tags --project some-name # registry lookup + global
+
+# read with tag/category/project filters (OR / any-intersection semantics for multi-tag)
+claudebase insight search "race" --tag tokio --tag mutex     # ANY of tokio/mutex
+claudebase insight search "deploy" --category general        # global only
+claudebase insight list --general-only                       # exclude project insights
+claudebase insight list --project-only                       # exclude global insights
+```
+
+**Default in-project reads merge local + global** so the agent sees both this-project insights and general lessons. `--general-only` / `--project-only` narrow when needed. Other projects are walled off; cross-project access requires explicit `--project <slug>` which resolves the path via the **project registry** (`~/.claude/knowledge/projects.json`, atomically populated at `claudebase run` startup).
+
+**SessionStart read-on-new-context hook** — when an agent enters a fresh context window, `claudebase-read-insights-reminder.{sh,ps1}` reminds it to discover tags via `insight tags` and pull only relevant insights via `insight search --tag <t>` (not re-read everything).
 
 **Cross-corpus search:**
 

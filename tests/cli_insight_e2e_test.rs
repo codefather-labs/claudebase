@@ -28,6 +28,20 @@ fn bin() -> Command {
     Command::cargo_bin("claudebase").expect("binary built")
 }
 
+/// Pin `$HOME` / `USERPROFILE` to a per-project sandbox dir so the GLOBAL
+/// insights db (`$HOME/.claude/knowledge/insights.db`) resolves UNDER the test
+/// tempdir, never the operator's real home. Slice 5 made the default insight
+/// read path merge the cwd-local db with the global db; without this pin, a
+/// test that asserts an exact local-only count would non-deterministically
+/// pick up the operator's real global insights. The home dir lives inside the
+/// project tempdir (`<project>/.testhome`) so it is auto-cleaned and shared
+/// consistently across the create + read commands of one test.
+fn pin_home(cmd: &mut Command, project: &Path) {
+    let home = project.join(".testhome");
+    let _ = fs::create_dir_all(&home);
+    cmd.env("HOME", &home).env("USERPROFILE", &home);
+}
+
 fn fresh_project() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().expect("tempdir");
     fs::create_dir_all(tmp.path().join(".claude/knowledge")).expect("mkdir .claude/knowledge");
@@ -50,7 +64,19 @@ fn create_insight(
     extra: &[&str],
 ) -> assert_cmd::assert::Assert {
     let mut cmd = bin();
+    pin_home(&mut cmd, project);
     cmd.current_dir(project).args(["insight", "create", body, "--type", kind, "--agent", agent]);
+    // Slice 3 made --category + --tags mandatory. Tests that don't exercise
+    // routing default to a project-scoped insight with a seed tag so they
+    // stay hermetic (cwd-local db only, never the operator's global db).
+    let caller_sets_category = extra.iter().any(|e| *e == "--category");
+    let caller_sets_tags = extra.iter().any(|e| *e == "--tags");
+    if !caller_sets_category {
+        cmd.args(["--category", "project"]);
+    }
+    if !caller_sets_tags {
+        cmd.args(["--tags", "seedtag"]);
+    }
     for e in extra {
         cmd.arg(e);
     }
@@ -97,9 +123,14 @@ fn create_writes_one_doc_with_v4_metadata() {
 #[test]
 fn create_reads_stdin_when_body_arg_omitted() {
     let tmp = fresh_project();
-    bin()
+    let mut pinned1 = bin();
+    pin_home(&mut pinned1, tmp.path());
+    pinned1
         .current_dir(tmp.path())
-        .args(["insight", "create", "--type", "reflection-observation", "--agent", "reflection"])
+        .args([
+            "insight", "create", "--type", "reflection-observation", "--agent", "reflection",
+            "--category", "project", "--tags", "seedtag",
+        ])
         .write_stdin("piped body from stdin")
         .assert()
         .success();
@@ -166,11 +197,14 @@ fn create_cross_agent_same_body_is_not_deduped() {
 #[test]
 fn create_rejects_empty_body_with_exit_2() {
     let tmp = fresh_project();
-    bin()
+    let mut pinned2 = bin();
+    pin_home(&mut pinned2, tmp.path());
+    pinned2
         .current_dir(tmp.path())
         .args([
             "insight", "create", "   \n\t  ",
             "--type", "agent-learned", "--agent", "x",
+            "--category", "project", "--tags", "seedtag",
         ])
         .assert()
         .failure()
@@ -229,7 +263,9 @@ fn search_returns_lexical_hit_for_written_insight() {
     // hyphen-free terms in the query string so the test exercises lexical
     // retrieval rather than FTS5 syntax handling (which is upstream search
     // territory, not insight-specific).
-    let assert = bin()
+    let mut pinned3 = bin();
+    pin_home(&mut pinned3, tmp.path());
+    let assert = pinned3
         .current_dir(tmp.path())
         .args(["insight", "search", "memory agents", "--mode", "lexical", "--json"])
         .assert()
@@ -267,7 +303,9 @@ fn gc_purges_low_salience_past_90_days() {
     ).unwrap();
     drop(conn);
     // Run gc.
-    let assert = bin()
+    let mut pinned4 = bin();
+    pin_home(&mut pinned4, tmp.path());
+    let assert = pinned4
         .current_dir(tmp.path())
         .args(["insight", "gc", "--json"])
         .assert()
@@ -299,7 +337,9 @@ fn gc_purges_medium_salience_past_365_days() {
     let old_ts = now - 400 * 86_400;
     conn.execute("UPDATE documents SET ingested_at = ?1", params![old_ts]).unwrap();
     drop(conn);
-    let assert = bin().current_dir(tmp.path()).args(["insight", "gc", "--json"]).assert().success();
+    let mut gc_cmd = bin();
+    pin_home(&mut gc_cmd, tmp.path());
+    let assert = gc_cmd.current_dir(tmp.path()).args(["insight", "gc", "--json"]).assert().success();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
     assert_eq!(v["medium_deleted"].as_u64().unwrap(), 1);
@@ -315,7 +355,9 @@ fn gc_dry_run_reports_without_deleting() {
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
     conn.execute("UPDATE documents SET ingested_at = ?1", params![now - 100*86_400]).unwrap();
     drop(conn);
-    let assert = bin().current_dir(tmp.path()).args(["insight", "gc", "--dry-run", "--json"]).assert().success();
+    let mut gc_cmd = bin();
+    pin_home(&mut gc_cmd, tmp.path());
+    let assert = gc_cmd.current_dir(tmp.path()).args(["insight", "gc", "--dry-run", "--json"]).assert().success();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
     assert_eq!(v["dry_run"].as_bool().unwrap(), true);
@@ -488,7 +530,9 @@ fn search_filter_by_agent_drops_other_agents_hits() {
     let tmp = fresh_project();
     create_insight(tmp.path(), "alpha rebalance commit", "agent-learned", "planner", &[]).success();
     create_insight(tmp.path(), "beta rebalance commit", "agent-learned", "verifier", &[]).success();
-    let assert = bin()
+    let mut pinned5 = bin();
+    pin_home(&mut pinned5, tmp.path());
+    let assert = pinned5
         .current_dir(tmp.path())
         .args([
             "insight", "search", "rebalance",
@@ -509,7 +553,9 @@ fn search_filter_by_salience_keeps_only_matching_tier() {
     let tmp = fresh_project();
     create_insight(tmp.path(), "highsal rebalance commit", "agent-learned", "a", &["--salience", "high"]).success();
     create_insight(tmp.path(), "medsal rebalance commit", "agent-learned", "b", &["--salience", "medium"]).success();
-    let assert = bin()
+    let mut pinned6 = bin();
+    pin_home(&mut pinned6, tmp.path());
+    let assert = pinned6
         .current_dir(tmp.path())
         .args([
             "insight", "search", "rebalance",
@@ -549,7 +595,9 @@ fn search_filter_by_type_and_feature_combine() {
         "c",
         &["--feature", "checkout-v1"],
     ).success();
-    let assert = bin()
+    let mut pinned7 = bin();
+    pin_home(&mut pinned7, tmp.path());
+    let assert = pinned7
         .current_dir(tmp.path())
         .args([
             "insight", "search", "rebalance",
@@ -572,14 +620,18 @@ fn search_since_filter_rejects_malformed_value() {
     let tmp = fresh_project();
     create_insight(tmp.path(), "anything", "agent-learned", "x", &[]).success();
     // No unit suffix.
-    bin()
+    let mut pinned8 = bin();
+    pin_home(&mut pinned8, tmp.path());
+    pinned8
         .current_dir(tmp.path())
         .args(["insight", "search", "anything", "--since", "30", "--mode", "lexical"])
         .assert()
         .failure()
         .code(2);
     // Unknown unit.
-    bin()
+    let mut pinned9 = bin();
+    pin_home(&mut pinned9, tmp.path());
+    pinned9
         .current_dir(tmp.path())
         .args(["insight", "search", "anything", "--since", "30x", "--mode", "lexical"])
         .assert()
@@ -603,7 +655,9 @@ fn search_since_filter_keeps_recent_drops_old() {
         .unwrap();
     drop(conn);
     // --since 7d → should drop the 100-day-old insight.
-    let assert = bin()
+    let mut pinned10 = bin();
+    pin_home(&mut pinned10, tmp.path());
+    let assert = pinned10
         .current_dir(tmp.path())
         .args([
             "insight", "search", "rebalance",
@@ -636,7 +690,9 @@ fn search_corpus_insights_opens_insights_db() {
         &[],
     )
     .success();
-    let assert = bin()
+    let mut pinned11 = bin();
+    pin_home(&mut pinned11, tmp.path());
+    let assert = pinned11
         .current_dir(tmp.path())
         .args([
             "search",
@@ -672,7 +728,9 @@ fn search_corpus_books_does_not_see_insights() {
     // `--corpus books` opens (or creates) index.db; since the insight was
     // written to insights.db, the books-corpus search must return ZERO
     // results — no cross-corpus bleed-through.
-    let assert = bin()
+    let mut pinned12 = bin();
+    pin_home(&mut pinned12, tmp.path());
+    let assert = pinned12
         .current_dir(tmp.path())
         .args([
             "search",
@@ -707,7 +765,9 @@ fn search_corpus_all_with_only_insights_present_returns_hits_with_source_corpus(
     .success();
     // index.db does NOT exist — Slice-6 contract: silently treat missing
     // corpus as empty, return hits from the other corpus.
-    let assert = bin()
+    let mut pinned13 = bin();
+    pin_home(&mut pinned13, tmp.path());
+    let assert = pinned13
         .current_dir(tmp.path())
         .args([
             "search",
@@ -767,7 +827,9 @@ fn list_default_page_size_is_ten_newest_first() {
         let agent = if i % 2 == 0 { "planner" } else { "verifier" };
         create_insight(tmp.path(), body, "agent-learned", agent, &[]).success();
     }
-    let assert = bin()
+    let mut list_cmd = bin();
+    pin_home(&mut list_cmd, tmp.path());
+    let assert = list_cmd
         .current_dir(tmp.path())
         .args(["insight", "list", "--offset", "0", "--json"])
         .assert()
@@ -797,7 +859,9 @@ fn list_offset_one_returns_remaining_two() {
         let agent = if i % 2 == 0 { "planner" } else { "verifier" };
         create_insight(tmp.path(), body, "agent-learned", agent, &[]).success();
     }
-    let assert = bin()
+    let mut list_cmd = bin();
+    pin_home(&mut list_cmd, tmp.path());
+    let assert = list_cmd
         .current_dir(tmp.path())
         .args(["insight", "list", "--offset", "1", "--json"])
         .assert()
@@ -812,7 +876,9 @@ fn list_filter_by_agent_only_returns_matches() {
     let tmp = fresh_project();
     create_insight(tmp.path(), "alpha body", "agent-learned", "planner", &[]).success();
     create_insight(tmp.path(), "beta body", "agent-learned", "verifier", &[]).success();
-    let assert = bin()
+    let mut pinned14 = bin();
+    pin_home(&mut pinned14, tmp.path());
+    let assert = pinned14
         .current_dir(tmp.path())
         .args(["insight", "list", "--agent", "planner", "--json"])
         .assert()
@@ -833,7 +899,9 @@ fn random_returns_one_row_when_corpus_non_empty() {
     let tmp = fresh_project();
     create_insight(tmp.path(), "alpha", "agent-learned", "planner", &[]).success();
     create_insight(tmp.path(), "beta", "agent-learned", "verifier", &[]).success();
-    let assert = bin()
+    let mut pinned15 = bin();
+    pin_home(&mut pinned15, tmp.path());
+    let assert = pinned15
         .current_dir(tmp.path())
         .args(["insight", "random", "--json"])
         .assert()
@@ -849,7 +917,9 @@ fn random_exits_1_on_empty_corpus() {
     let tmp = fresh_project();
     // Touch the db so open_or_init succeeds (no doc rows inside).
     fs::create_dir_all(tmp.path().join(".claude/knowledge")).unwrap();
-    bin()
+    let mut rand_cmd = bin();
+    pin_home(&mut rand_cmd, tmp.path());
+    rand_cmd
         .current_dir(tmp.path())
         .args(["insight", "random"])
         .assert()
@@ -867,7 +937,9 @@ fn get_by_integer_id_returns_full_record() {
     create_insight(tmp.path(), "the unique body", "agent-learned", "planner", &[]).success();
     let conn = open_db(&insights_db(tmp.path()));
     let id: i64 = conn.query_row("SELECT id FROM documents LIMIT 1", [], |r| r.get(0)).unwrap();
-    let assert = bin()
+    let mut pinned16 = bin();
+    pin_home(&mut pinned16, tmp.path());
+    let assert = pinned16
         .current_dir(tmp.path())
         .args(["insight", "get", &id.to_string(), "--json"])
         .assert()
@@ -885,7 +957,9 @@ fn get_by_sha_prefix_matches_via_like() {
     let conn = open_db(&insights_db(tmp.path()));
     let sha: String = conn.query_row("SELECT sha256 FROM documents LIMIT 1", [], |r| r.get(0)).unwrap();
     let prefix: String = sha.chars().take(8).collect();
-    bin()
+    let mut pinned17 = bin();
+    pin_home(&mut pinned17, tmp.path());
+    pinned17
         .current_dir(tmp.path())
         .args(["insight", "get", &prefix])
         .assert()
@@ -896,7 +970,9 @@ fn get_by_sha_prefix_matches_via_like() {
 fn get_unknown_id_exits_1() {
     let tmp = fresh_project();
     create_insight(tmp.path(), "anything", "agent-learned", "planner", &[]).success();
-    bin()
+    let mut pinned18 = bin();
+    pin_home(&mut pinned18, tmp.path());
+    pinned18
         .current_dir(tmp.path())
         .args(["insight", "get", "99999"])
         .assert()
@@ -907,7 +983,9 @@ fn get_unknown_id_exits_1() {
 #[test]
 fn get_short_non_numeric_ident_exits_2() {
     let tmp = fresh_project();
-    bin()
+    let mut pinned19 = bin();
+    pin_home(&mut pinned19, tmp.path());
+    pinned19
         .current_dir(tmp.path())
         .args(["insight", "get", "abc"])
         .assert()
@@ -918,7 +996,9 @@ fn get_short_non_numeric_ident_exits_2() {
 #[test]
 fn get_non_hex_ident_exits_2() {
     let tmp = fresh_project();
-    bin()
+    let mut pinned20 = bin();
+    pin_home(&mut pinned20, tmp.path());
+    pinned20
         .current_dir(tmp.path())
         .args(["insight", "get", "zzzzzz"])
         .assert()

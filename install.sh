@@ -338,7 +338,7 @@ install_claudebase_hooks() {
   # UserPromptSubmit reminder).
   rm -f "$hooks_dir/claudebase-insight-capture.sh" "$hooks_dir/claudebase-insight-capture.ps1"
 
-  local hook_files=(claudebase-selfcheck-reminder.sh claudebase-selfcheck-reminder.ps1)
+  local hook_files=(claudebase-selfcheck-reminder.sh claudebase-selfcheck-reminder.ps1 claudebase-read-insights-reminder.sh claudebase-read-insights-reminder.ps1)
   for hook in "${hook_files[@]}"; do
     local src="$SCRIPT_DIR/hooks/$hook"
     local dst="$hooks_dir/$hook"
@@ -360,21 +360,28 @@ install_claudebase_hooks() {
   if ! command -v jq >/dev/null 2>&1; then
     log_warn "jq required for settings.json hook merge — add manually:"
     log_warn '  hooks.UserPromptSubmit[*].hooks[*].command = ~/.claude/hooks/claudebase-selfcheck-reminder.sh'
+    log_warn '  hooks.SessionStart[*].hooks[*].command = ~/.claude/hooks/claudebase-read-insights-reminder.sh'
     log_warn '  (and remove any hooks.Stop entry pointing at claudebase-insight-capture.sh)'
     return 0
   fi
 
   local stop_cmd="$HOME/.claude/hooks/claudebase-insight-capture.sh"
   local selfcheck_cmd="$HOME/.claude/hooks/claudebase-selfcheck-reminder.sh"
+  local readins_cmd="$HOME/.claude/hooks/claudebase-read-insights-reminder.sh"
   local tmp; tmp="$(mktemp)"
 
   # (1) Ensure .hooks.UserPromptSubmit has exactly one matcher block with our
   #     command. (2) Actively UNWIRE the retired Stop insight-capture hook:
   #     drop matcher blocks whose only command was claudebase-insight-capture,
   #     and remove that command from any shared block. Foreign matchers stay.
+  # (3) Idempotently wire the SessionStart read-insights reminder. Match by
+  #     command-string equality across ALL SessionStart blocks (foreign blocks
+  #     and the SDLC onboarding block are preserved). The official SessionStart
+  #     shape nests command under a matcher block: {matcher, hooks[{type,command}]}.
   if jq \
       --arg stop_cmd "$stop_cmd" \
       --arg selfcheck_cmd "$selfcheck_cmd" \
+      --arg readins_cmd "$readins_cmd" \
       '
       .hooks //= {}
       | .hooks.UserPromptSubmit //= []
@@ -382,6 +389,12 @@ install_claudebase_hooks() {
           (if any(.[]?; (.hooks // []) | any(.command == $selfcheck_cmd))
            then .
            else . + [{"hooks": [{"type": "command", "command": $selfcheck_cmd}]}]
+           end)
+      | .hooks.SessionStart //= []
+      | .hooks.SessionStart |=
+          (if any(.[]?; (.hooks // []) | any(.command == $readins_cmd))
+           then .
+           else . + [{"matcher": "startup|resume|compact", "hooks": [{"type": "command", "command": $readins_cmd}]}]
            end)
       | (if (.hooks.Stop // []) | length > 0 then
            .hooks.Stop |= (
@@ -395,7 +408,7 @@ install_claudebase_hooks() {
      && jq -e . "$tmp" >/dev/null 2>&1; then
     mv "$tmp" "$settings"
     chmod 0644 "$settings"
-    log_ok "settings.json (UserPromptSubmit[selfcheck] wired; retired Stop[insight-capture] unwired)"
+    log_ok "settings.json (UserPromptSubmit[selfcheck] + SessionStart[read-insights] wired; retired Stop[insight-capture] unwired)"
   else
     rm -f "$tmp"
     log_warn "settings.json hook merge failed; please add manually"

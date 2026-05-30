@@ -392,3 +392,63 @@ pub fn rrf_fuse(lex: &[SearchHit], dense: &[SearchHit], top_k: u32) -> Vec<Searc
     fused.truncate(top_k as usize);
     fused
 }
+
+/// Arg-type-agnostic Reciprocal Rank Fusion over two pre-tagged ranked lists.
+///
+/// Drives the dual-DB insight read path (Slice 5 of insights-hybrid-corpus).
+/// Unlike [`rrf_fuse`] (which keys identity on `chunk_id` alone, valid only
+/// when both legs come from the SAME database), this helper keys hit identity
+/// on `(source_corpus, chunk_id)`. `chunk_id` values are scoped per-database,
+/// so a LOCAL chunk and a GENERAL chunk that share the same integer `chunk_id`
+/// are DIFFERENT documents — keying on `chunk_id` alone would wrongly collapse
+/// them and break recall (the bug the architect/red-team flagged: a binary
+/// `db_name == "insights.db"` label collides two insight legs).
+///
+/// `local` and `general` are the two ranked legs (typically tagged
+/// `source_corpus = "local"` / `"general"` by the caller, but the labels are
+/// read VERBATIM from each hit's `source_corpus` field — a `None` field is
+/// treated as `"local"`). For each `(corpus, chunk_id)` key present in either
+/// leg, the fused score is `Σ_leg 1/(RRF_K + rank_in_leg)` (1-based rank, same
+/// k=60 as every other RRF path in this crate). Returns the top-`top_k` hits
+/// by fused score, descending; each carries its `rrf_score`.
+pub fn rrf_fuse_hits(
+    local: Vec<SearchHit>,
+    general: Vec<SearchHit>,
+    top_k: usize,
+) -> Vec<SearchHit> {
+    use std::collections::HashMap;
+    // Key: (source_corpus_label, chunk_id). A None source_corpus defaults to
+    // "local" so callers that omit the tag still get well-defined identity.
+    type Key = (String, i64);
+    let key_of = |h: &SearchHit| -> Key {
+        (
+            h.source_corpus.as_deref().unwrap_or("local").to_string(),
+            h.chunk_id,
+        )
+    };
+    let mut score_acc: HashMap<Key, f64> = HashMap::new();
+    let mut by_key: HashMap<Key, SearchHit> = HashMap::new();
+    for (rank0, hit) in local.into_iter().enumerate() {
+        let key = key_of(&hit);
+        *score_acc.entry(key.clone()).or_insert(0.0) += 1.0 / (RRF_K + (rank0 as f64 + 1.0));
+        by_key.entry(key).or_insert(hit);
+    }
+    for (rank0, hit) in general.into_iter().enumerate() {
+        let key = key_of(&hit);
+        *score_acc.entry(key.clone()).or_insert(0.0) += 1.0 / (RRF_K + (rank0 as f64 + 1.0));
+        by_key.entry(key).or_insert(hit);
+    }
+    let mut scored: Vec<(f64, Key)> = score_acc.into_iter().map(|(k, s)| (s, k)).collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored
+        .into_iter()
+        .take(top_k)
+        .filter_map(|(rrf_score, key)| {
+            by_key.remove(&key).map(|mut h| {
+                h.score = rrf_score;
+                h.rrf_score = Some(rrf_score);
+                h
+            })
+        })
+        .collect()
+}

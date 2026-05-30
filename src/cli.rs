@@ -82,6 +82,29 @@ impl Salience {
     }
 }
 
+/// Corpus-scope category for the insights corpus (schema v5). `general`
+/// routes the insight to the cross-project GLOBAL db at
+/// `$HOME/.claude/knowledge/insights.db`; `project` routes it to the current
+/// project's LOCAL `insights.db`. The value is stored verbatim as TEXT in
+/// `documents.category` and is the SOLE selector of which db a write lands in
+/// — `--project <slug>` is data (a `project_slug` column value), never a path.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InsightCategory {
+    /// Cross-project lesson → GLOBAL `$HOME/.claude/knowledge/insights.db`.
+    General,
+    /// Project-scoped lesson → the current project's LOCAL `insights.db`.
+    Project,
+}
+
+impl InsightCategory {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            InsightCategory::General => "general",
+            InsightCategory::Project => "project",
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ProjectRootError {
     #[error("project-root must resolve under current working directory")]
@@ -689,6 +712,13 @@ pub enum InsightSubcommand {
     /// Delete one insight by integer `documents.id` (with chunks +
     /// chunks_vec cascade). Refuses to delete non-insight rows.
     Delete(InsightDeleteArgs),
+    /// Aggregate tag frequencies across the insights corpus. Default merges
+    /// the cwd-local project db with the global general db (summing counts for
+    /// tags present in both). `--category general` restricts to the global db,
+    /// `--category project` to the cwd-local db, `--project <slug>` to a
+    /// registered project's db (looked up in `~/.claude/knowledge/projects.json`)
+    /// merged with the global db.
+    Tags(InsightTagsArgs),
 }
 
 /// `claudebase insight create "<body>"` — agent write surface for the
@@ -737,6 +767,28 @@ pub struct InsightCreateArgs {
     #[arg(long = "source-artifact")]
     pub source_artifact: Option<String>,
 
+    /// Corpus-scope category — REQUIRED. `general` writes to the global
+    /// cross-project db; `project` writes to the current project's local db.
+    /// No default: clap exits 2 when absent (a category MUST be explicit so an
+    /// agent never silently lands a cross-project lesson in a single project).
+    #[arg(long, value_enum)]
+    pub category: InsightCategory,
+
+    /// Tag(s) for this insight — REPEATABLE, at least one required (the empty
+    /// check is business-logic in `run_insight_create`, not a clap-level
+    /// required-arg, so the operator-facing error names `--tag` explicitly).
+    /// Each tag is normalized: a single leading `#` stripped, lowercased,
+    /// trimmed; empties dropped, duplicates collapsed (stable order).
+    #[arg(long = "tags")]
+    pub tags: Vec<String>,
+
+    /// Explicit project slug stored in `documents.project_slug` (DATA, never a
+    /// path). For `--category project` it overrides the cwd-basename default;
+    /// for `--category general` it is silently ignored (project_slug stays
+    /// NULL). NEVER used to construct a filesystem path.
+    #[arg(long)]
+    pub project: Option<String>,
+
     #[arg(long)]
     pub project_root: Option<PathBuf>,
 
@@ -783,6 +835,28 @@ pub struct InsightSearchArgs {
     /// Examples: `30d`, `12h`, `90m`, `4w`. Rejected if no unit suffix.
     #[arg(long)]
     pub since: Option<String>,
+    /// Tag filter (repeatable). OR / any-intersection semantics: an insight
+    /// is kept if it carries ANY of the listed tags. `--tag nginx --tag docker`
+    /// returns insights tagged nginx, docker, or both. Bound as parameters.
+    #[arg(long)]
+    pub tag: Vec<String>,
+    /// Corpus-scope filter: `general` reads only the global db, `project`
+    /// reads only the cwd-local db. Absent → both legs merged.
+    #[arg(long, value_enum)]
+    pub category: Option<InsightCategory>,
+    /// Registry slug of a project whose db replaces the cwd-local leg (merged
+    /// with the global db). Looked up in `~/.claude/knowledge/projects.json`;
+    /// unknown slug → exit 1. DATA, never a raw filesystem path.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Read only the global db (skip the local/project leg). Mutually
+    /// exclusive with `--project-only` (both set → exit 2).
+    #[arg(long)]
+    pub general_only: bool,
+    /// Read only the local/project db (skip the global leg). Mutually
+    /// exclusive with `--general-only` (both set → exit 2).
+    #[arg(long)]
+    pub project_only: bool,
     #[arg(long)]
     pub project_root: Option<PathBuf>,
     #[arg(long, default_value = "insights.db")]
@@ -850,6 +924,21 @@ pub struct InsightListArgs {
     /// Optional filter on `documents.feature_slug` (exact match).
     #[arg(long)]
     pub feature: Option<String>,
+    /// Tag filter (repeatable, OR / any-intersection). See `InsightSearchArgs`.
+    #[arg(long)]
+    pub tag: Vec<String>,
+    /// Corpus-scope filter: `general` (global db) or `project` (cwd-local db).
+    #[arg(long, value_enum)]
+    pub category: Option<InsightCategory>,
+    /// Registry slug of a project whose db replaces the cwd-local leg.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Read only the global db. Mutually exclusive with `--project-only`.
+    #[arg(long)]
+    pub general_only: bool,
+    /// Read only the local/project db. Mutually exclusive with `--general-only`.
+    #[arg(long)]
+    pub project_only: bool,
     #[arg(long)]
     pub project_root: Option<PathBuf>,
     #[arg(long, default_value = "insights.db")]
@@ -872,6 +961,21 @@ pub struct InsightRandomArgs {
     /// Optional filter on `documents.feature_slug` (exact match).
     #[arg(long)]
     pub feature: Option<String>,
+    /// Tag filter (repeatable, OR / any-intersection). See `InsightSearchArgs`.
+    #[arg(long)]
+    pub tag: Vec<String>,
+    /// Corpus-scope filter: `general` (global db) or `project` (cwd-local db).
+    #[arg(long, value_enum)]
+    pub category: Option<InsightCategory>,
+    /// Registry slug of a project whose db replaces the cwd-local leg.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Read only the global db. Mutually exclusive with `--project-only`.
+    #[arg(long)]
+    pub general_only: bool,
+    /// Read only the local/project db. Mutually exclusive with `--general-only`.
+    #[arg(long)]
+    pub project_only: bool,
     #[arg(long)]
     pub project_root: Option<PathBuf>,
     #[arg(long, default_value = "insights.db")]
@@ -886,6 +990,10 @@ pub struct InsightGcArgs {
     /// surfaces `{would_delete_medium: N, would_delete_low: N}`.
     #[arg(long)]
     pub dry_run: bool,
+    /// Corpus scope: `general` gc's only the global db. Absent → gc BOTH the
+    /// cwd-local db and the global db sequentially, combining their reports.
+    #[arg(long, value_enum)]
+    pub category: Option<InsightCategory>,
     #[arg(long)]
     pub project_root: Option<PathBuf>,
     #[arg(long, default_value = "insights.db")]
@@ -900,6 +1008,10 @@ pub struct InsightDeleteArgs {
     /// targeting is not supported here — use `insight get <prefix>` to
     /// confirm the id first, then `insight delete <id>`.)
     pub id: i64,
+    /// Corpus scope: `general` resolves the id against the global db. Absent
+    /// (or `project`) → the cwd-local db (existing behavior).
+    #[arg(long, value_enum)]
+    pub category: Option<InsightCategory>,
     #[arg(long)]
     pub project_root: Option<PathBuf>,
     #[arg(long, default_value = "insights.db")]
@@ -915,6 +1027,40 @@ pub struct InsightGetArgs {
     pub ident: String,
     #[arg(long)]
     pub project_root: Option<PathBuf>,
+    #[arg(long, default_value = "insights.db")]
+    pub db_name: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `claudebase insight tags` — tag-frequency aggregation over the insights
+/// corpus (schema v5 `insight_tags` table).
+///
+/// DB selection:
+///   - default (no flags)            → cwd-local db + global db (merged)
+///   - `--category general`          → global db only
+///   - `--category project`          → cwd-local db only
+///   - `--project <slug>`            → registered project's db + global db
+///
+/// `--category` and `--project` are not combined: when `--project` is set the
+/// registry lookup drives the local leg and `--category` is ignored. `--project`
+/// is a registry KEY (data), looked up against the trusted
+/// `~/.claude/knowledge/projects.json` file — its resolved path comes from that
+/// trusted file, never joined from raw CLI input.
+#[derive(Args, Debug)]
+pub struct InsightTagsArgs {
+    /// Restrict to one corpus scope: `general` (global db) or `project`
+    /// (cwd-local db). Absent → merge both. Ignored when `--project` is set.
+    #[arg(long, value_enum)]
+    pub category: Option<InsightCategory>,
+    /// Registry slug of a project whose db to query (merged with the global
+    /// db). Looked up in `~/.claude/knowledge/projects.json`; absent slug →
+    /// exit 1. DATA, never a raw filesystem path.
+    #[arg(long)]
+    pub project: Option<String>,
+    #[arg(long)]
+    pub project_root: Option<PathBuf>,
+    /// Corpus file — `insights.db` by default. Tests/admin may override.
     #[arg(long, default_value = "insights.db")]
     pub db_name: String,
     #[arg(long)]

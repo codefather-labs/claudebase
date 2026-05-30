@@ -21,7 +21,17 @@ target
 #.idea/
 
 # claudebase: per-project ephemeral state (knowledge base + dev scratch)
-.claude/
+# Pattern is `.claude/*` (NOT `.claude/`) so the negation below can re-include
+# specific files — git's gitignore semantics forbid re-including a file whose
+# PARENT DIRECTORY is excluded, so directory-form `.claude/` would block any
+# `!.claude/...` negation. Listing the contents-form excludes everything
+# inside .claude/ but leaves the directory itself visible to negations.
+.claude/*
+# ...except release-notes files, which release-engineer writes here and
+# release.yml's body_path consumes at tag-checkout time to populate the
+# GitHub Release body. Negation re-includes them while keeping all other
+# .claude/ ephemera (plan, scratchpad, qa-evidence, knowledge/, *.db) ignored.
+!.claude/release-notes-*.md
 *.db
 *.db-wal
 *.db-shm

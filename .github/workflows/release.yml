@@ -346,6 +346,12 @@ jobs:
           name: ${{ github.ref_name }}
           draft: false
           prerelease: false
+          # body_path: consume the release-engineer-written release-notes file
+          # so the GitHub Release body is populated automatically. The file
+          # ships in the repo (.gitignore negates `.claude/release-notes-*.md`).
+          # If the file is missing for a given tag, action-gh-release falls
+          # back to an empty body without failing the workflow.
+          body_path: .claude/release-notes-${{ steps.source-tarball.outputs.version }}.md
           files: |
             dist/claudebase-darwin-arm64/claudebase-darwin-arm64
             dist/claudebase-darwin-x64/claudebase-darwin-x64
@@ -357,7 +363,7 @@ jobs:
             dist/telegram-plugin-rs-linux-x64/telegram-plugin-rs-linux-x64
             dist/telegram-plugin-rs-linux-arm64/telegram-plugin-rs-linux-arm64
             dist/telegram-plugin-rs-windows-x64/telegram-plugin-rs-windows-x64.exe
-            claude-code-sdlc-${{ steps.source-tarball.outputs.version }}-source.tar.gz
+            claudebase-${{ steps.source-tarball.outputs.version }}-source.tar.gz
           # Windows-x64 build is best-effort (continue-on-error in matrix).
           # When that build fails, the .exe artifact is missing — we still
           # publish the release with the 4 GA platforms + source tarball.

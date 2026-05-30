@@ -89,7 +89,8 @@ $ claudebase search "dependency rule" --top-k 3 --mode hybrid
    ...
 
 $ claudebase insight create "RRF k=60 outperforms k=40 on 17-PDF corpus" \
-    --type agent-learned --agent retrieval-tuning --salience high
+    --type agent-learned --agent retrieval-tuning \
+    --category general --tags rrf,retrieval --salience high
 {"status":"stored","sha":"a1b2c3d4..."}
 
 $ claudebase insight search "RRF parameters" --salience high --top-k 5
@@ -174,11 +175,31 @@ claudebase insight create <body>         persist an agent's cognitive observatio
                                          assumption-falsified | plan-reality-gap |
                                          reflection-observation | operator-correction
                           --agent <name> emitting agent (planner, reflection, ...)
+                          --category <general|project>  REQUIRED (v0.7.0+): general
+                                         routes to the global $HOME/.claude/knowledge/
+                                         insights.db; project routes to the per-project
+                                         local insights.db. Missing -> exit 2.
+                          --tags <t,..>  REQUIRED (v0.7.0+, >=1): comma-separated
+                                         free-form tags (e.g. nginx, mistakes, feature
+                                         slug). Normalized (# stripped, lowercased,
+                                         deduped). Missing -> exit 2.
                           [--feature SLUG] [--salience high|medium|low] [--session ID]
                           [--source-artifact REF]
+claudebase insight tags                  list distinct tag vocabulary with counts
+                          [--category C] [--project SLUG] [--json]
+                                         default merges local + global; --category
+                                         narrows; --project does registry lookup
 claudebase insight search <query>        hybrid retrieval over the insights corpus
                           [--mode M] [--top-k N] [--type T] [--agent A]
                           [--salience S] [--feature F] [--since <Nd|Nh|Nm|Nw>]
+                          [--tag T ...]  OR/any-intersection filter (v0.7.0+):
+                                         repeatable; an insight is returned if its
+                                         tag set intersects the requested tags by
+                                         at least one
+                          [--category C] [--project SLUG]
+                          [--general-only|--project-only]
+                                         in-project default = merge(local, global);
+                                         narrowing flags exclude the other leg
 claudebase insight list                  newest-first, 10 per page
                           [--offset N] [--page-size N] [filters]
 claudebase insight random [filters]      uniformly-sampled single insight

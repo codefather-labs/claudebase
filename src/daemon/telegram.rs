@@ -252,19 +252,283 @@ pub(crate) fn match_bot_command(text: &str) -> Option<&'static str> {
     BOT_COMMANDS.iter().copied().find(|&c| c == cmd)
 }
 
-/// Slice 3 stub for bot-command handling. Slice 2 only needs Step 1 of the
-/// routing tree to (a) detect that a message is a bot command and (b)
-/// short-circuit CLI routing. The real `/agents` / `/switch` / `/whoami` /
-/// `/here` handlers — which query SQLite and enqueue Telegram replies —
-/// land in Slice 3. This stub deliberately performs NO side effects and
-/// produces NO channel notification; it exists so the routing tree's
-/// Step-1 branch has a concrete dispatch target whose only Slice-2
-/// contract is "message recognised as a command, do not route to a CLI".
+/// The `/help` text listing all 7 bot commands (telegram-multi-cli Slice
+/// 3 / TC-TMC-12.1). The `/switch` line carries the group-rebind note so
+/// operators understand that `/switch` in a group rebinds the chat for
+/// ALL participants (chat-as-id). Byte content is asserted loosely by the
+/// QA cases (substring checks for each command name + "group").
+const HELP_TEXT: &str = "\
+Available commands:
+/agents — list CLIs currently online
+/switch <name> — bind this chat to a named CLI (in a group, rebinds for all participants)
+/whoami — show which CLI this chat is bound to
+/here — show the bound CLI's host and working directory
+/start — show the welcome message
+/help — show this help
+/status — show channel status";
+
+/// Slice 3 — handle one inbound bot command (`/agents` / `/switch` /
+/// `/whoami` / `/here` / `/start` / `/help` / `/status`). Returns the
+/// operator-facing reply text the caller enqueues into
+/// `BatchOutcome.pair_replies` (the SAME post-commit teloxide send path
+/// used for Step-5 "No CLIs online" and pairing replies — see
+/// `run_long_poll` line ~1336). Returning the text (rather than enqueuing
+/// directly) keeps the handler testable: a unit test calls it and asserts
+/// on the returned string + the SQLite side-effects, without an
+/// initialised `OUTBOUND_TG` global.
 ///
-/// `_command` / `_chat_id` / `_text` are accepted (and ignored) so the
-/// Slice-3 signature can grow without churning the call site.
-pub(crate) fn handle_bot_command(_command: &str, _chat_id: i64, _text: &str) {
-    // intentionally empty — Slice 3 implements the handlers.
+/// Contract for every command (TC-TMC-8.4 / TC-TMC-12.3 leak guard):
+/// bot commands query SQLite and reply, but publish NO channel
+/// notification and route to NO CLI. The caller `continue`s after this
+/// returns, so no `chat_messages` row and no `notifications` frame is
+/// produced.
+///
+/// `conn` is the caller's open transaction connection (`&tx` Derefs to
+/// `&Connection`), so all reads/writes here are inside the same SEC-13
+/// transactional snapshot as the rest of the batch.
+///
+/// SECURITY (plan.md Slice 3, MEDIUM):
+///   - `/switch <name>` calls `validate_agent_name` BEFORE any DB access,
+///     rejecting non-`[A-Za-z0-9_-]` / empty / >64-char names so an
+///     injection-style argument never reaches a SQL statement (TC-TMC-9.x).
+///     All `active_cli_per_chat` reads/writes are parameterised.
+///   - `/here` is scoped to THIS `chat_id`'s bound CLI only — it never
+///     reads another chat's binding or another CLI's host/cwd metadata.
+pub(crate) fn handle_bot_command(
+    conn: &Connection,
+    command: &str,
+    chat_id: i64,
+    text: &str,
+) -> Option<String> {
+    match command {
+        "/agents" => Some(handle_cmd_agents(conn)),
+        "/switch" => Some(handle_cmd_switch(conn, chat_id, text)),
+        "/whoami" => Some(handle_cmd_whoami(conn, chat_id)),
+        "/here" => Some(handle_cmd_here(conn, chat_id)),
+        "/help" => Some(HELP_TEXT.to_string()),
+        // `/start` and `/status` are preserved unchanged (UC-TMC-12). They
+        // are handled by the official channel-state / pairing flow upstream
+        // of the routing tree, not by this Slice-3 handler. We return None
+        // here so the caller emits no extra reply for them — the existing
+        // behaviour is untouched. (They still short-circuit CLI routing
+        // because `match_bot_command` recognised them, which is the only
+        // Step-1 contract for these two.)
+        "/start" | "/status" => None,
+        // Unreachable in practice — `match_bot_command` only yields the 7
+        // BOT_COMMANDS — but exhaustive for safety.
+        _ => None,
+    }
+}
+
+/// `/agents` (alias `/online`) — list the alive CLIs as a bullet list,
+/// one line per CLI: agent_name + last-seen + cwd-if-available. Empty
+/// registry → the exact "No CLIs currently online." reply (TC-TMC-8.2).
+fn handle_cmd_agents(conn: &Connection) -> String {
+    use crate::daemon::agent_registry::list_alive;
+    let rows = match list_alive(conn, None) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "list_alive failed in /agents handler");
+            return "Could not list online CLIs (internal error).".to_string();
+        }
+    };
+    if rows.is_empty() {
+        return "No CLIs currently online.".to_string();
+    }
+    let mut out = String::from("Online CLIs:");
+    for row in &rows {
+        // last-seen as a relative-ish hint: raw last_pinged_at ms. cwd is
+        // pulled from the agent's metadata JSON when present (best-effort).
+        let cwd = agent_cwd_from_metadata(conn, &row.agent_id);
+        match cwd {
+            Some(c) => out.push_str(&format!("\n• {} (last seen {}) — {}", row.agent_name, row.last_pinged_at, c)),
+            None => out.push_str(&format!("\n• {} (last seen {})", row.agent_name, row.last_pinged_at)),
+        }
+    }
+    out
+}
+
+/// `/switch <name>` — bind THIS chat to a named alive CLI. SECURITY: the
+/// name is validated with `validate_agent_name` BEFORE any DB access; an
+/// injection-style argument is rejected and NO row is written
+/// (TC-TMC-9.3/9.5). On an exact match against an alive CLI the binding
+/// is upserted with fully-parameterised values (never string-interpolated).
+fn handle_cmd_switch(conn: &Connection, chat_id: i64, text: &str) -> String {
+    use crate::daemon::agent_registry::{list_alive, validate_agent_name};
+
+    // Extract the first argument after the command token. `text` is e.g.
+    // "/switch mira" or "/switch@bot mira" — split off the command token,
+    // take the next whitespace-delimited token as the name.
+    let arg = text.split_whitespace().nth(1);
+    let name = match arg {
+        Some(n) => n,
+        None => return "Usage: /switch <name> — bind this chat to a named CLI. Use /agents to list online CLIs.".to_string(),
+    };
+
+    // ---- SECURITY: validate BEFORE touching the database --------------
+    // An injection-style argument (e.g. `'; DROP TABLE …`, `../x`, a
+    // 100-char blob) fails validate_agent_name and we return immediately,
+    // so NO SQL statement ever sees the value (TC-TMC-9.x).
+    if validate_agent_name(name).is_err() {
+        return format!(
+            "Invalid CLI name '{}'. Names are 1-64 chars of letters, digits, '_' or '-'.",
+            // Echo a truncated, char-safe rendering so an oversized/garbage
+            // arg cannot bloat or break the reply. Take up to 32 chars.
+            name.chars().take(32).collect::<String>()
+        );
+    }
+
+    // ---- exact-match against the alive set ----------------------------
+    let alive = match list_alive(conn, None) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "list_alive failed in /switch handler");
+            return "Could not switch (internal error).".to_string();
+        }
+    };
+    let matched = alive.iter().find(|r| r.agent_name == name);
+    let Some(row) = matched else {
+        let available = if alive.is_empty() {
+            "none online".to_string()
+        } else {
+            alive.iter().map(|r| r.agent_name.as_str()).collect::<Vec<_>>().join(", ")
+        };
+        return format!("Unknown CLI: '{name}'. Available: {available}.");
+    };
+
+    // ---- upsert the binding (parameterised) ---------------------------
+    // `set_by` records the chat_id as the setter (chat-as-id has no
+    // per-user identity in the routing key). All values bound, not
+    // interpolated.
+    let set_by = chat_id.to_string();
+    if let Err(e) = conn.execute(
+        "INSERT OR REPLACE INTO active_cli_per_chat \
+         (chat_id, active_cli_name, active_agent_id, set_at, set_by) \
+         VALUES (?1, ?2, ?3, strftime('%s','now'), ?4)",
+        params![chat_id, row.agent_name, row.agent_id, set_by],
+    ) {
+        tracing::warn!(error = %e, chat_id, "failed to upsert active_cli_per_chat in /switch");
+        return "Could not save the binding (internal error).".to_string();
+    }
+
+    // Group chats (negative chat_id) rebind for ALL participants — make
+    // that explicit (TC-TMC-9.6 asserts the group note).
+    let mut reply = format!(
+        "Switched to {}. Next free-text in this chat goes there.",
+        row.agent_name
+    );
+    if chat_id < 0 {
+        reply.push_str(" (Group chat: this rebinds the active CLI for all participants.)");
+    }
+    reply
+}
+
+/// `/whoami` — report THIS chat's bound CLI. Unbound → name the
+/// first_alive fallback so the operator knows where free-text lands.
+/// A bound-but-dead CLI is flagged with a /switch hint (TC-TMC-10.3).
+fn handle_cmd_whoami(conn: &Connection, chat_id: i64) -> String {
+    use crate::daemon::agent_registry::{first_alive, is_alive};
+
+    // Read THIS chat's binding only (parameterised, scoped to chat_id).
+    let binding: Option<(String, String)> = conn
+        .query_row(
+            "SELECT active_cli_name, active_agent_id FROM active_cli_per_chat WHERE chat_id = ?1",
+            params![chat_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .ok();
+
+    match binding {
+        Some((name, agent_id)) => match is_alive(conn, &agent_id) {
+            Ok(true) => format!("This chat is bound to {name} ({agent_id})."),
+            _ => format!(
+                "This chat is bound to {name} ({agent_id}), but that CLI is offline / no longer alive. Use /switch to bind another, or /agents to see who is online."
+            ),
+        },
+        None => match first_alive(conn, None, Some("orchestrator")) {
+            Ok(Some(row)) => format!(
+                "This chat has no explicit binding set. Free-text defaults to {} ({}). Use /switch to bind one.",
+                row.agent_name, row.agent_id
+            ),
+            _ => "This chat has no explicit binding set and no CLIs are online. Spawn one with `claudebase run`.".to_string(),
+        },
+    }
+}
+
+/// `/here` — report the host + cwd of THIS chat's bound CLI ONLY.
+/// SECURITY: strictly scoped to `chat_id`'s binding — it never reads
+/// another chat's binding nor another CLI's metadata. In v1 no slice
+/// populates host/cwd at `agent_register` (red-team F-6, grep-confirmed),
+/// so the host/cwd read returns absent and we reply "unavailable"
+/// (TC-TMC-11.2). A bound CLI whose registry row was reaped → "no longer
+/// online" + /switch hint (TC-TMC-11.3).
+fn handle_cmd_here(conn: &Connection, chat_id: i64) -> String {
+    use crate::daemon::agent_registry::is_alive;
+
+    // Scope to THIS chat's binding only.
+    let bound: Option<(String, String)> = conn
+        .query_row(
+            "SELECT active_cli_name, active_agent_id FROM active_cli_per_chat WHERE chat_id = ?1",
+            params![chat_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .ok();
+
+    let Some((name, agent_id)) = bound else {
+        return "This chat has no bound CLI. Use /switch <name> to bind one (see /agents).".to_string();
+    };
+
+    // The bound CLI's registry row may have been reaped between /switch
+    // and /here (TC-TMC-11.3).
+    match is_alive(conn, &agent_id) {
+        Ok(true) => {}
+        _ => {
+            return format!(
+                "{name} ({agent_id}) is no longer online. Use /switch to bind another, or /agents to see who is online."
+            )
+        }
+    }
+
+    // Pull host/cwd from the bound CLI's metadata JSON (best-effort v1).
+    let host = agent_metadata_field(conn, &agent_id, "host");
+    let cwd = agent_metadata_field(conn, &agent_id, "cwd");
+    match (host, cwd) {
+        (Some(h), Some(c)) => format!("{name} is running on {h} in {c}."),
+        (Some(h), None) => format!("{name} is running on {h} (working directory unavailable)."),
+        (None, Some(c)) => format!("{name} working directory: {c} (host unavailable)."),
+        (None, None) => format!(
+            "{name} host/cwd information is unavailable (the CLI did not report it)."
+        ),
+    }
+}
+
+/// Read a string field from an agent's `metadata` JSON column, scoped to
+/// the given `agent_id` (parameterised). Returns `None` when the row is
+/// absent, the metadata is NULL/empty/non-JSON, the field is missing, the
+/// field is not a string, or the string is empty. Used by `/here` and
+/// `/agents` — never reads metadata for any agent other than the one named.
+fn agent_metadata_field(conn: &Connection, agent_id: &str, field: &str) -> Option<String> {
+    let metadata_text: Option<String> = conn
+        .query_row(
+            "SELECT metadata FROM agent_registry WHERE agent_id = ?1",
+            params![agent_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten();
+    let raw = metadata_text?;
+    let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let s = val.get(field)?.as_str()?;
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+/// Convenience wrapper for the `cwd` metadata field used by `/agents`.
+fn agent_cwd_from_metadata(conn: &Connection, agent_id: &str) -> Option<String> {
+    agent_metadata_field(conn, agent_id, "cwd")
 }
 
 /// The outcome of running the 5-step routing decision tree over one
@@ -564,7 +828,14 @@ pub fn process_batch(
         // advanced above).
         let target_agent_id: Option<String> = match decision {
             RoutingDecision::BotCommand(cmd) => {
-                handle_bot_command(cmd, chat_id, &content);
+                // Step 1 — bot command: query SQLite, enqueue the reply via
+                // the same post-commit teloxide path as pairing/step-5
+                // replies, publish NO channel notification, route to NO CLI
+                // (TC-TMC-8.4 leak guard). `handle_bot_command` returns None
+                // for /start and /status (preserved-as-is, no extra reply).
+                if let Some(reply) = handle_bot_command(&tx, cmd, chat_id, &content) {
+                    pair_replies.push((chat_id, reply));
+                }
                 continue;
             }
             RoutingDecision::Route(agent_id) => Some(agent_id),
@@ -732,9 +1003,12 @@ pub fn process_batch_with_pairing(
         let decision = resolve_routing_target(&tx, chat_id, &thread_id, &content, reply_to_id);
         let target_agent_id: Option<String> = match decision {
             RoutingDecision::BotCommand(cmd) => {
-                // Step 1 — dispatch to the Slice-3 stub; no chat row, no
-                // CLI notification (TC-TMC-8.4 / TC-TMC-12.3 leak guard).
-                handle_bot_command(cmd, chat_id, &content);
+                // Step 1 — query SQLite, enqueue the reply via the post-commit
+                // teloxide path; no chat row, no CLI notification (TC-TMC-8.4
+                // / TC-TMC-12.3 leak guard). None for /start and /status.
+                if let Some(reply) = handle_bot_command(&tx, cmd, chat_id, &content) {
+                    pair_replies.push((chat_id, reply));
+                }
                 continue;
             }
             RoutingDecision::Route(agent_id) => Some(agent_id),
@@ -2080,13 +2354,429 @@ mod tests {
         let outcome =
             process_batch(&mut conn, &access, None, &[text_update(1, 111, "/agents", None)])
                 .unwrap();
-        // Step 1: bot command → no channel notification, no chat row, no
-        // step-5 reply.
+        // Step 1: bot command → no channel notification, no chat row
+        // (TC-TMC-8.4 leak guard). The /agents handler DOES enqueue an
+        // operator reply via pair_replies — exactly one, and it lists the
+        // alive CLI "mira" (Slice 3).
         assert_eq!(outcome.notifications.len(), 0);
         assert_eq!(outcome.messages_inserted, 0);
-        assert_eq!(outcome.pair_replies.len(), 0);
+        assert_eq!(outcome.pair_replies.len(), 1);
+        assert!(outcome.pair_replies[0].1.contains("mira"));
         // Offset still advanced.
         assert_eq!(outcome.new_offset, Some(1));
+    }
+
+    // ===================================================================
+    // telegram-multi-cli Slice 3 — bot-command handlers.
+    // Covers TC-TMC-8.x (/agents), 9.x (/switch + injection), 10.x
+    // (/whoami), 11.x (/here scoping), 12.x (/help, preserved cmds).
+    // ===================================================================
+
+    /// Seed an alive agent with a metadata JSON blob (for /here host/cwd).
+    fn seed_agent_with_metadata(conn: &Connection, agent_id: &str, name: &str, metadata: serde_json::Value) {
+        crate::daemon::agent_registry::register(conn, agent_id, name, "conn", None, Some(&metadata))
+            .unwrap();
+    }
+
+    /// Drive one inbound bot-command message through process_batch and
+    /// return the single operator reply text (asserts exactly one reply,
+    /// no notification, no chat row — the leak guard).
+    fn run_bot_cmd(conn: &mut Connection, chat_id: i64, text: &str) -> String {
+        let access = allow_all_access();
+        let outcome =
+            process_batch(conn, &access, None, &[text_update(1, chat_id, text, None)]).unwrap();
+        assert_eq!(outcome.notifications.len(), 0, "bot command must not notify a CLI");
+        assert_eq!(outcome.messages_inserted, 0, "bot command must not insert a chat row");
+        assert_eq!(outcome.pair_replies.len(), 1, "bot command must produce exactly one reply");
+        outcome.pair_replies[0].1.clone()
+    }
+
+    fn binding_count(conn: &Connection, chat_id: i64) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM active_cli_per_chat WHERE chat_id = ?1",
+            params![chat_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    // ---- TC-TMC-8.1: /agents lists alive CLIs -------------------------
+
+    #[test]
+    fn bot_cmd_agents_lists_alive() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+        seed_agent(&conn, "cli-2-id", "worker");
+
+        let reply = run_bot_cmd(&mut conn, 111, "/agents");
+        assert!(reply.contains("mira"), "reply should list mira: {reply}");
+        assert!(reply.contains("worker"), "reply should list worker: {reply}");
+    }
+
+    // ---- TC-TMC-8.2: /agents with empty registry ----------------------
+
+    #[test]
+    fn bot_cmd_agents_empty() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        let reply = run_bot_cmd(&mut conn, 111, "/agents");
+        assert!(reply.contains("No CLIs currently online"), "got: {reply}");
+    }
+
+    // ---- TC-TMC-8.3: /agents trailing space still matches -------------
+
+    #[test]
+    fn bot_cmd_agents_trailing_space() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+        let reply = run_bot_cmd(&mut conn, 111, "/agents ");
+        assert!(reply.contains("mira"), "got: {reply}");
+    }
+
+    // ---- TC-TMC-9.1: /switch valid → row written + ack ----------------
+
+    #[test]
+    fn bot_cmd_switch_valid_writes_binding() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+
+        let reply = run_bot_cmd(&mut conn, 111, "/switch mira");
+        assert!(reply.contains("mira"), "ack should name mira: {reply}");
+
+        // Assert the SQL row was written with the correct values.
+        let (name, agent_id, set_by): (String, String, String) = conn
+            .query_row(
+                "SELECT active_cli_name, active_agent_id, set_by FROM active_cli_per_chat WHERE chat_id = 111",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "mira");
+        assert_eq!(agent_id, "cli-1-id");
+        assert_eq!(set_by, "111");
+    }
+
+    // ---- TC-TMC-9.2: /switch replaces prior binding (1 row) -----------
+
+    #[test]
+    fn bot_cmd_switch_replaces_prior_binding() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+        seed_agent(&conn, "cli-2-id", "worker");
+        seed_binding(&conn, 111, "worker", "cli-2-id"); // prior binding
+
+        let _ = run_bot_cmd(&mut conn, 111, "/switch mira");
+        assert_eq!(binding_count(&conn, 111), 1, "exactly one row for chat 111");
+        let name: String = conn
+            .query_row("SELECT active_cli_name FROM active_cli_per_chat WHERE chat_id=111", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, "mira");
+    }
+
+    // ---- TC-TMC-9.3: /switch unknown name → rejected, no write --------
+
+    #[test]
+    fn bot_cmd_switch_unknown_name_rejected() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+
+        let reply = run_bot_cmd(&mut conn, 111, "/switch nonexistent");
+        assert!(reply.contains("Unknown") || reply.contains("nonexistent"), "got: {reply}");
+        assert!(reply.contains("mira"), "should list available CLI mira: {reply}");
+        // No binding row written (the name passed validation but did not match).
+        assert_eq!(binding_count(&conn, 111), 0);
+    }
+
+    // ---- TC-TMC-9.4: /switch with no arg → usage, no write ------------
+
+    #[test]
+    fn bot_cmd_switch_no_arg() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+
+        let reply = run_bot_cmd(&mut conn, 111, "/switch");
+        assert!(reply.to_lowercase().contains("usage"), "got: {reply}");
+        assert_eq!(binding_count(&conn, 111), 0);
+    }
+
+    // ---- TC-TMC-9.5: /switch partial name → rejected, no write --------
+
+    #[test]
+    fn bot_cmd_switch_partial_name_rejected() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+
+        let reply = run_bot_cmd(&mut conn, 111, "/switch mir");
+        assert!(reply.contains("mir"), "got: {reply}");
+        assert!(reply.contains("mira"), "should list mira as available: {reply}");
+        assert_eq!(binding_count(&conn, 111), 0);
+    }
+
+    // ---- TC-TMC-9.6: /switch in a group chat → group note + binding ---
+
+    #[test]
+    fn bot_cmd_switch_group_chat_rebind_note() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+
+        let reply = run_bot_cmd(&mut conn, -100111, "/switch mira");
+        assert!(
+            reply.to_lowercase().contains("group") || reply.contains("all participants"),
+            "group rebind note expected: {reply}"
+        );
+        let chat: i64 = conn
+            .query_row("SELECT chat_id FROM active_cli_per_chat WHERE chat_id=-100111", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(chat, -100111);
+    }
+
+    // ---- SECURITY TC-TMC-9.x: injection-style input → rejected BEFORE
+    //      any DB write (validate_agent_name guards the SQL boundary) -----
+
+    #[test]
+    fn bot_cmd_switch_injection_rejected_before_db() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        // An alive CLI exists so a non-validated path COULD theoretically
+        // write — but the injection arg must never reach the DB.
+        seed_agent(&conn, "cli-1-id", "mira");
+
+        // Each of these fails validate_agent_name (contains ';', space,
+        // '/', '.', or quote — none are [A-Za-z0-9_-]). The arg is the
+        // FIRST whitespace token after the command, so we pick payloads
+        // whose first token is itself invalid.
+        let payloads = [
+            "/switch ';DROP",          // contains ' and ;
+            "/switch ../etc",          // contains / and .
+            "/switch \"or\"1=1",       // contains quotes and =
+            "/switch mira;DROP",       // contains ;
+        ];
+        for p in payloads {
+            let reply = run_bot_cmd(&mut conn, 111, p);
+            assert!(
+                reply.to_lowercase().contains("invalid"),
+                "payload {p:?} should be rejected as invalid: {reply}"
+            );
+            // CRITICAL: no binding row was written for ANY injection payload.
+            assert_eq!(
+                binding_count(&conn, 111),
+                0,
+                "injection payload {p:?} must NOT write a binding row"
+            );
+        }
+        // The agent_registry table is untouched (no rows dropped/added).
+        let reg_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM agent_registry", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(reg_count, 1, "agent_registry must be intact after injection attempts");
+    }
+
+    #[test]
+    fn bot_cmd_switch_oversized_name_rejected_before_db() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+
+        // 100-char name — exceeds validate_agent_name's 64-char cap.
+        let big = "a".repeat(100);
+        let reply = run_bot_cmd(&mut conn, 111, &format!("/switch {big}"));
+        assert!(reply.to_lowercase().contains("invalid"), "got: {reply}");
+        assert_eq!(binding_count(&conn, 111), 0, "oversized name must not write a row");
+    }
+
+    // ---- TC-TMC-10.1: /whoami bound -----------------------------------
+
+    #[test]
+    fn bot_cmd_whoami_bound() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+        seed_binding(&conn, 111, "mira", "cli-1-id");
+
+        let reply = run_bot_cmd(&mut conn, 111, "/whoami");
+        assert!(reply.contains("mira"), "got: {reply}");
+        assert!(reply.contains("cli-1-id"), "got: {reply}");
+    }
+
+    // ---- TC-TMC-10.2: /whoami unbound → first_alive fallback ----------
+
+    #[test]
+    fn bot_cmd_whoami_no_binding() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "orch-id", "orchestrator-main");
+
+        let reply = run_bot_cmd(&mut conn, 111, "/whoami");
+        assert!(
+            reply.to_lowercase().contains("no explicit binding") || reply.to_lowercase().contains("default"),
+            "got: {reply}"
+        );
+        assert!(reply.contains("orchestrator-main"), "should name first_alive: {reply}");
+    }
+
+    // ---- TC-TMC-10.3: /whoami bound-but-dead → offline + /switch ------
+
+    #[test]
+    fn bot_cmd_whoami_dead_binding() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        // Binding points at a CLI not in the alive registry.
+        seed_binding(&conn, 111, "ghost", "cli-dead-id");
+
+        let reply = run_bot_cmd(&mut conn, 111, "/whoami");
+        assert!(
+            reply.to_lowercase().contains("offline") || reply.to_lowercase().contains("no longer"),
+            "got: {reply}"
+        );
+        assert!(reply.contains("/switch"), "should suggest /switch: {reply}");
+    }
+
+    // ---- TC-TMC-11.1: /here with host/cwd present (metadata populated) -
+
+    #[test]
+    fn bot_cmd_here_shows_host_cwd() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent_with_metadata(
+            &conn,
+            "cli-1-id",
+            "mira",
+            serde_json::json!({"host": "devbox", "cwd": "/home/operator/project"}),
+        );
+        seed_binding(&conn, 111, "mira", "cli-1-id");
+
+        let reply = run_bot_cmd(&mut conn, 111, "/here");
+        assert!(reply.contains("devbox"), "got: {reply}");
+        assert!(reply.contains("/home/operator/project"), "got: {reply}");
+    }
+
+    // ---- TC-TMC-11.2: /here with absent metadata → "unavailable" (v1) -
+
+    #[test]
+    fn bot_cmd_here_missing_metadata() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        // No metadata populated (the v1 reality per red-team F-6).
+        seed_agent(&conn, "cli-1-id", "mira");
+        seed_binding(&conn, 111, "mira", "cli-1-id");
+
+        let reply = run_bot_cmd(&mut conn, 111, "/here");
+        assert!(reply.to_lowercase().contains("unavailable"), "got: {reply}");
+    }
+
+    // ---- TC-TMC-11.3: /here bound CLI reaped → no longer online -------
+
+    #[test]
+    fn bot_cmd_here_reaped_cli() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        // Binding exists but the CLI's registry row is gone (reaped).
+        seed_binding(&conn, 111, "mira", "cli-1-id");
+
+        let reply = run_bot_cmd(&mut conn, 111, "/here");
+        assert!(reply.to_lowercase().contains("no longer"), "got: {reply}");
+        assert!(
+            reply.contains("/switch") || reply.contains("/agents"),
+            "should suggest /switch or /agents: {reply}"
+        );
+    }
+
+    // ---- SECURITY: /here is scoped to THIS chat only ------------------
+    // A second chat (222) is bound to a DIFFERENT CLI whose metadata holds
+    // a secret host. /here in chat 111 must NEVER leak chat-222's CLI
+    // host/cwd — it reads chat 111's binding only.
+
+    #[test]
+    fn bot_cmd_here_scoped_to_this_chat_only() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        // Chat 111 → cli-1 (no metadata). Chat 222 → cli-2 (secret host).
+        seed_agent(&conn, "cli-1-id", "mira");
+        seed_agent_with_metadata(
+            &conn,
+            "cli-2-id",
+            "worker",
+            serde_json::json!({"host": "SECRET-HOST", "cwd": "/secret/path"}),
+        );
+        seed_binding(&conn, 111, "mira", "cli-1-id");
+        seed_binding(&conn, 222, "worker", "cli-2-id");
+
+        let reply = run_bot_cmd(&mut conn, 111, "/here");
+        // chat 111's CLI (mira) has no metadata → unavailable; the OTHER
+        // chat's secret host MUST NOT appear.
+        assert!(!reply.contains("SECRET-HOST"), "leaked another chat's host: {reply}");
+        assert!(!reply.contains("/secret/path"), "leaked another chat's cwd: {reply}");
+        assert!(reply.contains("mira"), "should name THIS chat's CLI: {reply}");
+    }
+
+    // ---- TC-TMC-12.1: /help lists all 7 commands + group note ---------
+
+    #[test]
+    fn bot_cmd_help_lists_all_commands() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        let reply = run_bot_cmd(&mut conn, 111, "/help");
+        for needle in ["agents", "switch", "whoami", "here", "start", "help", "status", "group"] {
+            assert!(reply.contains(needle), "help missing '{needle}': {reply}");
+        }
+    }
+
+    // ---- TC-TMC-12.2: /help@botname suffix handled as /help -----------
+
+    #[test]
+    fn bot_cmd_help_with_botname_suffix() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        let reply = run_bot_cmd(&mut conn, 111, "/help@my_bot");
+        assert!(reply.contains("agents"), "got: {reply}");
+        assert!(reply.contains("switch"), "got: {reply}");
+    }
+
+    // ---- TC-TMC-12.3: /start and /status preserved (no extra reply,
+    //      no CLI notification) — they short-circuit routing but emit no
+    //      Slice-3 reply (handled by the upstream channel-state flow) -----
+
+    #[test]
+    fn bot_cmd_start_status_preserved_no_reply() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+        seed_binding(&conn, 111, "mira", "cli-1-id");
+
+        let access = allow_all_access();
+        for cmd in ["/start", "/status"] {
+            let outcome =
+                process_batch(&mut conn, &access, None, &[text_update(1, 111, cmd, None)]).unwrap();
+            // No channel notification (leak guard), no chat row, and the
+            // Slice-3 handler returns None → no extra pair reply.
+            assert_eq!(outcome.notifications.len(), 0, "{cmd} must not notify a CLI");
+            assert_eq!(outcome.messages_inserted, 0, "{cmd} must not insert a chat row");
+            assert_eq!(outcome.pair_replies.len(), 0, "{cmd} must emit no Slice-3 reply");
+        }
+    }
+
+    // ---- /switch handler does NOT publish a channel notification ------
+
+    #[test]
+    fn bot_cmd_switch_no_cli_notification() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+
+        let access = allow_all_access();
+        let outcome =
+            process_batch(&mut conn, &access, None, &[text_update(1, 111, "/switch mira", None)])
+                .unwrap();
+        assert_eq!(outcome.notifications.len(), 0, "/switch must not leak to a CLI");
+        assert_eq!(outcome.messages_inserted, 0);
     }
 
     #[test]

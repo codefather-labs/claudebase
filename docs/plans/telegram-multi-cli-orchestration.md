@@ -1,7 +1,7 @@
 # Plan: Telegram ↔ CLI multi-instance orchestration
 
 **Owner:** Mira (orchestrator)
-**Status:** draft — awaiting operator review
+**Status:** operator decisions resolved 2026-05-30 — awaiting bootstrap (OQ-3 closed: routing key is `chat_id` alone, 1 chat = 1 CLI; see `## Decisions made` below). Remaining OQs (1, 2, 4, 5, 6, 7, 8) are still implementer-discretion; they don't block bootstrap, planner can decide at slice time.
 **Created:** 2026-05-24
 
 **DEPENDS ON (must land first):**
@@ -118,13 +118,14 @@ When server receives a TG message via `getUpdates`, decide where to route in thi
    → if miss (cli offline / message too old): fallback to step 4 with a note
      ("the agent who sent the message you replied to is offline, routing to {active_cli} instead")
 
-3. Was the previous TG message FROM the user, addressing a specific cli? (per-user state has "last addressed cli")
-   → not used in v1; revisit if step 4 proves insufficient
+3. ~~Was the previous TG message FROM the user, addressing a specific cli? (per-user state has "last addressed cli")~~
+   → CUT under the chat-as-id model (operator decision 2026-05-30): there is no per-user "last addressed cli" — the chat itself carries the binding via step 4.
 
-4. Free-text without reply quote: route to PER-USER ACTIVE CLI
-   → state: active_cli_per_user[user_id] = "<cli_name>"
-   → default if unset: "orchestrator" role (or "first alive cli" if no orchestrator)
-   → user can change via /switch X
+4. Free-text without reply quote: route to PER-CHAT ACTIVE CLI
+   → state: `active_cli_per_chat[chat_id] = "<cli_name>"`
+   → `chat_id` is the canonical routing key — same for DMs and group chats. In a DM the chat has exactly one human; in a group chat ALL humans in the group share the same chat-bound cli (by design — see `## Decisions made` for the tradeoff vs `(user_id, chat_id)` keying).
+   → default if unset: "orchestrator" role (or "first alive cli" if no orchestrator).
+   → any user in the chat can change via `/switch X` — affects the whole chat.
 
 5. No alive cli at all → server replies in TG: "No cli's online. Spawn one with `claudebase run` somewhere."
 ```
@@ -135,9 +136,9 @@ When server receives a TG message via `getUpdates`, decide where to route in thi
 |---|---|
 | Target cli (per active_cli) is offline | Reply in TG: "agent X (your active cli) is offline. Switch with `/switch Y` or wait for restart." Don't route, don't queue. |
 | User replies to a thread but cli has died since | Reply in TG: "the agent who sent that message (X) is offline. Routing to active cli (Y) instead." Then routes to active_cli with the prior message's content as context-quote. |
-| User replies in a group chat | Group has its own active_cli (group_id → cli_name); fallback to "first alive cli in group's allow list" if unset. |
-| User sends a command in group (`/agents`) | Server handles per-group (lists cli's that are configured to listen in that group, not all cli's). |
-| Two users share the bot (multi-user allowlist) | Per-user state means user A's active_cli is independent from user B's. Each user's `/switch` only affects their own routing. |
+| User replies in a group chat | Same as DM — `active_cli_per_chat[group_chat_id]` resolves the bound cli. No special-case group path; fallback to "first alive cli in chat's allow list" if unset. |
+| User sends a command in group (`/agents`) | Server handles per-chat (lists cli's that are configured to listen in that chat). |
+| Two users share the bot (multi-user allowlist) | Routing key is `chat_id`, NOT user_id. Two users in DIFFERENT DMs each get their own chat (= their own active_cli). Two users in the SAME group chat share that group's chat_id → both see the SAME bound cli. Either user's `/switch` rebinds the shared chat. (Intentional simplification — see `## Decisions made` for the rejected `(user_id, chat_id)` alternative.) |
 
 ## Bot commands API
 
@@ -146,12 +147,12 @@ All handled SERVER-SIDE, never reach any cli.
 | Command | Args | Effect |
 |---|---|---|
 | `/agents` or `/online` | none | reply with bullet list: "• planner-projectX (developer, last seen 12s ago, cwd ~/proj/X)\n• architect-projectY ...". One line per alive cli. |
-| `/switch <agent-name>` | name (required, must be alive) | set `active_cli_per_user[user_id] = name`; reply "switched to <agent-name>. Next free-text msg goes there." Validates target exists + is alive; refuses with helpful error otherwise. |
-| `/whoami` | none | reply with active_cli for this user + last 3 messages exchanged with it ("Currently talking to planner-projectX. Last: ... Last: ... Last: ...") |
-| `/here` | none | reply with `host:cwd` of active_cli ("active cli runs on `desktop-mira`, cwd=`/Users/aleksandra/projects/X`") |
+| `/switch <agent-name>` | name (required, must be alive) | set `active_cli_per_chat[chat_id] = name`; reply "switched to <agent-name>. Next free-text msg in this chat goes there." Validates target exists + is alive; refuses with helpful error otherwise. **Group chats:** the switch affects the whole chat (all users in it) — by design of chat-as-id keying. |
+| `/whoami` | none | reply with active_cli for THIS CHAT + last 3 messages exchanged with it ("This chat is bound to planner-projectX. Last: ... Last: ... Last: ...") |
+| `/here` | none | reply with `host:cwd` of the chat's active_cli ("this chat's cli runs on `desktop-mira`, cwd=`/Users/aleksandra/projects/X`") |
 | `/start` | none | (preserved from current plugin) onboarding text — bot intro + pairing instructions |
 | `/help` | none | (preserved) usage summary including new `/agents`, `/switch`, etc |
-| `/status` | none | (preserved) pairing status for this user + active_cli summary |
+| `/status` | none | (preserved) pairing status for this user + the chat's active_cli summary |
 
 ### Bot command UX guidance
 
@@ -212,21 +213,21 @@ CREATE INDEX tg_message_map_sent_at ON tg_message_map(sent_at);
 -- Periodic cleanup of rows older than TTL (default 30 days).
 ```
 
-### 2. `active_cli_per_user` (in-memory + JSON persist)
+### 2. `active_cli_per_chat` (in-memory + JSON persist)
+
+Chat-as-id model (operator decision 2026-05-30): the routing key is `chat_id` alone — DMs and group chats use the SAME shape. In Telegram, DMs have positive `chat_id`s (equal to the peer's `user_id`) and group chats have negative `chat_id`s; both flow through the same `chats` map.
 
 ```jsonc
 // ~/.claudebase/server/state/active_cli.json
 {
   "schema_version": 1,
-  "users": {
-    "434566766": {                       // tg user_id
+  "chats": {
+    "434566766": {                       // DM chat_id (in TG: equals peer user_id)
       "active_cli_name": "planner-projectX",
       "set_at": "2026-05-24T11:23:45Z",
       "set_by": "user_command_/switch"   // or "default" or "auto-fallback"
-    }
-  },
-  "groups": {
-    "-1002962597876": {
+    },
+    "-1002962597876": {                  // group chat_id (negative in TG)
       "active_cli_name": "architect-projectY",
       "set_at": "...",
       "set_by": "user_command_/switch"
@@ -271,9 +272,9 @@ Refactor `telegram-plugin-rs` to a `claudebase:telegram` plugin client:
 Server handles `/agents` `/switch` `/whoami` `/here` plus preserved `/start` `/help` `/status`.
 
 - `/agents`: query agent_registry list_alive, format as bullet list.
-- `/switch X`: validate target alive, write `active_cli_per_user[user_id]=X`, persist, ack.
-- `/whoami`: query agent_registry + recent tg_message_map rows for this user.
-- `/here`: query agent_registry for cli's `host` + `cwd`.
+- `/switch X`: validate target alive, write `active_cli_per_chat[chat_id]=X`, persist, ack. (In a group chat, this rebinds the chat for everyone in it — chat-as-id by design.)
+- `/whoami`: query agent_registry + recent tg_message_map rows for this CHAT (not this user).
+- `/here`: query agent_registry for the chat's bound cli's `host` + `cwd`.
 
 **Done when:** all 4 new commands return correct data; existing 3 commands still work.
 
@@ -292,7 +293,7 @@ fn route_inbound(msg: TgMessage) -> RoutingDecision {
             // else fallthrough to active_cli with a note
         }
     }
-    if let Some(active) = active_cli_per_user.get(msg.from.user_id) {
+    if let Some(active) = active_cli_per_chat.get(msg.chat.id) {
         if agent_registry.is_alive(active) {
             return RoutingDecision::RouteToCli(active, RouteReason::ActiveCli);
         }
@@ -312,22 +313,23 @@ Every outbound TG message from server-proxied `reply` / `edit_message` records `
 
 **Done when:** user gets msg from cli A; replies to it in TG; server reads `reply_to_message`, looks up tg_message_map → cli A → routes back to cli A.
 
-### Phase 6 — Group chat support
+### Phase 6 — Group chat semantics
 
-- Per-group `active_cli` state (in same `active_cli.json`, just under `groups` key).
-- `/switch` in group affects group's `active_cli` (per-group), not user's.
-- Mention detection: if no active_cli set for group, only mentions trigger routing (mirrors current behavior for groups).
-- Bot commands in groups gated by group's allow_from list.
+Group chats use the SAME `active_cli_per_chat[chat_id]` map as DMs (the chat-as-id model has no separate "groups" code path). What differs is socially, not structurally:
 
-**Done when:** bot in group → user mentions bot with `/switch architect-Y` → all subsequent group messages route to architect-Y until next `/switch`.
+- `/switch` in a group rebinds the chat for ALL users in it. Any participant who runs `/switch X` redirects everyone's free-text in that chat to X. This is the intentional consequence of chat-as-id keying; document it in `/help` output so users in shared rooms aren't surprised.
+- Mention detection: if no `active_cli` set for the group chat, only `@botname`-mentioned messages trigger routing (mirrors current group behavior). Once `/switch` binds the group → free-text routes normally.
+- Bot commands in groups gated by the chat's allow_from list (unchanged).
+
+**Done when:** bot in group → any participant runs `@botname /switch architect-Y` → `active_cli_per_chat[group_chat_id] = architect-Y`; subsequent free-text from ANY participant in that group routes to architect-Y until the next `/switch`.
 
 ### Phase 7 — Cli lifecycle handling
 
-- On `agent_unregister` (cli shuts down): if any `active_cli_per_user` row points to it, soft-clear to "needs-refresh"; on next message to that user, server informs "your active cli X is offline, routing to default" and routes to fallback.
-- On `agent_register` (cli starts up): no auto-reattach to past users; user must `/switch` back. Avoids surprise routing to a fresh cli that thinks it's continuing a 3-day-old conversation.
+- On `agent_unregister` (cli shuts down): if any `active_cli_per_chat` row points to it, soft-clear to "needs-refresh"; on next message in that chat, server informs "this chat's cli X is offline, routing to default" and routes to fallback.
+- On `agent_register` (cli starts up): no auto-reattach to past chats; a user in that chat must `/switch` back. Avoids surprise routing to a fresh cli that thinks it's continuing a 3-day-old conversation.
 - Periodic `last_seen_at` ping every 30s (existing agent_registry reap logic); reap unresponsive cli's.
 
-**Done when:** cli A is `active_cli` for user → cli A killed → user sends msg → server replies "agent A offline, routing to fallback Y" + routes; later cli A respawns → user must `/switch A` to resume.
+**Done when:** cli A is `active_cli` for some chat → cli A killed → user sends msg in that chat → server replies "this chat's agent A is offline, routing to fallback Y" + routes; later cli A respawns → a user in that chat must `/switch A` to resume.
 
 ### Phase 8 — Migration + backward compat
 
@@ -347,8 +349,8 @@ Every outbound TG message from server-proxied `reply` / `edit_message` records `
 | 3 | Bot commands | `/agents` `/switch` `/whoami` `/here` work; `/start` `/help` `/status` preserved |
 | 4 | Routing tree | reply-quote / active-cli / default-orchestrator all route correctly |
 | 5 | Outbound tracking | reply-quote round-trip works across server restarts |
-| 6 | Group chats | per-group active_cli works; mentions still gate |
-| 7 | Lifecycle | active_cli offline → fallback; respawn requires `/switch` reattach |
+| 6 | Group chat semantics | `active_cli_per_chat[group_chat_id]` works exactly like DMs; mentions still gate untagged messages until first `/switch` binds the group |
+| 7 | Lifecycle | per-chat active_cli offline → fallback; respawn requires `/switch` reattach |
 | 8 | Migration | config flag flips; conflict gate prevents dual-poller; legacy mode preserved |
 
 ## Risks + mitigations
@@ -361,7 +363,7 @@ Every outbound TG message from server-proxied `reply` / `edit_message` records `
 | Two cli's registered with same name (collision) | agent_registry already validates `validate_agent_name`; on duplicate, second registration rejected; cli has to pick different name |
 | Token-rotation while users have active conversations | New token activates new poller; old `tg_message_map` survives (message_ids stable across token rotation per Telegram); seamless |
 | Refactor breaks current telegram-plugin-rs users | Migration gate (Phase 8) keeps legacy path until operator opts in; can revert by flipping `enabled=false` |
-| Group chat `/switch X` affects all users in the group → confusion | Document clearly: in groups, switch is per-group not per-user; mirrors how Slack/Discord channels work |
+| Group chat `/switch X` affects all users in the group | INTENTIONAL under chat-as-id (operator decision 2026-05-30): the chat itself is bound to one cli, so a switch from any participant rebinds the chat for everyone. Mirrors how a shared Slack/Discord channel works. Document the behavior in `/help`, `/start`, and group-onboarding text so participants understand. (Rejected alternative: `(user_id, chat_id)` keying — see `## Decisions made`.) |
 | Bot commands collision with existing skills (`/telegram:configure`, `/telegram:access`) | Those are Claude Code SKILL invocations (`/skill:command`) — different namespace; no collision with bot commands (`/agents`, etc) which are TG-server-handled. Document the distinction. |
 
 ## Open questions (to settle before Phase 1 starts)
@@ -370,7 +372,7 @@ Every outbound TG message from server-proxied `reply` / `edit_message` records `
 
 2. **Active cli persistence format.** JSON file at `~/.claudebase/server/state/active_cli.json` or row in server's SQLite DB? JSON is simpler; SQLite is consistent with other server tables. Leaning JSON for v1 (small, simple); migrate to SQLite if it ever grows.
 
-3. **Per-user vs per-(user,chat).** Right now active_cli is keyed by `user_id`. But what if user has bot in both their personal DM AND a group? Do they want different active_cli per location? Probably yes. Leaning: key by `(user_id, chat_id)` not just `user_id`.
+3. ~~**Per-user vs per-(user,chat).**~~ **RESOLVED 2026-05-30:** routing key is `chat_id` ALONE (NOT `user_id`, NOT `(user_id, chat_id)`). 1 chat = 1 CLI. All users in a group chat share that chat's bound cli; any participant's `/switch` rebinds the shared chat. DMs work the same way (a DM is a chat with one human). Operator decision: simpler routing > per-user routing within a chat. Decision recorded in `## Decisions made`.
 
 4. **/switch validation strictness.** If user does `/switch architect-X` and architect-X has never existed → reject with "no such cli". If architect-X was alive but is now offline → reject with "cli offline, currently alive: …"? Or accept and auto-fallback when message comes? Leaning: reject strict (force user to pick alive one — clearer mental model).
 
@@ -413,7 +415,7 @@ claudebase/
 │   │   ├── telegram_bridge.rs        ← NEW — server-side TG poller (Phase 1)
 │   │   ├── telegram_router.rs        ← NEW — routing decision tree (Phase 4)
 │   │   ├── telegram_commands.rs      ← NEW — bot command handlers (Phase 3)
-│   │   ├── telegram_state.rs         ← NEW — active_cli_per_user + tg_message_map (Phase 5)
+│   │   ├── telegram_state.rs         ← NEW — active_cli_per_chat + tg_message_map (Phase 5)
 │   │   └── server.rs                 ← wire bridge into server event loop
 │   └── plugin/
 │       └── (telegram-plugin-rs)       ← refactor: drop polling, drop ALL outbound bot calls;
@@ -450,7 +452,7 @@ claudebase/
 ### Assumptions
 
 - Operators using TG with multiple cli's strongly prefer one bot to N bots. Verbal confirmation from operator brief this session ("по одному боту на инстанс это не правильно и не масштабируемо"). Salience: high.
-- Per-user active_cli routing is sufficient for v1; no per-(user,chat) split for groups. May need to revisit (see Open question 3). Salience: medium.
+- Per-chat active_cli routing (chat_id alone, NOT per-user, NOT (user_id, chat_id)) is the operator-decided model for v1 (2026-05-30; OQ-3 closed; see `## Decisions made`). Group chats and DMs go through the same `active_cli_per_chat[chat_id]` map. Salience: high.
 - Telegram's `Message.message_id` is stable across token rotation (the same message keeps the same id even if the bot's token changes). Believed-true based on Bot API docs but not verified this session. If wrong, tg_message_map would need re-keying on token rotation. Salience: low (token rotation is rare).
 - The existing per-cli `telegram-plugin-rs` can be refactored to a thin client without breaking compatibility with skill commands (`/telegram:configure`, `/telegram:access`) — those skills live in `~/.claude/plugins/cache/.../skills/`, owned by the plugin manifest, NOT the server.ts logic. Refactor of server.ts/server-rs doesn't touch skills. Salience: medium.
 
@@ -468,13 +470,13 @@ claudebase/
 
 - **Decision:** Server owns TG bot connection. ALL polling, ALL outbound, ALL bot commands centralised. Cli's are thin clients via existing chat_subscribe bus. Alternatives rejected: (a) bot-per-cli (doesn't scale — operator's reject); (b) keep per-cli polling + add coordinator (would still hit 409 conflict; band-aid). Q1-Q5: not a hack ✓ / proportionate (load-bearing refactor justified by the constraint) ✓ / alternatives evaluated ✓ / addresses root cause (TG's single-consumer-per-token constraint) ✓ / n/a. Salience: high.
 - **Decision:** Native TG `reply_to_message` for thread routing. NO fake `@agent:` prefix syntax. Operator uses existing TG UX gesture. Alternative rejected: prefix-parsing (introduces parsing rules, confuses non-technical users, breaks if user types `@architect` in unrelated context). Salience: high.
-- **Decision:** Per-user `active_cli` for free-text routing fallback. `/switch X` updates it. Default to `orchestrator` role (or first alive cli). Alternative rejected: broadcasting all messages to all cli's (would spam cli inputs + cost N× tokens). Salience: high.
+- **Decision (operator 2026-05-30, closes OQ-3):** Routing key is `chat_id` ALONE. The TG chat is the canonical identifier of the bound cli instance: 1 chat = 1 cli. `/switch X` rebinds the chat (`active_cli_per_chat[chat_id] = X`), affecting every participant in that chat. DMs and group chats use the same shape. Default if unset: `orchestrator` role (or first alive cli). Alternatives rejected: (a) per-user keying within a chat — adds complexity, "your /switch vs my /switch" UX confusion in shared rooms; (b) `(user_id, chat_id)` keying — superficially more flexible but introduces routing ambiguity (whose `/switch` wins?), doubles state size, and the operator's actual use case (one operator across DMs to many cli's) is fully served by chat_id alone; (c) broadcasting to all cli's — N× token cost. Tradeoff accepted: in a shared group, anyone's `/switch` rebinds for everyone; documented in `/help`. Salience: high.
 - **Decision:** Bot commands handled SERVER-SIDE, never reach cli. Includes existing `/start /help /status` (preserved with server-side impl since server now owns the bot). Alternative rejected: routing commands through cli (complicates the trivial case + adds latency). Salience: medium.
 - **Decision:** Migration flag (Phase 8) keeps legacy per-cli mode default-OFF for new model until operator opts in. Refuses to start with dual-poller if conflict detected. Salience: medium (operator-safety net).
 
 ### Hacks acknowledged
 
-- v1 server-side `active_cli.json` is plain JSON file persistence, not a proper SQLite row. Removal path: if scale becomes an issue (>10k users), migrate to SQLite table with single-row upsert. Currently overkill for single-operator-multi-cli use case.
+- v1 server-side `active_cli.json` is plain JSON file persistence (single `chats` map keyed by `chat_id`), not a proper SQLite row. Removal path: if scale becomes an issue (>10k chats), migrate to SQLite table with single-row upsert. Currently overkill for single-operator-multi-cli use case.
 - v1 reply-quote lookup misses (deleted row, old message) fall back to active_cli with a polite note. Removal path: more sophisticated UX (e.g. inline keyboard "route to X / route to Y / cancel") if operator finds the auto-fallback confusing.
 
 ### Symptom-only patches

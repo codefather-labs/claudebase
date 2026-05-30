@@ -46,7 +46,7 @@
 use clap::Parser;
 
 use claudebase::cli::{self, Cli, Command};
-use claudebase::{encoder, ingest, migrations, output, pdf, search, store};
+use claudebase::{encoder, ingest, migrations, output, pdf, registry, search, store};
 
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
@@ -162,6 +162,18 @@ fn main() -> std::process::ExitCode {
 /// every session boot — no extra plumbing required here.
 fn run_claude_with_preset(args: &cli::RunArgs) -> std::process::ExitCode {
     use std::ffi::OsString;
+
+    // FR-IHC-6.1..6.6 — record this project in the registry BEFORE exec.
+    // Must happen BEFORE the unix `exec()` below (exec replaces the process
+    // image; any code after it never runs). Non-fatal: a registry failure
+    // logs to stderr but does NOT block the operator's `claude` session —
+    // the registry is a convenience layer for later `--project <slug>`
+    // lookups, not a correctness requirement for `claudebase run`.
+    let cwd = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    if let Err(e) = registry::upsert_project(&cwd) {
+        eprintln!("claudebase run: registry upsert failed (non-fatal): {e}");
+    }
 
     let claude_path = match which("claude") {
         Some(p) => p,
@@ -1855,40 +1867,13 @@ fn resolve_registry_project_db(
     slug: &str,
     db_name: &str,
 ) -> Result<std::path::PathBuf, std::process::ExitCode> {
-    let registry_path = match store::resolve_global_insights_db() {
-        // resolve_global_insights_db returns `<home>/.claude/knowledge/insights.db`;
-        // the registry sits alongside it as `projects.json`.
-        Ok(p) => p.with_file_name("projects.json"),
-        Err(e) => {
-            eprintln!("error: {e}");
-            return Err(std::process::ExitCode::from(1));
-        }
-    };
-    let body = match std::fs::read_to_string(&registry_path) {
-        Ok(b) => b,
-        Err(_) => {
-            eprintln!("error: project '{slug}' not found in registry");
-            return Err(std::process::ExitCode::from(1));
-        }
-    };
-    // Registry shape (FR-IHC-6.1): JSON array of {name, path, last_seen}.
-    let entries: Vec<serde_json::Value> = match serde_json::from_str(&body) {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!("error: project '{slug}' not found in registry");
-            return Err(std::process::ExitCode::from(1));
-        }
-    };
-    let matched = entries.iter().find_map(|e| {
-        let name = e.get("name").and_then(|n| n.as_str())?;
-        if name == slug {
-            e.get("path").and_then(|p| p.as_str()).map(|s| s.to_string())
-        } else {
-            None
-        }
-    });
-    match matched {
-        Some(path) => Ok(std::path::PathBuf::from(path)
+    // Slice 6 (FR-IHC-6.1..6.6): registry lookup is now centralised in
+    // `registry::resolve_project_path`. `None` collapses missing-registry,
+    // malformed-json, and unknown-slug into one operator-facing message —
+    // matching the literal stderr `error: project '<slug>' not found in
+    // registry` that the Slice 4 tests already assert against.
+    match registry::resolve_project_path(slug) {
+        Some(project_root) => Ok(project_root
             .join(".claude")
             .join("knowledge")
             .join(db_name)),

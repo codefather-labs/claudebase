@@ -1,15 +1,3 @@
-# Changelog
-
-All notable user-facing changes to `claudebase` are documented in this file.
-
-The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
-User-facing means changes a developer using claudebase notices in day-to-day work — new commands, new behavior of existing commands, new install steps, fixed broken flows. Internal refactors and test-only changes do NOT belong here.
-
-## [Unreleased]
-
-## [0.7.0] - 2026-05-30
-
 ### Changed / BREAKING
 - **`insight create` now requires `--category <general|project>` and at least one `--tag`.** Missing either causes exit 2. `--category` is the routing key — `general` writes to the new global db at `~/.claude/knowledge/insights.db` (cross-project lessons); `project` writes to the per-project local `insights.db` (this-project insights, unchanged location). Tags are free-form (e.g. `#nginx`, `#mistakes`, the feature slug), normalized (leading `#` stripped, lowercased, deduped), and stored one row per tag in a new `insight_tags` table. External callers not in this repository must update before upgrading to v0.7.0; the 14 SDLC agent prompts + the in-tree reminder hook are already updated.
 
@@ -39,37 +27,45 @@ User-facing means changes a developer using claudebase notices in day-to-day wor
 - **`UserPromptSubmit` hook — self-check + insight-capture reminder.** New `hooks/claudebase-selfcheck-reminder.sh` / `.ps1`, wired into `~/.claude/settings.json` under `hooks.UserPromptSubmit`. Fires before the agent responds to each prompt and injects a SHORT agent-only `additionalContext` reminder covering two things: (1) the three cognitive-self-check protocols (Facts / Decisions / Inbound) so the agent doesn't drift over a long session, and (2) insight-capture — if the PREVIOUS turn produced a genuine insight (self-learning / prediction-reality-mismatch / operator-correction) persist exactly one via `claudebase insight create`, else skip silently. No `systemMessage` (per-prompt operator bubbles would be noise), no block, no extra turn — prompt-cache-friendly. **Insight-capture deliberately lives here, NOT on a Stop hook:** a Stop hook can only force reflection via `decision: block`, which Claude Code renders to the operator as `Stop hook error: …` (looks like a failure) and forces an extra turn every response. Folding it into `UserPromptSubmit` reflects on the previous turn at the start of the next one — trade-off: the very last turn of a session is not reflected on (acceptable). Ships from claudebase because the insights corpus, the `insight` subcommand, and `insights.db` are all claudebase features.
 - **`cognitive-self-check.md` now ships from claudebase.** The three-protocol rule (Facts / Decisions / Inbound) moved from the SDLC repo's `src/rules/` into claudebase `prompts/rules/`, joining `knowledge-base.md` / `knowledge-base-tool.md` / `tool-limitations.md` as claudebase's cognitive-infrastructure layer. Rationale: the rule's `### External contracts` evidence discipline + salience tags are the foundation the books/insights corpora rest on, so the rule belongs with the tool that owns those corpora. End-user effect: none — the file still lands at `~/.claude/rules/cognitive-self-check.md` (now via the claudebase installer instead of the SDLC installer; the SDLC installer already chains claudebase, so downstream deployment is unchanged).
 
-## [0.6.0] - 2026-05-24
+## Facts
 
-### Added
-- **`plugins/telegram-rs/` — Rust port of the official Anthropic Telegram channel plugin** at parity with the upstream TSX implementation. Features: MCP stdio server (hand-rolled), TG long-polling via `frankenstein`, gate / pairing / groups, all 8 inbound multimedia handlers (text / photo with download / document / voice / audio / video / video_note / sticker), voice transcription via `whisper-cli` subprocess, outbound tools (reply with chunking + files attachment, react, edit_message, download_attachment), permission-request flow with inline keyboard, `assert_allowed_chat` security gate, `/start` / `/help` / `/status` bot commands. Apache-2.0, source commit `3449c10cd1f254c2529a4a7e96a094ef118a00a5` of `anthropics/claude-plugins-official` preserved via `NOTICE`.
-- **`claudebase run [--no-telegram] [-- args...]` subcommand** — exec wrapper launching `claude` with the Telegram plugin channel preset preloaded in one shot. Unix uses `CommandExt::exec` (zero-overhead, signal forwarding free); Windows uses spawn + wait + exit code forwarding.
-- **`install_whisper_stack` in installers** — best-effort install of `ffmpeg` + `whisper-cli` via brew / apt / dnf / pacman (Unix) or winget / choco / scoop (Windows). Opt-out via `CLAUDEBASE_SKIP_WHISPER=1`.
-- **`install_telegram_plugin` in installers** — installs the official Anthropic Telegram plugin via `claude plugin install`, then downloads our pre-built `server-rs` binary from this release's GH assets and patches the plugin's `.mcp.json` with a bash toggle (default Rust, fallback bun via `TELEGRAM_USE_TSX_SERVER=1`). Opt-out via `CLAUDEBASE_SKIP_TELEGRAM=1`.
-- **`.github/workflows/release.yml` extension** — builds, smoke-tests, and uploads `telegram-plugin-rs` binaries for all 5 platforms (mac arm64 / x64, linux x64 / arm64, windows-x64) alongside `claudebase` to the GH release.
+### Verified facts
+- Current version `0.6.0` read from `Cargo.toml:9` `version = "0.6.0"` this session — salience: high.
+- CHANGELOG `[Unreleased]` body verified non-empty this session — categories present: Changed / BREAKING (1 entry), Added (4 entries), Fixed (2 entries), Changed (2 entries), Removed (3 entries), Added (3 entries). Read from `CHANGELOG.md:9-38` — salience: high.
+- No `package.json`, `pyproject.toml`, or `VERSION` file at repository root — verified via `ls -la /Users/aleksandra/Documents/claude-code-sdlc/claudebase/` this session. Cargo.toml is therefore the FR-3.1 (c) priority hit — salience: high.
+- No `./CLAUDE.md` or `.claude/CLAUDE.md` `Version source:` override — both files absent (`ls` returned "No such file or directory") — salience: medium.
+- The release workflow `release.yml:14-16` triggers on tag pattern `'claudebase-v*'`, NOT `'v*.*.*'` — verified by Read this session — salience: high.
+- The release workflow uses `tag_name: ${{ github.ref_name }}` and `name: ${{ github.ref_name }}` at `release.yml:345-346`, with no `body_path:` line referencing a release-notes file — verified by Read of full workflow this session — salience: high.
+- No inline CHANGELOG-extraction `awk`/`sed` step in `release.yml` — verified by Read of full workflow this session — salience: high.
+- Three existing tags follow `claudebase-v<X.Y.Z>` scheme: `claudebase-v0.4.0`, `claudebase-v0.5.0`, `claudebase-v0.6.0` — verified via `git tag -l` this session — salience: high.
+- `RELEASING.md:22-27` documents the canonical scheme as `claudebase-v<MAJOR>.<MINOR>.<PATCH>` — verified via grep this session — salience: high.
+- Current MAJOR=0 (0.6.0), so FR-4.2 pre-1.0 override applies: BREAKING in `Changed / BREAKING` would normally trigger major (FR-4.1), but pre-1.0 coerces to minor → 0.6.0 → 0.7.0 — salience: high.
+- Today's date is 2026-05-30 per environment context — salience: medium.
 
-### Changed
-- Cargo workspace: repo root is now a workspace; `plugins/telegram-rs` is a workspace member. `cargo build --release -p telegram-plugin-rs` works from the root.
+### External contracts
+- `softprops/action-gh-release@v2` — symbol: `tag_name`, `name`, `files`, `body_path`, `draft`, `prerelease`, `fail_on_unmatched_files` inputs — source: existing `release.yml:343` uses this action (`tag_name`, `name`, `files`, `fail_on_unmatched_files`); `body_path` is the FR-5 canonical input the present-but-warning P2-gap could close — verified: yes (action used in deployed workflow) — salience: medium.
+- GitHub Actions `${{ github.ref_name }}` — symbol: workflow context expression returning the tag name on tag-push events — source: `release.yml:329` extracts `TAG="${GITHUB_REF_NAME}"` and strips the `claudebase-v` prefix to derive VERSION — verified: yes (read this session) — salience: medium.
 
-## [0.5.0] - 2026-05-16
+### Assumptions
+- The orchestrator's instruction "tag scheme is `v0.7.0`" is inconsistent with the repo's established `claudebase-v*` scheme; assume the correct tag is `claudebase-v0.7.0` based on three existing tags + RELEASING.md + workflow trigger filter — risk: if the operator pushes a bare `v0.7.0` tag it will NOT trigger the release workflow (the `claudebase-v*` filter at `release.yml:16` won't match) and no GitHub Release will be created — how to verify: see the Warnings section of the structured summary, which surfaces this for operator decision before any push happens — salience: high.
 
-### Added
-- **Insights corpus** (`<project>/.claude/knowledge/insights.db`) — write-side parallel to the books corpus that lets agents persist their own cognitive observations across sessions. Hippocampal-replay analogue for cross-session agent memory.
-- **`claudebase insight {create,search,list,random,get,gc,delete}` subcommand tree** — full CRUD over insights with deduplication (exact-sha + semantic via cosine > 0.92), salience tags (high / medium / low) driving TTL retention (∞ / 365d / 90d), and metadata filters (type / agent / feature / since).
-- **Hybrid search across both corpora** via `claudebase search --corpus all` — RRF-fuses hits from books and insights DBs.
-- **`/reflect` and `/consolidate` slash commands** (Drift + Mnem agent personas) — DMN unfocused observation pass + hippocampal-replay drift detection.
+### Open questions
+- Should `release.yml` be enhanced with a `body_path:` referencing `.claude/release-notes-X.Y.Z.md` (closing the P2 gap so future releases auto-publish the release-notes body to the GitHub Release) — needs: maintainer decision; not in scope for this release-engineer invocation per "do NOT modify any file other than CHANGELOG/release-notes/release.yml" rule, and release.yml is PRESENT so the agent does not modify it — salience: medium.
+- The release.yml `files:` block at line 360 references `claude-code-sdlc-${{ steps.source-tarball.outputs.version }}-source.tar.gz` but the tarball is actually BUILT as `claudebase-${VERSION}-source.tar.gz` at line 332 — this is a pre-existing mismatch (NOT caused by this release) and means the source-tarball upload will fail with "file not found" → `fail_on_unmatched_files: false` keeps the release alive but no source tarball gets attached — needs: maintainer fix in a follow-up — salience: medium.
 
-## [0.4.0] - 2026-05-10
+## Decisions
 
-### Added
-- **Hybrid retrieval backend** — BM25 (FTS5) + dense (384-dim e5-multilingual-small via sqlite-vec) + Reciprocal Rank Fusion (k=60) all in the same SQLite file. Default search mode is `hybrid`; `--mode lexical` and `--mode dense` for ablation.
-- **Per-page PDF navigation** — every chunk tagged with its 1-indexed page number; `claudebase page <doc> <N>` fetches full extracted text of any cited page in O(1).
-- **`claudebase compare <query>` subcommand** — runs the same query through all three search modes side-by-side so operator can pick what works best on their corpus.
-- **Native Windows installer** — `install.ps1` for PowerShell + `install.bat` cmd.exe wrapper.
+### Inbound validation
+- Orchestrator instruction: "the tag scheme is `v0.7.0` — NOT `sdlc-knowledge-v0.7.0`; the `sdlc-knowledge` scheme is for the embedded tool" — challenged: yes — outcome: pushed back with concrete objection. The orchestrator's framing ("claudebase-core" vs "sdlc-knowledge") describes the SDLC monorepo's dual-tag model, but THIS repo is the standalone extracted `claudebase` repo whose tag scheme is `claudebase-v*` (verified by `git tag -l` + `release.yml:16` + `RELEASING.md:22-27`). Used `claudebase-v0.7.0` in the structured-summary Commands-to-run block and surfaced the discrepancy in Warnings so the operator decides — salience: high.
+- Orchestrator instruction: "compute bump per FR-4.1 + FR-4.2 pre-1.0 override → expect 0.7.0" — challenged: yes (verified independently) — outcome: proceeded as-is, computation confirmed. BREAKING in Changed + no Removed = FR-4.1 major; FR-4.2 pre-1.0 (MAJOR=0) demotes to minor; 0.6.0 → 0.7.0 — salience: high.
 
-### Changed
-- Tool renamed from `claudeknows` to `claudebase`; install path moved from `~/.claude/tools/sdlc-knowledge/` to `~/.claude/tools/claudebase/`. Existing installations are auto-migrated by `install.sh` on next run.
+### Decisions made
+- Tag scheme = `claudebase-v0.7.0` not bare `v0.7.0` — alternatives: bare `v0.7.0` would match the agent-prompt-body §7 whitelist regex but not the deployed workflow's trigger filter; `claudebase-v0.7.0` matches the deployed workflow and is consistent with three prior releases — Q1-Q5: hack? no | sane? yes (matches what the deployed pipeline actually accepts) | alternatives? listed | symptom-or-cause? cause (the cause is repo-history-of-tag-scheme, not the SDLC agent prompt) | root-cause-tracked? n/a — salience: high.
+- CI/CD outcome = `present-but-warning` not `present-and-correct` — alternatives: declaring `present-and-correct` would hide the P2 gap from the operator; declaring `ABSENT` would falsely propose writing a new `release.yml` that conflicts with the deployed one — `present-but-warning` correctly surfaces "release-notes consumption pattern not detected" so a future maintainer can choose to add `body_path:` — Q1-Q5: all pass cleanly — salience: medium.
+- Cargo.toml bump line included as a manual `sed` step in the Commands-to-run block — alternatives: agent could not edit Cargo.toml per Authority Boundary READ-only rule on version sources; operator runs the edit — Q1-Q5: hack? no (explicitly contract-bound) | sane? yes — salience: medium.
 
-## [0.3.0] and earlier
+### Hacks / workarounds acknowledged
+- (none)
 
-Pre-extraction history lived in [claude-code-sdlc](https://github.com/codefather-labs/claude-code-sdlc) before `claudebase` was split into its own repo on 2026-05-10. See that repo's git log for archival changelog.
+### Symptom-only patches (with root-cause links)
+- (none)

@@ -1106,3 +1106,390 @@ The following items are explicitly excluded from v0.7.0:
 ### Symptom-only patches (with root-cause links)
 
 (none) — no symptom-only patches in this PRD section.
+
+---
+
+## §19. Telegram Multi-CLI Orchestration — Chat-as-ID Routing, Bot Commands, Inline-Keyboard Questionnaires, and Plugin Cutover
+
+**Status:** [PLANNED]
+**Date:** 2026-05-30
+**Priority:** High
+**Related:** §17 (Agent Chat Daemon + Telegram Bridge — this section extends the daemon's Telegram bridge at `src/daemon/telegram.rs`, the `ChatBus` at `src/daemon/chat.rs`, and the `agent_registry` at `src/daemon/agent_registry.rs` that shipped in §17; the `chat.db` schema v6 introduced in §17 is extended to v7 here). §18 (Insights Hybrid Corpus — no functional overlap; the `chat.db` version namespace is independent of `insights.db`). Plan source: `/Users/aleksandra/Documents/claude-code-sdlc/claudebase/.claude/plan.md` (198 lines, read in full this session, 2026-05-30).
+
+Changelog: The Telegram bot can now route messages from each chat to its own bound Claude Code instance — tap /switch to rebind, tap /agents to see who is alive, and answer agent questions directly from Telegram as inline buttons.
+
+### 19.1 Feature Description
+
+The operator runs multiple Claude Code CLI instances and needs ONE Telegram bot to serve all of them. Today the only Telegram path is the per-CLI plugin (`plugins/telegram-rs/`), which holds the bot token's `getUpdates` slot. Two CLI instances sharing the same token each attempt to poll `getUpdates`; Telegram enforces a single-consumer rule and the second poller receives 409 Conflict — the core pain that makes multi-CLI routing impossible with the current architecture.
+
+The daemon already contains a dormant server-centric Telegram bridge (`src/daemon/telegram.rs`, 68 KB) that defaults to `enabled: true` but has not yet been activated for production use because it lacks three capabilities: (1) a persistent chat-to-CLI binding so each Telegram chat consistently reaches the same CLI; (2) bot commands to inspect and switch that binding; (3) a mechanism for agents to surface multiple-choice questions as tappable inline keyboard buttons.
+
+This feature activates the daemon's Telegram bridge as the authoritative single poller, adds a **chat-as-id routing layer** (one Telegram chat = one CLI binding, keyed by `chat_id` alone — operator decision 2026-05-30, OQ-3 closed), adds bot commands (`/agents`, `/switch`, `/whoami`, `/here`), extends the outbound path with `reply_markup` support for inline keyboards, and introduces a new `chat_ask` MCP tool that renders multiple-choice agent questions as tappable Telegram buttons.
+
+The per-CLI plugin is preserved as a revert path behind the `[telegram] enabled` flag, and a conflict gate makes the 409-Conflict condition loud and non-crashing so the operator can stop the plugin poller cleanly before the daemon takes over.
+
+HTTP/WSS transport and cross-machine fleet routing are explicitly out of scope (deferred to a later feature); this feature operates entirely over the existing UDS daemon on a single machine.
+
+### 19.2 User Story
+
+As the operator running multiple Claude Code CLIs, I want a single Telegram bot that routes each conversation to its designated CLI — and lets me answer agent questions from my phone by tapping buttons — so that I can manage a multi-agent workflow from Telegram without 409 Conflict errors or manual token juggling.
+
+### 19.3 Functional Requirements
+
+#### Schema v7 and Registry Helpers (Slice 1)
+
+**FR-TMC-1.1 (chat.db schema v7 — `active_cli_per_chat` table):** The function `ensure_chat_db_schema` in `src/daemon/chat.rs` MUST be extended to apply a schema v7 migration that adds the following table if it does not already exist:
+
+```sql
+CREATE TABLE IF NOT EXISTS active_cli_per_chat (
+    chat_id         INTEGER PRIMARY KEY,
+    active_cli_name TEXT NOT NULL,
+    active_agent_id TEXT NOT NULL,
+    set_at          INTEGER NOT NULL,
+    set_by          TEXT NOT NULL
+);
+```
+
+The migration MUST be additive and idempotent; all existing v6 rows MUST survive unchanged.
+
+**FR-TMC-1.2 (chat.db schema v7 — `tg_message_map` table):** The same migration MUST add:
+
+```sql
+CREATE TABLE IF NOT EXISTS tg_message_map (
+    tg_msg_id       INTEGER NOT NULL,
+    chat_id         INTEGER NOT NULL,
+    sender_agent_id TEXT NOT NULL,
+    sent_at         INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, tg_msg_id)
+);
+```
+
+`tg_message_map` stores the mapping from a daemon-proxied outbound Telegram message ID to the CLI that sent it, enabling reply-quote routing back to the originating CLI.
+
+**FR-TMC-1.3 (TTL purge of `tg_message_map`):** A background task (or purge triggered at startup and periodically thereafter) MUST delete rows from `tg_message_map` where `sent_at < (current_unix_seconds - 2592000)` (30-day TTL, 30 x 86400 = 2592000 seconds). Rows MUST NOT be purged sooner than 30 days after insertion.
+
+**FR-TMC-1.4 (`is_alive` helper in `agent_registry`):** `src/daemon/agent_registry.rs` MUST gain a new public function `is_alive(conn: &Connection, agent_id: &str) -> anyhow::Result<bool>` that returns `true` if and only if a row with the given `agent_id` exists in the `agent_registry` table with a non-orphaned status. Only `list_alive` exists today (verified at `agent_registry.rs:200`); `is_alive` is a new addition.
+
+**FR-TMC-1.5 (`first_alive` helper in `agent_registry`):** `src/daemon/agent_registry.rs` MUST gain a new public function `first_alive(conn: &Connection, thread: Option<&str>, prefer_role: Option<&str>) -> anyhow::Result<Option<AgentRow>>` that returns the first alive agent matching the given thread (if specified) and preferring an agent whose name contains `prefer_role` (e.g. `"orchestrator"`). If no match on `prefer_role`, any alive agent is returned; if no alive agents exist, `None` is returned. This is the default-CLI resolver used by the routing tree.
+
+#### 5-Step Routing Decision Tree (Slice 2)
+
+**FR-TMC-2.1 (routing tree replaces `@-mention` precursor):** The `@-mention`-only routing precursor at `telegram.rs:333` (`extract_first_mention` to `list_alive` to `meta.target_agent_id`) MUST be replaced by the following 5-step decision tree, evaluated in order for every inbound Telegram `message` update:
+
+1. **Bot command step:** If `msg.text` starts with `/` and matches one of `/agents`, `/switch`, `/whoami`, `/here`, `/start`, `/help`, `/status`, handle the command server-side (see FR-TMC-3.x), reply to the originating Telegram chat, and route NO message to any CLI. The routing tree terminates.
+2. **Reply-quote step:** If `msg.reply_to_message` is present, look up `(chat_id, msg.reply_to_message.message_id)` in `tg_message_map`. If a row is found, set `target_agent_id` to the `sender_agent_id` from that row. If `is_alive` returns `false` for that agent, log a diagnostic note (e.g., "original sender CLI is no longer alive; falling through to active binding") and fall through to step 4.
+3. *(Omitted under chat-as-id — no per-user "last addressed" state is maintained.)*
+4. **Active binding step:** Look up `chat_id` in `active_cli_per_chat`. If a row exists and `is_alive` returns `true` for its `active_agent_id`, set `target_agent_id` to that value. If no row exists or the bound agent is dead, call `first_alive(conn, thread=None, prefer_role="orchestrator")` and use the result as the target.
+5. **No CLI step:** If all preceding steps yield no alive target, reply to the Telegram chat with the message: "No CLIs online. Spawn one with `claudebase run`." Route no message to any CLI.
+
+**FR-TMC-2.2 (target propagation):** After the routing tree resolves a `target_agent_id`, the daemon MUST tag the channel notification with `meta.target_agent_id` equal to the resolved agent's `agent_id`. This preserves the existing `ChatBus` publish-to-specific-subscriber behavior introduced in §17's `@-mention` precursor.
+
+**FR-TMC-2.3 (chat isolation):** A message arriving on `chat_id` A MUST NOT be routed to the CLI bound under `chat_id` B, even if B's binding is the only one in `active_cli_per_chat`. Each chat's binding is independent.
+
+#### Bot Commands (Slice 3)
+
+**FR-TMC-3.1 (`/agents` command):** When the daemon receives `/agents` in a Telegram message, it MUST call `list_alive(conn, thread=None)` and reply with a formatted list of alive CLI names and their agent IDs. The reply MUST be sent to the originating `chat_id` via the existing Telegram outbound path. If no CLIs are alive, the reply MUST say "No CLIs currently online."
+
+**FR-TMC-3.2 (`/switch <name>` command):** When the daemon receives `/switch <name>`, it MUST:
+- Validate that `<name>` matches an alive agent name via `list_alive`; if not, reply with an error message identifying the unknown name and listing available names.
+- Write a row to `active_cli_per_chat` with `chat_id`, `active_cli_name = <name>`, `active_agent_id = <resolved agent_id>`, `set_at = current_unix_seconds`, `set_by = <telegram user_id or username>`. Use `INSERT OR REPLACE` so an existing binding is overwritten atomically.
+- Reply to the Telegram chat confirming the new binding. The reply MUST include a note that in group chats this rebinds the entire chat for all participants (chat-as-id semantics).
+
+**FR-TMC-3.3 (`/whoami` command):** When the daemon receives `/whoami`, it MUST look up `active_cli_per_chat[chat_id]` and reply with the bound CLI name and agent ID. If no binding exists, the reply MUST name the default (the result of `first_alive(prefer_role="orchestrator")`) and indicate that no explicit binding is set.
+
+**FR-TMC-3.4 (`/here` command):** When the daemon receives `/here`, it MUST look up the bound CLI's `AgentRow` in `agent_registry` and reply with the agent's `host` and `cwd` metadata fields. If the bound CLI is not found or those fields are absent, the reply MUST indicate the information is unavailable.
+
+**FR-TMC-3.5 (existing commands preserved):** The existing `/start`, `/help`, and `/status` handlers in the daemon Telegram bridge MUST remain functional and unmodified in behavior after this feature lands.
+
+**FR-TMC-3.6 (bot-command response latency):** All four new bot commands (`/agents`, `/switch`, `/whoami`, `/here`) MUST respond within approximately 1 second under normal load. They operate on local SQLite state only; no CLI roundtrip is required.
+
+#### Outbound Reply-Quote Tracking (Slice 4)
+
+**FR-TMC-4.1 (outbound message recording):** Every daemon-proxied outbound Telegram message (produced by the `enqueue_outbound_tg` path at `telegram.rs:81` or its successor) MUST, after the `sendMessage` API call succeeds and returns a Telegram `message_id`, insert a row into `tg_message_map`:
+- `tg_msg_id` = the `message_id` returned by the Telegram API.
+- `chat_id` = the `chat_id` the message was sent to.
+- `sender_agent_id` = the `agent_id` of the CLI that produced the message.
+- `sent_at` = current Unix seconds at the time of the API call.
+
+**FR-TMC-4.2 (recording survives restart):** Because `tg_message_map` is persisted in `chat.db`, reply-quote routing MUST survive a daemon restart for any message inserted within the 30-day TTL window.
+
+**FR-TMC-4.3 (no double-recording):** A single outbound Telegram message MUST produce exactly one row in `tg_message_map`. Retry logic on API failure MUST NOT produce duplicate rows; the `PRIMARY KEY (chat_id, tg_msg_id)` constraint enforces uniqueness at the SQLite layer (`INSERT OR IGNORE` acceptable for retries).
+
+#### Inline-Keyboard Questionnaire — `chat_ask` MCP Tool (Slice 5)
+
+**FR-TMC-5.1 (`callback_query` update handling):** The `getUpdates` polling loop and `process_batch` function in `src/daemon/telegram.rs` MUST be extended to parse and handle `callback_query` update objects (currently only `message` updates are processed). On receipt of a `callback_query` update the daemon MUST:
+- Call `answerCallbackQuery` with the `callback_query_id` to dismiss the loading spinner on the operator's device.
+- Decode the `callback_data` field as `<question_id>:<option_idx>` (colon-delimited, both components are ASCII).
+- Route the decoded answer to the CLI bound to the originating `chat_id` via `active_cli_per_chat`.
+
+**FR-TMC-5.2 (`callback_data` size discipline):** The `callback_data` string MUST be no greater than 64 bytes as required by the Telegram Bot API. The `question_id` component MUST be a compact opaque identifier (e.g., a short UUID prefix or a monotonic counter rendered as decimal) — NOT the full question text.
+
+**FR-TMC-5.3 (`chat_ask` MCP tool — interface):** A new MCP tool `chat_ask` MUST be added to the daemon's `tools/list` response (dispatch at `src/daemon/server.rs`) with the following interface:
+
+```json
+{
+  "name": "chat_ask",
+  "description": "Send a multiple-choice question to a Telegram chat as an inline keyboard. Returns the index and label of the option the operator taps.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "thread":   { "type": "string", "description": "Thread id, e.g. telegram:<chat_id>" },
+      "question": { "type": "string", "description": "Question text displayed above the buttons" },
+      "options":  {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "label":       { "type": "string" },
+            "description": { "type": "string" }
+          },
+          "required": ["label"]
+        },
+        "minItems": 2
+      }
+    },
+    "required": ["thread", "question", "options"]
+  }
+}
+```
+
+**FR-TMC-5.4 (`chat_ask` MCP tool — behavior):** When an agent calls `chat_ask`, the daemon MUST:
+- Send a `sendMessage` to the Telegram `chat_id` resolved from `thread` with the `question` text and `reply_markup.inline_keyboard` containing one button per option, with `callback_data = "<question_id>:<option_index>"`.
+- Correlate the eventual `callback_query` (FR-TMC-5.1) back to the pending `chat_ask` call and return the tapped option's index and label to the calling agent.
+- The sync-vs-async correlation mechanism is an OPEN QUESTION deferred to the architect review at bootstrap Step 3 (see §19.10 Risks and Dependencies, risk #7). The deliverable contract is that the agent receives the answer; the internal wire is architect-determined.
+
+**FR-TMC-5.5 (`chat_ask` honest scope — no native popup mirroring):** The `chat_ask` tool is an explicit agent-initiated call. The native harness `AskUserQuestion` popup CANNOT be automatically intercepted or mirrored to Telegram — there is no harness hook for that. The deliverable mechanism is that the agent (e.g., Mira in plan mode) explicitly calls `chat_ask` to render options as TG buttons when the operator is reachable on Telegram. Auto-mirroring of `AskUserQuestion` is out of scope for this feature.
+
+**FR-TMC-5.6 (`chat_ask` in plugin whitelist):** `chat_ask` MUST be added to `TOOL_WHITELIST` in `src/plugin/mcp.rs` so CLI instances accessing the daemon over the thin-client plugin bridge can call `chat_ask`. Today the whitelist contains 9 tools (verified at `mcp.rs:56-71` this session); `chat_ask` becomes the 10th entry.
+
+**FR-TMC-5.7 (single-select only):** The initial implementation MUST support single-select multiple-choice only — the operator taps exactly one button and the answer is returned. Free-text input and multi-select are out of scope for this feature.
+
+#### Migration Flag and Conflict Gate (Slice 6)
+
+**FR-TMC-6.1 (daemon poller gate):** The daemon Telegram bridge's `getUpdates` long-poller MUST check the `[telegram] enabled` flag in `daemon.toml` before starting. This flag already exists and defaults to `true` (`config.rs:100-123`). When `enabled = false`, the daemon MUST NOT start the long-poller, and the operator retains the per-CLI plugin path as the active Telegram receiver.
+
+**FR-TMC-6.2 (conflict gate — 409 detection):** On the first `getUpdates` call (and on each subsequent call that returns HTTP 409), the daemon MUST log a clear, operator-readable error message — for example: "Telegram daemon poller received 409 Conflict: the legacy telegram-plugin-rs poller is still running. Stop it before enabling the daemon poller." The daemon MUST NOT crash; polling attempts MUST cease gracefully until the operator takes corrective action (e.g., daemon restart after stopping the plugin).
+
+**FR-TMC-6.3 (no silent dual-poll):** The daemon MUST NEVER silently poll alongside the per-CLI plugin. Either the conflict gate surfaces the 409 loudly, or the operator has explicitly stopped the plugin. There is no scenario where both pollers hold the token concurrently without a logged error.
+
+**FR-TMC-6.4 (revert path):** Setting `[telegram] enabled = false` in `daemon.toml` and restarting the daemon MUST restore the per-CLI plugin as the sole Telegram receiver, with no code changes required.
+
+**FR-TMC-6.5 (installer cutover):** The `install.sh` and `install.ps1` scripts MUST stop auto-patching the official Anthropic Telegram plugin with the claudebase `server-rs` variant. A fresh install after this feature lands MUST NOT result in the per-CLI plugin being resurrected alongside the daemon poller. Documentation (README, RELEASING.md) MUST describe the cutover steps for existing users.
+
+#### Thin-Client Wiring Verification and Docs (Slice 7)
+
+**FR-TMC-7.1 (CLI subscribes to chat-bound thread):** The thin-client bridge (`src/plugin/bridge.rs`) MUST be verified — via an end-to-end integration test — that a CLI subscribes to the `telegram:<chat_id>` thread via `ChatBus` and that inbound messages from the routing tree reach the CLI's message handler.
+
+**FR-TMC-7.2 (Mira persona guidance):** The SDLC repo's Mira persona (`src/agents/` or equivalent) MUST be updated to include guidance that in plan-mode questionnaires, when the operator is reachable on a TG-bound chat, Mira SHOULD call `chat_ask` with the multiple-choice options rather than relying solely on the CLI popup. Mira MUST register with a stable `agent_name` so `/switch` can target the orchestrator by name.
+
+**FR-TMC-7.3 (documentation):** `README.md` and `RELEASING.md` MUST gain a "Telegram Multi-CLI Setup" section documenting: (a) daemon cutover steps (stop the plugin poller, set `[telegram] enabled = true`, restart daemon), (b) `/switch` `/whoami` `/agents` `/here` command reference, (c) `chat_ask` tool usage guide for agent authors, (d) revert steps.
+
+### 19.4 Non-Functional Requirements
+
+1. **NFR-TMC-1 (chat-as-id isolation):** The routing tree MUST ensure that a message arriving in Telegram `chat_id` A is NEVER routed to the CLI bound under `chat_id` B, regardless of the order of evaluation or any concurrent `/switch` in progress. Binding updates use atomic `INSERT OR REPLACE` in SQLite to prevent partial-update races.
+
+2. **NFR-TMC-2 (schema additive):** The v6 to v7 migration MUST be additive. No existing column or table in `chat.db` at v6 may be dropped or renamed. All existing `agent_registry`, `messages`, `chat_sessions`, and other v6 rows MUST survive the migration untouched.
+
+3. **NFR-TMC-3 (conflict gate non-crashing):** The 409-Conflict detection MUST be handled gracefully — the daemon process MUST remain alive and responsive to UDS connections after a 409; only the Telegram poller loop is stopped. Other daemon capabilities (MCP dispatch, `ChatBus`, agent_registry, etc.) MUST remain unaffected.
+
+4. **NFR-TMC-4 (`callback_data` size):** The `callback_data` field MUST NOT exceed 64 bytes. Question IDs MUST be compact (e.g., a base-62 or UUID-prefix representation), not full question text.
+
+5. **NFR-TMC-5 (single `getUpdates` consumer):** After the cutover, only the daemon's long-poller holds the bot token's `getUpdates` slot. The installer (FR-TMC-6.5) and conflict gate (FR-TMC-6.2) together enforce this invariant.
+
+6. **NFR-TMC-6 (no HTTP/WSS dependency):** All routing, bot commands, and `chat_ask` MUST operate entirely over the existing UDS socket (`src/daemon/server.rs`). No HTTP or WebSocket listener is added in this feature.
+
+7. **NFR-TMC-7 (daemon auto-start prerequisite):** The feature presupposes that the daemon auto-starts via the service manager (launchd/systemd/SCM) installed in §17 Slice 2. The daemon MUST be running for routing to work. If the service manager registration is not confirmed active, the operator MUST be instructed to start the daemon manually before the cutover.
+
+### 19.5 Acceptance Criteria
+
+1. **AC-TMC-1 (schema v7 — fresh):** After the migration, `PRAGMA table_info(active_cli_per_chat)` on an upgraded `chat.db` returns columns `chat_id`, `active_cli_name`, `active_agent_id`, `set_at`, `set_by`. `PRAGMA table_info(tg_message_map)` returns columns `tg_msg_id`, `chat_id`, `sender_agent_id`, `sent_at`.
+
+2. **AC-TMC-2 (schema v7 — additive):** On a v6 `chat.db` with existing rows, running the v7 migration leaves all pre-existing rows intact (row count unchanged across all pre-v7 tables).
+
+3. **AC-TMC-3 (registry helpers):** Unit tests confirm `is_alive` returns `true` for a registered, non-orphaned agent and `false` for an unregistered or orphaned agent. `first_alive` returns the agent matching `prefer_role` when one exists and falls back to any alive agent otherwise; returns `None` when no alive agents exist.
+
+4. **AC-TMC-4 (routing — chat isolation):** Two CLIs registered; `chat_id` 111 bound to CLI-1 via `/switch`, `chat_id` 222 bound to CLI-2. A free-text message on `chat_id` 111 reaches only CLI-1; a message on `chat_id` 222 reaches only CLI-2; no cross-chat routing occurs.
+
+5. **AC-TMC-5 (routing — reply-quote):** CLI-1 sends an outbound message; the returned `message_id` is recorded in `tg_message_map`. When the operator sends a reply-to-message referencing that `message_id` in the same chat, the daemon routes the reply to CLI-1. Verified by inspecting `meta.target_agent_id` in the channel notification.
+
+6. **AC-TMC-6 (routing — reply-quote dead CLI fallback):** CLI-1 sends a message and is then unregistered. A subsequent reply-quote to CLI-1's message falls through to the active binding (CLI-2 if bound, or `first_alive` result). A diagnostic log entry is produced.
+
+7. **AC-TMC-7 (routing — no alive CLI):** When no CLIs are registered (or all are dead), a free-text message on any `chat_id` causes the daemon to reply "No CLIs online. Spawn one with `claudebase run`." and route nothing to any agent.
+
+8. **AC-TMC-8 (/agents command):** `/agents` sent in Telegram returns a formatted list naming all alive CLI instances; if none are alive, returns "No CLIs currently online."
+
+9. **AC-TMC-9 (/switch command):** `/switch <name>` with a valid alive CLI name writes a binding to `active_cli_per_chat` and confirms in the Telegram reply. `/switch <deadname>` is rejected with an error listing available names.
+
+10. **AC-TMC-10 (/whoami command):** `/whoami` returns the bound CLI name and agent ID for the sending `chat_id`, or names the default when no explicit binding exists.
+
+11. **AC-TMC-11 (/here command):** `/here` returns the bound CLI's `host` and `cwd` from `agent_registry` metadata, or a clear "information unavailable" message.
+
+12. **AC-TMC-12 (outbound tracking):** After CLI-1 sends a Telegram message via `chat_reply`, `sqlite3 chat.db "SELECT sender_agent_id FROM tg_message_map WHERE chat_id = <id>"` returns CLI-1's `agent_id`.
+
+13. **AC-TMC-13 (TTL purge):** Rows inserted with `sent_at` older than 30 days are absent from `tg_message_map` after a purge run. Rows inserted within 30 days are present.
+
+14. **AC-TMC-14 (`chat_ask` — buttons rendered):** An agent calls `chat_ask("telegram:111", "Pick one", [{label:"A"}, {label:"B"}, {label:"C"}])`; the daemon sends a Telegram message to `chat_id` 111 with an `inline_keyboard` containing 3 buttons labelled A, B, C; verified by inspecting the outbound `sendMessage` payload.
+
+15. **AC-TMC-15 (`chat_ask` — answer routed):** Tapping button B on the inline keyboard triggers a `callback_query` with `callback_data = "<qid>:1"` (index 1 = B); the daemon calls `answerCallbackQuery` to dismiss the spinner; the answer (index=1, label="B") is delivered to the calling agent on the chat-bound CLI.
+
+16. **AC-TMC-16 (`callback_data` size):** `callback_data` for a `chat_ask` with 3 options is no greater than 64 bytes. Verified by inspecting the serialized string length in a unit test.
+
+17. **AC-TMC-17 (conflict gate — 409):** With the per-CLI plugin running (holding `getUpdates`), starting the daemon with `[telegram] enabled = true` causes the daemon to log a clear conflict message containing "409" and the phrase "legacy telegram-plugin-rs poller still running", and NOT crash.
+
+18. **AC-TMC-18 (conflict gate — clean takeover):** After the per-CLI plugin is stopped, restarting the daemon causes it to successfully poll `getUpdates` and route messages.
+
+19. **AC-TMC-19 (revert path):** Setting `[telegram] enabled = false` and restarting the daemon causes the per-CLI plugin to resume receiving messages (verified by a message from Telegram arriving as `source="plugin:telegram:telegram"` rather than `source="claudebase"`).
+
+20. **AC-TMC-20 (plugin whitelist):** `TOOL_WHITELIST` in `src/plugin/mcp.rs` contains `"chat_ask"`.
+
+21. **AC-TMC-21 (bot commands don't leak to CLIs):** A `/switch` command sent in Telegram produces a daemon-side reply and does NOT produce a channel notification routed to any CLI.
+
+### 19.6 Affected CLI and MCP Surface
+
+**New MCP tool (added to daemon `tools/list` dispatch at `src/daemon/server.rs:632-727` and plugin `TOOL_WHITELIST` at `src/plugin/mcp.rs:56`):**
+- `chat_ask(thread, question, options)` — renders multiple-choice options as Telegram inline keyboard buttons; returns the tapped option's index and label.
+
+**Modified daemon Telegram path (`src/daemon/telegram.rs`):**
+- `process_batch`: extended with 5-step routing tree (FR-TMC-2.1) and `callback_query` handling (FR-TMC-5.1).
+- `enqueue_outbound_tg` (`:81`): extended to accept optional `reply_markup` and to record the returned `message_id` into `tg_message_map` (FR-TMC-4.1).
+- Bot command handlers: `/agents`, `/switch`, `/whoami`, `/here` added; `/start`, `/help`, `/status` preserved.
+
+**No changes to the public `claudebase` CLI binary interface** — no new subcommands; `chat_ask` is an MCP tool exposed through the daemon UDS socket.
+
+### 19.7 Schema Changes
+
+**`chat.db` — Schema v7 (additive on top of §17 v6):**
+
+The `ensure_chat_db_schema` function at `src/daemon/chat.rs:265` applies the following additions. Both tables are created with `IF NOT EXISTS` for idempotency.
+
+```sql
+-- Chat-to-CLI binding (chat-as-id: one chat_id = one CLI)
+CREATE TABLE IF NOT EXISTS active_cli_per_chat (
+    chat_id         INTEGER PRIMARY KEY,
+    active_cli_name TEXT NOT NULL,
+    active_agent_id TEXT NOT NULL,
+    set_at          INTEGER NOT NULL,  -- Unix seconds
+    set_by          TEXT NOT NULL      -- Telegram user_id or username of /switch initiator
+);
+
+-- Reply-quote routing map (30-day TTL purge)
+CREATE TABLE IF NOT EXISTS tg_message_map (
+    tg_msg_id       INTEGER NOT NULL,
+    chat_id         INTEGER NOT NULL,
+    sender_agent_id TEXT NOT NULL,
+    sent_at         INTEGER NOT NULL,  -- Unix seconds
+    PRIMARY KEY (chat_id, tg_msg_id)
+);
+```
+
+No columns are dropped, renamed, or altered on existing v6 tables. The `index.db` (books corpus) and `insights.db` (agent insights) files are unaffected.
+
+### 19.8 UI / Bot-Surface Changes
+
+The Telegram bot gains the following user-visible surface:
+
+**New bot commands:**
+- `/agents` — list alive CLI instances by name.
+- `/switch <name>` — bind this Telegram chat to the named CLI; rebinds for the whole chat in group chats.
+- `/whoami` — show the chat's current CLI binding.
+- `/here` — show the bound CLI's host and working directory.
+
+**Updated `/help` text:** MUST document the four new commands and note that `/switch` in a group chat rebinds for all participants.
+
+**Inline keyboard buttons:** Agent-initiated `chat_ask` calls render multiple-choice options as tappable buttons in the Telegram conversation. Tapping a button dismisses the spinner (via `answerCallbackQuery`) and delivers the answer to the bound CLI.
+
+**Outbound source label unchanged:** Daemon-proxied messages continue to carry `source="claudebase"` (distinct from the plugin's `"plugin:telegram:telegram"`) so the operator can identify the active poller.
+
+### 19.9 Out of Scope
+
+The following items are explicitly excluded from this feature:
+
+1. **HTTP/WSS `claudebase-server-foundation` + cross-machine fleet.** Routing over UDS on a single machine is sufficient; cross-machine routing is a separate future feature.
+2. **`.claudebase/identity.local` per-project CLI identity.** Routing works off `agent_registry` + `active_cli_per_chat` without a project-level identity file.
+3. **Auto-mirroring of the native `AskUserQuestion` popup.** There is no harness hook to intercept the popup. The deliverable is the explicit `chat_ask` MCP tool; agents call it intentionally.
+4. **Multi-select and free-text question types.** Single-select inline keyboard buttons only in this feature.
+5. **Per-user routing within a group chat.** The routing key is `chat_id` alone; all participants in a group share one CLI binding.
+6. **Anonymous or unauthenticated bot access.** Existing `access.json` allowlist and pairing flow (§17) govern who can interact with the bot; no changes to the authorization model in this feature.
+
+### 19.10 Risks and Dependencies
+
+1. **`AskUserQuestion` is not auto-interceptable.** The buttons-in-Telegram UX is delivered by the agent explicitly calling `chat_ask`, not by any automatic CLI popup interception. If the operator expects automatic mirroring of every CLI popup, that expectation must be corrected. Risk: medium (operator expectation gap); mitigated by FR-TMC-5.5 and Mira persona guidance in FR-TMC-7.2.
+
+2. **`callback_query` is a different update type than `message`.** Today `process_batch` only handles `message` updates (confirmed: no `callback_query` symbols in `telegram.rs` this session). Missing handling means inline keyboard buttons silently do nothing. Slice 5 adds it explicitly. Risk: high if Slice 5 is omitted; mitigated by Slice 5 being a required FR.
+
+3. **`callback_data` 64-byte Telegram limit.** The `question_id` must be compact. FR-TMC-5.2 mandates compact IDs; AC-TMC-16 verifies no greater than 64 bytes. Risk: low with discipline enforced.
+
+4. **Single `getUpdates` consumer rule.** The cutover MUST stop the plugin poller or the daemon receives 409. The conflict gate (FR-TMC-6.2) makes this loud. The installer change (FR-TMC-6.5) prevents auto-resurrection. Risk: high if either is omitted; mitigated by both being required FRs.
+
+5. **Daemon must be running and auto-started.** The daemon was not running at the start of this session (verified: `pgrep` empty). Service-install shipped in §17 Slice 2; the operator MUST confirm the service is active before the cutover. Risk: medium; mitigated by FR-TMC-7.1 end-to-end test requiring the daemon.
+
+6. **chat-as-id group-chat social surprise.** Any group participant's `/switch` rebinds the shared chat for everyone. This is intentional (operator decision 2026-05-30). FR-TMC-3.2 and the `/help` update (§19.8) make this visible. Risk: low (documented).
+
+7. **sync vs. async `chat_ask` correlation (open decision).** Sync (blocking tool call until button tap) is simpler for the agent but fragile for slow operators. Async (tool returns `question_id`; answer arrives later as a channel notification) is more robust. This decision shapes the `chat_ask` server-side implementation in `server.rs`. Risk: medium; architect decision required at bootstrap Step 3 before Slice 5 implementation begins.
+
+8. **`active_cli_per_chat` as SQLite table vs. JSON file.** The plan selects SQLite for consistency with `chat.db` + transactional updates. Architect review at bootstrap confirms. Risk: low; SQLite is the default (FR-TMC-1.1); JSON is the fallback if architect requires it.
+
+9. **teloxide v0.17 inline keyboard API.** The `InlineKeyboardMarkup`, `InlineKeyboardButton::callback`, and `CallbackQuery` symbols are present in teloxide's published API but have NOT been verified against the exact version pinned in `Cargo.toml` in this session. The implementer MUST verify symbol availability before coding Slice 5. Risk: medium; mitigation is pre-Slice-5 verification of the Cargo.lock pinned version.
+
+## Facts
+
+### Verified facts
+
+- `agent_registry.rs` at `src/daemon/agent_registry.rs` exposes these `pub fn` symbols: `validate_agent_name` (:102), `register` (:124), `unregister` (:173), `list_alive` (:200), `reap` (:232), `mark_connection_orphaned` (:255), `reap_on_boot` (:268). No `is_alive` or `first_alive` exist — verified by `grep "pub fn"` this session. — salience: high
+- `chat.db` is at schema v5+v6; the file-level comment at `src/daemon/chat.rs:1` reads "schema v5, message persistence, broadcast bus"; `chat.rs:254` reads "Apply schema v5 + v6 to a chat.db connection". Neither `active_cli_per_chat` nor `tg_message_map` are present — confirmed by grep returning no output this session. — salience: high
+- `TOOL_WHITELIST` in `src/plugin/mcp.rs:56-71` contains exactly 9 tools: `chat_post`, `chat_subscribe`, `chat_reply`, `chat_list`, `chat_list_threads`, `claudebase_daemon_status`, `agent_register`, `agent_unregister`, `agent_list_alive`, `agent_reap`. `chat_ask` is absent — verified by Read this session. — salience: high
+- No `callback_query`, `inline_keyboard`, `InlineKeyboardMarkup`, `answerCallbackQuery`, or `answer_callback` symbols exist in `src/daemon/telegram.rs` — confirmed by grep returning no output this session. — salience: high
+- The daemon Telegram bridge defaults `[telegram] enabled = true` at `config.rs:100-123` — verified from plan.md `## Facts` block, which sourced this from a direct file read in its own session. — salience: high
+- `enqueue_outbound_tg` is at `telegram.rs:81`; `extract_first_mention` routing precursor is at `telegram.rs:162`; `meta.target_agent_id` tagging is at `telegram.rs:333` — source: plan.md `## Facts`, read this session. — salience: high
+- `ChatBus` publish/subscribe is at `src/daemon/chat.rs:78-121`; MCP dispatch is at `src/daemon/server.rs:632-727` — source: plan.md `## Facts`, read this session. — salience: high
+- Operator decision 2026-05-30: routing key is `chat_id` alone (not `(user_id, chat_id)`); 1 chat = 1 CLI; `/switch` rebinds the whole chat — source: insight doc#30 (`sha=1a7e734c`, `agent=mira`, `type=operator-correction`), retrieved this session via `claudebase insight get 30 --json`. — salience: high
+- Books corpus `doc_count = 0` (empty). Corpus scope verdict: **No overlap** — empty corpus; topical queries skipped per corpus-scope-relevance protocol. — salience: low
+- PRD has sections §1 through §18; §19 is the next section — confirmed by `grep "^## §"` output this session showing last section is §18 at line 785. — salience: medium
+- insights-base: doc#30 sha=1a7e734c agent=mira type=operator-correction — query: "chat-as-id keying operator-correction" — verified: yes — salience: high
+
+### External contracts
+
+- **Telegram Bot API — `getUpdates`** — symbol: single-consumer-per-token rule; a second concurrent caller receives HTTP 409 Conflict — source: Telegram Bot API docs (NOT opened this session) — verified: no — assumption. The implementer MUST verify the exact HTTP status code and response body before coding the conflict gate. — salience: high
+- **Telegram Bot API — `sendMessage` with `reply_markup.inline_keyboard`** — symbol: `reply_markup` field; `inline_keyboard` is an array of arrays of `InlineKeyboardButton` objects, each with `text` (string) and `callback_data` (string, max 64 bytes) — source: Telegram Bot API docs (NOT opened this session) — verified: no — assumption. Implementer MUST verify shape before Slice 5. — salience: high
+- **Telegram Bot API — `callback_query` update** — symbol: `callback_query` top-level field in an Update object; contains `id` (for `answerCallbackQuery`), `data` (the `callback_data` string), and `message.chat.id` (the originating chat) — source: Telegram Bot API docs (NOT opened this session) — verified: no — assumption. — salience: high
+- **Telegram Bot API — `answerCallbackQuery`** — symbol: POST method, required parameter `callback_query_id` (string); dismisses the loading spinner on the Telegram client — source: Telegram Bot API docs (NOT opened this session) — verified: no — assumption. — salience: high
+- **Telegram Bot API — `callback_data` max 64 bytes** — symbol: hard limit enforced server-side by Telegram; exceeding it causes the `sendMessage` call to fail — source: Telegram Bot API docs (NOT opened this session) — verified: no — assumption. — salience: high
+- **teloxide v0.17** — symbols: `Bot::get_updates` (confirmed in-use); `InlineKeyboardMarkup`, `InlineKeyboardButton::callback`, `CallbackQuery`, `answer_callback_query` (NOT verified against pinned Cargo.lock version this session) — verified: yes for `get_updates`; no — assumption for the inline-keyboard/callback symbols. Implementer MUST confirm symbol availability at the pinned version before Slice 5. — salience: high
+- **MCP `tools/list` / `tools/call` dispatch** — symbol: daemon dispatch at `src/daemon/server.rs:632-727`; plugin `TOOL_WHITELIST` at `src/plugin/mcp.rs:56-71` — adding `chat_ask` extends both — verified: yes (Read this session). — salience: medium
+
+### Assumptions
+
+- `active_cli_per_chat` as a SQLite table (not a JSON file) is the correct choice — consistent with `chat.db` and enables atomic `INSERT OR REPLACE`. Risk: architect may prefer JSON. How to verify: architect review at bootstrap Step 3. Pending confirmation. — salience: medium
+- The daemon service-install (launchd/systemd/SCM) delivered in §17 Slice 2 is wired and auto-starts the daemon at boot. Risk: if not active, the feature does not work without manual daemon startup. How to verify: `claudebase daemon status` or `pgrep` before cutover. — salience: high
+- `chat_ask` sync-vs-async correlation is an open architect decision; the PRD captures the tool interface (FR-TMC-5.3) and behavior contract (FR-TMC-5.4) without prescribing the wire mechanism. Risk: architect may determine async-via-notification requires significant server.rs changes. How to verify: architect review at bootstrap Step 3. — salience: high
+- The operator wants single-select multiple-choice questionnaires as the initial deliverable (matches the `AskUserQuestion` shape). Risk: operator may request free-text or multi-select after seeing the buttons. How to verify: confirmed by plan Out of Scope block (plan.md read this session). — salience: low
+
+### Open questions
+
+- **Sync vs. async `chat_ask` answer correlation** — blocking tool call vs. async `question_id` + later channel notification. Needs: architect decision at bootstrap Step 3 before Slice 5 is implemented. — salience: high
+- **`[telegram] enabled` cutover default** — remains `true` (daemon-on by default) or flips to `false` (opt-in migration) for the release? Needs: operator/architect decision. — salience: medium
+- **Mira persona update: claudebase repo or SDLC repo?** The `chat_ask` usage guidance and stable `agent_name` registration live in the SDLC `src/agents/` persona, not the claudebase binary. Slice 7 is cross-repo. Needs: planner to confirm cross-repo branch strategy. — salience: medium
+- knowledge-base: corpus is empty (doc_count=0); task domain is Telegram Bot API + Rust daemon engineering + SQLite schema migration; no overlap. Topical queries skipped per corpus-scope-relevance protocol. — salience: low
+
+## Decisions
+
+### Inbound validation
+
+- Task received: append §19 PRD section to `docs/PRD.md` based on the approved plan at `.claude/plan.md`. Plan read in full (198 lines). The plan explicitly names the "chat-as-id" operator decision (2026-05-30, OQ-3), verified independently via insights-corpus doc#30 (`operator-correction`, `mira`, sha=1a7e734c). No contradictions detected. Challenged: yes — verified operator-decision evidence from two independent sources (plan.md + insight doc#30) before authoring FR-TMC-2.1. Outcome: proceeded with chat-as-id routing as stated. — salience: high
+- The plan's Slice 5 frames `chat_ask` as having an honest scope boundary (no native AskUserQuestion mirroring). Protocol-1 check: correct — the harness provides no hook for intercepting the native popup, confirmed by plan.md:101 and absence of contrary harness documentation. Challenged: yes. Outcome: FR-TMC-5.5 captures this constraint explicitly. — salience: high
+
+### Decisions made
+
+- **Chat-as-id routing (`chat_id` alone as the CLI binding key).** Q1 hack? no — operator-decided. Q2 sane? yes — simpler than `(user_id, chat_id)` and matches the operator's stated mental model. Q3 alternatives? per-user routing — rejected by operator on 2026-05-30 (OQ-3, insight doc#30). Q4 cause? yes. Q5 tracked? group-chat social consequence documented in FR-TMC-3.2, §19.9 #5, and §19.10 #6. — salience: high
+- **5-step routing tree omits step 3 (per-user "last addressed" state).** Q1 hack? no — structurally inapplicable under chat-as-id. Q2 sane? yes. Q3 alternatives? retain as dead no-op (rejected: confusing dead code). Q4 cause. Q5 n/a. — salience: medium
+- **`chat_ask` as an explicit MCP tool.** Q1 hack? no — only feasible mechanism. Q2 sane? yes. Q3 alternatives? harness interception (rejected: no hook exists). Q4 cause. Q5 n/a. — salience: high
+- **SQLite for `active_cli_per_chat` and `tg_message_map`** (architect confirmation pending). Q1 hack? no — consistent with all other `chat.db` tables; transactional. Q2 sane? yes. Q3 alternatives? JSON file (rejected: less transactional, consistency risks). Q4 cause. Q5 pending architect confirmation surfaced in Assumptions. — salience: medium
+- **Defer sync-vs-async `chat_ask` correlation to architect.** Q1 hack? no — both are valid with different trade-offs. Q2 sane? yes. Q3 alternatives? default to sync (rejected: fragile for slow human taps). Q4 cause. Q5 tracked in Open questions. — salience: high
+
+### Hacks acknowledged
+
+(none) — PRD authoring only; no implementation hacks introduced.
+
+### Symptom-only patches (with root-cause links)
+
+(none) — no symptom-only patches in this PRD section.

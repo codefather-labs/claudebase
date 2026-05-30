@@ -8,6 +8,14 @@ User-facing means changes a developer using claudebase notices in day-to-day wor
 
 ## [Unreleased]
 
+### Changed
+- **`install.sh` + `install.ps1` now resolve the install-target version DYNAMICALLY from origin's latest `claudebase-v*` git tag** (via `git ls-remote --tags --refs`, semver-sorted, no GitHub API rate limit, no `jq` dep). The hardcoded `CLAUDEBASE_VERSION` constant that bit v0.7.0 (operators upgrading saw "binary already at version 0.6.0" because install.sh still claimed 0.6.0) is now a fallback only — used if the remote lookup fails (air-gapped / GitHub down). Operators can pin a specific version via env: `CLAUDEBASE_VERSION=0.7.0 bash install.sh`. Eliminates the chronic dual-bump-Cargo.toml-AND-install.sh trap.
+- **`darwin-x64` (Intel Mac) binary distribution dropped from the release matrix.** `ort 2.0.0-rc.12` stopped shipping prebuilt binaries for `x86_64-apple-darwin`, and building ONNX Runtime from source for a single legacy platform is disproportionate. Apple stopped selling Intel Macs in late 2023; users still on Intel Mac can run the Linux binary under Rosetta-via-VM, or build from source via `cargo install --path .`. `install.sh` now emits a clear deprecation warning and `cargo install` instructions on `Darwin x86_64` detection. (Filed under Changed rather than Removed because no FEATURE was removed — only a build target was dropped; semver bump should be patch, not minor.)
+
+### Fixed
+- **`windows-x64` binary cap raised 35 MB → 40 MB.** The `insights-hybrid-corpus` v0.7.0 feature (~5 KLOC of new Rust — schema v5 migration + registry + dual-DB routing + RRF extraction + tag filter) pushed the windows-x64 binary 21 KB past the 35 MB iter-2 NFR-1.1 cap, silently failing the release build (`Process completed with exit code 1` at the `Assert binary size` step). Cap raised to 40 MB; typical observed sizes still well under (linux-x64 ~29 MB, darwin-arm64 ~24 MB, windows-x64 ~35 MB).
+- **`linux-arm64` build runner image bumped `ubuntu-22.04-arm` → `ubuntu-24.04-arm`** to pick up `glibc >= 2.38` (needed for `__isoc23_strtoull`) and the matching `libstdc++` ABI version. The prebuilt `ort-sys` static library expected a newer glibc than the 22.04 runner image provides, causing `undefined reference to __isoc23_strtoull` + `__cxa_call_terminate` link errors during release builds.
+
 ## [0.7.0] - 2026-05-30
 
 ### Changed / BREAKING

@@ -70,7 +70,13 @@ bash install.sh --local --yes      # or .\install.ps1 -Yes -Local on Windows
 
 > The installer downloads the pre-built `claudebase` binary + the `telegram-plugin-rs` binary from the latest GitHub release, drops the agent toolkit (rules / commands / agents) into `~/.claude/`, installs PDFium + the e5 encoder cache, best-effort installs `ffmpeg` + `whisper-cli` for voice transcription, and patches the official Anthropic Telegram plugin's cache with our Rust binary. No Rust toolchain required on the install machine.
 
+**Supported binary platforms** (release matrix):
+- **macOS**: arm64 only (M1/M2/M3/M4+). **Intel Mac (`x86_64-apple-darwin`) deprecated as of v0.7.1** — `ort 2.0.0-rc.12` stopped shipping prebuilt binaries for that target. If you're on Intel Mac, either run the Linux binary under Rosetta-via-VM, or build from source: `cargo install --path .` (requires Rust toolchain).
+- **Linux**: x64 + arm64.
+- **Windows**: x64.
+
 **Opt-outs** (env vars before running the installer):
+- `CLAUDEBASE_VERSION=x.y.z` — pin a specific version (downgrade, repeatable CI installs). Default: latest `claudebase-v*` tag on origin (via `git ls-remote`, no API quota). Falls back to a baked-in constant if the remote lookup fails (air-gapped / GitHub unreachable).
 - `CLAUDEBASE_SKIP_WHISPER=1` — skip ffmpeg + whisper-cli install (no voice transcription)
 - `CLAUDEBASE_SKIP_TELEGRAM=1` — skip Telegram plugin install + patch
 

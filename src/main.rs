@@ -1867,6 +1867,18 @@ fn resolve_registry_project_db(
     slug: &str,
     db_name: &str,
 ) -> Result<std::path::PathBuf, std::process::ExitCode> {
+    // SECURITY (security-auditor advisory on Slice 6 — pre-existing gap
+    // inherited from Slice 4's inline read): the `db_name` join below is
+    // on a registry-trusted root, but `db_name` itself is a user-supplied
+    // CLI arg — without validation a caller could pass `../../etc/passwd.db`
+    // and have it joined into the resolved path. Reject path-traversal /
+    // separators / hidden-file prefixes up front via the canonical db-name
+    // gate (same gate `open_and_validate` uses for the root-relative open
+    // path at main.rs:2292).
+    if let Err(e) = cli::validate_db_name(db_name) {
+        eprintln!("error: {e}");
+        return Err(std::process::ExitCode::from(2));
+    }
     // Slice 6 (FR-IHC-6.1..6.6): registry lookup is now centralised in
     // `registry::resolve_project_path`. `None` collapses missing-registry,
     // malformed-json, and unknown-slug into one operator-facing message —

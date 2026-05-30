@@ -17,24 +17,45 @@
 use claudebase::registry::{registry_path, resolve_project_path, upsert_project, ProjectEntry};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 use std::thread;
 use tempfile::TempDir;
+
+/// Process-local mutex serializing every HomeGuard-acquiring test in this
+/// binary. `HomeGuard::new` mutates process-wide `$HOME` / `$USERPROFILE`;
+/// without serialization the default `cargo test` parallelism races and
+/// panics — see TC-IHC-12.1 / qa-engineer iter-1 FAIL. We use a process-local
+/// `Mutex<()>` instead of pulling in `serial_test` to avoid a new dependency
+/// (deliberate-mode "no new abstractions / no new dependencies").
+///
+/// Poison handling: if a prior test panicked while holding the lock the
+/// mutex becomes poisoned; we `.unwrap_or_else(|e| e.into_inner())` so the
+/// next test still proceeds (the env state is independently restored by
+/// the previous HomeGuard's Drop, which runs even on panic).
+static HOME_LOCK: Mutex<()> = Mutex::new(());
 
 /// RAII guard that saves $HOME / $USERPROFILE, points them at a tempdir for
 /// the duration of the test, and restores them on Drop. Mirrors the manual
 /// save/restore in `tests/store_global_resolver_test.rs` but as a guard so a
 /// panic in the test body cannot leak env state into the next test in the
 /// same binary.
+///
+/// Holds a `MutexGuard<'static, ()>` over `HOME_LOCK` for its entire
+/// lifetime so concurrent HomeGuard-using tests serialize on the env
+/// mutation rather than racing.
 struct HomeGuard {
     _tmp: TempDir,
     home_path: PathBuf,
     saved_home: Option<std::ffi::OsString>,
     saved_userprofile: Option<std::ffi::OsString>,
+    _lock: MutexGuard<'static, ()>,
 }
 
 impl HomeGuard {
     fn new() -> Self {
+        // Acquire the process-local HOME_LOCK FIRST, before touching env vars,
+        // so two threads cannot interleave save/set. Recover from poison.
+        let lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().expect("home tempdir");
         let home_path = tmp.path().to_path_buf();
         let saved_home = std::env::var_os("HOME");
@@ -49,6 +70,7 @@ impl HomeGuard {
             home_path,
             saved_home,
             saved_userprofile,
+            _lock: lock,
         }
     }
 

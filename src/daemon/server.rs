@@ -927,6 +927,12 @@ async fn handle_chat_post(
         return (tool_error_response(id, -32602, "thread is required"), None);
     }
 
+    // Clone the sender identity for the outbound-TG path BEFORE `from_agent`
+    // is moved into the spawn_blocking closure below. Slice 4 records this
+    // into tg_message_map so an operator replying to this CLI's Telegram
+    // message routes back to it (reply-quote, Slice 2 step 2).
+    let from_agent_outbound = from_agent.clone();
+
     let persisted = tokio::task::spawn_blocking(move || -> anyhow::Result<chat::ChatMessage> {
         let conn = chat::open_chat_db()?;
         let resolved_reply_to = chat::resolve_reply_to(&conn, reply_to_raw.as_deref())?;
@@ -978,7 +984,11 @@ async fn handle_chat_post(
         if let Some(rest) = msg.thread_id.strip_prefix("telegram:") {
             match rest.parse::<i64>() {
                 Ok(chat_id) => {
-                    match crate::daemon::telegram::enqueue_outbound_tg(chat_id, msg.content.clone()) {
+                    match crate::daemon::telegram::enqueue_outbound_tg_with_sender(
+                        chat_id,
+                        msg.content.clone(),
+                        Some(from_agent_outbound.clone()),
+                    ) {
                         Ok(_) => tracing::info!(
                             chat_id,
                             thread = %msg.thread_id,

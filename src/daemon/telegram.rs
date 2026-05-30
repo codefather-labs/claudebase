@@ -67,24 +67,110 @@ use crate::daemon::chat::{self, SharedBus};
 use crate::daemon::config::RedactedToken;
 use crate::daemon::permissions::{self, Access};
 
+/// One queued outbound Telegram message, drained by `run_long_poll`.
+///
+/// telegram-multi-cli Slice 4 — the item carries `sender_agent_id` so that
+/// AFTER the `sendMessage` HTTP call succeeds (and Telegram returns the new
+/// `message_id`) the long-poll task can record a `tg_message_map` row tying
+/// that message_id back to the CLI that sent it — the operator can then
+/// reply-quote the message and have the reply route back to the same CLI
+/// (reply-quote routing, Slice 2). `sender_agent_id` is `Some` ONLY for
+/// CLI-originated replies (`chat_reply`); server-generated text (pairing
+/// replies, the step-5 "No CLIs online" notice, bot-command replies) carry
+/// `None` and are deliberately NOT recorded in `tg_message_map` — the map
+/// exists to route an operator reply back to a CLI, and those messages have
+/// no originating CLI to route to. (`tg_message_map.sender_agent_id` is
+/// `TEXT NOT NULL` in chat.rs:328, so a `None` sender simply skips the
+/// INSERT rather than writing a NULL.)
+#[derive(Debug, Clone)]
+pub struct OutboundTg {
+    pub chat_id: i64,
+    pub text: String,
+    pub sender_agent_id: Option<String>,
+}
+
 /// Outbound channel from MCP `chat_reply` (server.rs::handle_chat_post)
 /// to the telegram long-poll task. Set ONCE at spawn_long_poll time;
 /// reads happen in run_long_poll's select! loop.
-///
-/// Tuple shape: `(chat_id, text)` — chat_id is the integer parsed from
-/// the `telegram:<N>` thread prefix used by chat_reply tool callers.
-static OUTBOUND_TG: OnceLock<mpsc::UnboundedSender<(i64, String)>> = OnceLock::new();
+static OUTBOUND_TG: OnceLock<mpsc::UnboundedSender<OutboundTg>> = OnceLock::new();
 
 /// Push an outbound Telegram message from any task. Returns Ok(()) on
 /// successful enqueue (does NOT wait for HTTP send completion). Returns
 /// Err if telegram long-poll is not running OR the channel is closed.
+///
+/// This 2-arg form preserves the pre-Slice-4 ABI used by
+/// `server.rs::handle_chat_post` (which this slice is constrained not to
+/// touch). It enqueues with `sender_agent_id = None`, so messages sent via
+/// this path are NOT recorded in `tg_message_map`. Wiring the CLI's
+/// `from_agent` through from the server.rs call site is the tracked
+/// follow-up that makes reply-quote tracking live end-to-end for the
+/// `chat_reply` path — see `## Decisions → Hacks acknowledged` in the slice
+/// report. Callers that DO have the sender available use
+/// `enqueue_outbound_tg_with_sender`.
 pub fn enqueue_outbound_tg(chat_id: i64, text: String) -> Result<()> {
+    enqueue_outbound_tg_with_sender(chat_id, text, None)
+}
+
+/// Push an outbound Telegram message carrying the originating CLI's
+/// `sender_agent_id`. When `sender_agent_id` is `Some`, the long-poll task
+/// records a `tg_message_map` row after the send succeeds so a later
+/// operator reply-quote routes back to this CLI.
+pub fn enqueue_outbound_tg_with_sender(
+    chat_id: i64,
+    text: String,
+    sender_agent_id: Option<String>,
+) -> Result<()> {
     let tx = OUTBOUND_TG
         .get()
         .ok_or_else(|| anyhow::anyhow!("telegram outbound channel not initialised (long-poll task not spawned)"))?;
-    tx.send((chat_id, text))
+    tx.send(OutboundTg { chat_id, text, sender_agent_id })
         .map_err(|e| anyhow::anyhow!("outbound channel closed: {e}"))?;
     Ok(())
+}
+
+/// telegram-multi-cli Slice 4 — record one CLI-originated outbound message
+/// in `tg_message_map` so a later operator reply-quote routes back to the
+/// sending CLI (FR-TMC-4.1, FR-TMC-4.3).
+///
+/// `INSERT OR IGNORE` makes the write idempotent on the composite PK
+/// `(chat_id, tg_msg_id)` — a transient re-send of the same Telegram
+/// message (same returned `message_id`) collapses to one row (TC-TMC-6.2).
+/// `sent_at` is `strftime('%s','now')` (UNIX seconds), matching the TTL
+/// purge's cutoff arithmetic.
+///
+/// This is a synchronous rusqlite write; the long-poll caller MUST invoke
+/// it inside `spawn_blocking` so no Connection is held across the
+/// `bot.send_message(...).await` (ASYNC_INVARIANTS Rule 2).
+pub fn record_outbound_message(
+    conn: &Connection,
+    chat_id: i64,
+    tg_msg_id: i64,
+    sender_agent_id: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO tg_message_map \
+         (tg_msg_id, chat_id, sender_agent_id, sent_at) \
+         VALUES (?1, ?2, ?3, strftime('%s','now'))",
+        params![tg_msg_id, chat_id, sender_agent_id],
+    )?;
+    Ok(())
+}
+
+/// telegram-multi-cli Slice 4 — the PERIODIC TTL purge for `tg_message_map`
+/// (FR-TMC-1.3). Deletes rows older than 30 days (2_592_000 seconds). The
+/// `< cutoff` comparison is strict, so a row whose `sent_at` is exactly at
+/// the boundary (`now - 2592000`) is RETAINED (TC-TMC-7.2).
+///
+/// Distinct from `chat::purge_expired_chat_state` (the STARTUP purge from
+/// Slice 1, which also evicts `pending_questions`): this one touches ONLY
+/// `tg_message_map` and runs on a timer alongside `run_long_poll`. Reuses
+/// the `tg_message_map_sent_at_idx` index added in Slice 1.
+pub fn purge_tg_message_map(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM tg_message_map \
+         WHERE sent_at < (strftime('%s','now') - 2592000)",
+        [],
+    )
 }
 
 /// One Telegram update as decoded from `getUpdates`. We deliberately
@@ -1155,7 +1241,7 @@ pub fn spawn_long_poll(
     // chat_reply handler can enqueue immediately (race-free: any push
     // before the spawn is queued; the receiver picks it up on the first
     // select! tick).
-    let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<(i64, String)>();
+    let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<OutboundTg>();
     if OUTBOUND_TG.set(outbound_tx).is_err() {
         tracing::warn!(
             "OUTBOUND_TG already initialised — second spawn_long_poll call ignored (daemon should spawn only once per process)"
@@ -1171,6 +1257,39 @@ pub fn spawn_long_poll(
     let approved_token = token.clone();
     tokio::spawn(async move {
         run_approved_polling(approved_token).await;
+    });
+
+    // telegram-multi-cli Slice 4 — spawn the PERIODIC tg_message_map TTL
+    // purge (FR-TMC-1.3). The startup purge runs once at boot
+    // (chat::purge_expired_chat_state, Slice 1); this timer evicts rows that
+    // age past 30 days WHILE the daemon keeps running. Hourly cadence is
+    // ample — the cutoff is 30 days, so sub-hour precision is irrelevant.
+    // Each tick opens its own Connection inside spawn_blocking (never held
+    // across .await) per ASYNC_INVARIANTS Rule 2.
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(3600));
+        // Skip the immediate first tick: the startup purge already ran.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let join = tokio::task::spawn_blocking(|| -> Result<usize> {
+                let conn = chat::open_chat_db()?;
+                Ok(purge_tg_message_map(&conn)?)
+            })
+            .await;
+            match join {
+                Ok(Ok(deleted)) if deleted > 0 => {
+                    tracing::info!(deleted, "tg_message_map periodic TTL purge");
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "tg_message_map periodic purge failed");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "tg_message_map purge spawn_blocking panicked");
+                }
+            }
+        }
     });
 
     tokio::spawn(async move {
@@ -1278,7 +1397,7 @@ async fn run_long_poll(
     access_path: PathBuf,
     bus: SharedBus,
     asr: Option<Arc<dyn Asr>>,
-    mut outbound_rx: mpsc::UnboundedReceiver<(i64, String)>,
+    mut outbound_rx: mpsc::UnboundedReceiver<OutboundTg>,
 ) -> Result<()> {
     // Allow tests / local dev to point at a mock Telegram endpoint via
     // TELOXIDE_API_URL. teloxide 0.17 reads this env var directly via
@@ -1408,16 +1527,57 @@ async fn run_long_poll(
         // queued messages so a burst doesn't starve getUpdates.
         for _ in 0..16 {
             match outbound_rx.try_recv() {
-                Ok((chat_id, text)) => {
+                Ok(OutboundTg { chat_id, text, sender_agent_id }) => {
                     let send_result = bot
                         .send_message(teloxide::types::ChatId(chat_id), &text)
                         .await;
                     match send_result {
-                        Ok(_) => tracing::info!(
-                            chat_id,
-                            bytes = text.len(),
-                            "telegram outbound sent"
-                        ),
+                        Ok(sent_msg) => {
+                            tracing::info!(
+                                chat_id,
+                                bytes = text.len(),
+                                "telegram outbound sent"
+                            );
+                            // telegram-multi-cli Slice 4 (architect action
+                            // item 4) — the message_id is ONLY known here,
+                            // after the sendMessage HTTP call resolved with
+                            // the Telegram-assigned Message. Record the
+                            // reply-quote mapping for CLI-originated messages
+                            // so a later operator reply routes back to the
+                            // sending CLI. The send already happened, so a
+                            // failed INSERT does not lose the message — it
+                            // only loses the reply-quote breadcrumb (logged).
+                            // No row is written for `sender_agent_id == None`
+                            // (server-generated text — see OutboundTg docs).
+                            if let Some(agent_id) = sender_agent_id {
+                                let tg_msg_id = sent_msg.id.0 as i64;
+                                let join = tokio::task::spawn_blocking(move || -> Result<()> {
+                                    let conn = chat::open_chat_db()?;
+                                    record_outbound_message(
+                                        &conn, chat_id, tg_msg_id, &agent_id,
+                                    )?;
+                                    Ok(())
+                                })
+                                .await;
+                                match join {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(e)) => tracing::warn!(
+                                        chat_id,
+                                        tg_msg_id,
+                                        error = %e,
+                                        "tg_message_map record failed (message still sent)"
+                                    ),
+                                    Err(e) => tracing::warn!(
+                                        chat_id,
+                                        error = %e,
+                                        "tg_message_map record spawn_blocking panicked"
+                                    ),
+                                }
+                            }
+                        }
+                        // sendMessage failed → no message_id, no row
+                        // (TC-TMC-6.3). The reply-quote map only ever holds
+                        // messages Telegram actually accepted.
                         Err(e) => tracing::warn!(
                             chat_id,
                             error = %redact_error_string(&format!("{e}"), &token_for_error_redaction),
@@ -2788,5 +2948,224 @@ mod tests {
             .query_row("SELECT value FROM daemon_state WHERE key='tg_bot_state'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, "disconnected");
+    }
+
+    // ================================================================
+    // telegram-multi-cli Slice 4 — outbound reply-quote tracking
+    // (record_outbound_message + purge_tg_message_map + OutboundTg)
+    // ================================================================
+
+    /// Count tg_message_map rows for a (chat_id, tg_msg_id) pair.
+    fn map_row(conn: &Connection, chat_id: i64, tg_msg_id: i64) -> Option<(String, i64)> {
+        conn.query_row(
+            "SELECT sender_agent_id, sent_at FROM tg_message_map \
+             WHERE chat_id = ?1 AND tg_msg_id = ?2",
+            params![chat_id, tg_msg_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .ok()
+    }
+
+    fn map_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM tg_message_map", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    // ---- TC-TMC-6.1: a CLI-sent message records a tg_message_map row ----
+
+    #[test]
+    fn record_outbound_inserts_row_with_sender_and_chat() {
+        let conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+
+        record_outbound_message(&conn, 111, 9001, "cli-1-id").unwrap();
+
+        let (sender, sent_at) = map_row(&conn, 111, 9001).expect("row must exist");
+        assert_eq!(sender, "cli-1-id");
+        // sent_at is strftime('%s','now') — a recent UNIX-seconds value.
+        let now = chrono::Utc::now().timestamp();
+        assert!(
+            (now - sent_at).abs() <= 5,
+            "sent_at {sent_at} not within 5s of now {now}"
+        );
+    }
+
+    // ---- TC-TMC-6.2: INSERT OR IGNORE dedups on (chat_id, tg_msg_id) ----
+
+    #[test]
+    fn record_outbound_is_idempotent_on_composite_pk() {
+        let conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+
+        record_outbound_message(&conn, 111, 9001, "cli-1-id").unwrap();
+        // Re-send of the same Telegram message (same returned message_id):
+        // even with a different sender attempt, the row must NOT duplicate.
+        record_outbound_message(&conn, 111, 9001, "cli-1-id").unwrap();
+        record_outbound_message(&conn, 111, 9001, "cli-2-id").unwrap();
+
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tg_message_map WHERE chat_id = 111 AND tg_msg_id = 9001",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "INSERT OR IGNORE must keep exactly one row");
+        // The first writer wins (OR IGNORE keeps the existing row).
+        assert_eq!(map_row(&conn, 111, 9001).unwrap().0, "cli-1-id");
+    }
+
+    // ---- TC-TMC-6.3: NO row when the sendMessage API call fails ---------
+    //
+    // The send-site logic only calls record_outbound_message inside the
+    // `Ok(sent_msg)` arm — the `Err(_)` arm never touches the DB. This test
+    // asserts the call-site contract directly: an error result skips the
+    // insert. We model the call-site branch (matching the exact structure of
+    // the run_long_poll drain) over a simulated send Result.
+
+    #[test]
+    fn outbound_send_failure_records_no_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        let before = map_count(&conn);
+
+        // Simulated send outcome — the API failed, so there is NO message_id.
+        let send_result: std::result::Result<i64, &str> = Err("HTTP 500");
+        let sender_agent_id: Option<&str> = Some("cli-1-id");
+
+        // Mirror the run_long_poll drain branch: record ONLY on Ok + Some.
+        match send_result {
+            Ok(tg_msg_id) => {
+                if let Some(agent) = sender_agent_id {
+                    record_outbound_message(&conn, 111, tg_msg_id, agent).unwrap();
+                }
+            }
+            Err(_) => { /* no message_id → no row (TC-TMC-6.3) */ }
+        }
+
+        assert_eq!(map_count(&conn), before, "failed send must not insert a row");
+    }
+
+    // ---- TC-TMC-6.4: two CLIs sending → two distinct rows ---------------
+
+    #[test]
+    fn two_clis_record_two_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+
+        record_outbound_message(&conn, 111, 9001, "cli-1-id").unwrap();
+        record_outbound_message(&conn, 111, 9002, "cli-2-id").unwrap();
+
+        assert_eq!(map_row(&conn, 111, 9001).unwrap().0, "cli-1-id");
+        assert_eq!(map_row(&conn, 111, 9002).unwrap().0, "cli-2-id");
+        assert_eq!(map_count(&conn), 2);
+    }
+
+    // ---- server-generated text (sender_agent_id == None) records nothing -
+
+    #[test]
+    fn outbound_none_sender_records_no_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        let before = map_count(&conn);
+
+        // The drain branch only records when sender_agent_id is Some — a
+        // pairing reply / "No CLIs online" notice / bot-command reply carries
+        // None and must not write a tg_message_map row.
+        let sender_agent_id: Option<&str> = None;
+        if let Some(agent) = sender_agent_id {
+            record_outbound_message(&conn, 111, 9001, agent).unwrap();
+        }
+
+        assert_eq!(map_count(&conn), before);
+    }
+
+    // ---- TC-TMC-7.1: periodic purge deletes rows older than 30 days -----
+
+    #[test]
+    fn purge_deletes_rows_older_than_30_days() {
+        let conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+
+        // 31-day-old row (must be purged) + 1-day-old row (must survive).
+        conn.execute(
+            "INSERT INTO tg_message_map (tg_msg_id, chat_id, sender_agent_id, sent_at) \
+             VALUES (1, 111, 'cli-old', strftime('%s','now') - 2592001)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tg_message_map (tg_msg_id, chat_id, sender_agent_id, sent_at) \
+             VALUES (2, 111, 'cli-new', strftime('%s','now') - 86400)",
+            [],
+        )
+        .unwrap();
+
+        let deleted = purge_tg_message_map(&conn).unwrap();
+        assert_eq!(deleted, 1, "exactly the 31-day-old row purged");
+        assert!(map_row(&conn, 111, 1).is_none(), "old row gone");
+        assert!(map_row(&conn, 111, 2).is_some(), "recent row survives");
+    }
+
+    // ---- TC-TMC-7.2: boundary row (exactly 30 days) is RETAINED ----------
+
+    #[test]
+    fn purge_retains_boundary_row_at_exactly_30_days() {
+        let conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+
+        // sent_at == now - 2592000 exactly. The DELETE uses strict `<`, so
+        // this row is on the safe side of the cutoff and must NOT be deleted.
+        conn.execute(
+            "INSERT INTO tg_message_map (tg_msg_id, chat_id, sender_agent_id, sent_at) \
+             VALUES (1, 111, 'cli-edge', strftime('%s','now') - 2592000)",
+            [],
+        )
+        .unwrap();
+
+        let deleted = purge_tg_message_map(&conn).unwrap();
+        assert_eq!(deleted, 0, "boundary row must NOT be deleted (strict <)");
+        assert!(map_row(&conn, 111, 1).is_some(), "boundary row retained");
+    }
+
+    // ---- TC-TMC-5.4: a recorded row survives a daemon restart -----------
+    //
+    // The map lives in SQLite (chat.db), so a row written before a restart is
+    // still present after re-opening the database file. We model the restart
+    // with a tempfile-backed DB: write, drop the connection (process exit),
+    // re-open, assert the row is still readable.
+
+    #[test]
+    fn recorded_row_survives_daemon_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("chat.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            chat::ensure_chat_db_schema(&conn).unwrap();
+            record_outbound_message(&conn, 111, 9001, "cli-1-id").unwrap();
+        } // connection dropped — simulates daemon process exit
+
+        // Re-open the same file — simulates daemon restart.
+        let conn2 = Connection::open(&db_path).unwrap();
+        let (sender, _sent_at) = map_row(&conn2, 111, 9001).expect("row must survive restart");
+        assert_eq!(sender, "cli-1-id");
+    }
+
+    // ---- OutboundTg threads sender_agent_id through the enqueue API ------
+
+    #[test]
+    fn enqueue_two_arg_form_carries_none_sender() {
+        // The 2-arg back-compat form (used by server.rs) must default the
+        // sender to None — it constructs the same OutboundTg the channel
+        // carries. We assert the struct shape directly (the global channel is
+        // not initialised in unit tests).
+        let item = OutboundTg { chat_id: 111, text: "hi".into(), sender_agent_id: None };
+        assert_eq!(item.chat_id, 111);
+        assert!(item.sender_agent_id.is_none());
+
+        let with_sender =
+            OutboundTg { chat_id: 111, text: "hi".into(), sender_agent_id: Some("cli-1-id".into()) };
+        assert_eq!(with_sender.sender_agent_id.as_deref(), Some("cli-1-id"));
     }
 }

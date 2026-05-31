@@ -306,18 +306,64 @@ Be honest with the tag — marking everything `high` defeats the purge and turns
 | "Did a prior planner flag this scope as oversized?" | insights |
 | Genuinely spans both | `claudebase search --corpus all` (RRF-fused; each hit tagged with `source_corpus`) |
 
+## 💬 Telegram Multi-CLI Setup
+
+One bot, many Claude Code CLIs. The daemon acts as the single Telegram poller and routes each chat to a bound CLI instance.
+
+### How it works
+
+The daemon owns the bot token's `getUpdates` polling slot. Each Telegram chat (DM or group) is bound to exactly one CLI instance — the **chat-as-id** model. Sending a message in a chat delivers it to that chat's bound CLI. Multiple CLIs can connect to the daemon simultaneously; each operator or team chat can be switched to whichever CLI is relevant at the moment.
+
+**Group chats:** all members of a group share one binding. `/switch` in a group chat rebinds the entire chat for everyone — this is intentional and documented in `/help`.
+
+### Bot command reference
+
+| Command | Effect |
+|---|---|
+| `/agents` | List all CLI instances currently online and registered with the daemon. |
+| `/switch <name>` | Rebind this chat to the named CLI. The name must match a live agent (use `/agents` to see available names). Rejected with a helpful error if the target is unknown or offline. |
+| `/whoami` | Show which CLI this chat is currently bound to, and its agent ID. |
+| `/here` | Show the bound CLI's hostname and working directory (best-effort; reports "unavailable" in v1 if the CLI has not registered location metadata). |
+
+### `chat_ask` — multiple-choice questions as Telegram buttons
+
+Agents can surface a multiple-choice question as native Telegram inline keyboard buttons:
+
+```
+chat_ask(thread, question, options=[{label, description}, ...])
+```
+
+The daemon sends a Telegram message with one button per option. The operator taps a button; the daemon dismisses the spinner and routes the answer back to the requesting agent on the chat-bound CLI.
+
+**v1 scope:** single-select only; DM chats only (group-chat `chat_ask` is deferred — see `docs/PRD.md` §19 Out of Scope). Free-text answers and multi-select are not supported in v1.
+
+### Migrating from the per-CLI plugin (cutover)
+
+Before this feature, each Claude Code CLI ran its own Telegram plugin (`plugins/telegram-rs/`) which caused 409 conflicts when multiple CLIs shared a bot token. The daemon poller replaces this.
+
+**To migrate:**
+
+1. Confirm the daemon is running: `claudebase daemon status`
+2. Stop the per-CLI plugin if it is still active (see `RELEASING.md` for the step-by-step gate).
+3. Verify `[telegram] enabled = true` is set (or absent — it defaults to `true`) in `daemon.toml`.
+4. Send a test message to your bot; it should now be received by the daemon and routed to the bound CLI.
+
+**To revert** to the legacy per-CLI plugin path: set `[telegram] enabled = false` in `daemon.toml` and restart the daemon. The daemon will no longer poll; restart the plugin to resume receiving messages.
+
+---
+
 ## 🗺 Roadmap
 
-The next big design milestone is the **multi-CLI agent fleet** — a claudebase server with HTTP/WSS + mandatory Bearer-token auth that hosts the agent registry and routes channel callbacks between cli instances (including TG bot ↔ cli routing). Four plans cover the path end-to-end:
+The next big design milestone for the **multi-CLI agent fleet** is cross-machine routing — a claudebase server with HTTP/WSS + mandatory Bearer-token auth. The UDS-based single-machine multi-CLI routing with Telegram is now shipped (see above). Remaining plans:
 
 | Plan | Status |
 |---|---|
 | [`claudebase-server-foundation.md`](docs/plans/claudebase-server-foundation.md) | foundation — HTTP/WSS + auth + OS service install (launchd / systemd / Windows SCM) |
 | [`agent-registry-multi-cli.md`](docs/plans/agent-registry-multi-cli.md) | registry + cli↔cli message bus + permission-gated spawn + monitoring |
-| [`telegram-multi-cli-orchestration.md`](docs/plans/telegram-multi-cli-orchestration.md) | server-side TG poller + `/agents` `/switch` bot commands + reply-quote routing |
+| [`telegram-multi-cli-orchestration.md`](docs/plans/telegram-multi-cli-orchestration.md) | UDS-based single-machine multi-CLI Telegram routing — **shipped** |
 | [`claudebase-project-dir.md`](docs/plans/claudebase-project-dir.md) | per-project `.claudebase/` dir (config.toml + identity.local + state) |
 
-All four are concept-fixed but not yet implemented. Discuss in [GH Discussions](https://github.com/codefather-labs/claudebase/discussions) or open an issue.
+Discuss in [GH Discussions](https://github.com/codefather-labs/claudebase/discussions) or open an issue.
 
 ## 🆚 Comparison
 

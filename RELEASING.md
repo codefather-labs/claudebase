@@ -238,6 +238,60 @@ To upgrade pdfium binary alone (without changing the Rust bindings):
 
 ---
 
+---
+
+## Telegram Multi-CLI Cutover
+
+Before releasing a version that includes the `telegram-multi-cli` feature, and before decommissioning the per-CLI `telegram-plugin-rs` on any existing deployment, follow these steps in order. **Do not skip Step 0.**
+
+### Step 0 — Verify the daemon is running (mandatory gate)
+
+**Step 0 (mandatory gate):** Verify `claudebase daemon status` returns `running` AND the service-manager registration (launchd on macOS / systemd on Linux / SCM on Windows) is active. If not, run:
+
+```
+claudebase daemon install
+claudebase daemon start
+```
+
+**DO NOT proceed to stopping the plugin until `claudebase daemon status` shows `running`.** Stopping the plugin before the daemon is active leaves the bot with no poller — Telegram messages are silently dropped until either the plugin is restarted or the daemon comes up. This gate is the F-3 mandatory pre-condition that prevents the inert-and-silent failure mode.
+
+### Step 1 — Stop the legacy per-CLI Telegram plugin
+
+Once the daemon is confirmed running, stop the per-CLI plugin that previously held the `getUpdates` polling slot. How to stop it depends on how it was started:
+
+- If it was launched via `claudebase run` (the exec wrapper): kill or stop the `claude` process that was started with the Telegram channel preset.
+- If it was installed as a Claude Code plugin: disable or remove it via `claude plugin` commands, or stop the process that is running it.
+
+**Confirm the plugin is no longer polling** by checking that no `plugin:telegram` process is running. The daemon's log will show:
+
+```
+telegram getUpdates conflict cleared — daemon poller now owns the bot
+```
+
+when the next successful poll completes after the plugin stops.
+
+### Step 2 — Confirm `[telegram] enabled = true` in daemon.toml
+
+The default value is `true`, so this step is a no-op for a fresh install. For operators who previously set `enabled = false` as a precaution, ensure the flag is either absent or explicitly set to `true` in `daemon.toml` before continuing.
+
+### Step 3 — Verify the daemon owns the bot
+
+Send a test message to the bot from Telegram. The message should arrive as `source="claudebase"` in the daemon logs (not `source="plugin:telegram:telegram"`). If the daemon is the sole poller, you will see the message routed to the bound CLI.
+
+You can also confirm with `/agents` — the bot should reply listing the connected CLI instances.
+
+### Step 4 — Revert path (if needed)
+
+To fall back to the legacy per-CLI plugin:
+
+1. Set `[telegram] enabled = false` in `daemon.toml`.
+2. Restart the daemon: `claudebase daemon restart`.
+3. Restart the per-CLI plugin (or re-run `claudebase run` with the Telegram channel preset).
+
+The daemon will no longer poll `getUpdates`; the plugin takes over. No code changes are required.
+
+---
+
 ## Facts
 
 ### Verified facts

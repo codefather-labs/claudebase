@@ -8,7 +8,16 @@ User-facing means changes a developer using claudebase notices in day-to-day wor
 
 ## [Unreleased]
 
+### Added
+- **Telegram Multi-CLI — one bot, many CLIs.** The daemon now owns the Telegram bot and routes each chat to a single bound CLI instance (chat-as-id: one chat ID = one CLI). Operators running multiple Claude Code sessions share a single bot token without 409 conflicts.
+- **Chat-as-id binding.** Each Telegram chat (DM or group) is bound to one CLI instance at a time. All users in a group share that chat's binding; `/switch` rebinds the whole chat for everyone.
+- **Bot commands: `/agents`, `/switch`, `/whoami`, `/here`.** `/agents` lists all CLIs currently online; `/switch <name>` rebinds the active chat to the named CLI; `/whoami` shows the chat's current binding; `/here` shows the bound CLI's host and working directory (best-effort; may show "unavailable" in v1 if the CLI has not registered location metadata).
+- **`chat_ask` — multiple-choice questions as Telegram inline keyboard buttons.** Agents can call `chat_ask(thread, question, options)` to present a question as tappable buttons in Telegram. The operator taps a button; the daemon routes the answer back to the calling agent. (DM chats in v1; single-select only.)
+- **Conflict gate — 409 detection without crashing.** If the legacy per-CLI Telegram plugin still holds the bot token's polling slot when the daemon starts, the daemon logs a clear "legacy poller still running" warning and backs off 60 s per cycle — it does not crash. Stopping the plugin lets the daemon take over automatically.
+
 ### Changed
+- **The installer no longer auto-activates the per-CLI Telegram plugin.** `install_telegram_plugin` has been removed from `install.sh` / `install.ps1`. Fresh installs use the daemon poller as the sole Telegram receiver. Existing users can revert to the plugin path by setting `[telegram] enabled = false` in `daemon.toml` and restarting the daemon.
+
 - **`install.sh` + `install.ps1` now resolve the install-target version DYNAMICALLY from origin's latest `claudebase-v*` git tag** (via `git ls-remote --tags --refs`, semver-sorted, no GitHub API rate limit, no `jq` dep). The hardcoded `CLAUDEBASE_VERSION` constant that bit v0.7.0 (operators upgrading saw "binary already at version 0.6.0" because install.sh still claimed 0.6.0) is now a fallback only — used if the remote lookup fails (air-gapped / GitHub down). Operators can pin a specific version via env: `CLAUDEBASE_VERSION=0.7.0 bash install.sh`. Eliminates the chronic dual-bump-Cargo.toml-AND-install.sh trap.
 - **`darwin-x64` (Intel Mac) binary distribution dropped from the release matrix.** `ort 2.0.0-rc.12` stopped shipping prebuilt binaries for `x86_64-apple-darwin`, and building ONNX Runtime from source for a single legacy platform is disproportionate. Apple stopped selling Intel Macs in late 2023; users still on Intel Mac can run the Linux binary under Rosetta-via-VM, or build from source via `cargo install --path .`. `install.sh` now emits a clear deprecation warning and `cargo install` instructions on `Darwin x86_64` detection. (Filed under Changed rather than Removed because no FEATURE was removed — only a build target was dropped; semver bump should be patch, not minor.)
 

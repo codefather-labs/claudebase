@@ -35,7 +35,7 @@ $Script:RepoUrl                 = 'https://github.com/codefather-labs/claudebase
 # GitHub unreachable). NOT authoritative — the actual version installed
 # is whatever Get-ClaudebaseVersion resolves at runtime. Bump on each
 # release as a courtesy for cold-start installs without network.
-$Script:ClaudebaseFallbackVersion = '0.7.1'
+$Script:ClaudebaseFallbackVersion = '0.8.0'
 
 # Authoritative version resolution (v0.7.1+) — mirrors install.sh.
 # Priority: 1) env override $env:CLAUDEBASE_VERSION; 2) latest

@@ -32,7 +32,7 @@ RELEASE_BASE="https://github.com/codefather-labs/claudebase/releases/download"
 # the actual version installed is whatever `detect_claudebase_version`
 # resolves at runtime. Bump on each release as a courtesy for cold-start
 # installs without network, but absence of bump no longer breaks anything.
-CLAUDEBASE_FALLBACK_VERSION="0.7.1"
+CLAUDEBASE_FALLBACK_VERSION="0.8.0"
 
 # Authoritative version resolution (v0.7.1+): authoritative source is
 # the latest `claudebase-v*` tag on origin, fetched via `git ls-remote`.

@@ -8,6 +8,8 @@ User-facing means changes a developer using claudebase notices in day-to-day wor
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-31
+
 ### Added
 - **Telegram Multi-CLI — one bot, many CLIs.** The daemon now owns the Telegram bot and routes each chat to a single bound CLI instance (chat-as-id: one chat ID = one CLI). Operators running multiple Claude Code sessions share a single bot token without 409 conflicts.
 - **Chat-as-id binding.** Each Telegram chat (DM or group) is bound to one CLI instance at a time. All users in a group share that chat's binding; `/switch` rebinds the whole chat for everyone.

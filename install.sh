@@ -649,14 +649,108 @@ install_whisper_stack() {
 }
 
 # ============================================================================
-# Per-CLI Telegram plugin auto-activation was REMOVED in the telegram-multi-cli cutover.
-# The daemon now ships a server-centric Telegram poller (one bot -> many CLIs).
-# See RELEASING.md for cutover steps. To revert: set [telegram] enabled=false in daemon.toml.
+# Install Telegram channel bridge wiring (Slice 6 v0.8.0)
 # ============================================================================
-# A fresh install no longer resurrects the per-CLI plugin alongside the daemon
-# poller — that is exactly what caused the 409 dual-poller this feature kills.
-# An operator who genuinely wants the legacy per-CLI plugin installs it manually:
-#   claude plugin install telegram@claude-plugins-official
+# The daemon now owns the single Telegram `getUpdates` poller (one bot -> many CLIs).
+# This function patches the official Telegram plugin's .mcp.json to run the
+# daemon bridge (`claudebase plugin serve`) as the MCP server for the channel.
+# The bridge only relays the daemon's notifications (does not poll), so there
+# is no dual-poll and NFR-TMC-5 is preserved.
+#
+# Best-effort: if `claude` CLI is not on PATH or the plugin install fails,
+# the function logs and returns 0 (does not abort the installer).
+#
+# The function is idempotent: re-running rewrites the same .mcp.json.
+# To revert, restore .mcp.json from .mcp.json.upstream-backup, or run
+# `claude plugin install telegram@claude-plugins-official` to restore
+# the upstream version.
+install_telegram_channel_bridge() {
+  if [ "${CLAUDEBASE_SKIP_TELEGRAM:-0}" = "1" ]; then
+    log_info "CLAUDEBASE_SKIP_TELEGRAM=1 — skipping telegram channel bridge wiring"
+    return 0
+  fi
+
+  if ! command -v claude >/dev/null 2>&1; then
+    log_info "claude CLI not on PATH; skipping telegram channel bridge setup"
+    log_info "  to install manually after Claude Code is installed:"
+    log_info "    claude plugin install telegram@claude-plugins-official"
+    log_info "    then re-run this installer to wire the bridge"
+    return 0
+  fi
+
+  # ----- 1. Install official plugin if not already -----
+  log_info "Installing telegram@claude-plugins-official (idempotent)..."
+  if ! claude plugin install telegram@claude-plugins-official 2>&1 | tail -2; then
+    log_warn "telegram plugin install failed; skipping bridge wiring"
+    return 0
+  fi
+
+  # ----- 2. Locate the installed plugin dir -----
+  # Prefer installed_plugins.json (authoritative — points to the currently
+  # ACTIVE version). Fall back to newest-version glob if jq/python3 absent
+  # or manifest unreadable.
+  local plugin_root="$CLAUDE_DIR/plugins/cache/claude-plugins-official/telegram"
+  if [ ! -d "$plugin_root" ]; then
+    log_warn "official telegram plugin not found at $plugin_root after install — skipping bridge wiring"
+    return 0
+  fi
+
+  local plugin_dir=""
+  local installed_manifest="$CLAUDE_DIR/plugins/installed_plugins.json"
+  if [ -f "$installed_manifest" ]; then
+    if command -v jq >/dev/null 2>&1; then
+      plugin_dir=$(jq -r '.plugins["telegram@claude-plugins-official"][0].installPath // empty' "$installed_manifest" 2>/dev/null)
+    elif command -v python3 >/dev/null 2>&1; then
+      plugin_dir=$(python3 -c "import json,sys; d=json.load(open('$installed_manifest')); p=d.get('plugins',{}).get('telegram@claude-plugins-official',[]); print(p[0]['installPath'] if p else '')" 2>/dev/null)
+    fi
+  fi
+
+  if [ -z "$plugin_dir" ] || [ ! -d "$plugin_dir" ]; then
+    # Fallback: newest version subdir (semver-sortable).
+    local version_dir
+    version_dir=$(ls -1 "$plugin_root" 2>/dev/null | sort -V | tail -1)
+    if [ -z "$version_dir" ] || [ ! -d "$plugin_root/$version_dir" ]; then
+      log_warn "no version subdir found under $plugin_root — skipping bridge wiring"
+      return 0
+    fi
+    plugin_dir="$plugin_root/$version_dir"
+    log_info "manifest lookup unavailable; falling back to newest-version glob: $plugin_dir"
+  fi
+  log_info "wiring daemon bridge at $plugin_dir"
+
+  # ----- 3. Back up upstream .mcp.json and patch with daemon bridge -----
+  local mcp_json="$plugin_dir/.mcp.json"
+  local mcp_backup="$plugin_dir/.mcp.json.upstream-backup"
+
+  if [ -f "$mcp_json" ] && [ ! -f "$mcp_backup" ]; then
+    cp "$mcp_json" "$mcp_backup"
+    log_ok ".mcp.json.upstream-backup preserved"
+  fi
+
+  # Write .mcp.json to run the daemon bridge as the MCP server for the
+  # telegram channel. The bridge relays the daemon (does not poll), so
+  # there is no dual-poll and NFR-TMC-5 is preserved.
+  cat > "$mcp_json" <<'EOF'
+{
+  "mcpServers": {
+    "telegram": {
+      "command": "${HOME}/.claude/tools/claudebase/claudebase",
+      "args": ["plugin", "serve"]
+    }
+  }
+}
+EOF
+  chmod 0644 "$mcp_json"
+  log_ok ".mcp.json patched (daemon bridge relays the daemon poller, no dual-poll)"
+
+  log_info "to enable: launch Claude Code with"
+  log_info "  claude --channels plugin:telegram@claude-plugins-official"
+  log_info "or use the shorthand:"
+  log_info "  claudebase run"
+  log_info "to revert: restore .mcp.json from .mcp.json.upstream-backup, or"
+  log_info "  claude plugin install telegram@claude-plugins-official"
+  return 0
+}
 
 # ============================================================================
 # Main
@@ -688,7 +782,7 @@ install_claudebase_hooks
 install_pdfium
 install_whisper_stack
 preload_encoder
-# install_telegram_plugin removed in telegram-multi-cli cutover (daemon poller now owns the bot).
+install_telegram_channel_bridge
 
 # ============================================================================
 # Optional post-install daemon hook (Slice 2 — STRUCTURAL-2-3)

@@ -274,11 +274,11 @@ when the next successful poll completes after the plugin stops.
 
 The default value is `true`, so this step is a no-op for a fresh install. For operators who previously set `enabled = false` as a precaution, ensure the flag is either absent or explicitly set to `true` in `daemon.toml` before continuing.
 
-### Step 3 — Verify the daemon owns the bot
+### Step 3 — Verify the daemon owns the bot + channel push works
 
-Send a test message to the bot from Telegram. The message should arrive as `source="claudebase"` in the daemon logs (not `source="plugin:telegram:telegram"`). If the daemon is the sole poller, you will see the message routed to the bound CLI.
+The installer wires the official Telegram plugin's `.mcp.json` to run the claudebase daemon bridge (`claudebase plugin serve`) as the channel server. Launch a session with `claudebase run` (= `claude --channels plugin:telegram@claude-plugins-official`). The agent calls `agent_register` + `chat_subscribe` once.
 
-You can also confirm with `/agents` — the bot should reply listing the connected CLI instances.
+Send a test message to the bot from Telegram. It is routed by the daemon to the bound CLI and injected into the live session as `<channel source="plugin:telegram:telegram" chat_id="..." user="...">...</channel>` (the `source` is the telegram channel slot whose MCP server is the bridge — this is expected and correct). You can also confirm with `/agents` — the bot replies listing the connected CLI instances.
 
 ### Step 4 — Revert path (if needed)
 

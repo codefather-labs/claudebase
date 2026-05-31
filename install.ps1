@@ -530,20 +530,115 @@ function Install-WhisperStack {
     }
 
     if ((Get-Command ffmpeg -ErrorAction SilentlyContinue) -and (Get-Command whisper-cli -ErrorAction SilentlyContinue)) {
-        Write-Info "voice transcription stack ready — model auto-downloads on first voice msg"
+        Write-Info "voice transcription stack ready - model auto-downloads on first voice msg"
         Write-Info "  (or pre-download to ~\AppData\Local\whisper-cpp\models\ggml-medium.bin)"
     }
 }
 
 # ============================================================================
-# Per-CLI Telegram plugin auto-activation was REMOVED in the telegram-multi-cli cutover.
-# The daemon now ships a server-centric Telegram poller (one bot -> many CLIs).
-# See RELEASING.md for cutover steps. To revert: set [telegram] enabled=false in daemon.toml.
+# Install Telegram channel bridge wiring (Slice 6 v0.8.0)
 # ============================================================================
-# A fresh install no longer resurrects the per-CLI plugin alongside the daemon
-# poller -- that is exactly what caused the 409 dual-poller this feature kills.
-# An operator who genuinely wants the legacy per-CLI plugin installs it manually:
-#   claude plugin install telegram@claude-plugins-official
+# The daemon now owns the single Telegram getUpdates poller (one bot -> many CLIs).
+# This function patches the official Telegram plugin's .mcp.json to run the
+# daemon bridge (claudebase plugin serve) as the MCP server for the channel.
+# The bridge only relays the daemon's notifications (does not poll), so there
+# is no dual-poll and NFR-TMC-5 is preserved.
+#
+# Best-effort: if claude CLI is not on PATH or the plugin install fails,
+# the function logs and returns (does not abort the installer).
+#
+# The function is idempotent: re-running rewrites the same .mcp.json.
+# To revert, restore .mcp.json from .mcp.json.upstream-backup, or run
+# claude plugin install telegram@claude-plugins-official to restore
+# the upstream version.
+function Install-TelegramChannelBridge {
+    if ($env:CLAUDEBASE_SKIP_TELEGRAM -eq '1') {
+        Write-Info "CLAUDEBASE_SKIP_TELEGRAM=1 - skipping telegram channel bridge wiring"
+        return
+    }
+
+    if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
+        Write-Info "claude CLI not on PATH; skipping telegram channel bridge setup"
+        Write-Info "  to install manually after Claude Code is installed:"
+        Write-Info "    claude plugin install telegram@claude-plugins-official"
+        Write-Info "    then re-run this installer to wire the bridge"
+        return
+    }
+
+    # ----- 1. Install official plugin if not already -----
+    Write-Info "Installing telegram@claude-plugins-official (idempotent)..."
+    try {
+        & claude plugin install telegram@claude-plugins-official 2>&1 | Out-Null
+    } catch {
+        Write-Warn "telegram plugin install failed: $($_.Exception.Message); skipping bridge wiring"
+        return
+    }
+
+    # ----- 2. Locate the installed plugin dir -----
+    # Prefer installed_plugins.json (authoritative - points to the currently
+    # ACTIVE version). Fall back to newest-version glob if manifest unreadable.
+    $pluginRoot = Join-Path $Script:ClaudeDir 'plugins\cache\claude-plugins-official\telegram'
+    if (-not (Test-Path $pluginRoot)) {
+        Write-Warn "official telegram plugin not found at $pluginRoot after install - skipping bridge wiring"
+        return
+    }
+
+    $pluginDir = $null
+    $installedManifest = Join-Path $Script:ClaudeDir 'plugins\installed_plugins.json'
+    if (Test-Path $installedManifest) {
+        try {
+            $manifest = Get-Content -Raw -Path $installedManifest | ConvertFrom-Json
+            $pluginInfo = $manifest.plugins.'telegram@claude-plugins-official'
+            if ($pluginInfo -and $pluginInfo.Count -gt 0) {
+                $pluginDir = $pluginInfo[0].installPath
+            }
+        } catch {}
+    }
+
+    if (-not $pluginDir -or -not (Test-Path $pluginDir)) {
+        # Fallback: newest version subdir (semver-sortable).
+        $versionDir = Get-ChildItem -Path $pluginRoot -Directory -ErrorAction SilentlyContinue `
+            | Sort-Object -Property Name -Descending `
+            | Select-Object -First 1
+        if (-not $versionDir) {
+            Write-Warn "no version subdir found under $pluginRoot - skipping bridge wiring"
+            return
+        }
+        $pluginDir = $versionDir.FullName
+        Write-Info "manifest lookup unavailable; falling back to newest-version glob: $pluginDir"
+    }
+    Write-Info "wiring daemon bridge at $pluginDir"
+
+    # ----- 3. Back up upstream .mcp.json and patch with daemon bridge -----
+    $mcpJson = Join-Path $pluginDir '.mcp.json'
+    $mcpBackup = Join-Path $pluginDir '.mcp.json.upstream-backup'
+
+    if ((Test-Path $mcpJson) -and (-not (Test-Path $mcpBackup))) {
+        Copy-Item $mcpJson $mcpBackup
+        Write-Ok ".mcp.json.upstream-backup preserved"
+    }
+
+    # Write .mcp.json to run the daemon bridge as the MCP server for the
+    # telegram channel. The bridge relays the daemon (does not poll), so
+    # there is no dual-poll and NFR-TMC-5 is preserved.
+    $cfg = @{
+        mcpServers = @{
+            telegram = @{
+                command = "`${HOME}/.claude/tools/claudebase/claudebase"
+                args = @('plugin', 'serve')
+            }
+        }
+    }
+    $cfg | ConvertTo-Json -Depth 6 | Set-Content -Path $mcpJson -Encoding UTF8
+    Write-Ok ".mcp.json patched (daemon bridge relays the daemon poller, no dual-poll)"
+
+    Write-Info "to enable: launch Claude Code with"
+    Write-Info "  claude --channels plugin:telegram@claude-plugins-official"
+    Write-Info "or use the shorthand:"
+    Write-Info "  claudebase run"
+    Write-Info "to revert: restore .mcp.json from .mcp.json.upstream-backup, or"
+    Write-Info "  claude plugin install telegram@claude-plugins-official"
+}
 
 # ============================================================================
 # Main
@@ -576,7 +671,7 @@ Install-ClaudebaseHooks
 Install-Pdfium
 Install-WhisperStack
 Preload-Encoder
-# Install-TelegramPlugin removed in telegram-multi-cli cutover (daemon poller now owns the bot).
+Install-TelegramChannelBridge
 
 # Optional post-install daemon hook (Slice 2 — STRUCTURAL-2-3)
 # Opt-in via `$env:CLAUDEBASE_INSTALL_DAEMON=1`. Fails soft.

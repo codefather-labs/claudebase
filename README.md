@@ -337,18 +337,19 @@ The daemon sends a Telegram message with one button per option. The operator tap
 
 **v1 scope:** single-select only; DM chats only (group-chat `chat_ask` is deferred — see `docs/PRD.md` §19 Out of Scope). Free-text answers and multi-select are not supported in v1.
 
-### Migrating from the per-CLI plugin (cutover)
+### Connecting a CLI session (real-time channel push)
 
-Before this feature, each Claude Code CLI ran its own Telegram plugin (`plugins/telegram-rs/`) which caused 409 conflicts when multiple CLIs shared a bot token. The daemon poller replaces this.
+For a routed Telegram message to arrive **in your live Claude Code session** (not just be polled on demand), the session must be launched with the Telegram plugin registered as a **channel** — Claude Code injects `notifications/claude/channel` as `<channel ...>` turns only from a `--channels`-registered plugin, never from a plain `mcpServers` entry.
 
-**To migrate:**
+The installer (`install.sh` / `install.ps1`) wires this for you: it patches the official Telegram plugin's `.mcp.json` so the channel's MCP server is the claudebase **daemon bridge** (`claudebase plugin serve`). The bridge relays the single daemon (it does not poll), so there is no dual-poll. Then:
 
-1. Confirm the daemon is running: `claudebase daemon status`
-2. Stop the per-CLI plugin if it is still active (see `RELEASING.md` for the step-by-step gate).
-3. Verify `[telegram] enabled = true` is set (or absent — it defaults to `true`) in `daemon.toml`.
-4. Send a test message to your bot; it should now be received by the daemon and routed to the bound CLI.
+```
+claudebase run        # = claude --channels plugin:telegram@claude-plugins-official
+```
 
-**To revert** to the legacy per-CLI plugin path: set `[telegram] enabled = false` in `daemon.toml` and restart the daemon. The daemon will no longer poll; restart the plugin to resume receiving messages.
+launches a session connected to the channel. A Telegram message routed to your CLI arrives automatically as `<channel source="plugin:telegram:telegram" chat_id="..." user="...">...</channel>`, and you reply with the `chat_reply` tool. (The agent calls `agent_register` + `chat_subscribe` once per session to receive its bound thread; auto-register by `CLAUDE_CODE_SESSION_ID` is planned for a follow-up.)
+
+**To revert** the channel wiring: restore the plugin's `.mcp.json.upstream-backup`, or `claude plugin install telegram@claude-plugins-official`. To stop the daemon polling entirely: set `[telegram] enabled = false` in `daemon.toml` and restart the daemon.
 
 ---
 

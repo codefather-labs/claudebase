@@ -195,7 +195,10 @@ pub fn build_channel_notification_routed(
 /// field names + types.
 #[derive(Debug, Clone)]
 pub struct TelegramMessageMeta {
-    /// `msg.chat.id` — i64 number, serialised as JSON number (not string).
+    /// `msg.chat.id` — i64 internally, but serialised into the channel meta
+    /// as a STRING (Claude Code's channel-surface parser expects all numeric
+    /// IDs as strings, per the official telegram plugin; a numeric chat_id is
+    /// silently dropped).
     pub chat_id: i64,
     /// `msg.message_id` — i64 number, serialised as STRING per
     /// server.ts:1268 `String(msgId)`.
@@ -227,9 +230,16 @@ pub fn build_channel_notification_telegram(
     params.insert("content".into(), Value::String(content.to_string()));
 
     let mut meta = serde_json::Map::new();
+    // chat_id MUST be a STRING, not a JSON number — Claude Code's
+    // channel-surface parser follows the official telegram plugin's
+    // "all numeric IDs serialized as strings" rule (frankenstein
+    // notification.rs::channel_message). A numeric chat_id is silently
+    // dropped by the parser, so the routed <channel ...> tag never reaches
+    // the LLM and inbound push appears broken. (Confirmed live 2026-05-31:
+    // demo agent received `"chat_id":434566766` and Claude Code discarded it.)
     meta.insert(
         "chat_id".into(),
-        Value::Number(serde_json::Number::from(tg_meta.chat_id)),
+        Value::String(tg_meta.chat_id.to_string()),
     );
     meta.insert(
         "message_id".into(),
@@ -659,6 +669,34 @@ pub type SharedBus = Arc<ChatBus>;
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    /// Regression (live 2026-05-31): chat_id MUST serialize as a STRING in the
+    /// channel meta. Claude Code's channel-surface parser drops a numeric
+    /// chat_id, so the routed `<channel ...>` tag never reaches the LLM and
+    /// inbound Telegram push appears broken. The official frankenstein plugin
+    /// serializes all IDs as strings — this builder must match.
+    #[test]
+    fn channel_meta_chat_id_serializes_as_string() {
+        let tg_meta = TelegramMessageMeta {
+            chat_id: 434566766,
+            message_id_str: "15".to_string(),
+            user: "codefather_dev".to_string(),
+            user_id: "434566766".to_string(),
+            ts_iso8601: "2026-05-31T10:00:00.000Z".to_string(),
+        };
+        let frame = build_channel_notification_telegram("hi", &tg_meta, Some("mira-live"));
+        let meta = &frame["params"]["meta"];
+        assert!(
+            meta["chat_id"].is_string(),
+            "chat_id must be a JSON string, got {:?}",
+            meta["chat_id"]
+        );
+        assert_eq!(meta["chat_id"].as_str(), Some("434566766"));
+        assert!(meta["user_id"].is_string());
+        assert!(meta["message_id"].is_string());
+        assert_eq!(meta["target_agent_id"].as_str(), Some("mira-live"));
+        assert_eq!(frame["method"].as_str(), Some("notifications/claude/channel"));
+    }
 
     fn fresh_db() -> Connection {
         let conn = Connection::open_in_memory().expect("in-memory db");

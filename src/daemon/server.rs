@@ -439,9 +439,44 @@ pub async fn serve(_args: &DaemonServeArgs) -> anyhow::Result<()> {
             }
         };
 
-        let _ =
-            crate::daemon::telegram::spawn_long_poll(token, access_path, bus_for_tg, asr_opt);
-        tracing::info!("telegram long-poll spawned");
+        // telegram-multi-cli Slice 6 — gate the daemon poller behind
+        // `[telegram] enabled`. This is the cutover/revert switch: the daemon
+        // poller and the legacy per-cli plugin share ONE getUpdates slot per
+        // bot token, so the operator reverts to the plugin path by setting
+        // `enabled=false` here. Default is `true` (cutover-on-by-default); the
+        // 409 conflict gate in telegram.rs makes a dual-poll situation loud
+        // but safe rather than requiring opt-in. A missing OR malformed
+        // daemon.toml falls back to the `true` default — a config read error
+        // must NOT silently kill Telegram (that would be a worse failure than
+        // the loud-409 path the conflict gate handles).
+        let telegram_enabled: bool = {
+            let toml_path = crate::daemon::config::user_level_daemon_toml_path();
+            if toml_path.exists() {
+                match crate::daemon::config::load_daemon_toml(&toml_path) {
+                    Ok(cfg) => cfg.telegram.enabled,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "daemon.toml load failed in serve(); defaulting [telegram] enabled=true"
+                        );
+                        true
+                    }
+                }
+            } else {
+                true
+            }
+        };
+
+        if telegram_enabled {
+            let _ =
+                crate::daemon::telegram::spawn_long_poll(token, access_path, bus_for_tg, asr_opt);
+            tracing::info!("telegram long-poll spawned");
+        } else {
+            tracing::info!(
+                "telegram daemon poller disabled via [telegram] enabled=false — not starting \
+                 getUpdates loop (legacy plugin path remains active if installed)"
+            );
+        }
     }
 
     // Accept loop. We never return Ok(()) from here in Slice 1a — the

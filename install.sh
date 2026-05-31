@@ -649,169 +649,14 @@ install_whisper_stack() {
 }
 
 # ============================================================================
-# Install the Rust port of the official Anthropic Telegram plugin.
+# Per-CLI Telegram plugin auto-activation was REMOVED in the telegram-multi-cli cutover.
+# The daemon now ships a server-centric Telegram poller (one bot -> many CLIs).
+# See RELEASING.md for cutover steps. To revert: set [telegram] enabled=false in daemon.toml.
 # ============================================================================
-# Strategy (per operator brief — always download from GH release):
-#   1. install the OFFICIAL upstream plugin (telegram@claude-plugins-official)
-#   2. download our pre-built Rust binary from the matching claudebase
-#      release asset (telegram-plugin-rs-<platform>); never cargo-build
-#   3. copy it into the plugin cache as `server-rs` alongside upstream `server.ts`
-#   4. patch `.mcp.json` with a bash toggle that defaults to Rust (server-rs)
-#      and falls back to bun (TSX) if env var TELEGRAM_USE_TSX_SERVER=1 OR
-#      if the Rust binary is missing
-#
-# Skipped (best-effort):
-#   - `claude` CLI not on PATH → log + return 0 (no plugin to patch into)
-#   - CLAUDEBASE_SKIP_TELEGRAM=1 → silent skip (for headless CI)
-#   - download fails → log warn + leave upstream TSX plugin in place; no
-#     cargo-build fallback (operator must wait for a release or build
-#     manually if they want Rust before release artifacts exist)
-#
-# Idempotent: re-running re-downloads, recopies, re-patches.
-# Backup of upstream `.mcp.json` is preserved at `.mcp.json.upstream-backup`.
-# ============================================================================
-install_telegram_plugin() {
-  if [ "${CLAUDEBASE_SKIP_TELEGRAM:-0}" = "1" ]; then
-    log_info "CLAUDEBASE_SKIP_TELEGRAM=1 — skipping telegram plugin install"
-    return 0
-  fi
-
-  if ! command -v claude >/dev/null 2>&1; then
-    log_info "claude CLI not on PATH; skipping telegram plugin install"
-    log_info "  to install manually after Claude Code is installed:"
-    log_info "    claude plugin install telegram@claude-plugins-official"
-    log_info "    then re-run this installer to patch the Rust binary"
-    return 0
-  fi
-
-  # ----- 1. Install official plugin if not already -----
-  local marketplace_already=false
-  if claude plugin marketplace list 2>/dev/null | grep -q "claude-plugins-official"; then
-    marketplace_already=true
-  fi
-  if [ "$marketplace_already" = false ]; then
-    log_info "Adding marketplace anthropics/claude-plugins-official..."
-    claude plugin marketplace add anthropics/claude-plugins-official 2>&1 | tail -2 || true
-  fi
-  log_info "Installing telegram@claude-plugins-official (idempotent)..."
-  claude plugin install telegram@claude-plugins-official 2>&1 | tail -2 || true
-
-  # ----- 2. Locate the installed plugin dir -----
-  # Prefer installed_plugins.json (authoritative — points to the currently
-  # ACTIVE version, not whatever orphan dirs leftover in cache). Fall back
-  # to newest-version glob if jq/python3 absent or manifest unreadable.
-  local plugin_root="$CLAUDE_DIR/plugins/cache/claude-plugins-official/telegram"
-  if [ ! -d "$plugin_root" ]; then
-    log_warn "official telegram plugin not found at $plugin_root after install — skipping Rust patch"
-    return 0
-  fi
-  local plugin_dir=""
-  local installed_manifest="$CLAUDE_DIR/plugins/installed_plugins.json"
-  if [ -f "$installed_manifest" ]; then
-    if command -v jq >/dev/null 2>&1; then
-      plugin_dir=$(jq -r '.plugins["telegram@claude-plugins-official"][0].installPath // empty' "$installed_manifest" 2>/dev/null)
-    elif command -v python3 >/dev/null 2>&1; then
-      plugin_dir=$(python3 -c "import json,sys; d=json.load(open('$installed_manifest')); p=d.get('plugins',{}).get('telegram@claude-plugins-official',[]); print(p[0]['installPath'] if p else '')" 2>/dev/null)
-    fi
-  fi
-  if [ -z "$plugin_dir" ] || [ ! -d "$plugin_dir" ]; then
-    # Fallback: newest version subdir (semver-sortable).
-    local version_dir
-    version_dir=$(ls -1 "$plugin_root" 2>/dev/null | sort -V | tail -1)
-    if [ -z "$version_dir" ] || [ ! -d "$plugin_root/$version_dir" ]; then
-      log_warn "no version subdir found under $plugin_root — skipping Rust patch"
-      return 0
-    fi
-    plugin_dir="$plugin_root/$version_dir"
-    log_info "manifest lookup unavailable; falling back to newest-version glob: $plugin_dir"
-  fi
-  log_info "patching plugin at $plugin_dir"
-
-  # ----- 3. Resolve binary: download from GH release first; fall back to
-  #         cargo build only if download fails (e.g. offline, asset missing
-  #         for this platform, claudebase version with no telegram-plugin-rs
-  #         artifacts yet). Cargo fallback requires `cargo` on PATH AND the
-  #         repo's plugins/telegram-rs/ source tree (present in local-mode
-  #         install or fresh clone). -----
-  local platform=""
-  local exe_ext=""
-  case "$(uname -ms)" in
-    "Darwin arm64")  platform="darwin-arm64"  ;;
-    "Darwin x86_64")
-      # Intel Mac dropped as of v0.7.1 — see the matching note in
-      # download_claudebase_binary above. No telegram-plugin-rs binary
-      # for x86_64-apple-darwin in the release matrix either.
-      log_warn "telegram-plugin-rs binary unavailable for Intel Mac (deprecated v0.7.1); skipping"
-      return 0
-      ;;
-    "Linux x86_64")  platform="linux-x64"     ;;
-    "Linux aarch64") platform="linux-arm64"   ;;
-    MINGW*|MSYS*|CYGWIN*)
-      case "$(uname -m)" in
-        x86_64) platform="windows-x64"; exe_ext=".exe" ;;
-        *)      log_warn "unsupported Windows arch: $(uname -m); skipping telegram-plugin-rs"; return 0 ;;
-      esac
-      ;;
-    *) log_warn "telegram-plugin-rs binary unavailable for $(uname -ms); skipping"; return 0 ;;
-  esac
-
-  local target_bin="$plugin_dir/server-rs${exe_ext}"
-  local url="${RELEASE_BASE}/claudebase-v${CLAUDEBASE_VERSION}/telegram-plugin-rs-${platform}${exe_ext}"
-  local downloaded=false
-  local tmp_download
-  tmp_download="$(mktemp)"
-
-  log_info "downloading telegram-plugin-rs binary from GH release for $platform..."
-  if command -v curl >/dev/null 2>&1; then
-    if curl --proto '=https' --tlsv1.2 -fsSL --max-redirs 5 --max-time 120 "$url" -o "$tmp_download" 2>/dev/null; then
-      downloaded=true
-    fi
-  elif command -v wget >/dev/null 2>&1; then
-    if wget --https-only --secure-protocol=TLSv1_2 --max-redirect=5 --timeout=120 -q -O "$tmp_download" "$url" 2>/dev/null; then
-      downloaded=true
-    fi
-  fi
-
-  if [ "$downloaded" = true ] && [ -s "$tmp_download" ]; then
-    mv "$tmp_download" "$target_bin"
-    chmod 0755 "$target_bin"
-    log_ok "server-rs downloaded ($(wc -c <"$target_bin" | tr -d ' ') bytes) → $target_bin"
-  else
-    rm -f "$tmp_download"
-    log_warn "telegram-plugin-rs download failed for $platform from $url"
-    log_warn "  the upstream TSX plugin will run unchanged via bun"
-    log_warn "  to force a build from source locally: cargo build --release -p telegram-plugin-rs"
-    log_warn "  then copy target/release/telegram-plugin-rs${exe_ext} → $target_bin"
-    return 0
-  fi
-
-  # ----- 5. Patch .mcp.json with toggle (backup upstream version first) -----
-  local mcp_json="$plugin_dir/.mcp.json"
-  local mcp_backup="$plugin_dir/.mcp.json.upstream-backup"
-  if [ -f "$mcp_json" ] && [ ! -f "$mcp_backup" ]; then
-    cp "$mcp_json" "$mcp_backup"
-    log_ok ".mcp.json.upstream-backup preserved"
-  fi
-  cat > "$mcp_json" <<'EOF'
-{
-  "mcpServers": {
-    "telegram": {
-      "command": "bash",
-      "args": [
-        "-c",
-        "if [ -z \"$TELEGRAM_USE_TSX_SERVER\" ] && [ -x \"$CLAUDE_PLUGIN_ROOT/server-rs\" ]; then exec \"$CLAUDE_PLUGIN_ROOT/server-rs\" 2>>/tmp/telegram-rs.log; else exec bun run --cwd \"$CLAUDE_PLUGIN_ROOT\" --shell=bun --silent start; fi"
-      ]
-    }
-  }
-}
-EOF
-  chmod 0644 "$mcp_json"
-  log_ok ".mcp.json patched (Rust by default; TELEGRAM_USE_TSX_SERVER=1 falls back to bun)"
-
-  log_info "to enable: launch Claude Code with"
-  log_info "  claude --channels plugin:telegram@claude-plugins-official"
-  log_info "Rust binary stderr → /tmp/telegram-rs.log"
-}
+# A fresh install no longer resurrects the per-CLI plugin alongside the daemon
+# poller — that is exactly what caused the 409 dual-poller this feature kills.
+# An operator who genuinely wants the legacy per-CLI plugin installs it manually:
+#   claude plugin install telegram@claude-plugins-official
 
 # ============================================================================
 # Main
@@ -843,7 +688,7 @@ install_claudebase_hooks
 install_pdfium
 install_whisper_stack
 preload_encoder
-install_telegram_plugin
+# install_telegram_plugin removed in telegram-multi-cli cutover (daemon poller now owns the bot).
 
 # ============================================================================
 # Optional post-install daemon hook (Slice 2 — STRUCTURAL-2-3)

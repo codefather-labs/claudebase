@@ -915,6 +915,25 @@ fn redact_error_string(s: &str, token: &str) -> String {
     s.replace(token, "***")
 }
 
+/// telegram-multi-cli Slice 6 (red-team F-2) — detect the 409 "terminated by
+/// other getUpdates" conflict from the Display string of a teloxide
+/// `RequestError`.
+///
+/// teloxide-core 0.13.0 renders `ApiError::TerminatedByOtherGetUpdates` as
+/// `"Conflict: terminated by other getUpdates request; make sure that only one
+/// bot instance is running"` (teloxide-core-0.13.0/src/errors.rs:700). We match
+/// on the substring `"terminated by other getUpdates"` rather than `"Conflict"`
+/// alone — `Conflict` could in principle appear in other Telegram 409 bodies,
+/// whereas this phrase is unique to the dual-poller case the gate handles. The
+/// surrounding error handler already classifies 401/429 via `err_str.contains`,
+/// so this stays consistent with the established string-matching baseline (the
+/// typed `RequestError::Api(ApiError::TerminatedByOtherGetUpdates)` variant is
+/// not imported in this module, and string-contains is robust to teloxide's
+/// error wrapping through `get_updates().await`).
+fn is_conflict_error(err_str: &str) -> bool {
+    err_str.contains("terminated by other getUpdates")
+}
+
 /// Open the chat.db connection. Mirrors `chat::open_chat_db` but kept here
 /// so the telegram module's call sites are explicit (the daemon spawns
 /// telegram with its own DB handle — never share Connections across tasks
@@ -1989,6 +2008,14 @@ async fn run_long_poll(
     // users get filtered out. The pending-pair generation lives in the
     // /start branch we route through bot's message handler.
     let mut consecutive_429_retries: u32 = 0;
+    // telegram-multi-cli Slice 6 (red-team F-2) — log-once + 60s backoff for
+    // the 409 "terminated by other getUpdates" conflict. The legacy per-cli
+    // telegram plugin and the daemon poller share ONE getUpdates slot per bot
+    // token; running both makes Telegram return 409 every poll. Without this
+    // flag the generic catch-all below would log + sleep 5s every iteration
+    // (log spam). We log ONE actionable line on the first conflict, suppress
+    // the rest, back off 60s, and emit a recovery line when a poll succeeds.
+    let mut conflict_logged: bool = false;
     let token_for_error_redaction = token.as_str().to_string();
 
     // Slice 7.x — 1:1 port of the official Anthropic telegram plugin.
@@ -2188,6 +2215,17 @@ async fn run_long_poll(
         let raw_updates = match updates_result {
             Ok(v) => {
                 consecutive_429_retries = 0;
+                // telegram-multi-cli Slice 6 (F-2) — a successful poll means
+                // the 409 conflict cleared (the operator stopped the legacy
+                // plugin). Reset the log-once flag and, if we had previously
+                // logged a conflict, emit the matching recovery edge so the
+                // operator sees both "conflict-started" and "conflict-cleared".
+                if conflict_logged {
+                    tracing::info!(
+                        "telegram getUpdates conflict cleared — daemon poller now owns the bot"
+                    );
+                    conflict_logged = false;
+                }
                 v
             }
             Err(e) => {
@@ -2231,6 +2269,30 @@ async fn run_long_poll(
                         );
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     }
+                    continue;
+                }
+                // telegram-multi-cli Slice 6 (red-team F-2) — 409 "terminated
+                // by other getUpdates": the legacy per-cli telegram plugin
+                // still holds the single getUpdates slot for this bot token.
+                // Log ONE actionable line (then suppress), back off 60s (not
+                // the generic 5s, which would spam), and continue — never
+                // crash the daemon. The recovery edge is logged in the Ok(v)
+                // arm above when a poll later succeeds. The log line is a fixed
+                // literal that does NOT embed `err_str`, so there is no token
+                // to redact (SEC discipline: nothing from the error reaches the
+                // log here).
+                if is_conflict_error(&err_str) {
+                    if !conflict_logged {
+                        tracing::warn!(
+                            "telegram getUpdates 409 conflict — the \
+                             legacy telegram-plugin-rs poller still running (plugin:telegram) \
+                             holds the getUpdates slot; stop it to let the daemon poller take \
+                             over. Backing off 60s; this message logs once until the conflict \
+                             clears."
+                        );
+                        conflict_logged = true;
+                    }
+                    tokio::time::sleep(Duration::from_secs(60)).await;
                     continue;
                 }
                 tracing::warn!(
@@ -2703,6 +2765,31 @@ mod tests {
     fn redact_error_string_no_op_on_empty_token() {
         let s = "Error";
         assert_eq!(redact_error_string(s, ""), s);
+    }
+
+    // telegram-multi-cli Slice 6 (red-team F-2) — the 409 conflict-detection
+    // predicate must match teloxide-core 0.13.0's Display string for
+    // `ApiError::TerminatedByOtherGetUpdates` and must NOT match the 401/429
+    // /generic error strings the surrounding handler already classifies.
+    #[test]
+    fn is_conflict_error_matches_teloxide_409_display() {
+        // Verbatim Display string from teloxide-core-0.13.0/src/errors.rs:700.
+        let teloxide_409 = "Conflict: terminated by other getUpdates request; \
+                            make sure that only one bot instance is running";
+        assert!(is_conflict_error(teloxide_409));
+    }
+
+    #[test]
+    fn is_conflict_error_rejects_other_errors() {
+        assert!(!is_conflict_error("Error 401: Unauthorized"));
+        assert!(!is_conflict_error("429: Too Many Requests; RetryAfter 5"));
+        assert!(!is_conflict_error(
+            "ApiError: some generic getUpdates error — continuing"
+        ));
+        // "Conflict" alone (a hypothetical different 409 body) must NOT trip
+        // the gate — only the dual-poller phrase does.
+        assert!(!is_conflict_error("Conflict: message is not modified"));
+        assert!(!is_conflict_error(""));
     }
 
     #[test]

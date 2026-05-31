@@ -53,8 +53,7 @@ use tokio::time::timeout;
 
 use claudebase::daemon::agent_registry::register;
 use claudebase::daemon::chat::{ensure_chat_db_schema, ChatBus};
-use claudebase::daemon::config::DmPolicy;
-use claudebase::daemon::permissions::Access;
+use claudebase::daemon::channel_state::{Access, DmPolicy};
 use claudebase::daemon::telegram::{process_batch, Message, Update, User, Chat};
 
 // ── in-process helpers ──────────────────────────────────────────────────────

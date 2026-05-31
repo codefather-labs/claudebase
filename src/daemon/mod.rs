@@ -22,7 +22,6 @@ pub mod channel_state;
 pub mod chat;
 pub mod config;
 pub mod ipc;
-pub mod permissions;
 pub mod server;
 pub mod service;
 pub mod telegram;

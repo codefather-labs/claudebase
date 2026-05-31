@@ -66,7 +66,6 @@ use crate::daemon::asr::Asr;
 use crate::daemon::channel_state::{self, GateAction};
 use crate::daemon::chat::{self, SharedBus};
 use crate::daemon::config::RedactedToken;
-use crate::daemon::permissions::{self, Access};
 
 /// One queued outbound Telegram message, drained by `run_long_poll`.
 ///
@@ -955,7 +954,7 @@ pub fn open_chat_db() -> Result<Connection> {
 /// inside the transaction — no DB row is inserted, but the offset moves.
 pub fn process_batch(
     conn: &mut Connection,
-    access: &Access,
+    access: &channel_state::Access,
     bus: Option<&SharedBus>,
     batch: &[Update],
 ) -> Result<BatchOutcome> {
@@ -989,8 +988,15 @@ pub fn process_batch(
         };
         let user_id = msg.from.as_ref().map(|u| u.id).unwrap_or(0);
         // SEC-12 / TC-4.3: drop messages from disallowed users without
-        // inserting. Offset still advances (handled above).
-        if !permissions::check_allowed(access, user_id) {
+        // inserting. Offset still advances (handled above). dm_policy
+        // Disabled passes all (matches the legacy check_allowed semantics this
+        // test-only harness relies on — see allow_all_access); Allowlist /
+        // Pairing require allow_from membership. The PRODUCTION path
+        // (process_batch_with_pairing → gate_dm) keeps Disabled→Drop; this
+        // pass-all is a test-harness convenience only.
+        let allowed = matches!(access.dm_policy, channel_state::DmPolicy::Disabled)
+            || access.allow_from.iter().any(|id| id == &user_id.to_string());
+        if !allowed {
             continue;
         }
 
@@ -1792,7 +1798,6 @@ pub fn set_bot_state(conn: &Connection, state: &str) -> Result<()> {
 /// be ready to run.
 pub fn spawn_long_poll(
     token: RedactedToken,
-    access_path: PathBuf,
     bus: SharedBus,
     asr: Option<Arc<dyn Asr>>,
 ) -> tokio::task::JoinHandle<()> {
@@ -1856,7 +1861,7 @@ pub fn spawn_long_poll(
         // unhandled error logs structured (without leaking the token) and
         // the daemon's other tasks keep running.
         let token_str = token.as_str().to_string();
-        if let Err(e) = run_long_poll(token, access_path, bus, asr, outbound_rx).await {
+        if let Err(e) = run_long_poll(token, bus, asr, outbound_rx).await {
             tracing::error!(
                 error = %redact_error_string(&format!("{e:#}"), &token_str),
                 "telegram long-poll fatal"
@@ -1953,7 +1958,6 @@ async fn run_approved_polling(token: RedactedToken) {
 /// ASYNC_INVARIANTS Rule 4.
 async fn run_long_poll(
     token: RedactedToken,
-    access_path: PathBuf,
     bus: SharedBus,
     asr: Option<Arc<dyn Asr>>,
     mut outbound_rx: mpsc::UnboundedReceiver<OutboundTg>,
@@ -2021,11 +2025,8 @@ async fn run_long_poll(
     // Slice 7.x — 1:1 port of the official Anthropic telegram plugin.
     // The skill-managed channel state lives at the path documented in
     // `src/daemon/channel_state.rs` (`~/.claude/channels/claudebase/`),
-    // NOT the legacy `~/.config/claudebase/` location. The legacy
-    // `access_path` parameter is retained so existing CLI shims continue
-    // to compile but the long-poll body ignores it — channel_state owns
+    // NOT the legacy `~/.config/claudebase/` location. Channel_state owns
     // state from here onward.
-    let _ = &access_path; // suppress unused-var lint without changing the API
     let channel_access_path = channel_state::access_json_path();
 
     loop {
@@ -2638,7 +2639,7 @@ pub fn no_op_arc() -> Arc<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::config::DmPolicy;
+    use crate::daemon::channel_state::{Access, DmPolicy};
 
     // Slice 7 — @-mention parser tests (STRUCTURAL-7-1)
     #[test]
@@ -2806,7 +2807,7 @@ mod tests {
 
         let mut access = Access::default();
         access.dm_policy = DmPolicy::Allowlist;
-        access.allow_from.push(1001);
+        access.allow_from.push("1001".to_string());
 
         let batch = vec![Update {
             update_id: 7,
@@ -2874,7 +2875,7 @@ mod tests {
 
         let mut access = Access::default();
         access.dm_policy = DmPolicy::Allowlist;
-        access.allow_from.push(1001);
+        access.allow_from.push("1001".to_string());
 
         let batch = vec![Update {
             update_id: 3,

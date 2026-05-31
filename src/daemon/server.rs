@@ -406,7 +406,6 @@ pub async fn serve(_args: &DaemonServeArgs) -> anyhow::Result<()> {
     // serving MCP plugins. When secrets.toml is absent the daemon runs
     // chat-only (Slice 1-3 behaviour unchanged).
     if let Some(token) = telegram_token_opt {
-        let access_path = crate::daemon::permissions::user_level_access_json_path();
         let bus_for_tg = bus.clone();
 
         // Slice 6-MVP — best-effort Asr construction. When daemon.toml
@@ -469,7 +468,7 @@ pub async fn serve(_args: &DaemonServeArgs) -> anyhow::Result<()> {
 
         if telegram_enabled {
             let _ =
-                crate::daemon::telegram::spawn_long_poll(token, access_path, bus_for_tg, asr_opt);
+                crate::daemon::telegram::spawn_long_poll(token, bus_for_tg, asr_opt);
             tracing::info!("telegram long-poll spawned");
         } else {
             tracing::info!(

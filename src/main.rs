@@ -608,10 +608,10 @@ fn run_daemon_config_show(args: &cli::DaemonConfigShowArgs) -> std::process::Exi
 /// invalid format is generic — the operator does NOT learn which check
 /// failed, defeating timing + content side-channels.
 fn run_daemon_access_pair(args: &cli::DaemonAccessPairArgs) -> std::process::ExitCode {
-    use claudebase::daemon::permissions;
+    use claudebase::daemon::channel_state;
 
-    let path = permissions::user_level_access_json_path();
-    let mut access = match permissions::load_access(&path) {
+    let path = channel_state::access_json_path();
+    let mut access = match channel_state::load_access(&path) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("error: failed to load access.json: {e}");
@@ -619,14 +619,14 @@ fn run_daemon_access_pair(args: &cli::DaemonAccessPairArgs) -> std::process::Exi
         }
     };
 
-    let now = permissions::now_ms();
-    match permissions::redeem_pairing_code(&mut access, &args.code, now) {
-        Ok(user_id) => {
-            if let Err(e) = permissions::save_access(&path, &access) {
+    let now = channel_state::now_ms();
+    match channel_state::redeem_pairing_code(&mut access, &args.code, now) {
+        Ok(sender_id) => {
+            if let Err(e) = channel_state::save_access(&path, &access) {
                 eprintln!("error: failed to save access.json: {e}");
                 return std::process::ExitCode::FAILURE;
             }
-            println!("paired user_id={user_id}");
+            println!("paired sender_id={sender_id}");
             std::process::ExitCode::SUCCESS
         }
         Err(e) => {
@@ -639,16 +639,16 @@ fn run_daemon_access_pair(args: &cli::DaemonAccessPairArgs) -> std::process::Exi
     }
 }
 
-/// `claudebase daemon access list` (Slice 4).
+/// `claudebase daemon access list` (Slice 2).
 ///
 /// Prints authorized users + pending-code count. Pending codes themselves
 /// are NEVER printed (SEC-16 — leaking active codes defeats the
-/// constant-time-pair flow). `allowFrom` user ids are shown verbatim.
+/// constant-time-pair flow). `allowFrom` user ids are shown verbatim (now strings).
 fn run_daemon_access_list(args: &cli::DaemonAccessListArgs) -> std::process::ExitCode {
-    use claudebase::daemon::permissions;
+    use claudebase::daemon::channel_state;
 
-    let path = permissions::user_level_access_json_path();
-    let access = match permissions::load_access(&path) {
+    let path = channel_state::access_json_path();
+    let access = match channel_state::load_access(&path) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("error: failed to load access.json: {e}");
@@ -656,27 +656,43 @@ fn run_daemon_access_list(args: &cli::DaemonAccessListArgs) -> std::process::Exi
         }
     };
 
-    let summary = permissions::redacted_summary(&access);
     if args.json {
+        // Build JSON summary inline (channel_state schema uses strings for allow_from)
+        let now = channel_state::now_ms();
+        let pending_view: Vec<serde_json::Value> = access
+            .pending
+            .values()
+            .map(|e| {
+                let remaining_ms = (e.expires_at - now).max(0);
+                serde_json::json!({
+                    "sender_id": e.sender_id,
+                    "expires_in_ms": remaining_ms,
+                })
+            })
+            .collect();
+        let summary = serde_json::json!({
+            "dmPolicy": access.dm_policy,
+            "allowFrom": access.allow_from,
+            "pending_count": access.pending.len(),
+            "pending": pending_view,
+        });
         println!("{}", summary);
     } else {
-        let policy = summary.get("dmPolicy").map(|v| v.to_string()).unwrap_or_default();
-        let allow: Vec<i64> = summary
-            .get("allowFrom")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
-            .unwrap_or_default();
-        let pending_count = summary.get("pending_count").and_then(|v| v.as_i64()).unwrap_or(0);
+        let policy = match access.dm_policy {
+            claudebase::daemon::channel_state::DmPolicy::Pairing => "pairing",
+            claudebase::daemon::channel_state::DmPolicy::Allowlist => "allowlist",
+            claudebase::daemon::channel_state::DmPolicy::Disabled => "disabled",
+        };
         println!("dmPolicy = {policy}");
         print!("allowFrom = [");
-        for (i, u) in allow.iter().enumerate() {
+        for (i, u) in access.allow_from.iter().enumerate() {
             if i > 0 {
                 print!(", ");
             }
             print!("{u}");
         }
         println!("]");
-        println!("pending = {pending_count}");
+        println!("pending = {}", access.pending.len());
     }
     std::process::ExitCode::SUCCESS
 }

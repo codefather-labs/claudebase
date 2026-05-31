@@ -268,6 +268,107 @@ pub fn is_callback_allowed(access: &Access, sender_id: &str) -> bool {
     access.allow_from.iter().any(|id| id == sender_id)
 }
 
+/// Outcome of `redeem_pairing_code`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedeemError {
+    /// Code format invalid (length / charset). Same surface treatment as
+    /// `Unknown` to avoid leaking which check failed.
+    InvalidFormat,
+    /// Code not present in `pending`. Note: caller's error message MUST
+    /// NOT distinguish this from `InvalidFormat` per SEC-16.
+    Unknown,
+    /// Code present but `expires_at <= now`.
+    Expired,
+}
+
+impl std::fmt::Display for RedeemError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RedeemError::Expired => write!(f, "pairing code expired"),
+            // SEC-16: same message for unknown / invalid format so timing
+            // and string-content do not distinguish them.
+            RedeemError::Unknown | RedeemError::InvalidFormat => {
+                write!(f, "unknown or invalid pairing code")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RedeemError {}
+
+/// Constant-time byte comparison. Equivalent to `a == b` semantically but
+/// runs in O(len) regardless of where the first mismatch is — defeats
+/// timing-side-channel attacks on the pending-code lookup (SEC-16).
+///
+/// Returns `true` iff both slices have the same length AND all bytes match.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Validate a candidate pairing code is well-formed: 6 lowercase hex chars.
+/// Matches channel_state's `generate_pairing_code` format.
+pub fn is_valid_pairing_format(code: &str) -> bool {
+    if code.len() != 6 {
+        return false;
+    }
+    code.bytes()
+        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// Redeem a pairing code: look it up via constant-time compare across the
+/// pending map, check expiry, move the sender into `allow_from`, and drop the
+/// pending entry. Returns the sender_id (String) that was just added to allow_from on
+/// success.
+///
+/// On failure the access struct is NOT mutated — caller can safely retry.
+pub fn redeem_pairing_code(
+    access: &mut Access,
+    code: &str,
+    now_ms: i64,
+) -> std::result::Result<String, RedeemError> {
+    if !is_valid_pairing_format(code) {
+        return Err(RedeemError::InvalidFormat);
+    }
+
+    // Constant-time scan over every pending key. We collect the match in a
+    // separate variable rather than short-circuiting on first hit so the
+    // running time depends only on the total number of pending entries,
+    // not on which entry matches.
+    let code_bytes = code.as_bytes();
+    let mut matched: Option<(String, PendingEntry)> = None;
+    for (k, v) in access.pending.iter() {
+        if constant_time_eq(k.as_bytes(), code_bytes) {
+            matched = Some((k.clone(), v.clone()));
+            // Do NOT break — keep scanning in constant time.
+        }
+    }
+
+    let (matched_code, entry) = matched.ok_or(RedeemError::Unknown)?;
+
+    if entry.expires_at <= now_ms {
+        // Drop the expired entry as a courtesy so it doesn't pollute future
+        // lookups, but reject the redeem.
+        access.pending.remove(&matched_code);
+        return Err(RedeemError::Expired);
+    }
+
+    // Move to allow_from. De-dup so re-pairing an already-allowed user
+    // doesn't accumulate duplicate ids.
+    let sender_id = entry.sender_id.clone();
+    if !access.allow_from.contains(&sender_id) {
+        access.allow_from.push(sender_id.clone());
+    }
+    access.pending.remove(&matched_code);
+    Ok(sender_id)
+}
+
 /// Evaluate a Telegram DM under the current access policy. Mutates
 /// `access.pending` when a new pairing code is issued (caller MUST save
 /// access.json afterward to persist).
@@ -573,5 +674,93 @@ mod tests {
         let parsed: Access = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed.allow_from, vec!["434566766".to_string()]);
         assert_eq!(parsed.pending.get("101b06").unwrap().sender_id, "434566766");
+    }
+
+    #[test]
+    fn redeem_pairing_code_valid_code_succeeds() {
+        let mut access = Access::default();
+        let now = now_ms();
+        access.pending.insert(
+            "abc123".to_string(),
+            PendingEntry {
+                sender_id: "12345".to_string(),
+                chat_id: "12345".to_string(),
+                created_at: now,
+                expires_at: now + PAIRING_CODE_TTL_MS,
+                replies: 1,
+            },
+        );
+        let sender_id = redeem_pairing_code(&mut access, "abc123", now).unwrap();
+        assert_eq!(sender_id, "12345");
+        assert!(access.allow_from.contains(&"12345".to_string()));
+        assert!(!access.pending.contains_key("abc123"));
+    }
+
+    #[test]
+    fn redeem_pairing_code_expired_rejects() {
+        let mut access = Access::default();
+        let now = now_ms();
+        access.pending.insert(
+            "abc123".to_string(),
+            PendingEntry {
+                sender_id: "12345".to_string(),
+                chat_id: "12345".to_string(),
+                created_at: now - PAIRING_CODE_TTL_MS - 1000,
+                expires_at: now - 1,
+                replies: 1,
+            },
+        );
+        let err = redeem_pairing_code(&mut access, "abc123", now).unwrap_err();
+        assert_eq!(err, RedeemError::Expired);
+        assert!(!access.pending.contains_key("abc123"));
+    }
+
+    #[test]
+    fn redeem_pairing_code_unknown_rejects() {
+        let mut access = Access::default();
+        let now = now_ms();
+        let err = redeem_pairing_code(&mut access, "ffffff", now).unwrap_err();
+        assert_eq!(err, RedeemError::Unknown);
+    }
+
+    #[test]
+    fn redeem_pairing_code_invalid_format_rejects() {
+        let mut access = Access::default();
+        let now = now_ms();
+        let err = redeem_pairing_code(&mut access, "BADCODE", now).unwrap_err();
+        assert_eq!(err, RedeemError::InvalidFormat);
+    }
+
+    #[test]
+    fn redeem_pairing_code_sec16_constant_time_display() {
+        // SEC-16: Unknown and InvalidFormat return the same error message
+        let unknown_err = RedeemError::Unknown;
+        let invalid_err = RedeemError::InvalidFormat;
+        assert_eq!(unknown_err.to_string(), invalid_err.to_string());
+        assert_eq!(unknown_err.to_string(), "unknown or invalid pairing code");
+        assert_ne!(unknown_err.to_string(), RedeemError::Expired.to_string());
+    }
+
+    #[test]
+    fn redeem_pairing_code_deduplicates() {
+        let mut access = Access {
+            allow_from: vec!["12345".to_string()],
+            ..Default::default()
+        };
+        let now = now_ms();
+        access.pending.insert(
+            "abc123".to_string(),
+            PendingEntry {
+                sender_id: "12345".to_string(),
+                chat_id: "12345".to_string(),
+                created_at: now,
+                expires_at: now + PAIRING_CODE_TTL_MS,
+                replies: 1,
+            },
+        );
+        let sender_id = redeem_pairing_code(&mut access, "abc123", now).unwrap();
+        assert_eq!(sender_id, "12345");
+        // Should still be 1 (no duplicate added)
+        assert_eq!(access.allow_from.iter().filter(|id| *id == &"12345".to_string()).count(), 1);
     }
 }

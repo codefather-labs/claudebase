@@ -244,6 +244,30 @@ pub enum GateAction {
     Pair { code: String, is_resend: bool },
 }
 
+/// Read-only allowlist predicate for inline-keyboard `callback_query` taps
+/// (telegram-multi-cli Slice 5, security defense-in-depth).
+///
+/// Unlike the inbound MESSAGE path, a button tap must NEVER emit a pairing
+/// code or mutate `access.pending` — a callback is an answer to a question
+/// the operator was already asked, not a fresh contact attempt. So this is a
+/// pure, side-effect-free predicate that returns `true` only for the exact
+/// senders `gate_dm` would `Deliver`:
+///
+/// - `Disabled` → `false` (the message path drops Disabled DMs at
+///   `gate_dm` line `Disabled → Drop`; the callback path mirrors it).
+/// - `allow_from` hit → `true` (the message path's `Deliver` arm).
+/// - otherwise (`Allowlist`/`Pairing` without an allow_from hit) → `false`
+///   (the message path would `Drop`/`Pair` — neither is a route).
+///
+/// This is the callback-side sibling of `permissions::check_allowed`, scoped
+/// to the `channel_state::Access` type the production update loop carries.
+pub fn is_callback_allowed(access: &Access, sender_id: &str) -> bool {
+    if access.dm_policy == DmPolicy::Disabled {
+        return false;
+    }
+    access.allow_from.iter().any(|id| id == sender_id)
+}
+
 /// Evaluate a Telegram DM under the current access policy. Mutates
 /// `access.pending` when a new pairing code is issued (caller MUST save
 /// access.json afterward to persist).

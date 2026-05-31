@@ -204,11 +204,13 @@ async fn test_tools_list_daemon_up_returns_chat_tools() {
         .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
         .collect();
 
-    // Slice 3 chat tools + Slice 5 agent_registry tools — daemon-up
-    // tools/list MUST include all 8 (the sentinel daemon-down tool
-    // `claudebase_daemon_status` is plugin-side only).
+    // Slice 3 chat tools + chat_list_threads + telegram-multi-cli Slice 5
+    // chat_ask + agent_registry tools — daemon-up tools/list MUST include all
+    // 10 (the sentinel daemon-down tool `claudebase_daemon_status` is
+    // plugin-side only).
     for required in &[
-        "chat_post", "chat_subscribe", "chat_reply", "chat_list",
+        "chat_post", "chat_subscribe", "chat_reply", "chat_list", "chat_ask",
+        "chat_list_threads",
         "agent_register", "agent_unregister", "agent_list_alive", "agent_reap",
     ] {
         assert!(
@@ -218,8 +220,8 @@ async fn test_tools_list_daemon_up_returns_chat_tools() {
     }
     assert_eq!(
         tools.len(),
-        8,
-        "post-Slice-5 daemon-up tools/list should expose exactly 8 tools (4 chat + 4 agent_registry); got {names:?}"
+        10,
+        "daemon-up tools/list should expose exactly 10 tools (5 chat incl. chat_ask + chat_list_threads + 4 agent_registry); got {names:?}"
     );
 
     // Clean up

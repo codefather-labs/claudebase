@@ -57,7 +57,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde_json::json;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
@@ -87,6 +88,13 @@ pub struct OutboundTg {
     pub chat_id: i64,
     pub text: String,
     pub sender_agent_id: Option<String>,
+    /// telegram-multi-cli Slice 5 — when `Some`, the long-poll drain builds
+    /// an `InlineKeyboardMarkup` from these `(button_text, callback_data)`
+    /// pairs and attaches it via `.reply_markup(...)`. `None` for plain
+    /// `chat_reply` / pairing / bot-command text (the pre-Slice-5 ABI).
+    /// Each `callback_data` is guaranteed ≤ 64 bytes by `handle_chat_ask_inner`
+    /// (the Telegram limit; AC-TMC-16 / TC-TMC-13.2).
+    pub inline_keyboard: Option<Vec<(String, String)>>,
 }
 
 /// Outbound channel from MCP `chat_reply` (server.rs::handle_chat_post)
@@ -123,8 +131,36 @@ pub fn enqueue_outbound_tg_with_sender(
     let tx = OUTBOUND_TG
         .get()
         .ok_or_else(|| anyhow::anyhow!("telegram outbound channel not initialised (long-poll task not spawned)"))?;
-    tx.send(OutboundTg { chat_id, text, sender_agent_id })
+    tx.send(OutboundTg { chat_id, text, sender_agent_id, inline_keyboard: None })
         .map_err(|e| anyhow::anyhow!("outbound channel closed: {e}"))?;
+    Ok(())
+}
+
+/// telegram-multi-cli Slice 5 — enqueue a `sendMessage` carrying an inline
+/// keyboard (the `chat_ask` question buttons). `buttons` is a list of
+/// `(button_label, callback_data)` pairs; the long-poll drain renders ONE
+/// button per pair (one button per row, matching the QA fixtures which count
+/// `inline_keyboard` length = N options).
+///
+/// `sender_agent_id` is `None` — a `chat_ask` question is NOT a reply-quote
+/// target (the operator answers by tapping a button, not by reply-quoting the
+/// message), so we deliberately skip the `tg_message_map` write. The durable
+/// answer-routing state lives in `pending_questions`, keyed by `question_id`.
+pub fn enqueue_outbound_tg_with_keyboard(
+    chat_id: i64,
+    text: String,
+    buttons: Vec<(String, String)>,
+) -> Result<()> {
+    let tx = OUTBOUND_TG
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("telegram outbound channel not initialised (long-poll task not spawned)"))?;
+    tx.send(OutboundTg {
+        chat_id,
+        text,
+        sender_agent_id: None,
+        inline_keyboard: Some(buttons),
+    })
+    .map_err(|e| anyhow::anyhow!("outbound channel closed: {e}"))?;
     Ok(())
 }
 
@@ -187,6 +223,57 @@ pub struct Update {
     pub update_id: i64,
     #[serde(default)]
     pub message: Option<Message>,
+    /// telegram-multi-cli Slice 5 — inline-keyboard button taps arrive as
+    /// `callback_query` updates (NOT `message`). We hand-decode the minimal
+    /// subset needed to (a) answer the callback (`id`), (b) route the answer
+    /// (`data` = `"<qid>:<idx>"`), and (c) scope the pending-question lookup
+    /// to the originating chat (`message.chat.id`). The full teloxide
+    /// `CallbackQuery` carries `from`, `inline_message_id`, etc. — none of
+    /// which the production path needs. `allowed_updates` (get_updates :~937)
+    /// MUST include `CallbackQuery` or Telegram never delivers these.
+    #[serde(default)]
+    pub callback_query: Option<CallbackQuery>,
+}
+
+/// Minimal hand-decode of a Telegram `callback_query` update (Slice 5).
+/// Mirrors the `Message` minimal-decode style above — we only deserialise
+/// the fields the routing path reads.
+#[derive(Debug, Deserialize)]
+pub struct CallbackQuery {
+    /// The callback-query id, echoed back to `answerCallbackQuery` so the
+    /// Telegram client clears the button's loading spinner.
+    pub id: String,
+    /// The `callback_data` the button carried — our `"<qid>:<idx>"` payload.
+    /// Absent if the button used `url`/`switch_inline_query` instead of
+    /// `callback_data` (never the case for our buttons, but the wire field
+    /// is optional so we decode it as such).
+    #[serde(default)]
+    pub data: Option<String>,
+    /// The message the button is attached to. We read `message.chat.id` to
+    /// scope the `pending_questions` lookup to the right chat (F-1 / SEC:
+    /// a forged callback for chat A must not resolve a question in chat B).
+    #[serde(default)]
+    pub message: Option<CallbackMessage>,
+    /// The user who tapped the button (`callback_query.from`). Decoded so the
+    /// callback branch can re-apply the access.json allowlist that the inbound
+    /// MESSAGE path enforces — without it, a button tap silently bypasses the
+    /// gate (security defense-in-depth, latent the moment group chat_ask
+    /// ships). Telegram always populates `from` on a callback_query; we decode
+    /// only its `id`.
+    pub from: CallbackFrom,
+}
+
+/// Minimal `message.chat.id` carrier for a callback query (Slice 5).
+#[derive(Debug, Deserialize)]
+pub struct CallbackMessage {
+    pub chat: Chat,
+}
+
+/// Minimal `callback_query.from` carrier — the tapping user's numeric id,
+/// gated against the access.json allowlist before the callback is routed.
+#[derive(Debug, Deserialize)]
+pub struct CallbackFrom {
+    pub id: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1166,6 +1253,459 @@ pub fn process_batch_with_pairing(
     })
 }
 
+// ===========================================================================
+// telegram-multi-cli Slice 5 — chat_ask: outbound question + callback routing
+// ===========================================================================
+
+/// Max bytes for a Telegram `callback_data` string (Bot API hard limit).
+/// `handle_chat_ask_inner` guarantees every generated `callback_data`
+/// (`"<qid>:<idx>"`) is ≤ this (AC-TMC-16 / TC-TMC-13.2). The check is a
+/// belt-and-suspenders guard — the qid is sized so the worst-case
+/// `"<qid>:<max_idx>"` still fits.
+pub const TG_CALLBACK_DATA_MAX_BYTES: usize = 64;
+
+/// Upper bound on `chat_ask` `options` (security/robustness, bundled with the
+/// Slice 5 callback-allowlist hardening). The JSON schema sets `minItems:2`
+/// but had no upper bound — a CLI sending thousands of options produces a
+/// Telegram-rejected `sendMessage` (inline keyboards realistically support a
+/// small number of buttons) and a silent dead `pending_questions` row that
+/// lingers until its 1-hour TTL. 10 is a generous cap for a multiple-choice
+/// prompt while keeping the keyboard render-able; oversized requests are
+/// rejected BEFORE any DB write or Telegram send (mirrors `minItems`).
+pub const MAX_CHAT_ASK_OPTIONS: usize = 10;
+
+/// The text shown in the Telegram client's callback toast when a tap is
+/// rejected because the question is unknown / already answered / expired.
+/// Single literal so production and the unit tests assert the same bytes.
+pub const CALLBACK_ALREADY_ANSWERED_TEXT: &str = "This question was already answered or has expired.";
+/// Toast text for an expired (TTL-lapsed) question.
+pub const CALLBACK_EXPIRED_TEXT: &str = "This question has expired.";
+/// Toast text for a malformed `callback_data` (no `<qid>:<idx>` colon).
+pub const CALLBACK_MALFORMED_TEXT: &str = "Invalid response.";
+/// Toast text for an out-of-range option index.
+pub const CALLBACK_OUT_OF_RANGE_TEXT: &str = "Invalid option.";
+/// Toast text shown when the requesting CLI is no longer alive.
+pub const CALLBACK_CLI_GONE_TEXT: &str = "The assistant that asked this is no longer available.";
+
+/// What `validate_callback` decided about an inbound `callback_query`.
+///
+/// `answer_callback_query` is ALWAYS called by the production path FIRST
+/// (outside any rusqlite transaction), so this enum carries ONLY the
+/// post-answer routing decision plus the optional toast text the production
+/// caller may surface. The SECURITY invariant (TC-TMC-S1..S4): every variant
+/// EXCEPT `Route` results in ZERO ChatBus notifications — no arbitrary string
+/// derived from a forged `callback_data` is ever routed to a CLI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallbackOutcome {
+    /// All 4 validation steps + TTL passed. The answer must be broadcast to
+    /// `requesting_agent_id` via ChatBus (correlated by `meta.target_agent_id`),
+    /// and the `pending_questions` row has been DELETEd (consumed).
+    Route {
+        thread_id: String,
+        requesting_agent_id: String,
+        /// 0-indexed option chosen.
+        index: usize,
+        /// The chosen option's label (the human-readable answer).
+        label: String,
+        question_id: String,
+    },
+    /// Step 1 fail — `callback_data` had no `<qid>:<idx>` colon. No routing.
+    Malformed,
+    /// Step 2 fail — `qid` not in `pending_questions` for this chat (forged,
+    /// stale, or double-tap after the row was consumed). No routing.
+    UnknownQuestion,
+    /// TTL fail — the row existed but `expires_at` is in the past. The row is
+    /// evicted; no routing.
+    Expired,
+    /// Step 3 fail — `idx` is not a number OR is ≥ the option count. No routing.
+    OutOfRange,
+    /// Step 4 fail — the requesting CLI is no longer alive. The row is
+    /// consumed (DELETEd) so a later tap doesn't re-trigger; no routing.
+    DeadCli,
+}
+
+impl CallbackOutcome {
+    /// The toast text the production path passes to `answerCallbackQuery`
+    /// for a non-routing outcome. `Route` returns `None` (no error toast —
+    /// the answer landing in the CLI is the visible effect).
+    pub fn toast_text(&self) -> Option<&'static str> {
+        match self {
+            CallbackOutcome::Route { .. } => None,
+            CallbackOutcome::Malformed => Some(CALLBACK_MALFORMED_TEXT),
+            CallbackOutcome::UnknownQuestion => Some(CALLBACK_ALREADY_ANSWERED_TEXT),
+            CallbackOutcome::Expired => Some(CALLBACK_EXPIRED_TEXT),
+            CallbackOutcome::OutOfRange => Some(CALLBACK_OUT_OF_RANGE_TEXT),
+            CallbackOutcome::DeadCli => Some(CALLBACK_CLI_GONE_TEXT),
+        }
+    }
+
+    /// True ONLY for `Route` — the single variant that ends in a ChatBus
+    /// broadcast. Tests assert `!outcome.routes()` for every forged/stale
+    /// callback (the SECURITY invariant: forged data → ZERO notifications).
+    pub fn routes(&self) -> bool {
+        matches!(self, CallbackOutcome::Route { .. })
+    }
+}
+
+/// SECURITY-LOAD-BEARING (TC-TMC-S1..S4): validate an inbound `callback_query`
+/// `data` string against the durable `pending_questions` table and decide
+/// whether (and to whom) the answer routes. This is a PURE synchronous
+/// function over an open `Connection` so it is directly unit-testable without
+/// any Telegram I/O — the production path calls `answer_callback_query`
+/// (network) BEFORE this, then runs this inside `spawn_blocking`.
+///
+/// The 4-step validation, in order (each failure short-circuits with NO
+/// routing — the answer_callback_query was already done by the caller):
+///
+/// 1. **Colon split** — `data.split_once(':')` → no colon → `Malformed`
+///    (TC-TMC-S1: `"INVALID_NO_COLON"`).
+/// 2. **Durable lookup** — `SELECT ... FROM pending_questions WHERE
+///    question_id = ?1 AND chat_id = ?2`. Not found → `UnknownQuestion`
+///    (TC-TMC-S4: stale/forged qid; also the double-tap case TC-TMC-14.2,
+///    because step 5 DELETEs the row so the second tap finds nothing). The
+///    `chat_id` scoping means a forged callback echoing chat A's qid in
+///    chat B's update does NOT resolve.
+/// 3. **TTL** — if `expires_at < now` the row is EVICTED and `Expired` is
+///    returned (F-1 TTL). Checked AFTER lookup so we know which row to evict.
+/// 4. **Index range** — `idx` parsed as `usize`; `idx >= options.len()` →
+///    `OutOfRange` (TC-TMC-S2: `"q7a:999"`).
+/// 5. **CLI liveness** — `is_alive(requesting_agent_id)` false → the row is
+///    consumed and `DeadCli` returned (TC-TMC-14.3).
+///
+/// On full success the row is DELETEd (consumed — durable idempotency: a
+/// double-tap finds no row and returns `UnknownQuestion`) and `Route` is
+/// returned carrying the requesting CLI + chosen option.
+///
+/// NOTE: the row is deleted in the SAME synchronous call (no `.await` between
+/// the SELECT and the DELETE) so there is no TOCTOU window where two
+/// concurrent taps both route. `spawn_blocking` bodies run to completion on a
+/// dedicated thread; rusqlite's connection-level serialisation handles the
+/// rest.
+pub fn validate_callback(
+    conn: &Connection,
+    chat_id: i64,
+    data: &str,
+) -> rusqlite::Result<CallbackOutcome> {
+    use crate::daemon::agent_registry::is_alive;
+
+    // Step 1 — colon split. A forged `callback_data` with no colon never
+    // reaches the DB (TC-TMC-S1).
+    let Some((qid, idx_str)) = data.split_once(':') else {
+        return Ok(CallbackOutcome::Malformed);
+    };
+
+    // Step 2 — durable lookup scoped to (question_id, chat_id). NOT an
+    // in-memory map (F-1): this row survives a daemon restart.
+    let row: Option<(String, String, i64)> = conn
+        .query_row(
+            "SELECT requesting_agent_id, options_json, expires_at \
+             FROM pending_questions WHERE question_id = ?1 AND chat_id = ?2",
+            params![qid, chat_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)),
+        )
+        .optional()?;
+
+    let Some((requesting_agent_id, options_json, expires_at)) = row else {
+        // Unknown qid: forged, stale, or already-consumed (double-tap).
+        return Ok(CallbackOutcome::UnknownQuestion);
+    };
+
+    // Step 3 — TTL. Evict an expired row and report Expired (F-1 TTL). Use
+    // SQL `strftime` for the cutoff so the unit matches the producer's
+    // `strftime('%s','now')` write (UNIX seconds).
+    let now_secs: i64 = conn.query_row("SELECT strftime('%s','now')", [], |r| {
+        // strftime returns TEXT; parse to i64.
+        let s: String = r.get(0)?;
+        Ok(s.parse::<i64>().unwrap_or(0))
+    })?;
+    if expires_at < now_secs {
+        conn.execute(
+            "DELETE FROM pending_questions WHERE question_id = ?1",
+            params![qid],
+        )?;
+        return Ok(CallbackOutcome::Expired);
+    }
+
+    // Parse the options so we can both range-check the index AND recover the
+    // chosen label. A row with a corrupt options_json is treated as
+    // OutOfRange (defensive — never route on un-parseable state).
+    let options: Vec<serde_json::Value> = match serde_json::from_str(&options_json) {
+        Ok(serde_json::Value::Array(a)) => a,
+        _ => return Ok(CallbackOutcome::OutOfRange),
+    };
+
+    // Step 4 — index range. A non-numeric idx (forged) OR idx >= len rejects
+    // (TC-TMC-S2). We do NOT consume the row on a range failure: the question
+    // is still legitimately pending, and a forged out-of-range tap should not
+    // be able to evict a real pending question (DoS guard).
+    let Ok(idx) = idx_str.parse::<usize>() else {
+        return Ok(CallbackOutcome::OutOfRange);
+    };
+    if idx >= options.len() {
+        return Ok(CallbackOutcome::OutOfRange);
+    }
+
+    // Step 5 — CLI liveness. is_alive returns anyhow::Result; map any error to
+    // a not-alive verdict (fail-closed — never route to a possibly-dead CLI).
+    let alive = is_alive(conn, &requesting_agent_id).unwrap_or(false);
+    if !alive {
+        // Consume the row so a later tap doesn't re-trigger the dead-CLI path
+        // repeatedly (TC-TMC-14.3). The question is unanswerable now.
+        conn.execute(
+            "DELETE FROM pending_questions WHERE question_id = ?1",
+            params![qid],
+        )?;
+        return Ok(CallbackOutcome::DeadCli);
+    }
+
+    // All checks passed. Recover the chosen label (the option may be either a
+    // bare string OR an object `{label, description}` — accept both shapes).
+    let label = option_label(&options[idx], idx);
+
+    // Consume the row (durable idempotency: a double-tap now finds nothing →
+    // UnknownQuestion). No `.await` between SELECT and DELETE → no TOCTOU.
+    conn.execute(
+        "DELETE FROM pending_questions WHERE question_id = ?1",
+        params![qid],
+    )?;
+
+    Ok(CallbackOutcome::Route {
+        thread_id: format!("telegram:{chat_id}"),
+        requesting_agent_id,
+        index: idx,
+        label,
+        question_id: qid.to_string(),
+    })
+}
+
+/// Extract a human-readable label from one option JSON value. Accepts the
+/// `{label, description}` object shape the MCP descriptor advertises AND a
+/// bare string fallback. Falls back to the 0-indexed position when neither
+/// shape yields a label.
+fn option_label(opt: &serde_json::Value, idx: usize) -> String {
+    if let Some(s) = opt.as_str() {
+        return s.to_string();
+    }
+    if let Some(label) = opt.get("label").and_then(|v| v.as_str()) {
+        return label.to_string();
+    }
+    format!("option {idx}")
+}
+
+/// The structured answer broadcast to the requesting CLI when a button is
+/// tapped. Carried as the `content` of a `notifications/claude/channel` frame
+/// with `meta.target_agent_id = requesting_agent_id` so only the asking CLI
+/// consumes it (async ruling A — `chat_ask` returned the `question_id`
+/// immediately; the answer arrives later via this out-of-band notification).
+pub fn build_chat_ask_answer_frame(
+    thread_id: &str,
+    requesting_agent_id: &str,
+    question_id: &str,
+    index: usize,
+    label: &str,
+) -> serde_json::Value {
+    let content = json!({
+        "type": "chat_ask_answer",
+        "question_id": question_id,
+        "index": index,
+        "label": label,
+    })
+    .to_string();
+    let mut meta = serde_json::Map::new();
+    meta.insert("thread".into(), serde_json::Value::String(thread_id.to_string()));
+    meta.insert(
+        "target_agent_id".into(),
+        serde_json::Value::String(requesting_agent_id.to_string()),
+    );
+    meta.insert(
+        "question_id".into(),
+        serde_json::Value::String(question_id.to_string()),
+    );
+    json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/claude/channel",
+        "params": {
+            "content": content,
+            "meta": serde_json::Value::Object(meta),
+        },
+    })
+}
+
+/// Error categories returned by `handle_chat_ask_inner` — mapped by the
+/// server.rs handler to MCP error responses. Each variant is a DISTINCT
+/// failure the QA cases assert on separately (malformed thread TC-TMC-13.5,
+/// too-few options TC-TMC-13.4, group-chat F-4, oversized callback TC-TMC-S3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatAskError {
+    /// Thread did not match `telegram:<chat_id>` (TC-TMC-13.5).
+    MalformedThread,
+    /// `options` had < 2 entries (TC-TMC-13.4 / minItems:2).
+    TooFewOptions,
+    /// `options` exceeded `MAX_CHAT_ASK_OPTIONS` (security/robustness: a CLI
+    /// sending thousands of options would produce a Telegram-rejected
+    /// sendMessage and a silent dead question until TTL). Rejected BEFORE any
+    /// DB write or Telegram send — no `pending_questions` row, no sendMessage.
+    TooManyOptions,
+    /// chat_id < 0 — group chat. F-4 DM-only gate (returns BEFORE any DB /
+    /// Telegram side-effect).
+    GroupChatNotAllowed,
+    /// The generated `callback_data` would exceed 64 bytes (TC-TMC-S3). In
+    /// practice the qid is sized so this never trips, but the guard fails
+    /// CLOSED rather than sending an over-limit button Telegram would reject.
+    CallbackDataTooLong,
+}
+
+impl ChatAskError {
+    pub fn message(&self) -> String {
+        match self {
+            ChatAskError::MalformedThread => {
+                "thread must match telegram:<chat_id>".to_string()
+            }
+            ChatAskError::TooFewOptions => {
+                "options must contain at least 2 entries".to_string()
+            }
+            ChatAskError::TooManyOptions => {
+                format!(
+                    "options must contain at most {MAX_CHAT_ASK_OPTIONS} entries"
+                )
+            }
+            ChatAskError::GroupChatNotAllowed => {
+                "chat_ask is only available in DM chats in v1; group-chat chat_ask deferred"
+                    .to_string()
+            }
+            ChatAskError::CallbackDataTooLong => {
+                "generated callback_data exceeds Telegram's 64-byte limit".to_string()
+            }
+        }
+    }
+}
+
+/// What `handle_chat_ask_inner` produced on success: the durable
+/// `question_id` plus everything the async caller needs to send the
+/// `sendMessage` with the inline keyboard. The `pending_questions` row is
+/// ALREADY inserted (durability BEFORE the Telegram send — TC-TMC-13.1(d) /
+/// F-1: the answer routes even if sendMessage later times out).
+#[derive(Debug, Clone)]
+pub struct ChatAskOutcome {
+    pub question_id: String,
+    pub chat_id: i64,
+    pub question_text: String,
+    /// `(button_label, callback_data)` pairs, one per option, in order.
+    pub buttons: Vec<(String, String)>,
+}
+
+/// Parse a `telegram:<chat_id>` thread into its i64 chat_id. Returns None for
+/// any other prefix or an unparseable id (TC-TMC-13.5).
+fn parse_telegram_thread(thread: &str) -> Option<i64> {
+    thread.strip_prefix("telegram:").and_then(|r| r.parse::<i64>().ok())
+}
+
+/// Generate a COMPACT question_id such that `qid.len() + 1 + max_idx_digits
+/// <= 64` (callback_data ≤ 64 bytes). We use a short base36 of the low bits
+/// of a UUID — ~9 chars — leaving ample room for the `:<idx>` suffix even for
+/// large option counts. Collisions across concurrent pending questions are
+/// astronomically unlikely AND `question_id` is the PRIMARY KEY so a collision
+/// would surface as an INSERT failure (caller retries), never a silent
+/// misroute.
+fn generate_question_id() -> String {
+    let u = uuid::Uuid::new_v4();
+    // Take the low 64 bits, render base36 — compact and callback-data-safe
+    // (alphanumeric only, no colon).
+    let n = u.as_u128() as u64;
+    to_base36(n)
+}
+
+/// Render a u64 as lowercase base36 (0-9a-z). Compact, colon-free.
+fn to_base36(mut n: u64) -> String {
+    const ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if n == 0 {
+        return "0".to_string();
+    }
+    let mut buf = Vec::new();
+    while n > 0 {
+        buf.push(ALPHABET[(n % 36) as usize]);
+        n /= 36;
+    }
+    buf.reverse();
+    String::from_utf8(buf).expect("base36 alphabet is ASCII")
+}
+
+/// Pure, synchronous core of the `chat_ask` MCP tool. SECURITY + F-4 +
+/// durability all live here so they are unit-testable without Telegram I/O.
+///
+/// Sequence (matches the slice spec):
+/// 1. Validate thread → `telegram:<chat_id>` (TC-TMC-13.5).
+/// 2. **F-4 DM-only gate** — `chat_id < 0` (group chat) → `GroupChatNotAllowed`
+///    BEFORE any DB write or button generation (no side-effects on reject).
+/// 3. Validate `options.len() >= 2` (TC-TMC-13.4).
+/// 4. Generate a compact `question_id`; build `"<qid>:<idx>"` callback_data
+///    per option; guard each ≤ 64 bytes (TC-TMC-S3).
+/// 5. INSERT the `pending_questions` row (durability BEFORE the Telegram send
+///    — F-1 / TC-TMC-13.1(d)).
+///
+/// Returns the `ChatAskOutcome` (question_id + buttons) for the async caller
+/// to perform the `sendMessage`. The caller returns `{"question_id": ...}` to
+/// the agent IMMEDIATELY (async ruling A); the answer arrives later via a
+/// ChatBus notification when the operator taps a button.
+pub fn handle_chat_ask_inner(
+    conn: &Connection,
+    thread: &str,
+    question: &str,
+    requesting_agent_id: &str,
+    options: &[serde_json::Value],
+) -> Result<std::result::Result<ChatAskOutcome, ChatAskError>> {
+    // Step 1 — thread shape.
+    let Some(chat_id) = parse_telegram_thread(thread) else {
+        return Ok(Err(ChatAskError::MalformedThread));
+    };
+
+    // Step 2 — F-4 DM-only gate. MUST be before any DB / Telegram work.
+    if chat_id < 0 {
+        return Ok(Err(ChatAskError::GroupChatNotAllowed));
+    }
+
+    // Step 3 — options minItems:2.
+    if options.len() < 2 {
+        return Ok(Err(ChatAskError::TooFewOptions));
+    }
+    // Step 3b — options maxItems cap. Reject oversized requests BEFORE the
+    // INSERT / button generation so an over-large `options` array produces NO
+    // pending_questions row and NO sendMessage (same no-side-effect contract
+    // as the minItems reject above).
+    if options.len() > MAX_CHAT_ASK_OPTIONS {
+        return Ok(Err(ChatAskError::TooManyOptions));
+    }
+
+    // Step 4 — compact qid + per-option callback_data ≤ 64 bytes.
+    let qid = generate_question_id();
+    let mut buttons: Vec<(String, String)> = Vec::with_capacity(options.len());
+    for (idx, opt) in options.iter().enumerate() {
+        let cb = format!("{qid}:{idx}");
+        if cb.len() > TG_CALLBACK_DATA_MAX_BYTES {
+            return Ok(Err(ChatAskError::CallbackDataTooLong));
+        }
+        let label = option_label(opt, idx);
+        buttons.push((label, cb));
+    }
+
+    // Step 5 — durable INSERT (BEFORE the Telegram send). options stored
+    // verbatim so the callback path can recover labels + count.
+    let options_json = serde_json::Value::Array(options.to_vec()).to_string();
+    conn.execute(
+        "INSERT INTO pending_questions \
+         (question_id, chat_id, requesting_agent_id, options_json, created_at, expires_at) \
+         VALUES (?1, ?2, ?3, ?4, strftime('%s','now'), strftime('%s','now') + 3600)",
+        params![qid, chat_id, requesting_agent_id, options_json],
+    )?;
+
+    Ok(Ok(ChatAskOutcome {
+        question_id: qid,
+        chat_id,
+        question_text: question.to_string(),
+        buttons,
+    }))
+}
+
 /// Wall-clock millis since epoch — local helper because the chat module's
 /// `now_millis` is private. Behaviour identical.
 fn chrono_millis() -> i64 {
@@ -1413,7 +1953,9 @@ async fn run_long_poll(
     // teloxide's `set_api_url` accepts a `reqwest::Url`; we parse via the
     // url crate then convert. Both crates use the same underlying
     // representation so the conversion is a free re-parse.
+    use teloxide::payloads::AnswerCallbackQuerySetters;
     use teloxide::payloads::GetUpdatesSetters;
+    use teloxide::payloads::SendMessageSetters;
     use teloxide::requests::Requester;
     let bot = if let Some(url_str) = api_url.as_deref() {
         match url::Url::parse(url_str) {
@@ -1527,10 +2069,33 @@ async fn run_long_poll(
         // queued messages so a burst doesn't starve getUpdates.
         for _ in 0..16 {
             match outbound_rx.try_recv() {
-                Ok(OutboundTg { chat_id, text, sender_agent_id }) => {
-                    let send_result = bot
-                        .send_message(teloxide::types::ChatId(chat_id), &text)
-                        .await;
+                Ok(OutboundTg { chat_id, text, sender_agent_id, inline_keyboard }) => {
+                    // telegram-multi-cli Slice 5 — when the queued item
+                    // carries an inline keyboard (a `chat_ask` question),
+                    // attach it via `.reply_markup(...)`. `SendMessageSetters`
+                    // is in scope via the `use` at the top of run_long_poll.
+                    let send_request = bot.send_message(teloxide::types::ChatId(chat_id), &text);
+                    let send_result = match &inline_keyboard {
+                        Some(buttons) => {
+                            use teloxide::types::{
+                                InlineKeyboardButton, InlineKeyboardMarkup,
+                            };
+                            // One button per row — the QA fixtures count
+                            // `inline_keyboard` length = N options.
+                            let rows: Vec<Vec<InlineKeyboardButton>> = buttons
+                                .iter()
+                                .map(|(label, cb)| {
+                                    vec![InlineKeyboardButton::callback(
+                                        label.clone(),
+                                        cb.clone(),
+                                    )]
+                                })
+                                .collect();
+                            let markup = InlineKeyboardMarkup::new(rows);
+                            send_request.reply_markup(markup).await
+                        }
+                        None => send_request.await,
+                    };
                     match send_result {
                         Ok(sent_msg) => {
                             tracing::info!(
@@ -1598,6 +2163,17 @@ async fn run_long_poll(
         let updates_result = bot
             .get_updates()
             .offset(offset.saturating_add(1) as i32)
+            // telegram-multi-cli Slice 5 — without an explicit allowed_updates
+            // list Telegram delivers the DEFAULT set, which EXCLUDES
+            // `callback_query`. We must opt in to both `message` (the existing
+            // inbound DM path) AND `callback_query` (the new inline-button-tap
+            // path) or button taps are silently dropped server-side. Listing
+            // `Message` explicitly does not narrow the message path — it is the
+            // same update kind the loop already processes.
+            .allowed_updates(vec![
+                teloxide::types::AllowedUpdate::Message,
+                teloxide::types::AllowedUpdate::CallbackQuery,
+            ])
             // Long-poll timeout MUST be strictly less than teloxide's default
             // reqwest client timeout (17 seconds — see teloxide-core/src/net.rs
             // doc comment "If you are using the polling mechanism to get updates,
@@ -1714,6 +2290,125 @@ async fn run_long_poll(
                     msg.text = Some(voice_text);
                     msg.voice = None;
                 }
+            }
+        }
+
+        // telegram-multi-cli Slice 5 — process inline-keyboard button taps
+        // (callback_query updates) BEFORE the message batch. These updates
+        // carry no `message` so process_batch_with_pairing skips their body
+        // (it still bumps the offset via max_update_id, so leaving them in
+        // `decoded` keeps the offset monotone). The ordering invariants per
+        // architect ruling C: answer_callback_query (network) FIRST, OUTSIDE
+        // any rusqlite transaction; then the 4-step validation + DELETE in
+        // spawn_blocking (no Connection across .await); then the ChatBus
+        // broadcast from the async side (only on a Route outcome).
+        for update in decoded.iter() {
+            let Some(cq) = &update.callback_query else { continue };
+            let cq_id = cq.id.clone();
+
+            // Answer the callback FIRST so the Telegram client clears the
+            // button spinner regardless of the routing decision (and so a
+            // forged callback gets the same acknowledgement — no oracle).
+            let answer_req = bot.answer_callback_query(
+                teloxide::types::CallbackQueryId(cq_id.clone()),
+            );
+
+            // Resolve the chat_id from the callback's message. Without it we
+            // cannot scope the pending_questions lookup (SECURITY: a forged
+            // callback with no chat is unroutable) — answer + drop.
+            let Some(chat_id) = cq.message.as_ref().map(|m| m.chat.id) else {
+                let _ = answer_req.await;
+                tracing::warn!(cq_id = %cq_id, "callback_query without message.chat — dropped");
+                continue;
+            };
+
+            // SECURITY (defense-in-depth): re-apply the access.json allowlist
+            // the inbound MESSAGE path enforces (process_batch_with_pairing →
+            // gate_dm Deliver arm). A button tap from a non-allowlisted user
+            // must NOT route — drop it BEFORE the pending_questions lookup and
+            // before any ChatBus publish, exactly as the message path drops a
+            // non-allowlisted DM. This is a pure in-memory access lookup (no
+            // Connection across .await). Not exploitable while chat_ask is
+            // DM-only (F-4), but a latent authz hole the instant group
+            // chat_ask ships — closed now.
+            let tapping_user_id = cq.from.id.to_string();
+            if !channel_state::is_callback_allowed(&cs_access, &tapping_user_id) {
+                // Dismiss the spinner (same acknowledgement as the no-chat
+                // drop above — no oracle), then drop without routing.
+                let _ = answer_req.await;
+                tracing::warn!(
+                    cq_id = %cq_id,
+                    "callback_query from non-allowlisted user — dropped (no route)"
+                );
+                continue;
+            }
+
+            let data = cq.data.clone().unwrap_or_default();
+
+            // Run the validation + (on success) the row DELETE in
+            // spawn_blocking. NO Connection is held across an .await.
+            let validate_join = tokio::task::spawn_blocking(move || -> Result<CallbackOutcome> {
+                let conn = chat::open_chat_db()?;
+                Ok(validate_callback(&conn, chat_id, &data)?)
+            })
+            .await;
+
+            let outcome = match validate_join {
+                Ok(Ok(o)) => o,
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        cq_id = %cq_id,
+                        error = %redact_error_string(&format!("{e}"), &token_for_error_redaction),
+                        "callback validation failed"
+                    );
+                    // Still answer the callback so the client spinner clears.
+                    let _ = answer_req.await;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(cq_id = %cq_id, error = %e, "callback validation task panicked");
+                    let _ = answer_req.await;
+                    continue;
+                }
+            };
+
+            // Answer the callback (with the per-outcome toast for non-routing
+            // verdicts). For Route there is no error toast — the answer
+            // landing in the CLI is the visible effect.
+            match outcome.toast_text() {
+                Some(text) => {
+                    let _ = answer_req.text(text.to_string()).await;
+                }
+                None => {
+                    let _ = answer_req.await;
+                }
+            }
+
+            // Broadcast the answer ONLY on Route (SECURITY: every other
+            // outcome emits ZERO notifications — no forged string routes to a
+            // CLI). meta.target_agent_id = requesting CLI (async ruling A).
+            if let CallbackOutcome::Route {
+                thread_id,
+                requesting_agent_id,
+                index,
+                label,
+                question_id,
+            } = outcome
+            {
+                let frame = build_chat_ask_answer_frame(
+                    &thread_id,
+                    &requesting_agent_id,
+                    &question_id,
+                    index,
+                    &label,
+                );
+                let n = bus.publish(&thread_id, frame).await;
+                tracing::info!(
+                    thread = %thread_id,
+                    target = %requesting_agent_id,
+                    subscribers = n,
+                    "chat_ask answer routed"
+                );
             }
         }
 
@@ -2040,6 +2735,7 @@ mod tests {
                 voice: None,
                 reply_to_message: None,
             }),
+            callback_query: None,
         }];
 
         let outcome = process_batch(&mut conn, &access, None, &batch).unwrap();
@@ -2071,6 +2767,7 @@ mod tests {
                 voice: None,
                 reply_to_message: None,
             }),
+            callback_query: None,
         }];
 
         let outcome = process_batch(&mut conn, &access, None, &batch).unwrap();
@@ -2109,6 +2806,7 @@ mod tests {
                 }),
                 reply_to_message: None,
             }),
+            callback_query: None,
         }];
 
         let outcome = process_batch(&mut conn, &access, None, &batch).unwrap();
@@ -2171,6 +2869,7 @@ mod tests {
                 voice: None,
                 reply_to_message: reply_to.map(|id| ReplyToMessage { message_id: id }),
             }),
+            callback_query: None,
         }
     }
 
@@ -3160,12 +3859,558 @@ mod tests {
         // sender to None — it constructs the same OutboundTg the channel
         // carries. We assert the struct shape directly (the global channel is
         // not initialised in unit tests).
-        let item = OutboundTg { chat_id: 111, text: "hi".into(), sender_agent_id: None };
+        let item = OutboundTg {
+            chat_id: 111,
+            text: "hi".into(),
+            sender_agent_id: None,
+            inline_keyboard: None,
+        };
         assert_eq!(item.chat_id, 111);
         assert!(item.sender_agent_id.is_none());
 
-        let with_sender =
-            OutboundTg { chat_id: 111, text: "hi".into(), sender_agent_id: Some("cli-1-id".into()) };
+        let with_sender = OutboundTg {
+            chat_id: 111,
+            text: "hi".into(),
+            sender_agent_id: Some("cli-1-id".into()),
+            inline_keyboard: None,
+        };
         assert_eq!(with_sender.sender_agent_id.as_deref(), Some("cli-1-id"));
+    }
+
+    // =====================================================================
+    // telegram-multi-cli Slice 5 — chat_ask + callback_query (TC-TMC-13/14/
+    // 18/S1-S4). Hermetic in-memory chat.db — never touches the operator's
+    // real ~/.claude/knowledge/chat.db.
+    // =====================================================================
+
+    /// Build the standard 3 options A/B/C as `{label}` objects.
+    fn opts_abc() -> Vec<serde_json::Value> {
+        vec![
+            json!({"label": "A"}),
+            json!({"label": "B"}),
+            json!({"label": "C"}),
+        ]
+    }
+
+    /// Seed a pending_questions row directly (simulates a prior chat_ask /
+    /// the post-restart durable state). expires_at defaults to +3600s.
+    fn seed_pending(
+        conn: &Connection,
+        qid: &str,
+        chat_id: i64,
+        requesting_agent_id: &str,
+        options: &[serde_json::Value],
+        ttl_secs: i64,
+    ) {
+        let options_json = serde_json::Value::Array(options.to_vec()).to_string();
+        conn.execute(
+            "INSERT INTO pending_questions \
+             (question_id, chat_id, requesting_agent_id, options_json, created_at, expires_at) \
+             VALUES (?1, ?2, ?3, ?4, strftime('%s','now'), strftime('%s','now') + ?5)",
+            params![qid, chat_id, requesting_agent_id, options_json, ttl_secs],
+        )
+        .unwrap();
+    }
+
+    fn pending_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM pending_questions", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    // ---- handle_chat_ask_inner (TC-TMC-13.x, F-4) ----
+
+    #[test]
+    fn chat_ask_inserts_pending_row_and_builds_buttons() {
+        // TC-TMC-13.1: chat_ask inserts a pending_questions row; sendMessage
+        // payload has inline_keyboard with N buttons + callback_data
+        // ^<qid>:[0-9]+$ ≤ 64 bytes.
+        let conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        let opts = opts_abc();
+        let res = handle_chat_ask_inner(&conn, "telegram:111", "Pick one", "cli-1-id", &opts)
+            .unwrap()
+            .expect("valid chat_ask");
+
+        // Durable row inserted (TC-TMC-13.1(d) / F-1).
+        assert_eq!(pending_count(&conn), 1);
+        // 3 buttons, one per option.
+        assert_eq!(res.buttons.len(), 3);
+        for (idx, (_label, cb)) in res.buttons.iter().enumerate() {
+            // callback_data format ^<qid>:<idx>$ and ≤ 64 bytes.
+            assert!(cb.len() <= TG_CALLBACK_DATA_MAX_BYTES, "callback_data ≤ 64: {cb}");
+            assert_eq!(*cb, format!("{}:{}", res.question_id, idx));
+            assert!(!res.question_id.contains(':'), "qid must not contain a colon");
+        }
+        assert_eq!(res.chat_id, 111);
+        assert_eq!(res.question_text, "Pick one");
+    }
+
+    #[test]
+    fn chat_ask_minimum_two_options_ok() {
+        // TC-TMC-13.3.
+        let conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        let opts = vec![json!({"label": "Yes"}), json!({"label": "No"})];
+        let res = handle_chat_ask_inner(&conn, "telegram:5", "?", "cli-1-id", &opts)
+            .unwrap()
+            .expect("2 options ok");
+        assert_eq!(res.buttons.len(), 2);
+    }
+
+    #[test]
+    fn chat_ask_rejects_one_option_no_row() {
+        // TC-TMC-13.4: < 2 options → error BEFORE any row insert.
+        let conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        let opts = vec![json!({"label": "only"})];
+        let err = handle_chat_ask_inner(&conn, "telegram:5", "?", "cli-1-id", &opts)
+            .unwrap()
+            .expect_err("one option rejected");
+        assert_eq!(err, ChatAskError::TooFewOptions);
+        // No durable side-effect on rejection.
+        assert_eq!(pending_count(&conn), 0);
+    }
+
+    #[test]
+    fn chat_ask_rejects_malformed_thread_no_row() {
+        // TC-TMC-13.5: wrong prefix → error, no row.
+        let conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        let err = handle_chat_ask_inner(&conn, "nottelogram:111", "?", "cli-1-id", &opts_abc())
+            .unwrap()
+            .expect_err("bad thread rejected");
+        assert_eq!(err, ChatAskError::MalformedThread);
+        assert_eq!(pending_count(&conn), 0);
+    }
+
+    #[test]
+    fn chat_ask_group_chat_rejected_no_side_effects() {
+        // F-4 DM-only: negative chat_id (group) → error, NO sendMessage, NO
+        // pending_questions insert. Returns BEFORE any DB write.
+        let conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        let err = handle_chat_ask_inner(&conn, "telegram:-1001234", "?", "cli-1-id", &opts_abc())
+            .unwrap()
+            .expect_err("group chat rejected");
+        assert_eq!(err, ChatAskError::GroupChatNotAllowed);
+        assert_eq!(pending_count(&conn), 0, "F-4: no row written for group chat");
+    }
+
+    #[test]
+    fn chat_ask_callback_data_within_64_bytes_for_many_options() {
+        // TC-TMC-13.2 / TC-TMC-S3: the generated callback_data must stay ≤ 64
+        // bytes even at the WORST-CASE option count the maxItems cap permits
+        // (MAX_CHAT_ASK_OPTIONS → highest idx digits). Bounded to the cap so
+        // the request is accepted (oversized requests are covered separately
+        // by chat_ask_rejects_too_many_options_no_row).
+        let conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        let opts: Vec<serde_json::Value> = (0..MAX_CHAT_ASK_OPTIONS)
+            .map(|i| json!({"label": format!("opt {i}")}))
+            .collect();
+        let res = handle_chat_ask_inner(&conn, "telegram:7", "?", "cli-1-id", &opts)
+            .unwrap()
+            .expect("max-allowed options ok");
+        for (_l, cb) in &res.buttons {
+            assert!(cb.len() <= TG_CALLBACK_DATA_MAX_BYTES, "≤64: {cb} ({} bytes)", cb.len());
+        }
+    }
+
+    #[test]
+    fn chat_ask_rejects_too_many_options_no_row() {
+        // Security/robustness: > MAX_CHAT_ASK_OPTIONS → TooManyOptions error
+        // BEFORE any DB write or sendMessage. No pending_questions row.
+        let conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        let opts: Vec<serde_json::Value> = (0..MAX_CHAT_ASK_OPTIONS + 1)
+            .map(|i| json!({"label": format!("opt {i}")}))
+            .collect();
+        let err = handle_chat_ask_inner(&conn, "telegram:5", "?", "cli-1-id", &opts)
+            .unwrap()
+            .expect_err("oversized options rejected");
+        assert_eq!(err, ChatAskError::TooManyOptions);
+        // No durable side-effect on rejection — no row, hence no sendMessage
+        // (the async caller only enqueues a sendMessage on Ok).
+        assert_eq!(pending_count(&conn), 0);
+        // The exactly-at-cap count is accepted (boundary check).
+        let at_cap: Vec<serde_json::Value> = (0..MAX_CHAT_ASK_OPTIONS)
+            .map(|i| json!({"label": format!("opt {i}")}))
+            .collect();
+        assert!(
+            handle_chat_ask_inner(&conn, "telegram:5", "?", "cli-1-id", &at_cap)
+                .unwrap()
+                .is_ok(),
+            "exactly MAX_CHAT_ASK_OPTIONS must be accepted"
+        );
+    }
+
+    // ---- validate_callback happy path (TC-TMC-14.1) ----
+
+    #[test]
+    fn callback_routes_answer_and_consumes_row() {
+        // TC-TMC-14.1: a valid tap → Route{requesting CLI, idx, label}; row
+        // DELETEd. Also asserts the answer correlates to the requesting CLI.
+        let conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+        seed_pending(&conn, "q7a", 111, "cli-1-id", &opts_abc(), 3600);
+
+        let outcome = validate_callback(&conn, 111, "q7a:1").unwrap();
+        match outcome {
+            CallbackOutcome::Route {
+                ref requesting_agent_id,
+                index,
+                ref label,
+                ref question_id,
+                ref thread_id,
+            } => {
+                assert_eq!(requesting_agent_id, "cli-1-id");
+                assert_eq!(index, 1);
+                assert_eq!(label, "B");
+                assert_eq!(question_id, "q7a");
+                assert_eq!(thread_id, "telegram:111");
+            }
+            other => panic!("expected Route, got {other:?}"),
+        }
+        assert!(outcome.routes());
+        // Row consumed (durable idempotency).
+        assert_eq!(pending_count(&conn), 0);
+    }
+
+    // ---- callback allowlist gate (security defense-in-depth) ----
+
+    /// SECURITY regression: a callback_query from a NON-allowlisted user must
+    /// produce ZERO ChatBus routing even with an otherwise-valid `qid:idx`.
+    ///
+    /// The production loop gates the callback on
+    /// `channel_state::is_callback_allowed(&cs_access, &cq.from.id)` BEFORE it
+    /// calls `validate_callback` or publishes. This test models that exact
+    /// decision: with a VALID pending row seeded (so `validate_callback` WOULD
+    /// Route if reached), the non-allowlisted tapping user fails the gate, so
+    /// the branch drops before validation — zero routes. The companion
+    /// assertion proves the payload was genuinely valid (allowlisted user →
+    /// gate passes → same `qid:idx` Routes), so the zero-route result is the
+    /// gate working, not an invalid payload.
+    #[test]
+    fn callback_from_non_allowlisted_user_does_not_route() {
+        use crate::daemon::channel_state::{
+            Access as CsAccess, DmPolicy as CsDmPolicy,
+        };
+
+        // Allowlist contains user "100" but NOT the tapping user "999".
+        let access = CsAccess {
+            dm_policy: CsDmPolicy::Allowlist,
+            allow_from: vec!["100".to_string()],
+            ..CsAccess::default()
+        };
+
+        // The tapping user (999) is NOT allowed → the production loop drops
+        // the callback before ever calling validate_callback.
+        let tapping_user = 999i64;
+        let gate_pass =
+            channel_state::is_callback_allowed(&access, &tapping_user.to_string());
+        assert!(!gate_pass, "non-allowlisted user must NOT pass the callback gate");
+
+        // Prove the payload itself is valid: a VALID pending row exists, so
+        // validate_callback WOULD Route if the gate had let the tap through.
+        // Because the gate blocks, validate_callback is never reached in
+        // production → ZERO ChatBus publishes (the publish is reachable ONLY
+        // on a Route outcome AFTER the gate).
+        let conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+        seed_pending(&conn, "q7a", 111, "cli-1-id", &opts_abc(), 3600);
+
+        // Companion: an ALLOWLISTED tap of the same payload passes the gate
+        // AND Routes — confirming the qid:idx is genuinely valid and the
+        // zero-route above is solely the allowlist gate.
+        let allowed_user = 100i64;
+        assert!(
+            channel_state::is_callback_allowed(&access, &allowed_user.to_string()),
+            "allowlisted user must pass the callback gate"
+        );
+        let outcome = validate_callback(&conn, 111, "q7a:1").unwrap();
+        assert!(
+            outcome.routes(),
+            "the seeded payload is valid — only the gate blocks the non-allowlisted tap"
+        );
+    }
+
+    /// Unit coverage of the gate predicate itself: Disabled drops (matching
+    /// the message path's `gate_dm` Disabled→Drop arm), allow_from hit passes,
+    /// non-hit under Allowlist/Pairing drops.
+    #[test]
+    fn is_callback_allowed_mirrors_gate_dm_deliver_arm() {
+        use crate::daemon::channel_state::{
+            Access as CsAccess, DmPolicy as CsDmPolicy,
+        };
+        let mut a = CsAccess {
+            allow_from: vec!["42".to_string()],
+            ..CsAccess::default()
+        };
+
+        // Disabled → drop (message path drops Disabled DMs).
+        a.dm_policy = CsDmPolicy::Disabled;
+        assert!(!channel_state::is_callback_allowed(&a, "42"));
+
+        // Allowlist: hit passes, miss drops.
+        a.dm_policy = CsDmPolicy::Allowlist;
+        assert!(channel_state::is_callback_allowed(&a, "42"));
+        assert!(!channel_state::is_callback_allowed(&a, "7"));
+
+        // Pairing: hit passes (pending codes do NOT count), miss drops.
+        a.dm_policy = CsDmPolicy::Pairing;
+        assert!(channel_state::is_callback_allowed(&a, "42"));
+        assert!(!channel_state::is_callback_allowed(&a, "7"));
+    }
+
+    #[test]
+    fn callback_double_tap_second_is_unknown_no_route() {
+        // TC-TMC-14.2: same callback twice → first Routes, second finds no row
+        // → UnknownQuestion, ZERO further routing.
+        let conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+        seed_pending(&conn, "q7a", 111, "cli-1-id", &opts_abc(), 3600);
+
+        let first = validate_callback(&conn, 111, "q7a:0").unwrap();
+        assert!(first.routes());
+        let second = validate_callback(&conn, 111, "q7a:0").unwrap();
+        assert_eq!(second, CallbackOutcome::UnknownQuestion);
+        assert!(!second.routes());
+    }
+
+    #[test]
+    fn callback_dead_cli_drops_answer_and_consumes_row() {
+        // TC-TMC-14.3: requesting CLI not alive → DeadCli, no routing; row
+        // consumed so it doesn't re-trigger.
+        let conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        // NOTE: we DON'T seed the agent → is_alive("cli-1-id") == false.
+        seed_pending(&conn, "q7a", 111, "cli-1-id", &opts_abc(), 3600);
+        let outcome = validate_callback(&conn, 111, "q7a:0").unwrap();
+        assert_eq!(outcome, CallbackOutcome::DeadCli);
+        assert!(!outcome.routes());
+        assert_eq!(pending_count(&conn), 0);
+    }
+
+    #[test]
+    fn callback_two_concurrent_questions_only_target_consumed() {
+        // TC-TMC-14.4: two pending; tapping one leaves the other intact.
+        let conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+        seed_agent(&conn, "cli-2-id", "vera");
+        seed_pending(&conn, "q7a", 111, "cli-1-id", &opts_abc(), 3600);
+        seed_pending(&conn, "q8b", 222, "cli-2-id", &opts_abc(), 3600);
+
+        let outcome = validate_callback(&conn, 111, "q7a:0").unwrap();
+        match outcome {
+            CallbackOutcome::Route { requesting_agent_id, .. } => {
+                assert_eq!(requesting_agent_id, "cli-1-id");
+            }
+            other => panic!("expected Route, got {other:?}"),
+        }
+        // q8b untouched.
+        let still: Option<String> = conn
+            .query_row(
+                "SELECT question_id FROM pending_questions WHERE question_id='q8b'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(still.as_deref(), Some("q8b"));
+    }
+
+    // ---- F-1 durability: survives a daemon restart ----
+
+    #[test]
+    fn callback_resolves_after_simulated_restart() {
+        // F-1: insert a pending_questions row, simulate restart (FRESH chat.db
+        // open over the SAME file), tap → still resolves; row gone after.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("chat.db");
+
+        // "Pre-restart" connection — seed the durable row.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            chat::ensure_chat_db_schema(&conn).unwrap();
+            seed_agent(&conn, "cli-1-id", "mira");
+            seed_pending(&conn, "qdur", 111, "cli-1-id", &opts_abc(), 3600);
+            assert_eq!(pending_count(&conn), 1);
+        } // conn dropped — simulates process exit.
+
+        // "Post-restart" — brand new Connection over the same file.
+        let conn2 = Connection::open(&db_path).unwrap();
+        chat::ensure_chat_db_schema(&conn2).unwrap(); // idempotent re-apply at boot.
+        // is_alive needs the agent row to still be present — it is (durable).
+        let outcome = validate_callback(&conn2, 111, "qdur:2").unwrap();
+        match outcome {
+            CallbackOutcome::Route { ref label, index, .. } => {
+                assert_eq!(index, 2);
+                assert_eq!(label, "C");
+            }
+            other => panic!("expected Route after restart, got {other:?}"),
+        }
+        // Consumed.
+        assert_eq!(pending_count(&conn2), 0);
+    }
+
+    // ---- F-1 TTL: expired question evicted, no routing ----
+
+    #[test]
+    fn callback_expired_question_evicted_no_route() {
+        // F-1 TTL: a row whose expires_at is in the past → Expired, evicted,
+        // no routing.
+        let conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+        // ttl_secs negative → expires_at in the past.
+        seed_pending(&conn, "qold", 111, "cli-1-id", &opts_abc(), -10);
+        let outcome = validate_callback(&conn, 111, "qold:0").unwrap();
+        assert_eq!(outcome, CallbackOutcome::Expired);
+        assert!(!outcome.routes());
+        assert_eq!(pending_count(&conn), 0, "expired row evicted");
+    }
+
+    // ---- SECURITY S1-S4: forged callback_data → answer + ZERO routing ----
+
+    #[test]
+    fn security_s1_no_colon_rejected_no_route() {
+        // TC-TMC-S1: callback_data with no colon → Malformed, ZERO routing,
+        // does not even hit the DB lookup.
+        let conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+        seed_pending(&conn, "q7a", 111, "cli-1-id", &opts_abc(), 3600);
+        let outcome = validate_callback(&conn, 111, "INVALID_NO_COLON").unwrap();
+        assert_eq!(outcome, CallbackOutcome::Malformed);
+        assert!(!outcome.routes());
+        assert!(outcome.toast_text().is_some(), "malformed gets an error toast");
+        // Legitimate pending row untouched.
+        assert_eq!(pending_count(&conn), 1);
+    }
+
+    #[test]
+    fn security_s2_out_of_range_idx_rejected_no_route() {
+        // TC-TMC-S2: valid format but idx 999 out of range → OutOfRange, ZERO
+        // routing; the pending row is NOT consumed (DoS guard — a forged
+        // out-of-range tap must not evict a real question).
+        let conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+        seed_pending(&conn, "q7a", 111, "cli-1-id", &opts_abc(), 3600);
+        let outcome = validate_callback(&conn, 111, "q7a:999").unwrap();
+        assert_eq!(outcome, CallbackOutcome::OutOfRange);
+        assert!(!outcome.routes());
+        assert_eq!(pending_count(&conn), 1, "out-of-range tap must not evict the real question");
+    }
+
+    #[test]
+    fn security_s2b_nonnumeric_idx_rejected_no_route() {
+        // S2 variant: a non-numeric idx is also OutOfRange (no panic, no route).
+        let conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+        seed_pending(&conn, "q7a", 111, "cli-1-id", &opts_abc(), 3600);
+        let outcome = validate_callback(&conn, 111, "q7a:notanumber").unwrap();
+        assert_eq!(outcome, CallbackOutcome::OutOfRange);
+        assert!(!outcome.routes());
+    }
+
+    #[test]
+    fn security_s4_unknown_qid_rejected_no_route() {
+        // TC-TMC-S4: a qid not in the pending map (stale / forged) → no route.
+        let conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+        seed_pending(&conn, "q7a", 111, "cli-1-id", &opts_abc(), 3600);
+        let outcome = validate_callback(&conn, 111, "stale-qid:0").unwrap();
+        assert_eq!(outcome, CallbackOutcome::UnknownQuestion);
+        assert!(!outcome.routes());
+        // Real row untouched.
+        assert_eq!(pending_count(&conn), 1);
+    }
+
+    #[test]
+    fn security_forged_chat_id_does_not_resolve_other_chats_question() {
+        // SECURITY: a forged callback echoing chat A's qid but arriving with
+        // chat B's chat_id must NOT resolve (the lookup is scoped to
+        // (question_id, chat_id)). Prevents a group-chat member answering a
+        // DM question (defence-in-depth alongside F-4).
+        let conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        seed_agent(&conn, "cli-1-id", "mira");
+        seed_pending(&conn, "q7a", 111, "cli-1-id", &opts_abc(), 3600);
+        // Same qid, WRONG chat_id (222 instead of 111).
+        let outcome = validate_callback(&conn, 222, "q7a:0").unwrap();
+        assert_eq!(outcome, CallbackOutcome::UnknownQuestion);
+        assert!(!outcome.routes());
+        assert_eq!(pending_count(&conn), 1, "wrong-chat tap must not consume the real row");
+    }
+
+    // ---- answer frame shape (routing correlation) ----
+
+    #[test]
+    fn answer_frame_carries_target_agent_id_and_payload() {
+        let frame = build_chat_ask_answer_frame("telegram:111", "cli-1-id", "q7a", 1, "B");
+        assert_eq!(
+            frame.pointer("/params/meta/target_agent_id").and_then(|v| v.as_str()),
+            Some("cli-1-id")
+        );
+        assert_eq!(
+            frame.pointer("/params/meta/thread").and_then(|v| v.as_str()),
+            Some("telegram:111")
+        );
+        // content is a JSON string carrying the structured answer.
+        let content = frame.pointer("/params/content").and_then(|v| v.as_str()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(content).unwrap();
+        assert_eq!(parsed.get("type").and_then(|v| v.as_str()), Some("chat_ask_answer"));
+        assert_eq!(parsed.get("index").and_then(|v| v.as_i64()), Some(1));
+        assert_eq!(parsed.get("label").and_then(|v| v.as_str()), Some("B"));
+        assert_eq!(parsed.get("question_id").and_then(|v| v.as_str()), Some("q7a"));
+    }
+
+    // ---- Update struct decodes callback_query (allowed_updates plumbing) ----
+
+    #[test]
+    fn update_decodes_callback_query_minimal() {
+        // The hand-decoded Update must round-trip a callback_query from the
+        // Telegram wire JSON (so the production loop sees button taps).
+        let wire = json!({
+            "update_id": 99,
+            "callback_query": {
+                "id": "cq-xyz",
+                "data": "q7a:1",
+                "from": {"id": 5, "is_bot": false, "first_name": "Op"},
+                "message": {"message_id": 7, "chat": {"id": 111}}
+            }
+        });
+        let u: Update = serde_json::from_value(wire).unwrap();
+        let cq = u.callback_query.expect("callback_query decoded");
+        assert_eq!(cq.id, "cq-xyz");
+        assert_eq!(cq.data.as_deref(), Some("q7a:1"));
+        // The tapping user's id is decoded for the allowlist gate.
+        assert_eq!(cq.from.id, 5);
+        assert_eq!(cq.message.unwrap().chat.id, 111);
+        // message is None for a callback-only update.
+        assert!(u.message.is_none());
+    }
+
+    #[test]
+    fn callback_data_format_matches_security_regex() {
+        // The generated callback_data matches ^[^:]+:[0-9]+$ (the QA fixture
+        // regex) — qid has no colon, suffix is the decimal index.
+        let conn = Connection::open_in_memory().unwrap();
+        chat::ensure_chat_db_schema(&conn).unwrap();
+        let res = handle_chat_ask_inner(&conn, "telegram:1", "?", "cli-1-id", &opts_abc())
+            .unwrap()
+            .unwrap();
+        for (idx, (_l, cb)) in res.buttons.iter().enumerate() {
+            let (qid, suffix) = cb.split_once(':').expect("has colon");
+            assert!(!qid.is_empty() && !qid.contains(':'));
+            assert_eq!(suffix.parse::<usize>().unwrap(), idx);
+        }
     }
 }

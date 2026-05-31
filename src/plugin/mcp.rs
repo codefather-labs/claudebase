@@ -58,6 +58,11 @@ pub const TOOL_WHITELIST: &[&str] = &[
     "chat_subscribe",
     "chat_reply",
     "chat_list",
+    // telegram-multi-cli Slice 5 — chat_ask (inline-keyboard questionnaires).
+    // 3-surface parity: this whitelist entry + server.rs dispatch arm +
+    // build_tools_list_response descriptor MUST all carry "chat_ask" or the
+    // plugin SEC-7-gates the call to -32601 before the daemon sees it.
+    "chat_ask",
     // Slice 7.x — thread-discovery helper (parity with server.rs dispatch
     // case + tools/list descriptor); without this entry the plugin gates
     // on SEC-7 and returns -32601 BEFORE the daemon ever sees the call.

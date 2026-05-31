@@ -694,6 +694,18 @@ where
                     .await;
                     let _ = outbound_tx.send(resp);
                 }
+                "chat_ask" => {
+                    // telegram-multi-cli Slice 5 — render a plan-mode
+                    // questionnaire as Telegram inline buttons. Validates +
+                    // inserts the durable pending_questions row + enqueues the
+                    // keyboard send, then returns {"question_id": ...}
+                    // IMMEDIATELY (async ruling A). The ANSWER arrives later,
+                    // out-of-band, via the telegram callback_query path which
+                    // broadcasts to this CLI's thread with
+                    // meta.target_agent_id = the requesting agent.
+                    let resp = handle_chat_ask(echo_id, &args).await;
+                    let _ = outbound_tx.send(resp);
+                }
                 "chat_list" => {
                     let resp = handle_chat_list(echo_id, &args).await;
                     let _ = outbound_tx.send(resp);
@@ -800,6 +812,42 @@ fn build_tools_list_response(id: serde_json::Value) -> serde_json::Value {
                             "limit": {"type": ["integer", "null"]}
                         },
                         "required": ["thread"]
+                    }
+                },
+                {
+                    "name": "chat_ask",
+                    "description": "Ask a Telegram DM operator a multiple-choice question, rendered as inline-keyboard buttons. ASYNC: returns a question_id immediately; the operator's tapped answer arrives later as an out-of-band channel notification (content {type:'chat_ask_answer', question_id, index, label}) targeted at the asking agent. The pending question is durable (survives a daemon restart) with a 1-hour TTL — if no answer arrives before the TTL lapses the question expires and you must call chat_ask again. DM-ONLY in v1: thread must be a telegram:<chat_id> DM (positive chat_id); group chats (negative chat_id) are rejected. Provide at least 2 options.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "thread": {
+                                "type": "string",
+                                "description": "telegram:<chat_id> DM thread (positive chat_id only)"
+                            },
+                            "question": {
+                                "type": "string",
+                                "description": "The question text shown above the buttons"
+                            },
+                            "from": {
+                                "type": "string",
+                                "description": "The asking agent's agent_id — the answer is routed back to this agent; it must be an alive registered agent at tap time"
+                            },
+                            "options": {
+                                "type": "array",
+                                "minItems": 2,
+                                "maxItems": crate::daemon::telegram::MAX_CHAT_ASK_OPTIONS,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": {"type": "string"},
+                                        "description": {"type": ["string", "null"]}
+                                    },
+                                    "required": ["label"]
+                                },
+                                "description": "Between 2 and 10 answer options; each rendered as one inline button"
+                            }
+                        },
+                        "required": ["thread", "question", "options"]
                     }
                 },
                 {
@@ -1016,6 +1064,117 @@ async fn handle_chat_post(
         tool_text_response(id, &response_payload),
         Some((thread_id, notif)),
     )
+}
+
+/// telegram-multi-cli Slice 5 — handle the `chat_ask` MCP tool.
+///
+/// Renders a multiple-choice question as Telegram inline-keyboard buttons.
+/// The async ASK is decoupled from the answer (ruling A): this handler
+/// validates, inserts the durable `pending_questions` row, enqueues the
+/// `sendMessage` (with the inline keyboard), and returns `{"question_id": ...}`
+/// to the agent IMMEDIATELY. The operator's button tap arrives later as a
+/// `callback_query` update in the telegram long-poll loop, which broadcasts
+/// the chosen option to this CLI's thread (`meta.target_agent_id`).
+///
+/// SECURITY / F-4: the DM-only gate (chat_id < 0 → error, NO side-effects) and
+/// the callback_data ≤ 64-byte guard live in `telegram::handle_chat_ask_inner`,
+/// the pure synchronous core unit-tested directly. This async wrapper does the
+/// spawn_blocking DB write (durability BEFORE the Telegram send) + the outbound
+/// enqueue.
+async fn handle_chat_ask(
+    id: serde_json::Value,
+    args: &serde_json::Value,
+) -> serde_json::Value {
+    let thread = args
+        .get("thread")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let question = args
+        .get("question")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    // `from` carries the requesting CLI's agent_id (same convention as
+    // chat_post). It is the routing key the callback path uses to deliver the
+    // answer back (meta.target_agent_id), and the liveness key for SECURITY
+    // step 4 (is_alive). Default to "unknown" — a chat_ask whose `from` never
+    // becomes alive simply has its answer dropped at tap time (TC-TMC-14.3).
+    let from_agent = args
+        .get("from")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let options: Vec<serde_json::Value> = args
+        .get("options")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    if thread.is_empty() {
+        return tool_error_response(id, -32602, "thread is required");
+    }
+    if question.is_empty() {
+        return tool_error_response(id, -32602, "question is required");
+    }
+
+    // Validate + durable INSERT inside spawn_blocking (no Connection across an
+    // .await). handle_chat_ask_inner runs the F-4 gate + minItems + ≤64-byte
+    // checks and returns either the outcome (row already inserted) or a typed
+    // error — none of which touch Telegram.
+    let inner = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<std::result::Result<crate::daemon::telegram::ChatAskOutcome, crate::daemon::telegram::ChatAskError>> {
+            let conn = chat::open_chat_db()?;
+            crate::daemon::telegram::handle_chat_ask_inner(
+                &conn,
+                &thread,
+                &question,
+                &from_agent,
+                &options,
+            )
+        },
+    )
+    .await;
+
+    let outcome = match inner {
+        Ok(Ok(Ok(o))) => o,
+        Ok(Ok(Err(e))) => {
+            // Validation / gate rejection (TC-TMC-13.4/13.5, F-4 group-chat,
+            // TC-TMC-S3 oversized). NO Telegram message was sent and (for the
+            // gate cases) NO pending_questions row was written — the inner
+            // function returns BEFORE the INSERT on every error.
+            return tool_error_response(id, -32602, &e.message());
+        }
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "chat_ask inner failed");
+            return tool_error_response(id, -32603, "persist failed");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "chat_ask spawn_blocking panicked");
+            return tool_error_response(id, -32603, "internal error");
+        }
+    };
+
+    // Enqueue the outbound sendMessage with the inline keyboard. The row is
+    // already durable (inserted above) so even if the enqueue fails (telegram
+    // task not running) the answer-routing state survives — the operator just
+    // won't see buttons until a resend. We log but do not fail the MCP call.
+    if let Err(e) = crate::daemon::telegram::enqueue_outbound_tg_with_keyboard(
+        outcome.chat_id,
+        outcome.question_text.clone(),
+        outcome.buttons.clone(),
+    ) {
+        tracing::warn!(
+            chat_id = outcome.chat_id,
+            error = %e,
+            "chat_ask keyboard enqueue failed (pending_questions row still durable)"
+        );
+    }
+
+    // Async ruling A — return the question_id immediately; the answer arrives
+    // later via the callback_query path.
+    let payload = serde_json::json!({ "question_id": outcome.question_id });
+    tool_text_response(id, &payload)
 }
 
 /// Handle `chat_subscribe`. Spawns a forwarding task that pumps the

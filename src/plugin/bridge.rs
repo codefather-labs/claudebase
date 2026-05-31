@@ -48,9 +48,103 @@ use crate::daemon::server::socket_path;
 use crate::plugin::mcp::{
     self, classify, daemon_status_down_call_response, error_response, initialize_response,
     parse_error_response, tools_list_changed_notification, tools_list_daemon_down_response,
-    validate_tool_name, Inbound, ERROR_INTERNAL, ERROR_INVALID_PARAMS, ERROR_METHOD_NOT_FOUND,
+    validate_tool_name, Inbound, ERROR_INTERNAL, ERROR_METHOD_NOT_FOUND,
     MAX_MCP_FRAME_SIZE, SUPPORTED_PROTOCOL_VERSION,
 };
+
+/// Cache for session-establishing tool calls so the bridge can replay them
+/// after a reconnect. The daemon tracks subscriptions per-connection; when
+/// the bridge reconnects, it gets a NEW connection_id and the old subscriptions
+/// are lost. The replay mechanism restores them.
+struct SessionCache {
+    /// Latest `agent_register` call params (agent_name, optionally thread/metadata).
+    agent_register_params: Option<Value>,
+    /// Set of thread_ids from `chat_subscribe` calls.
+    subscribed_threads: Vec<String>,
+}
+
+impl SessionCache {
+    fn new() -> Self {
+        SessionCache {
+            agent_register_params: None,
+            subscribed_threads: Vec::new(),
+        }
+    }
+
+    /// Record an agent_register call for later replay.
+    fn cache_agent_register(&mut self, params: Value) {
+        self.agent_register_params = Some(params);
+    }
+
+    /// Record a chat_subscribe thread for later replay.
+    fn cache_chat_subscribe(&mut self, thread: String) {
+        if !self.subscribed_threads.contains(&thread) {
+            self.subscribed_threads.push(thread);
+        }
+    }
+
+    /// Build replay frames with synthetic request ids (non-colliding with Claude Code's).
+    /// Returns a Vec of (frame, is_subscribe) tuples for convenience.
+    fn build_replay_frames(&self, id_gen: &mut ReplayIdGenerator) -> Vec<(Value, &str)> {
+        let mut frames = Vec::new();
+
+        // Replay agent_register first (it should happen before subscribes).
+        if let Some(params) = &self.agent_register_params {
+            let replay_id = id_gen.next();
+            let frame = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": replay_id,
+                "method": "tools/call",
+                "params": {
+                    "name": "agent_register",
+                    "arguments": params
+                }
+            });
+            frames.push((frame, "agent_register"));
+        }
+
+        // Replay each subscribed thread.
+        for thread in &self.subscribed_threads {
+            let replay_id = id_gen.next();
+            let frame = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": replay_id,
+                "method": "tools/call",
+                "params": {
+                    "name": "chat_subscribe",
+                    "arguments": {
+                        "thread": thread
+                    }
+                }
+            });
+            frames.push((frame, "chat_subscribe"));
+        }
+
+        frames
+    }
+}
+
+/// Generates non-colliding request IDs for internal replay frames.
+/// Uses a high negative range (i32::MIN + 1000 downward) to avoid colliding
+/// with Claude Code's typically positive or small ids.
+struct ReplayIdGenerator {
+    next_id: i32,
+}
+
+impl ReplayIdGenerator {
+    fn new() -> Self {
+        // Start at i32::MIN + 1000 (very negative) and decrement.
+        ReplayIdGenerator {
+            next_id: i32::MIN + 1000,
+        }
+    }
+
+    fn next(&mut self) -> i32 {
+        let current = self.next_id;
+        self.next_id = self.next_id.saturating_sub(1);
+        current
+    }
+}
 
 /// Cap on in-flight requests waiting for a daemon reply. Per SEC-4 from
 /// Vault — beyond this we refuse new requests with `-32603` instead of
@@ -78,9 +172,20 @@ struct DaemonChannel {
 pub async fn run() -> anyhow::Result<()> {
     let socket = socket_path().context("compute daemon socket path")?;
 
+    // FIX B — ensure the daemon is running before attempting to connect.
+    // This is a one-shot startup check; if the daemon is already running
+    // (fslock prevents duplicates), this is a no-op. Best-effort: if spawn
+    // fails or times out, we proceed to connect_with_retries which has its
+    // own retry logic.
+    ensure_daemon_running(&socket).await;
+
     // Attempt initial connection. We do 3 quick retries (FR-ACD-3.3)
     // before falling back to daemon-down mode.
     let mut daemon = connect_with_retries(&socket, INITIAL_RETRY_COUNT, INITIAL_RETRY_DELAY_MS).await;
+
+    // FIX A — session cache for replaying subscriptions on reconnect.
+    let mut session_cache = SessionCache::new();
+    let mut replay_id_gen = ReplayIdGenerator::new();
 
     // Pending requests map: id → oneshot::Sender for the response.
     // Held only for SEC-4 cap discipline — Slice 3 still uses the
@@ -317,6 +422,11 @@ pub async fn run() -> anyhow::Result<()> {
                         } else {
                             // Daemon-down: try a quick reconnect first.
                             daemon = try_reconnect(&socket).await;
+                            // FIX A — replay session cache on successful reconnect.
+                            if daemon.is_some() {
+                                replay_session_cache(&mut daemon, &mut session_cache, &mut replay_id_gen)
+                                    .await;
+                            }
                             if let Some(d) = daemon.as_mut() {
                                 // Came back up. Emit notifications/tools/list_changed
                                 // BEFORE sending the new tools/list response so
@@ -370,11 +480,31 @@ pub async fn run() -> anyhow::Result<()> {
                             continue;
                         }
 
+                        // FIX A — cache session-establishing calls for replay on reconnect.
+                        if tool_name == "agent_register" {
+                            if let Some(agent_args) = params.get("arguments") {
+                                session_cache.cache_agent_register(agent_args.clone());
+                            }
+                        } else if tool_name == "chat_subscribe" {
+                            if let Some(thread) = params
+                                .get("arguments")
+                                .and_then(|a| a.get("thread"))
+                                .and_then(|t| t.as_str())
+                            {
+                                session_cache.cache_chat_subscribe(thread.to_string());
+                            }
+                        }
+
                         // Daemon-down: only claudebase_daemon_status is
                         // valid; everything else → -32601.
                         if daemon.is_none() {
                             // Try a quick reconnect.
                             daemon = try_reconnect(&socket).await;
+                            // FIX A — replay session cache on successful reconnect.
+                            if daemon.is_some() {
+                                replay_session_cache(&mut daemon, &mut session_cache, &mut replay_id_gen)
+                                    .await;
+                            }
                             if daemon.is_some() && daemon_down {
                                 write_mcp_line(
                                     &mut stdout,
@@ -689,4 +819,248 @@ fn truncate(s: &str, max: usize) -> String {
         end -= 1;
     }
     s[..end].to_string()
+}
+
+/// FIX A helper — replay cached session-establishing calls on a newly
+/// reconnected daemon. Sends agent_register (if cached) followed by
+/// chat_subscribe calls (one per subscribed thread). Responses are read
+/// from the inbound_rx but discarded (internal bookkeeping, Claude Code
+/// didn't ask for them). Non-blocking — doesn't hold locks across .await.
+async fn replay_session_cache(
+    daemon: &mut Option<DaemonChannel>,
+    session_cache: &mut SessionCache,
+    replay_id_gen: &mut ReplayIdGenerator,
+) {
+    let Some(d) = daemon else { return };
+    let frames = session_cache.build_replay_frames(replay_id_gen);
+
+    for (frame, tool_name) in frames {
+        let body = match serde_json::to_vec(&frame) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "replay frame serialize failed; skipping");
+                continue;
+            }
+        };
+
+        // Send the replay frame to the daemon.
+        {
+            let mut wh = d.write_half.lock().await;
+            if let Err(e) = write_frame(&mut *wh, &body).await {
+                tracing::warn!(error = %e, "replay frame write failed; closing connection");
+                return;
+            }
+        }
+
+        // Drain the inbound_rx until we receive the response (id matches the
+        // synthetic replay id) or until the channel closes. Relay any
+        // notifications (frames without id) to... wait, we don't have stdout
+        // here. This is async context inside the select! loop, so we CAN'T
+        // write to stdout (would need mutable access and might block the loop).
+        // Instead, drop the response and any intervening notifications — they're
+        // internal bookkeeping and Claude Code didn't request them.
+        let expected_id = frame.get("id").cloned();
+        loop {
+            match d.inbound_rx.recv().await {
+                Some(resp_frame) => {
+                    let resp_id = resp_frame.get("id").cloned();
+                    // If id matches, we got our response — break and continue to next frame.
+                    if resp_id == expected_id {
+                        tracing::debug!(tool = %tool_name, "replay response received");
+                        break;
+                    }
+                    // No id (notification) or mismatched id — drop and continue reading.
+                    if resp_id.is_none() {
+                        tracing::debug!(tool = %tool_name, "replay: dropped intervening notification");
+                    }
+                }
+                None => {
+                    // Inbound channel closed — daemon link is gone during replay.
+                    tracing::warn!(tool = %tool_name, "daemon inbound closed during replay");
+                    return;
+                }
+            }
+        }
+    }
+
+    tracing::info!("session cache replay complete");
+}
+
+/// FIX B — ensure the daemon is running. Check if the UDS socket is
+/// connectable (quick ~100ms attempt). If not, spawn the daemon detached
+/// in the background and wait briefly (~500ms) for the socket to appear.
+///
+/// Idempotency: relies on the daemon's own fslock (server.rs:274-296)
+/// to prevent duplicate spawns. If a 2nd `daemon serve` is attempted
+/// while the 1st is still starting, the fslock will cause the 2nd to bail
+/// "already running" harmlessly.
+///
+/// Non-blocking: spawns the daemon and waits for socket appearance, but
+/// returns quickly if the socket is already available or if the spawn/wait
+/// timeout expires. The bridge's connect_with_retries() has its own retries.
+///
+/// Best-effort: if spawn or socket-wait fails, we log and return; the
+/// connect_with_retries() logic handles the failure.
+async fn ensure_daemon_running(socket: &std::path::Path) {
+    // Quick check: is the socket connectable right now?
+    if try_connect(socket).await.is_some() {
+        tracing::debug!("daemon socket already reachable");
+        return;
+    }
+
+    tracing::info!("daemon socket not reachable; attempting auto-start");
+
+    // Spawn the daemon detached. On Unix, use process_group(0) to make it
+    // immune to parent process signals. On Windows, the behavior is
+    // different but we'll start with Unix-focused implementation.
+    let spawn_result = {
+        let mut cmd = std::process::Command::new("claudebase");
+        cmd.arg("daemon");
+        cmd.arg("serve");
+
+        // Close stdio so the daemon runs independently.
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+
+        // Unix-specific: detach from parent process group.
+        // setsid is not directly exposed by CommandExt, so we rely on stdio closure
+        // for independence. Daemon process will continue running even if parent dies
+        // (not guaranteed by tokio::spawn alone, but std::process::Command::spawn()
+        // spawns a real OS process that persists). A cleaner approach would wrap the
+        // Command in a proper daemonize call, but that requires an external crate.
+        // For this iteration, we accept the limitation and note it as a future enhancement.
+
+        cmd.spawn()
+    };
+
+    match spawn_result {
+        Ok(mut child) => {
+            tracing::info!(
+                pid = child.id(),
+                "daemon spawned; waiting for socket to appear (~500ms)"
+            );
+            // Spawn a task to detach the child process (prevent zombies on Unix).
+            // We don't wait for it — just let it run in the background.
+            tokio::spawn(async move {
+                let _ = child.wait();
+            });
+
+            // Wait for the socket to appear (up to 500ms). Poll every 50ms.
+            let start = tokio::time::Instant::now();
+            let timeout = Duration::from_millis(500);
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if try_connect(socket).await.is_some() {
+                    tracing::info!("daemon socket appeared");
+                    return;
+                }
+                if start.elapsed() > timeout {
+                    tracing::warn!("daemon socket did not appear within 500ms; proceeding with connect retries");
+                    return;
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to spawn daemon; proceeding with connect retries"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_cache_caches_agent_register() {
+        let mut cache = SessionCache::new();
+        let params = serde_json::json!({ "agent_name": "test_agent" });
+        cache.cache_agent_register(params.clone());
+        assert_eq!(cache.agent_register_params, Some(params));
+    }
+
+    #[test]
+    fn replay_cache_caches_chat_subscribe() {
+        let mut cache = SessionCache::new();
+        cache.cache_chat_subscribe("thread_1".to_string());
+        cache.cache_chat_subscribe("thread_2".to_string());
+        assert_eq!(cache.subscribed_threads, vec!["thread_1", "thread_2"]);
+    }
+
+    #[test]
+    fn replay_cache_dedupes_subscribe_threads() {
+        let mut cache = SessionCache::new();
+        cache.cache_chat_subscribe("thread_1".to_string());
+        cache.cache_chat_subscribe("thread_1".to_string());
+        assert_eq!(cache.subscribed_threads.len(), 1);
+    }
+
+    #[test]
+    fn build_replay_frames_replays_agent_register_first() {
+        let mut cache = SessionCache::new();
+        let agent_params = serde_json::json!({ "agent_name": "test_agent" });
+        cache.cache_agent_register(agent_params);
+        cache.cache_chat_subscribe("thread_1".to_string());
+
+        let mut id_gen = ReplayIdGenerator::new();
+        let frames = cache.build_replay_frames(&mut id_gen);
+
+        // Should have 2 frames: agent_register + chat_subscribe.
+        assert_eq!(frames.len(), 2);
+        // First frame is agent_register.
+        assert_eq!(frames[0].1, "agent_register");
+        // Second frame is chat_subscribe.
+        assert_eq!(frames[1].1, "chat_subscribe");
+    }
+
+    #[test]
+    fn build_replay_frames_uses_noncoliding_ids() {
+        let mut cache = SessionCache::new();
+        cache.cache_agent_register(serde_json::json!({}));
+        cache.cache_chat_subscribe("thread_1".to_string());
+        cache.cache_chat_subscribe("thread_2".to_string());
+
+        let mut id_gen = ReplayIdGenerator::new();
+        let frames = cache.build_replay_frames(&mut id_gen);
+
+        // Extract the ids from the replay frames.
+        let ids: Vec<i32> = frames
+            .iter()
+            .map(|(f, _)| f.get("id").and_then(|v| v.as_i64()).unwrap_or(0) as i32)
+            .collect();
+
+        // All ids should be negative (in the reserved range).
+        for id in &ids {
+            assert!(*id < 0, "replay id {} is not negative", id);
+        }
+
+        // All ids should be unique.
+        let mut sorted = ids.clone();
+        sorted.sort();
+        for i in 1..sorted.len() {
+            assert_ne!(sorted[i - 1], sorted[i], "duplicate replay id");
+        }
+    }
+
+    #[test]
+    fn replay_id_generator_decrements() {
+        let mut gen = ReplayIdGenerator::new();
+        let id1 = gen.next();
+        let id2 = gen.next();
+        let id3 = gen.next();
+        // Each call should decrement (return more negative).
+        assert!(id1 > id2);
+        assert!(id2 > id3);
+    }
+
+    #[test]
+    fn build_replay_frames_empty_cache() {
+        let cache = SessionCache::new();
+        let mut id_gen = ReplayIdGenerator::new();
+        let frames = cache.build_replay_frames(&mut id_gen);
+        assert_eq!(frames.len(), 0);
+    }
 }

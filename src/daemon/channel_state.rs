@@ -477,6 +477,167 @@ pub fn load_bot_token_from_env(path: &Path) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// Outcome of the legacy access.json (File A) → canonical access.json (File B)
+/// migration. Returned by `migrate_from_legacy_access()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationOutcome {
+    /// Migration succeeded: File A was read and merged into File B.
+    Migrated,
+    /// No File A present — already migrated or fresh install.
+    NoOpAbsent,
+    /// File A is malformed JSON — skipped for manual inspection, File A NOT
+    /// renamed, File B unchanged.
+    SkippedMalformed,
+    /// File A already renamed to .migrated — idempotent, File B unchanged.
+    NoOpAlreadyMigrated,
+}
+
+impl std::fmt::Display for MigrationOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MigrationOutcome::Migrated => write!(f, "migrated"),
+            MigrationOutcome::NoOpAbsent => write!(f, "no-op (file absent)"),
+            MigrationOutcome::SkippedMalformed => write!(f, "skipped (malformed JSON)"),
+            MigrationOutcome::NoOpAlreadyMigrated => write!(f, "no-op (already migrated)"),
+        }
+    }
+}
+
+/// Migrate legacy access.json (File A at `~/.config/claudebase/access.json`)
+/// to the canonical channel state file (File B at `~/.claude/channels/claudebase/access.json`).
+///
+/// **Behavior:**
+/// 1. If File A.migrated exists → return `Ok(NoOpAlreadyMigrated)` (idempotent, check first).
+/// 2. If File A does not exist → return `Ok(NoOpAbsent)`.
+/// 3. Parse File A leniently as `serde_json::Value` (NOT a typed struct —
+///    the old permissions schema is gone). Handle `allowFrom` both as numeric
+///    (i64) and string forms, stringify numerics, skip malformed entries with
+///    a warn.
+/// 4. If File A cannot be parsed → log a WARN, return `Ok(SkippedMalformed)`,
+///    do NOT rename File A (leave it for operator inspection).
+/// 5. Load File B via `load_access()` (defaults to empty if absent).
+/// 6. **UNION allow_from (dedupe):** For each ID in File A's allowFrom:
+///    stringify numerics, add to File B's allow_from ONLY if not already present.
+/// 7. **Policy merge (no downgrade):** If File B has a non-default dm_policy,
+///    keep it; else take File A's dm_policy if non-default. Never downgrade
+///    from a stricter policy.
+/// 8. **Prune expired pending:** Drop any pending entries from File B that have
+///    expired (expires_at <= now). Do NOT migrate File A's pending (incompatible
+///    code format; new codes will be issued).
+/// 9. Save File B atomically.
+/// 10. Rename File A → `File A.migrated` (idempotent marker for future runs).
+/// 11. Return `Ok(Migrated)` with count of merged IDs.
+///
+/// **Returns** `Ok(outcome)` on success (migration ran, skipped, or no-op).
+/// Returns `Err(...)` only on unrecoverable I/O errors (save failed, rename failed).
+/// The daemon MUST still start on any error (fail-open to daemon-functional,
+/// fail-closed to access-unchanged — never fail-open-to-widened).
+pub fn migrate_from_legacy_access(legacy_path: &Path, canonical_path: &Path) -> Result<MigrationOutcome> {
+    // Step 1: Check if File A.migrated already exists (idempotent marker).
+    // This check FIRST, before checking File A existence, so second runs
+    // correctly return NoOpAlreadyMigrated even though File A no longer exists.
+    let migrated_marker = legacy_path.with_extension("json.migrated");
+    if migrated_marker.exists() {
+        return Ok(MigrationOutcome::NoOpAlreadyMigrated);
+    }
+
+    // Step 2: Check if File A exists.
+    if !legacy_path.exists() {
+        return Ok(MigrationOutcome::NoOpAbsent);
+    }
+
+    // Step 3: Parse File A leniently as serde_json::Value.
+    let legacy_body = match fs::read_to_string(legacy_path) {
+        Ok(body) => body,
+        Err(e) => {
+            return Err(anyhow!(
+                "failed to read legacy access.json at {}: {e}",
+                legacy_path.display()
+            ));
+        }
+    };
+
+    let legacy_json: serde_json::Value = match serde_json::from_str(&legacy_body) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                path = %legacy_path.display(),
+                error = %e,
+                "legacy access.json is malformed JSON; skipping migration (file left intact for inspection)"
+            );
+            return Ok(MigrationOutcome::SkippedMalformed);
+        }
+    };
+
+    // Step 4: Load File B (canonical). Defaults to empty Access if absent.
+    let mut canonical = load_access(canonical_path)?;
+
+    // Step 5: Extract allowFrom from File A and stringify.
+    let mut merged_count = 0;
+    if let Some(allow_from_val) = legacy_json.get("allowFrom") {
+        if let Some(allow_from_arr) = allow_from_val.as_array() {
+            for v in allow_from_arr.iter() {
+                let id_str = if let Some(n) = v.as_i64() {
+                    n.to_string()
+                } else if let Some(s) = v.as_str() {
+                    s.to_string()
+                } else {
+                    tracing::warn!(
+                        value = %v,
+                        "allowFrom entry is neither number nor string; skipping"
+                    );
+                    continue;
+                };
+
+                // Dedupe: only add if not already present.
+                if !canonical.allow_from.contains(&id_str) {
+                    canonical.allow_from.push(id_str);
+                    merged_count += 1;
+                }
+            }
+        }
+    }
+
+    // Step 6: dm_policy is INTENTIONALLY NOT migrated (security-auditor MAJOR,
+    // Slice 4). `gate_dm` checks `dm_policy == Disabled` BEFORE the allow_from
+    // membership check (channel_state gate_dm), so a Disabled policy drops ALL
+    // DMs — including from allowlisted ids. Adopting File A's policy on an
+    // unattended boot could therefore silently lock the operator out of the
+    // very channel this migration just granted them access to. We migrate
+    // GRANTS (allow_from) only; File B's existing dm_policy is preserved
+    // untouched. An operator who wants File A's policy re-sets it in-band
+    // (non-destructive, and recoverable — unlike a boot-time lockout).
+
+    // Step 7: Prune expired pending from File B.
+    let now = now_ms();
+    let _ = prune_expired(&mut canonical, now);
+
+    // Step 8: Save File B atomically.
+    save_access(canonical_path, &canonical).with_context(|| {
+        format!(
+            "failed to save canonical access.json at {} during migration",
+            canonical_path.display()
+        )
+    })?;
+
+    // Step 9: Rename File A → File A.migrated (idempotent marker).
+    fs::rename(legacy_path, &migrated_marker).with_context(|| {
+        format!(
+            "failed to rename legacy access.json to .migrated at {}",
+            legacy_path.display()
+        )
+    })?;
+
+    tracing::info!(
+        migrated_ids = merged_count,
+        legacy_path = %legacy_path.display(),
+        canonical_path = %canonical_path.display(),
+        "legacy access.json migrated to canonical channel state file"
+    );
+
+    Ok(MigrationOutcome::Migrated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

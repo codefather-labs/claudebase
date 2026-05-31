@@ -299,6 +299,31 @@ pub async fn serve(_args: &DaemonServeArgs) -> anyhow::Result<()> {
     // Reap-on-boot stub (Slice 1a — no-op until Slice 5 adds agent_registry).
     reap_on_boot_stub()?;
 
+    // Slice 4 — Migrate legacy access.json (File A at ~/.config/claudebase/access.json)
+    // to the canonical channel state file (File B at ~/.claude/channels/claudebase/access.json).
+    // This is a one-shot migration for operators with existing grants in the old location.
+    // Non-fatal: migration errors are logged as warnings; the daemon starts regardless
+    // (fail-open to daemon-functional, fail-closed to access-unchanged).
+    let legacy_access_path = config::user_level_config_dir().join("access.json");
+    match channel_state::migrate_from_legacy_access(&legacy_access_path, &channel_state::access_json_path()) {
+        Ok(outcome) => {
+            if outcome != channel_state::MigrationOutcome::NoOpAbsent && outcome != channel_state::MigrationOutcome::NoOpAlreadyMigrated {
+                tracing::info!(
+                    outcome = %outcome,
+                    legacy_path = %legacy_access_path.display(),
+                    canonical_path = %channel_state::access_json_path().display(),
+                    "access.json migration complete"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "access.json migration failed (non-fatal); daemon continuing with current access.json state"
+            );
+        }
+    }
+
     // Best-effort: remove any stale socket file before bind. The
     // interprocess crate does NOT auto-unlink on Unix when the previous
     // process exited uncleanly (SIGKILL leaves the file). Ignore errors —

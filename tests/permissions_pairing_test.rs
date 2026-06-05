@@ -20,28 +20,24 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Helper to create a valid access.json (File B: ~/.claude/channels/claudebase/access.json)
-/// with channel_state schema (string ids, new pending format)
+/// Helper to create a valid access.json
 fn create_access_json(
     tempdir: &Path,
     dm_policy: &str,
-    allow_from: Vec<&str>,
-    pending: Option<(String, &str, u64)>,
+    allow_from: Vec<u64>,
+    pending: Option<(String, u64, u64)>,
 ) -> Result<()> {
-    let channels_dir = tempdir.join(".claude").join("channels").join("claudebase");
-    fs::create_dir_all(&channels_dir)?;
+    let config_dir = tempdir.join(".config").join("claudebase");
+    fs::create_dir_all(&config_dir)?;
 
     let mut pending_map = serde_json::Map::new();
 
-    if let Some((code, sender_id, expires_at)) = pending {
+    if let Some((code, user_id, expires_at)) = pending {
         pending_map.insert(
             code,
             json!({
-                "senderId": sender_id,
-                "chatId": sender_id,
-                "createdAt": current_time_ms(),
-                "expiresAt": expires_at,
-                "replies": 1
+                "telegram_user_id": user_id,
+                "expires_at": expires_at
             }),
         );
     }
@@ -50,11 +46,10 @@ fn create_access_json(
         "dmPolicy": dm_policy,
         "allowFrom": allow_from,
         "groups": {},
-        "pending": pending_map,
-        "mentionPatterns": []
+        "pending": pending_map
     });
 
-    let access_path = channels_dir.join("access.json");
+    let access_path = config_dir.join("access.json");
     fs::write(&access_path, serde_json::to_string_pretty(&access_data)?)?;
 
     Ok(())
@@ -68,9 +63,9 @@ fn current_time_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Helper to read access.json and parse it (File B: ~/.claude/channels/claudebase/access.json)
+/// Helper to read access.json and parse it
 fn read_access_json(tempdir: &Path) -> Result<serde_json::Value> {
-    let access_path = tempdir.join(".claude").join("channels").join("claudebase").join("access.json");
+    let access_path = tempdir.join(".config").join("claudebase").join("access.json");
     let content = fs::read_to_string(&access_path)?;
     Ok(serde_json::from_str(&content)?)
 }
@@ -85,12 +80,12 @@ fn test_access_pair_valid_code_succeeds() -> Result<()> {
     let now_ms = current_time_ms();
     let expires_at = now_ms + 3_600_000; // 1 hour from now
 
-    // Setup: pairing code abc123 for user "1001", expiry in future
-    create_access_json(home_dir, "pairing", vec![], Some(("abc123".to_string(), "1001", expires_at)))?;
+    // Setup: pairing code ABC123 for user 1001, expiry in future
+    create_access_json(home_dir, "pairing", vec![], Some(("ABC123".to_string(), 1001, expires_at)))?;
 
-    // Run: claudebase daemon access pair abc123
+    // Run: claudebase daemon access pair ABC123
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_claudebase"));
-    cmd.args(["daemon", "access", "pair", "abc123"]);
+    cmd.args(["daemon", "access", "pair", "ABC123"]);
     cmd.env("HOME", home_dir);
 
     #[cfg(unix)]
@@ -103,29 +98,29 @@ fn test_access_pair_valid_code_succeeds() -> Result<()> {
 
     if !output.status.success() {
         bail!(
-            "access pair abc123 failed: {}",
+            "access pair ABC123 failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
 
-    // Verify: access.json now has "1001" in allowFrom
+    // Verify: access.json now has 1001 in allowFrom
     let access_json = read_access_json(home_dir)?;
 
     let allow_from = access_json["allowFrom"]
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("allowFrom is not an array"))?;
 
-    if !allow_from.iter().any(|v| v.as_str() == Some("1001")) {
-        bail!("user \"1001\" not found in allowFrom after pairing");
+    if !allow_from.iter().any(|v| v.as_u64() == Some(1001)) {
+        bail!("user 1001 not found in allowFrom after pairing");
     }
 
-    // Verify: pending code abc123 is removed
+    // Verify: pending code ABC123 is removed
     let pending = access_json["pending"]
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("pending is not an object"))?;
 
-    if pending.contains_key("abc123") {
-        bail!("pairing code abc123 still present in pending after pair success");
+    if pending.contains_key("ABC123") {
+        bail!("pairing code ABC123 still present in pending after pair success");
     }
 
     Ok(())
@@ -141,17 +136,17 @@ fn test_access_pair_expired_code_rejected() -> Result<()> {
     let now_ms = current_time_ms();
     let expires_at = now_ms - 1_000; // Expired 1 second ago
 
-    // Setup: pairing code aabbcc that expired (valid lowercase hex)
+    // Setup: pairing code EXP123 that expired
     create_access_json(
         home_dir,
         "pairing",
         vec![],
-        Some(("aabbcc".to_string(), "2002", expires_at)),
+        Some(("EXP123".to_string(), 2002, expires_at)),
     )?;
 
-    // Run: claudebase daemon access pair aabbcc
+    // Run: claudebase daemon access pair EXP123
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_claudebase"));
-    cmd.args(["daemon", "access", "pair", "aabbcc"]);
+    cmd.args(["daemon", "access", "pair", "EXP123"]);
     cmd.env("HOME", home_dir);
 
     #[cfg(unix)]
@@ -163,7 +158,7 @@ fn test_access_pair_expired_code_rejected() -> Result<()> {
     let output = cmd.output()?;
 
     if output.status.success() {
-        bail!("access pair exp789 succeeded — expected failure for expired code");
+        bail!("access pair EXP123 succeeded — expected failure for expired code");
     }
 
     let stderr = String::from_utf8(output.stderr)?;
@@ -186,17 +181,17 @@ fn test_access_pair_unknown_code_rejected() -> Result<()> {
     let now_ms = current_time_ms();
     let expires_at = now_ms + 3_600_000;
 
-    // Setup: only code abc123 exists
+    // Setup: only code ABC123 exists
     create_access_json(
         home_dir,
         "pairing",
         vec![],
-        Some(("abc123".to_string(), "1001", expires_at)),
+        Some(("ABC123".to_string(), 1001, expires_at)),
     )?;
 
-    // Run: attempt to pair with xxxxxx (unknown code)
+    // Run: attempt to pair with XXXXXXXX (unknown code)
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_claudebase"));
-    cmd.args(["daemon", "access", "pair", "xxxxxx"]);
+    cmd.args(["daemon", "access", "pair", "XXXXXXXX"]);
     cmd.env("HOME", home_dir);
 
     #[cfg(unix)]
@@ -208,7 +203,7 @@ fn test_access_pair_unknown_code_rejected() -> Result<()> {
     let output = cmd.output()?;
 
     if output.status.success() {
-        bail!("access pair xxxxxx succeeded — expected failure for unknown code");
+        bail!("access pair XXXXXXXX succeeded — expected failure for unknown code");
     }
 
     let stderr = String::from_utf8(output.stderr)?;
@@ -233,7 +228,7 @@ fn test_access_list_displays_users() -> Result<()> {
     let home_dir = tmpdir.path();
 
     // Setup: two users in allowFrom
-    create_access_json(home_dir, "pairing", vec!["1001", "2002"], None)?;
+    create_access_json(home_dir, "pairing", vec![1001, 2002], None)?;
 
     // Run: claudebase daemon access list
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_claudebase"));
@@ -271,7 +266,7 @@ fn test_policy_allowlist_configured() -> Result<()> {
     let home_dir = tmpdir.path();
 
     // Setup: dmPolicy = "allowlist" with one authorized user
-    create_access_json(home_dir, "allowlist", vec!["1001"], None)?;
+    create_access_json(home_dir, "allowlist", vec![1001], None)?;
 
     let access_json = read_access_json(home_dir)?;
 
@@ -312,15 +307,15 @@ fn test_duplicate_pairing_code_resent() -> Result<()> {
     let now_ms = current_time_ms();
     let expires_at = now_ms + 3_600_000;
 
-    // Setup: user "1001" has pending code abc123
+    // Setup: user 1001 has pending code ABC123
     create_access_json(
         home_dir,
         "pairing",
         vec![],
-        Some(("abc123".to_string(), "1001", expires_at)),
+        Some(("ABC123".to_string(), 1001, expires_at)),
     )?;
 
-    // In a real scenario, bot would resend abc123, not generate a new code
+    // In a real scenario, bot would resend ABC123, not generate a new code
     // This test verifies the access.json structure supports this
 
     let access_json = read_access_json(home_dir)?;
@@ -328,8 +323,8 @@ fn test_duplicate_pairing_code_resent() -> Result<()> {
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("pending is not an object"))?;
 
-    if !pending.contains_key("abc123") {
-        bail!("pending code abc123 not found");
+    if !pending.contains_key("ABC123") {
+        bail!("pending code ABC123 not found");
     }
 
     if pending.len() != 1 {
@@ -349,29 +344,23 @@ fn test_multiple_pending_codes() -> Result<()> {
     let now_ms = current_time_ms();
     let expires_at = now_ms + 3_600_000;
 
-    let channels_dir = home_dir.join(".claude").join("channels").join("claudebase");
-    fs::create_dir_all(&channels_dir)?;
+    let config_dir = home_dir.join(".config").join("claudebase");
+    fs::create_dir_all(&config_dir)?;
 
     // Create access.json with two pending codes
     let mut pending_map = serde_json::Map::new();
     pending_map.insert(
-        "abc123".to_string(),
+        "ABC123".to_string(),
         json!({
-            "senderId": "1001",
-            "chatId": "1001",
-            "createdAt": now_ms,
-            "expiresAt": expires_at,
-            "replies": 1
+            "telegram_user_id": 1001,
+            "expires_at": expires_at
         }),
     );
     pending_map.insert(
-        "xyz789".to_string(),
+        "XYZ789".to_string(),
         json!({
-            "senderId": "2002",
-            "chatId": "2002",
-            "createdAt": now_ms,
-            "expiresAt": expires_at,
-            "replies": 1
+            "telegram_user_id": 2002,
+            "expires_at": expires_at
         }),
     );
 
@@ -379,11 +368,10 @@ fn test_multiple_pending_codes() -> Result<()> {
         "dmPolicy": "pairing",
         "allowFrom": [],
         "groups": {},
-        "pending": pending_map,
-        "mentionPatterns": []
+        "pending": pending_map
     });
 
-    let access_path = channels_dir.join("access.json");
+    let access_path = config_dir.join("access.json");
     fs::write(&access_path, serde_json::to_string_pretty(&access_data)?)?;
 
     // Verify we can read both codes
@@ -416,7 +404,7 @@ fn test_pairing_code_ttl_one_hour() -> Result<()> {
         home_dir,
         "pairing",
         vec![],
-        Some(("ttltest".to_string(), "1001", expires_at)),
+        Some(("TTL_TEST".to_string(), 1001, expires_at)),
     )?;
 
     let access_json = read_access_json(home_dir)?;
@@ -425,12 +413,12 @@ fn test_pairing_code_ttl_one_hour() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("pending is not an object"))?;
 
     let entry = pending
-        .get("ttltest")
+        .get("TTL_TEST")
         .ok_or_else(|| anyhow::anyhow!("code not found"))?;
 
-    let expires_at_val = entry["expiresAt"]
+    let expires_at_val = entry["expires_at"]
         .as_u64()
-        .ok_or_else(|| anyhow::anyhow!("expiresAt not a number"))?;
+        .ok_or_else(|| anyhow::anyhow!("expires_at not a number"))?;
 
     // Verify the expiry is within 1 second of (now + 1 hour)
     let delta = (expires_at_val as i64 - expires_at as i64).abs();
@@ -452,13 +440,13 @@ fn test_access_json_atomic_write() -> Result<()> {
     let tmpdir = tempfile::tempdir()?;
     let home_dir = tmpdir.path();
 
-    let channels_dir = home_dir.join(".claude").join("channels").join("claudebase");
-    fs::create_dir_all(&channels_dir)?;
+    let config_dir = home_dir.join(".config").join("claudebase");
+    fs::create_dir_all(&config_dir)?;
 
     // Create initial access.json
     create_access_json(home_dir, "pairing", vec![], None)?;
 
-    let access_path = channels_dir.join("access.json");
+    let access_path = config_dir.join("access.json");
 
     // Verify file exists
     if !access_path.exists() {

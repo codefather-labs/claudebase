@@ -1,0 +1,3 @@
+{"timestamp":"2026-06-02T20:39:49.564660Z","level":"INFO","fields":{"message":"claudebase daemon listening","socket":"\\\\.\\pipe\\claudebase-daemon","pid":26012},"target":"claudebase::daemon::server"}
+{"timestamp":"2026-06-02T20:39:49.564882Z","level":"INFO","fields":{"message":"telegram long-poll spawned"},"target":"claudebase::daemon::server"}
+{"timestamp":"2026-06-02T20:39:49.565144Z","level":"INFO","fields":{"message":"telegram long-poll starting","chat_db":"C:\\Users\\madwh\\.claude\\knowledge\\chat.db"},"target":"claudebase::daemon::telegram"}

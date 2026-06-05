@@ -28,39 +28,9 @@ $ErrorActionPreference = 'Stop'
 # ============================================================================
 # Constants
 # ============================================================================
+$Script:ClaudebaseVersion       = '0.7.0'
 $Script:ClaudebasePdfiumVersion = 'chromium/7802'
 $Script:RepoUrl                 = 'https://github.com/codefather-labs/claudebase.git'
-
-# Fallback used only when the remote tag lookup below fails (air-gapped,
-# GitHub unreachable). NOT authoritative — the actual version installed
-# is whatever Get-ClaudebaseVersion resolves at runtime. Bump on each
-# release as a courtesy for cold-start installs without network.
-$Script:ClaudebaseFallbackVersion = '0.8.0'
-
-# Authoritative version resolution (v0.7.1+) — mirrors install.sh.
-# Priority: 1) env override $env:CLAUDEBASE_VERSION; 2) latest
-# claudebase-v* tag from origin via `git ls-remote`; 3) fallback.
-function Get-ClaudebaseVersion {
-  if ($env:CLAUDEBASE_VERSION) { return $env:CLAUDEBASE_VERSION }
-  $git = Get-Command git -ErrorAction SilentlyContinue
-  if ($git) {
-    try {
-      $tags = & git ls-remote --tags --refs $Script:RepoUrl 'refs/tags/claudebase-v*' 2>$null
-      if ($LASTEXITCODE -eq 0 -and $tags) {
-        $latest = $tags |
-          ForEach-Object {
-            $leaf = ($_ -split "`t")[-1]
-            ($leaf -split '/')[-1] -replace '^claudebase-v', ''
-          } |
-          Sort-Object { [version]$_ } |
-          Select-Object -Last 1
-        if ($latest) { return [string]$latest }
-      }
-    } catch { }
-  }
-  return $Script:ClaudebaseFallbackVersion
-}
-$Script:ClaudebaseVersion = Get-ClaudebaseVersion
 $Script:ReleaseBase             = 'https://github.com/codefather-labs/claudebase/releases/download'
 
 $Script:ClaudeDir = Join-Path $env:USERPROFILE '.claude'
@@ -163,6 +133,35 @@ function Install-Binary {
     New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
     $targetBin = Join-Path $targetDir 'claudebase.exe'
 
+    # -Local: build the binary from THIS checkout and install it, NEVER
+    # downloading a release. -Local means "install the code in front of me";
+    # pulling a pre-built release asset (possibly older or different, or
+    # absent after a tag was deleted) would silently contradict that intent.
+    # Requires a rust toolchain (cargo on PATH).
+    if ($Local) {
+        if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+            Write-Err "-Local binary build needs cargo (install the rust toolchain via rustup)"
+            return
+        }
+        Write-Info "Building claudebase from local checkout ($($Script:ScriptDir)) - cargo build --release"
+        Push-Location $Script:ScriptDir
+        & cargo build --release
+        $buildExit = $LASTEXITCODE
+        Pop-Location
+        if ($buildExit -ne 0) {
+            Write-Err "local 'cargo build --release' failed; binary not installed"
+            return
+        }
+        $localBin = Join-Path $Script:ScriptDir 'target\release\claudebase.exe'
+        if (-not (Test-Path $localBin)) {
+            Write-Err "local build produced no binary at $localBin"
+            return
+        }
+        Copy-Item -Force $localBin $targetBin
+        Write-Ok "tools\claudebase\claudebase.exe (local build, $platform)"
+        return
+    }
+
     if (Test-Path $targetBin) {
         try {
             $existingVer = (& $targetBin --version 2>$null) -replace '^claudebase ', ''
@@ -239,9 +238,15 @@ function Register-BashAllowlist {
     $settings = Join-Path $Script:ClaudeDir 'settings.json'
     $entry = '~/.claude/tools/claudebase/claudebase *'
 
+    # Issue 003: Set-Content -Encoding UTF8 writes UTF-8 WITH BOM on
+    # Windows PowerShell 5.1; some JSON parsers (notably Claude Code's
+    # MCP loader) silently reject BOM-prefixed config. Use
+    # [System.IO.File]::WriteAllText with an explicit no-BOM UTF8Encoding
+    # so we get clean output on both PS 5.1 and PS 7+.
     if (-not (Test-Path $settings)) {
         $obj = @{ permissions = @{ allow = @($entry) } }
-        $obj | ConvertTo-Json -Depth 10 | Set-Content -Path $settings -Encoding UTF8
+        $json = $obj | ConvertTo-Json -Depth 10
+        [System.IO.File]::WriteAllText($settings, $json, [System.Text.UTF8Encoding]::new($false))
         Write-Ok "settings.json (created with claudebase allowlist)"
         return
     }
@@ -253,7 +258,8 @@ function Register-BashAllowlist {
 
         if ($obj.permissions.allow -notcontains $entry) {
             $obj.permissions.allow = @($obj.permissions.allow) + $entry
-            $obj | ConvertTo-Json -Depth 10 | Set-Content -Path $settings -Encoding UTF8
+            $json = $obj | ConvertTo-Json -Depth 10
+            [System.IO.File]::WriteAllText($settings, $json, [System.Text.UTF8Encoding]::new($false))
             Write-Ok "settings.json (claudebase allowlist merged)"
         } else {
             Write-Ok "settings.json already contains claudebase allowlist"
@@ -264,12 +270,10 @@ function Register-BashAllowlist {
 }
 
 # ============================================================================
-# Install the claudebase UserPromptSubmit hook into ~/.claude/hooks/ and wire
-# into settings.json:
-#   - UserPromptSubmit -> claudebase-selfcheck-reminder.ps1 (self-check + insight-capture)
-# Migration: the retired Stop insight-capture hook (which rendered as
-# "Stop hook error: ..." via decision:block) is actively removed — files
-# deleted + Stop wiring unwired. Idempotent.
+# Install claudebase hooks into ~/.claude/hooks/ and wire into settings.json:
+#   - Stop -> claudebase-insight-capture.ps1 (insight-capture reflection)
+#   - UserPromptSubmit -> claudebase-selfcheck-reminder.ps1 (self-check nudge)
+# Idempotent — dedup by command-string equality so re-running never duplicates.
 # ============================================================================
 function Install-ClaudebaseHooks {
     $hooksDir = Join-Path $Script:ClaudeDir 'hooks'
@@ -307,20 +311,27 @@ function Install-ClaudebaseHooks {
             $json | Add-Member -NotePropertyName 'hooks' -NotePropertyValue ([pscustomobject]@{}) -Force
         }
 
-        # Idempotent merge of UserPromptSubmit by command-string equality.
-        if (-not ($json.hooks.PSObject.Properties.Name -contains 'UserPromptSubmit')) {
-            $json.hooks | Add-Member -NotePropertyName 'UserPromptSubmit' -NotePropertyValue @() -Force
+        # Helper — idempotent merge of one event by command-string equality.
+        $mergeEvent = {
+            param($eventName, $command)
+            if (-not ($json.hooks.PSObject.Properties.Name -contains $eventName)) {
+                $json.hooks | Add-Member -NotePropertyName $eventName -NotePropertyValue @() -Force
+            }
+            $existing = @($json.hooks.$eventName)
+            $already = $false
+            foreach ($entry in $existing) {
+                if ($entry.hooks) {
+                    foreach ($h in $entry.hooks) { if ($h.command -eq $command) { $already = $true; break } }
+                }
+                if ($already) { break }
+            }
+            if (-not $already) {
+                $newEntry = [pscustomobject]@{ hooks = @([pscustomobject]@{ type = 'command'; command = $command }) }
+                $json.hooks.$eventName = @($existing) + $newEntry
+            }
         }
-        $existing = @($json.hooks.UserPromptSubmit)
-        $already = $false
-        foreach ($entry in $existing) {
-            if ($entry.hooks) { foreach ($h in $entry.hooks) { if ($h.command -eq $selfcheckCmd) { $already = $true; break } } }
-            if ($already) { break }
-        }
-        if (-not $already) {
-            $newEntry = [pscustomobject]@{ hooks = @([pscustomobject]@{ type = 'command'; command = $selfcheckCmd }) }
-            $json.hooks.UserPromptSubmit = @($existing) + $newEntry
-        }
+
+        & $mergeEvent 'UserPromptSubmit' $selfcheckCmd
 
         # Idempotent merge of SessionStart read-insights reminder by command-string
         # equality. Official SessionStart shape: {matcher, hooks[{type,command}]}.
@@ -356,6 +367,7 @@ function Install-ClaudebaseHooks {
         Write-Ok "settings.json (UserPromptSubmit[selfcheck] + SessionStart[read-insights] wired; retired Stop[insight-capture] unwired)"
     } catch {
         Write-Warn "settings.json hook merge failed ($($_.Exception.Message)); add manually:"
+        Write-Warn "  hooks.Stop[*].hooks[*].command = $stopCmd"
         Write-Warn "  hooks.UserPromptSubmit[*].hooks[*].command = $selfcheckCmd"
         Write-Warn "  hooks.SessionStart[*].hooks[*].command = $readinsCmd"
         Write-Warn "  (and remove any hooks.Stop entry pointing at claudebase-insight-capture.ps1)"
@@ -454,11 +466,11 @@ function Preload-Encoder {
 # Install whisper-cli + ffmpeg (voice transcription dependencies). Mirrors
 # install.sh's install_whisper_stack. Best-effort + idempotent.
 # Opt-out: set $env:CLAUDEBASE_SKIP_WHISPER=1.
-# Model (~1.5 GB ggml-medium.bin) is NOT downloaded here — lazy on first voice.
+# Model (~1.5 GB ggml-medium.bin) is NOT downloaded here - lazy on first voice.
 # ============================================================================
 function Install-WhisperStack {
     if ($env:CLAUDEBASE_SKIP_WHISPER -eq '1') {
-        Write-Info "CLAUDEBASE_SKIP_WHISPER=1 — skipping ffmpeg + whisper-cli install"
+        Write-Info "CLAUDEBASE_SKIP_WHISPER=1 - skipping ffmpeg + whisper-cli install"
         return
     }
 
@@ -469,7 +481,7 @@ function Install-WhisperStack {
         return
     }
 
-    # Detect package manager — winget preferred, then choco, then scoop.
+    # Detect package manager - winget preferred, then choco, then scoop.
     $pkgMgr = $null
     if (Get-Command winget -ErrorAction SilentlyContinue) {
         $pkgMgr = 'winget'
@@ -488,8 +500,13 @@ function Install-WhisperStack {
 
     $cmds = @{
         winget = @{
-            ffmpeg  = @('install', '--accept-source-agreements', '-e', 'Gyan.FFmpeg')
-            whisper = @('install', '--accept-source-agreements', '-e', 'ggerganov.whisper-cpp')
+            # winget requires BOTH --accept-source-agreements (source EULA,
+            # one-time) AND --accept-package-agreements (per-package
+            # license). Without the second flag winget exits with
+            # APPINSTALLER_CLI_ERROR_PACKAGE_AGREEMENTS_NOT_ACCEPTED
+            # (-1978335212 / 0x8A150014) on packages that ship a EULA.
+            ffmpeg  = @('install', '--accept-source-agreements', '--accept-package-agreements', '-e', 'Gyan.FFmpeg')
+            whisper = @('install', '--accept-source-agreements', '--accept-package-agreements', '-e', 'ggerganov.whisper-cpp')
         }
         choco = @{
             ffmpeg  = @('install', '-y', 'ffmpeg')
@@ -536,108 +553,188 @@ function Install-WhisperStack {
 }
 
 # ============================================================================
-# Install Telegram channel bridge wiring (Slice 6 v0.8.0)
+# Install the Rust port of the official Anthropic Telegram plugin.
+# Mirrors install.sh's install_telegram_plugin - always downloads server-rs
+# from the matching claudebase release asset; no cargo build fallback.
+# Opt-out: $env:CLAUDEBASE_SKIP_TELEGRAM=1.
+# Requires: `claude` CLI on PATH.
+# Idempotent. Patches `.mcp.json` with direct exec of server-rs.exe.
 # ============================================================================
-# The daemon now owns the single Telegram getUpdates poller (one bot -> many CLIs).
-# This function patches the official Telegram plugin's .mcp.json to run the
-# daemon bridge (claudebase plugin serve) as the MCP server for the channel.
-# The bridge only relays the daemon's notifications (does not poll), so there
-# is no dual-poll and NFR-TMC-5 is preserved.
-#
-# Best-effort: if claude CLI is not on PATH or the plugin install fails,
-# the function logs and returns (does not abort the installer).
-#
-# The function is idempotent: re-running rewrites the same .mcp.json.
-# To revert, restore .mcp.json from .mcp.json.upstream-backup, or run
-# claude plugin install telegram@claude-plugins-official to restore
-# the upstream version.
-function Install-TelegramChannelBridge {
+function Install-TelegramPlugin {
     if ($env:CLAUDEBASE_SKIP_TELEGRAM -eq '1') {
-        Write-Info "CLAUDEBASE_SKIP_TELEGRAM=1 - skipping telegram channel bridge wiring"
+        Write-Info "CLAUDEBASE_SKIP_TELEGRAM=1 - skipping telegram plugin install"
         return
     }
-
     if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
-        Write-Info "claude CLI not on PATH; skipping telegram channel bridge setup"
+        Write-Info "claude CLI not on PATH; skipping telegram plugin install"
         Write-Info "  to install manually after Claude Code is installed:"
         Write-Info "    claude plugin install telegram@claude-plugins-official"
-        Write-Info "    then re-run this installer to wire the bridge"
+        Write-Info "    then re-run this installer to patch the Rust binary"
         return
     }
 
     # ----- 1. Install official plugin if not already -----
-    Write-Info "Installing telegram@claude-plugins-official (idempotent)..."
+    $marketplaceAlready = $false
     try {
-        & claude plugin install telegram@claude-plugins-official 2>&1 | Out-Null
-    } catch {
-        Write-Warn "telegram plugin install failed: $($_.Exception.Message); skipping bridge wiring"
-        return
+        $mpList = & claude plugin marketplace list 2>&1
+        if ($mpList -match "claude-plugins-official") { $marketplaceAlready = $true }
+    } catch {}
+    if (-not $marketplaceAlready) {
+        Write-Info "Adding marketplace anthropics/claude-plugins-official..."
+        try { & claude plugin marketplace add anthropics/claude-plugins-official 2>&1 | Out-Null } catch {}
     }
+    Write-Info "Installing telegram@claude-plugins-official (idempotent)..."
+    try { & claude plugin install telegram@claude-plugins-official 2>&1 | Out-Null } catch {}
 
-    # ----- 2. Locate the installed plugin dir -----
-    # Prefer installed_plugins.json (authoritative - points to the currently
-    # ACTIVE version). Fall back to newest-version glob if manifest unreadable.
+    # ----- 2. Locate installed plugin dir (newest version) -----
     $pluginRoot = Join-Path $Script:ClaudeDir 'plugins\cache\claude-plugins-official\telegram'
     if (-not (Test-Path $pluginRoot)) {
-        Write-Warn "official telegram plugin not found at $pluginRoot after install - skipping bridge wiring"
+        Write-Warn "official telegram plugin not found at $pluginRoot - skipping Rust patch"
+        return
+    }
+    $versionDir = Get-ChildItem -Path $pluginRoot -Directory -ErrorAction SilentlyContinue `
+        | Sort-Object -Property Name -Descending `
+        | Select-Object -First 1
+    if (-not $versionDir) {
+        Write-Warn "no version subdir found under $pluginRoot - skipping Rust patch"
+        return
+    }
+    $pluginDir = $versionDir.FullName
+    Write-Info "patching plugin v$($versionDir.Name) at $pluginDir"
+
+    # ----- 3. Resolve binary: download from GH release first; cargo build
+    #         fallback only if download fails (no release with this asset
+    #         yet, offline, etc). Mirrors install.sh download-first pattern. -----
+    $platform = $null
+    switch ("$(if ([System.Environment]::Is64BitOperatingSystem) {'x64'} else {'x86'})") {
+        'x64' { $platform = 'windows-x64' }
+        default {
+            Write-Warn "unsupported Windows arch; skipping telegram-plugin-rs"
+            return
+        }
+    }
+    $targetBin = Join-Path $pluginDir 'server-rs.exe'
+    $url = "$($Script:ReleaseBase)/claudebase-v$($Script:ClaudebaseVersion)/telegram-plugin-rs-$platform.exe"
+    $downloaded = $false
+    $tmp = New-TemporaryFile
+
+    Write-Info "downloading telegram-plugin-rs binary from GH release for $platform..."
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $tmp.FullName -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
+        $downloaded = $true
+    } catch {
+        Write-Warn "telegram-plugin-rs download failed: $($_.Exception.Message)"
+    }
+
+    if ($downloaded -and (Test-Path $tmp.FullName) -and ((Get-Item $tmp.FullName).Length -gt 0)) {
+        # Rename-trick for a running plugin: when the operator already has
+        # a Claude Code session running with the channel plugin loaded,
+        # server-rs.exe is held open by `claude.exe` and Move-Item -Force
+        # cannot overwrite it (Windows file lock). NTFS DOES allow rename
+        # of a running PE file though, so we rename the existing binary
+        # out of the way first, then place the fresh one at the target
+        # path. The renamed file is marked for delete on next reboot via
+        # Remove-Item below (best-effort; if that also fails, Windows
+        # cleans it up eventually).
+        if (Test-Path $targetBin) {
+            $stash = "$targetBin.old.$([guid]::NewGuid().ToString('N').Substring(0,8)).locked"
+            try {
+                Move-Item -Force $targetBin $stash
+                # The stash file may still be locked by the running plugin;
+                # we don't wait for it. Mark for cleanup attempt; failure
+                # is non-fatal (Windows reboot purges it).
+                Remove-Item -Force $stash -ErrorAction SilentlyContinue
+            } catch {
+                Write-Warn "could not stash existing server-rs.exe ($($_.Exception.Message)); attempting in-place overwrite anyway"
+            }
+        }
+        Move-Item -Force $tmp.FullName $targetBin
+        Write-Ok "server-rs.exe downloaded ($((Get-Item $targetBin).Length) bytes) -> $targetBin"
+    } else {
+        if (Test-Path $tmp.FullName) { Remove-Item -Force $tmp.FullName }
+        Write-Warn "telegram-plugin-rs download failed for $platform from $url"
+        Write-Warn "  the upstream TSX plugin will run unchanged via bun"
+        Write-Warn "  to force a build from source locally: cargo build --release -p telegram-plugin-rs"
+        Write-Warn "  then copy target\release\telegram-plugin-rs.exe -> $targetBin"
         return
     }
 
-    $pluginDir = $null
-    $installedManifest = Join-Path $Script:ClaudeDir 'plugins\installed_plugins.json'
-    if (Test-Path $installedManifest) {
-        try {
-            $manifest = Get-Content -Raw -Path $installedManifest | ConvertFrom-Json
-            $pluginInfo = $manifest.plugins.'telegram@claude-plugins-official'
-            if ($pluginInfo -and $pluginInfo.Count -gt 0) {
-                $pluginDir = $pluginInfo[0].installPath
-            }
-        } catch {}
-    }
-
-    if (-not $pluginDir -or -not (Test-Path $pluginDir)) {
-        # Fallback: newest version subdir (semver-sortable).
-        $versionDir = Get-ChildItem -Path $pluginRoot -Directory -ErrorAction SilentlyContinue `
-            | Sort-Object -Property Name -Descending `
-            | Select-Object -First 1
-        if (-not $versionDir) {
-            Write-Warn "no version subdir found under $pluginRoot - skipping bridge wiring"
-            return
-        }
-        $pluginDir = $versionDir.FullName
-        Write-Info "manifest lookup unavailable; falling back to newest-version glob: $pluginDir"
-    }
-    Write-Info "wiring daemon bridge at $pluginDir"
-
-    # ----- 3. Back up upstream .mcp.json and patch with daemon bridge -----
+    # ----- 5. Patch .mcp.json (backup upstream first) -----
     $mcpJson = Join-Path $pluginDir '.mcp.json'
     $mcpBackup = Join-Path $pluginDir '.mcp.json.upstream-backup'
-
     if ((Test-Path $mcpJson) -and (-not (Test-Path $mcpBackup))) {
         Copy-Item $mcpJson $mcpBackup
         Write-Ok ".mcp.json.upstream-backup preserved"
     }
-
-    # Write .mcp.json to run the daemon bridge as the MCP server for the
-    # telegram channel. The bridge relays the daemon (does not poll), so
-    # there is no dual-poll and NFR-TMC-5 is preserved.
+    # multi-agent-telegram-on-v0.6 architecture decision (operator
+    # 2026-06-03): TG communication MUST go through the daemon. The
+    # plugin slot in Claude Code is wired to `claudebase plugin serve`
+    # (the daemon-bridge) instead of `server-rs.exe` (the standalone
+    # TG poller). Daemon owns the bot connection via teloxide; bridge
+    # subscribes to the daemon's chat bus and relays
+    # notifications/claude/channel frames to CC's input stream as the
+    # operator-facing channel events.
+    #
+    # server-rs.exe is left in the plugin dir but unused — kept for
+    # backward-compat in case an operator wants to revert to the
+    # standalone plugin path manually.
+    #
+    # `env.HOME = $env:USERPROFILE` injected because the daemon-bridge
+    # (and the v0.6 plugin if it were still in use) reads the raw HOME
+    # env var to locate ~/.claude paths. Without this, claude.exe child
+    # processes on Windows have no HOME (Windows uses USERPROFILE).
+    $claudebaseBin = Join-Path $Script:ClaudeDir 'tools\claudebase\claudebase.exe'
     $cfg = @{
         mcpServers = @{
             telegram = @{
-                command = "`${HOME}/.claude/tools/claudebase/claudebase"
+                command = $claudebaseBin
                 args = @('plugin', 'serve')
+                env = @{
+                    HOME = $env:USERPROFILE
+                }
             }
         }
     }
-    $cfg | ConvertTo-Json -Depth 6 | Set-Content -Path $mcpJson -Encoding UTF8
-    Write-Ok ".mcp.json patched (daemon bridge relays the daemon poller, no dual-poll)"
+    $json = $cfg | ConvertTo-Json -Depth 6
+    # Issue 003: write UTF-8 WITHOUT BOM. Set-Content -Encoding UTF8
+    # on PS 5.1 writes a BOM that Claude Code's MCP loader rejects,
+    # producing a silent failure mode (plugin appears installed but
+    # never spawns as a child of claude.exe).
+    [System.IO.File]::WriteAllText($mcpJson, $json, [System.Text.UTF8Encoding]::new($false))
+    Write-Ok ".mcp.json patched (wired to claudebase plugin serve daemon-bridge + HOME env)"
 
     Write-Info "to enable: launch Claude Code with"
     Write-Info "  claude --channels plugin:telegram@claude-plugins-official"
-    Write-Info "or use the shorthand:"
-    Write-Info "  claudebase run"
-    Write-Info "to revert: restore .mcp.json from .mcp.json.upstream-backup, or"
-    Write-Info "  claude plugin install telegram@claude-plugins-official"
+}
+
+# ============================================================================
+# Cleanup legacy claudebase-dev plugin + marketplace from prior installs
+# ============================================================================
+# The v0.6 baseline used to register a `claudebase-dev` Claude Code
+# plugin marketplace and install `claudebase@claudebase-dev` as a channel
+# plugin (the "daemon-as-channel-plugin" architecture that v0.7 then
+# removed and that issue 002 documents as broken in CC 2.1.144). The
+# multi-agent-telegram-on-v0.6 rebuild uses the OFFICIAL Anthropic
+# `telegram@claude-plugins-official` plugin slot only.
+#
+# This function removes the legacy plugin + marketplace from operators
+# who installed an earlier claudebase version, so the system does not
+# carry dead registrations. Idempotent: if the plugin / marketplace are
+# already absent, both `claude plugin uninstall` and
+# `claude plugin marketplace remove` no-op (with stderr noise on PS 5.1
+# - hence the temporary ErrorActionPreference relax).
+function Cleanup-LegacyClaudebasePlugin {
+    if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
+        return
+    }
+    $prevErrPref = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    # Uninstall the plugin first; marketplace removal will then succeed
+    # without 'plugin still installed from this source' rejections.
+    & claude plugin uninstall claudebase@claudebase-dev 2>&1 | Out-Null
+    & claude plugin marketplace remove codefather-labs/claudebase 2>&1 | Out-Null
+    $ErrorActionPreference = $prevErrPref
+    Write-Ok "legacy claudebase-dev plugin + marketplace cleaned (idempotent)"
 }
 
 # ============================================================================
@@ -647,7 +744,7 @@ if ($Help) { Show-Help; exit 0 }
 
 Write-Host ""
 Write-Host "============================================" -ForegroundColor White
-Write-Host "  claudebase v$($Script:ClaudebaseVersion) — installer (Windows)" -ForegroundColor White
+Write-Host "  claudebase v$($Script:ClaudebaseVersion) - installer (Windows)" -ForegroundColor White
 Write-Host "============================================" -ForegroundColor White
 Write-Host ""
 Write-Host "  This will install to $($Script:ClaudeDir):"
@@ -667,21 +764,88 @@ Install-Prompts
 Install-Binary
 Register-Alias
 Register-BashAllowlist
-Install-ClaudebaseHooks
 Install-Pdfium
 Install-WhisperStack
 Preload-Encoder
-Install-TelegramChannelBridge
+Cleanup-LegacyClaudebasePlugin
+Install-TelegramPlugin
 
-# Optional post-install daemon hook (Slice 2 — STRUCTURAL-2-3)
-# Opt-in via `$env:CLAUDEBASE_INSTALL_DAEMON=1`. Fails soft.
-if ($env:CLAUDEBASE_INSTALL_DAEMON -eq "1") {
-    Write-Info "CLAUDEBASE_INSTALL_DAEMON=1 detected; installing daemon service unit..."
-    & claudebase daemon install --no-start --yes
-    if ($LASTEXITCODE -eq 0) {
-        Write-Ok "Daemon service unit installed (start with 'claudebase daemon start')"
+# Post-install daemon spawn (default-on, current-user, no admin needed)
+#
+# 2026-06-04: This block was reworked from `daemon install` (Windows SCM
+# service) to `daemon serve` (detached current-user process). The SCM
+# install path was structurally broken under operator's environment:
+# the Windows service ran as `NT AUTHORITY\LocalService` (per
+# `src/daemon/service.rs::windows::service_account`), so its
+# `$env:USERPROFILE` pointed at
+# `C:\Windows\ServiceProfiles\LocalService\` instead of the operator's
+# profile. The daemon then resolved `~/.claude/channels/claudebase/.env`
+# to a path that did NOT exist, came up with no Telegram token, and
+# silently ran in chat-only mode (no long-poll, no inbound messages).
+# Even the binary's USERPROFILE-fallback (commit 1e337c7) cannot rescue
+# that because the LocalService USERPROFILE is technically valid - just
+# pointing at the wrong tree.
+#
+# The current-user spawn path here uses `Start-Process` with
+# `-WindowStyle Hidden`, which produces a detached child that survives
+# this script's exit but stays scoped to the operator's login session.
+# Survival across reboots is now handled at first `claudebase run`
+# (Slice 25: `spawn_daemon_detached` in src/main.rs) which auto-spawns
+# the daemon if its UDS / named-pipe is unreachable. So the operator
+# does NOT need a Windows service at all - the daemon comes back on
+# first interactive invocation, with all the right env (HOME +
+# USERPROFILE) inherited from the user's shell.
+#
+# Opt-out: `$env:CLAUDEBASE_SKIP_DAEMON=1`.
+if ($env:CLAUDEBASE_SKIP_DAEMON -eq "1") {
+    Write-Info "CLAUDEBASE_SKIP_DAEMON=1 - skipping daemon spawn"
+} else {
+    $claudebaseExe = Join-Path $Script:ClaudeDir 'tools\claudebase\claudebase.exe'
+    if (-not (Test-Path $claudebaseExe)) {
+        Write-Warn "Daemon spawn skipped: $claudebaseExe not found"
     } else {
-        Write-Warn "Daemon install failed (exit $LASTEXITCODE); continuing without daemon"
+        # Best-effort: stop any prior daemon process so this script's
+        # respawn produces a process running the freshly-installed
+        # binary. Failures are NORMAL on a fresh box.
+        $prevErrPref = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        Get-Process claudebase -ErrorAction SilentlyContinue | ForEach-Object {
+            try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch {}
+        }
+        Start-Sleep -Milliseconds 500
+        $ErrorActionPreference = $prevErrPref
+
+        # Spawn detached daemon under current user. Logs to the same
+        # file `spawn_daemon_detached` writes to so the operator has one
+        # place to grep regardless of who started the daemon (this
+        # install script or `claudebase run`'s auto-spawn helper).
+        $logDir = Join-Path $Script:ClaudeDir 'logs'
+        if (-not (Test-Path $logDir)) {
+            New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+        }
+        $logFile = Join-Path $logDir 'claudebase-daemon.log'
+        try {
+            Start-Process -FilePath $claudebaseExe `
+                -ArgumentList 'daemon', 'serve' `
+                -WindowStyle Hidden `
+                -RedirectStandardOutput $logFile `
+                -RedirectStandardError $logFile `
+                -ErrorAction Stop | Out-Null
+            # Brief wait for the daemon to bind its named pipe so the
+            # operator sees a positive `daemon status` immediately after
+            # install completes.
+            Start-Sleep -Seconds 2
+            $status = & $claudebaseExe daemon status --json 2>$null
+            if ($status -match '"state":\s*"running"') {
+                Write-Ok "Daemon started (current-user, detached); logs at $logFile"
+            } else {
+                Write-Warn "Daemon spawn issued but status is not yet 'running'"
+                Write-Warn "  Check $logFile or run: claudebase daemon status"
+            }
+        } catch {
+            Write-Warn "Daemon spawn failed: $_"
+            Write-Warn "  Daemon will auto-spawn on first 'claudebase run' invocation"
+        }
     }
 }
 

@@ -1,0 +1,26 @@
+# Line-ending normalization.
+#
+# Shell scripts MUST be LF — bash on macOS/Linux chokes on a trailing CR
+# ("syntax error near unexpected token") so a CRLF checkout ships a broken
+# installer + broken hooks. This repo is authored partly on Windows, so
+# without these rules a Windows commit silently reintroduces CRLF into .sh.
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.bash text eol=lf
+
+# Windows-only scripts keep CRLF.
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binaries — never touch.
+*.png  binary
+*.jpg  binary
+*.pdf  binary
+*.ico  binary
+*.dylib binary
+*.so   binary
+*.dll  binary
+*.bin  binary
+*.onnx binary

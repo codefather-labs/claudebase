@@ -481,7 +481,7 @@ As the SDLC pipeline operator, I want a persistent Telegram bot backed by a loca
 2. **FR-ACD-6.2:** Inbound Telegram text messages MUST be persisted to `chat.db` thread `telegram:<chat_id>` and broadcast to all subscribed connections as `notifications/claude/channel`.
 3. **FR-ACD-6.3:** Inbound Telegram voice notes MUST be queued to the ASR pipeline (FR-ACD-7). The transcribed text MUST then be treated as an inbound text message per FR-ACD-6.2.
 4. **FR-ACD-6.4:** The bot token MUST be stored in `~/.config/claudebase/secrets.toml` with file permissions `0600`. The daemon MUST refuse to start if the bot-token file has permissions other than `0600`.
-5. **FR-ACD-6.5:** Access control MUST implement a pairing model ported from the voice-control reference repo (`ACCESS.md`, plan line 154): `dmPolicy` values `"pairing"` (default) | `"allowlist"` | `"disabled"`. On first message from an unknown user, the bot MUST reply with a pairing code via Telegram inline keyboard. The user runs `claudebase daemon access pair <code>` from the terminal to authorize. Once authorized, the user is added to the `allowFrom` list in `~/.claude/channels/claudebase/access.json`. **(Amended 2026-05-31 — access-json-path-reconciliation:** the canonical access file is `~/.claude/channels/claudebase/access.json` (returned by `channel_state::access_json_path()`), NOT the previously-documented `~/.config/claudebase/access.json`. The daemon's inbound gating, the pairing/`approved/` subsystem, and the `daemon access pair` CLI all operate on this single canonical file; `allowFrom` ids are stored as JSON strings. A one-shot boot-time migration carries any legacy `~/.config/claudebase/access.json` grants into the canonical file. Architect verdict: canonical = the channel-state file because the entire channel subsystem already lives under `~/.claude/channels/claudebase/`, matching the official-plugin convention.)
+5. **FR-ACD-6.5:** Access control MUST implement a pairing model ported from the voice-control reference repo (`ACCESS.md`, plan line 154): `dmPolicy` values `"pairing"` (default) | `"allowlist"` | `"disabled"`. On first message from an unknown user, the bot MUST reply with a pairing code via Telegram inline keyboard. The user runs `claudebase daemon access pair <code>` from the terminal to authorize. Once authorized, the user is added to the `allowFrom` list in `~/.config/claudebase/access.json`.
 6. **FR-ACD-6.6:** `claudebase daemon access pair <code>` MUST accept a pairing code and add the pending Telegram user to the authorized list.
 7. **FR-ACD-6.7:** `claudebase daemon access list` MUST print the current access list with user ids, Telegram usernames, and authorization dates.
 8. **FR-ACD-6.8:** `claudebase daemon config edit` MUST open `~/.config/claudebase/daemon.toml` in `$EDITOR` (default `vi`).
@@ -780,716 +780,821 @@ All new subcommands follow the existing `claudebase` CLI conventions: `--json` f
 
 (none) — no symptom-only patches in this PRD section.
 
----
-
-## §18. Insights Hybrid Corpus — Global General DB, Project Registry, Mandatory Tags, and Read-on-New-Context Hook
+## §18. Multi-Agent Telegram Routing on v0.6 Foundation
 
 **Status:** [PLANNED]
-**Date:** 2026-05-27
+**Date:** 2026-06-02
 **Priority:** High
-**Related:** §16 (Agent Insights Base — this section extends the `insight` subcommand tree and `insights.db` schema introduced in §16; schema v5 of `insights.db` is additive on top of §16's v4). §17 (Agent Chat Daemon — §17's `chat.db` uses an independent schema versioning scheme; no conflict). §15 (Vector + Multimodal Retrieval Backend — the `--corpus all` RRF fusion machinery at `main.rs:2548-2604` is reused for the local+general insight merge in FR-IHC-5). Plan source: `.claude/plan.md` (199 lines, read in full this session).
+**Related:** §17 (Agent Chat Daemon + Telegram Bridge — this feature is the additive, topic-aware routing layer on top of the v0.6 baseline shipped under §17; the daemon UDS framing, `chat.db` location, `agent_registry` table and the `notifications/claude/channel` wire shape from §17 are all preserved here). §16 (Insights Base — the `chat.db` sibling-file pattern continues). Plan source: `.claude/plan.md` (v2, 321 lines, read in full this session) — same body persisted at `docs/plans/multi-agent-telegram-on-v0.6.md` (untracked, 320 lines).
 
-Changelog: Agents can now share knowledge across projects — general lessons go to a global pool every project can read, while project-specific insights stay local. Tags make it fast to pull only what's relevant when a new session starts.
+Changelog: Adds topic-aware Telegram routing so one bot serves three Claude Code CLI instances bound to DM + forum topic α + forum topic β in the same group, rebuilt from the `claudebase-v0.6.0` tag after v0.7/v0.8 multi-CLI work was rolled back.
 
 ### 18.1 Feature Description
 
-The Agent Insights Base (§16) introduced per-project cognitive memory: `insights.db` at `<project>/.claude/knowledge/insights.db` lets SDLC agents write and read cross-session insights. Three structural gaps remain after §16:
+The v0.7 (2026-05-30) and v0.8 (2026-05-31) attempts at multi-CLI Telegram routing were declared empirically broken by the operator after extended debugging — root cause was not isolated and fix-forward cost exceeded rebuild cost. This feature **rolls the Telegram subsystem back to the `claudebase-v0.6.0` tag** and **additively extends** the daemon so a single Telegram bot can route inbound messages to three different Claude Code CLI instances based on a routing key `(chat_id, Option<message_thread_id>)`: one CLI bound to a DM, one bound to forum topic α inside a group, one bound to forum topic β inside the same group. (Plan §"Context — why", lines 9–22; plan §"Architecture", lines 17–21.)
 
-1. **No global collection point.** Insights about general tool-level or domain-level lessons (nginx reload signals, Tokio mutex gotchas, cognitive-bias patterns) are trapped in whichever project happened to discover them, invisible to every other project.
-2. **No selective read surface.** Agents filter by `feature_slug` / `agent` / `salience`. There is no topic-tag axis — an agent entering a fresh context either floods its window with all insights or reads none.
-3. **No scope discipline.** An agent working on project X has no mechanism to say "give me X's insights plus general ones, but not project Y's."
+The architecture is the operator-decided C1/C2/C3 triple (plan lines 17–21): **C1** — the mixed library stack (teloxide 0.17 in the daemon, frankenstein 0.49 in the plugin) is kept; **C2** — the daemon owns the Telegram connection via teloxide's high-level `Dispatcher` API and the plugin's frankenstein polling loop is disabled, making the daemon the sole `getUpdates` consumer and resolving v0.6's latent dual-poller 409 vulnerability; **C3** — the `reply` MCP tool gains one OPTIONAL `message_thread_id: Option<String>` param and the inbound `notifications/claude/channel` meta gains one OPTIONAL `thread_id: Option<String>` field. Both are additive per JSON-RPC convention so old v0.6 consumers ignore unknown fields and remain backward-compatible.
 
-This feature delivers a **hybrid corpus**:
-
-- **Project insights** stay in their project's LOCAL db (`<project>/.claude/knowledge/insights.db`). Existing v4 data is untouched; zero content migration.
-- **General insights** (cross-project, tool-level knowledge) live in ONE GLOBAL db at `~/.claude/knowledge/insights.db`.
-- A **project registry** at `~/.claude/knowledge/projects.json` is upserted at every `claudebase run` startup, mapping `project-name → path` so routing resolves the right db.
-- Every `insight create` call requires a **mandatory `--category` (`general` | `project`)** — the routing key — and at least one **mandatory free-form `--tag`**. Missing either causes exit 2.
-- A new **`insight tags` subcommand** lists the tag vocabulary with counts. `search`, `list`, `random`, `gc`, and `delete` gain `--tag`, `--category`, `--project`, `--general-only`, and `--project-only` filters.
-- The default in-project read posture is `merge(local-project + global-general)`. Other projects' insights are walled off unless explicitly named.
-- A **SessionStart hook** (`claudebase-read-insights-reminder.sh` / `.ps1`) reminds agents entering a fresh context window to pull relevant insights by tag and category — once per context, not every message.
-
-This is the first feature that makes `--category` and `--tags` required on `insight create`. Every existing caller (~22 SDLC agent prompt files, the knowledge-base rule docs, and the UserPromptSubmit reminder hook) is updated in this release so no caller breaks. This is a **BREAKING CLI change** — `insight create` without `--category` or without `--tags` returns exit 2.
-
-The release target is claudebase core **v0.7.0**.
+The CLI-observable surface — MCP tool names, notification method names, IPC framing, installer behavior, `claudebase run` argv — is frozen bit-for-bit to v0.6 except for the two optional-additive fields per C3. (Plan §"Architectural Constraints → Frozen", lines 78–91.)
 
 ### 18.2 User Story
 
-As an SDLC pipeline agent starting a fresh context window, I want to pull relevant insights by tag and category — merging this project's local insights with general cross-project ones — so that I ground decisions in what prior sessions actually learned without flooding my context with unrelated knowledge from other projects.
+As the SDLC pipeline operator, I want to run three independent Claude Code CLI sessions on the same machine, each bound to a different conversation surface in the same Telegram bot (one DM and two forum topics in a group), so that I can hold three parallel multi-agent conversations through a single bot token without per-CLI bots and without colliding routing keys.
 
 ### 18.3 Functional Requirements
 
-#### FR-IHC-1: Schema v5 Migration for `insights.db` (Slice 1) — SCHEMA CHANGE
+#### FR-MAT-1: Routing Key Shape — `(chat_id, Option<message_thread_id>)` (Slice 3, plan lines 126–137)
 
-1. **FR-IHC-1.1:** A `SCHEMA_V5_DELTA` constant MUST add two nullable columns to the `documents` table: `category TEXT` and `project_slug TEXT`. No existing column may be modified or removed.
-2. **FR-IHC-1.2:** A new normalized tags table MUST be created: `insight_tags(doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, tag TEXT NOT NULL, UNIQUE(doc_id, tag))`.
-3. **FR-IHC-1.3:** Two new indexes MUST be created: `CREATE INDEX idx_insight_tags_tag ON insight_tags(tag)` and `CREATE INDEX idx_documents_category ON documents(category)`.
-4. **FR-IHC-1.4:** The `open_or_init_v2` function in `src/store.rs` MUST be extended with: (a) a fresh-database branch that stamps schema version 5 and applies the V5 delta; (b) a `v4 → 5` upgrade branch that runs the delta transactionally and is additive — books-corpus rows in `index.db` are unaffected because `category` defaults to NULL; (c) a `v5` idempotent re-open branch that probes the two columns and the `insight_tags` table via `pragma_table_info` before proceeding.
-5. **FR-IHC-1.5:** On v4→v5 backfill, ALL existing insight rows (documents rows where `source_path` starts with `agent:`) MUST be updated: `category = 'project'`; `project_slug` derived from the db's project-path basename; one default tag equal to `feature_slug` (or `'untagged'` when `feature_slug` is NULL) inserted into `insight_tags`.
-6. **FR-IHC-1.6:** Books-corpus rows (documents rows where `source_path` does NOT start with `agent:`) MUST retain `category = NULL` and MUST NOT receive any `insight_tags` entries. The V5 migration MUST be verifiable with a test asserting zero `insight_tags` rows for books-corpus doc_ids.
-7. **FR-IHC-1.7:** `cargo test` MUST remain green after the migration: fresh→v5 stamp; v4→v5 adds columns and table; idempotent re-open; the 4 existing SDLC-repo insight rows backfill to `category='project'` with a non-empty tag.
+1. **FR-MAT-1.1:** The daemon's TG routing key MUST be the tuple `(chat_id: i64, message_thread_id: Option<i64>)`. Direct-message inbound MUST resolve to `(dm_chat_id, None)`. Forum-topic inbound MUST resolve to `(group_chat_id, Some(thread_id))`. The same bot token MUST serve all three routing keys in KP1, KP2 and KP3 (plan §"Success Criteria", lines 37–48).
+2. **FR-MAT-1.2:** When extracting the routing key from each teloxide `Update::Message`, the daemon MUST read `Message.message_thread_id` directly. If the field is absent on the inbound `Message` (DM case), the routing key MUST be `(chat_id, None)`. (Plan §"Open for modification", lines 95–98; OQ — Slice 1 architect verification of teloxide-0.17 `message_thread_id` field-existence per R4.)
+3. **FR-MAT-1.3:** Outbound replies MUST translate the optional `message_thread_id` from the CLI's `reply` call into teloxide's `SendMessageSetters::message_thread_id` so the reply lands in the correct topic. When the CLI omits the field (legacy reply), the reply lands in the main chat / DM (plan §"Architecture", line 21).
 
-#### FR-IHC-2: Global Insights Resolver (Slice 2) — SECURITY NOTE
+#### FR-MAT-2: `agent_registry` Schema — Additive Migration (Slice 2, plan lines 119–125)
 
-1. **FR-IHC-2.1:** A new function `resolve_global_insights_db() -> PathBuf` in `src/store.rs` MUST return the fixed path `$HOME/.claude/knowledge/insights.db` (resolved via `std::env::var("HOME")` on Unix or `USERPROFILE` on Windows).
-2. **FR-IHC-2.2:** The function MUST create the parent directory `~/.claude/knowledge/` if it does not exist, with the same permissions logic used for per-project db directories.
-3. **FR-IHC-2.3:** This function DELIBERATELY bypasses the `resolve_project_root` cwd-containment gate (established in §15 FR-7.3). The bypass is safe and MUST be documented in a code comment: the path is a fixed `$HOME`-rooted constant and contains NO user-input-derived component. The security-auditor MUST confirm this during Slice 2 review.
-4. **FR-IHC-2.4:** A unit test MUST assert the resolved path equals `$HOME/.claude/knowledge/insights.db` and that the parent directory is created.
+1. **FR-MAT-2.1:** The v0.6 `agent_registry` table (existing columns `agent_id, agent_name, connection_id, chat_thread_id, state, spawned_at, last_pinged_at` per §17.7) MUST be extended with two new nullable columns: `routing_chat_id INTEGER` and `routing_thread_id INTEGER NULL`. The migration MUST use `ALTER TABLE ... ADD COLUMN ... DEFAULT NULL` so existing rows survive untouched (plan Slice 2 done-when, line 124).
+2. **FR-MAT-2.2:** A new partial-unique index `agent_registry_routing_alive_uniq_idx ON agent_registry(routing_chat_id, routing_thread_id) WHERE state='alive'` MUST be created. This index enforces the at-most-one-alive-CLI-per-routing-key invariant required for deterministic routing in KP1–KP3 (plan §"Open for modification → agent_registry", line 96).
+3. **FR-MAT-2.3:** A new daemon-internal API `register_routing(cli_id: AgentId, chat_id: i64, thread_id: Option<i64>) -> Result<()>` MUST be exposed on `src/daemon/agent_registry.rs`. Calling it twice with the same `(chat_id, thread_id)` while both rows are `state='alive'` MUST fail with a UNIQUE-constraint violation surfaced as a clear application error (plan Slice 2 done-when subpoints a-b, line 124).
+4. **FR-MAT-2.4:** The migration MUST be idempotent — re-running on an already-migrated `chat.db` MUST be a no-op (exit 0) — AND MUST tolerate pre-existing v0.7/v0.8 leftover columns on dev boxes by leaving them in place rather than dropping them (plan Slice 2 migration discipline, lines 122–123; plan R7, line 209).
 
-#### FR-IHC-3: `insight create` — Mandatory Category and Tags, Dual-DB Routing (Slice 3) — BREAKING CLI CHANGE
+#### FR-MAT-3: Daemon Owns the Telegram Connection via teloxide `Dispatcher` (Slice 3, plan lines 126–137)
 
-1. **FR-IHC-3.1 [BREAKING]:** The `--category <general|project>` flag MUST be added to `InsightCreateArgs` in `src/cli.rs` as a `clap value_enum` required argument. Invocations that omit `--category` MUST exit 2 with a clap usage error. This is a breaking change from v0.6.0 where `--category` did not exist.
-2. **FR-IHC-3.2 [BREAKING]:** The `--tags <tag>` flag MUST be added to `InsightCreateArgs` as a repeatable required argument accepting one or more comma-separated or space-separated tag strings. Invocations that supply `--category` but omit `--tags` entirely MUST exit 2 with the literal stderr message `error: insight create requires at least one --tag`. This is a breaking change from v0.6.0 where `--tags` did not exist.
-3. **FR-IHC-3.3:** An optional `--project <slug>` flag MAY be supplied when `--category project`. When omitted with `--category project`, the project slug MUST be auto-derived from the cwd project basename. The `--project` flag MUST be silently ignored when `--category general`.
-4. **FR-IHC-3.4:** `run_insight_create` MUST route the db open by category: `--category general` opens the global db via `resolve_global_insights_db()`; `--category project` opens the cwd-resolved local db via the existing `resolve_project_root` path.
-5. **FR-IHC-3.5:** After the `documents` row insert, `run_insight_create` MUST insert one row per tag into `insight_tags`. Tag strings MUST be lowercased and stripped of leading `#` characters before insertion. Duplicate tags for the same doc MUST be silently dropped (the `UNIQUE(doc_id, tag)` constraint handles this).
-6. **FR-IHC-3.6:** The `category` and `project_slug` columns on the inserted `documents` row MUST be populated from the `--category` and `--project` arguments.
-7. **FR-IHC-3.7:** Existing exact-sha and semantic dedup logic MUST continue to fire per-db — general-category dedup is checked against the global db; project-category dedup is checked against the local db.
-8. **FR-IHC-3.8:** Tests MUST cover: missing `--tags` → exit 2; missing `--category` → clap exit 2; `--category general` writes to global db and NOT to local db (asserted via direct SQL on both files); `--category project` writes to local db; tags are persisted in `insight_tags`; dedup still fires.
+1. **FR-MAT-3.1:** `src/daemon/telegram.rs` MUST own the Telegram connection via teloxide 0.17's high-level `Dispatcher::builder` API wired to a `handler_tree!` routing every inbound `Message`. The daemon MUST NOT contain a hand-rolled `loop { get_updates }` long-poll — the library handles long-polling internally and dispatches events as callbacks (plan §"Architecture" C2, line 20; plan Slice 3, line 129).
+2. **FR-MAT-3.2:** For every inbound `Message`, the Dispatcher handler MUST extract the routing key per FR-MAT-1.2, look up the bound CLI in `agent_registry` via the partial-unique index from FR-MAT-2.2, and (on match) emit a `notifications/claude/channel` event with the optional `thread_id` meta field (per FR-MAT-7) scoped to that CLI's subscription. On no-match the orphan-inbound fallback policy per FR-MAT-9.5 applies (plan Slice 3 done-when, line 137).
+3. **FR-MAT-3.3:** The daemon MUST be the sole `getUpdates` consumer for the configured `TELEGRAM_BOT_TOKEN`. The plugin's frankenstein polling loop MUST be disabled per FR-MAT-4 so v0.6's latent dual-poller 409 vulnerability cannot fire (plan R6, line 208).
 
-#### FR-IHC-4: `insight tags` Subcommand (Slice 4) — NEW COMMAND
+#### FR-MAT-4: Plugin Is a Thin MCP Bridge — Frankenstein Polling Disabled (Slice 4, plan lines 139–144)
 
-1. **FR-IHC-4.1:** A new `InsightCmd::Tags` variant and `InsightTagsArgs` struct MUST be added to `src/cli.rs`. The subcommand is invoked as `claudebase insight tags`.
-2. **FR-IHC-4.2:** `run_insight_tags` MUST execute `SELECT tag, COUNT(*) AS count FROM insight_tags GROUP BY tag ORDER BY count DESC` and return a list of `{tag, count}` objects.
-3. **FR-IHC-4.3:** The `--category <c>` filter MUST restrict to tags for insights matching the given category (via a JOIN to `documents`).
-4. **FR-IHC-4.4:** The `--project <slug>` filter MUST resolve `<slug>` via the project registry (`registry::resolve_project_path` reading `~/.claude/knowledge/projects.json`) and open THAT project's `insights.db` + the global db, merging tag counts across both. A slug not present in the registry MUST exit 1 with the literal stderr `error: project '<slug>' not found in registry`. (Corrected 2026-05-30 from the original "filter by project_slug column" framing to match plan.md:222 + QA TC-IHC-6.3, which are the executable contract.)
-5. **FR-IHC-4.5:** The default posture (no filters) MUST merge tags from BOTH the local-project db and the global db — the same local+general merge posture as the read subcommands.
-6. **FR-IHC-4.6:** `--json` output shape MUST be `[{"tag": "<string>", "count": <integer>}, ...]`.
-7. **FR-IHC-4.7:** Tests MUST cover: returns distinct tags with descending counts; `--category general` lists only global-db tags; merged default includes both; json shape asserted.
+1. **FR-MAT-4.1:** `plugins/telegram-rs/src/telegram/bot.rs`'s `getUpdates` long-poll loop MUST be disabled by default. The loop MAY remain compiled-in behind `cfg(feature = "legacy-direct-poll")` as an emergency revert escape-hatch but MUST NOT run when the daemon-ownership build is active (plan §"Open for modification", line 99; plan R5, line 207; Decisions → Hacks acknowledged below).
+2. **FR-MAT-4.2:** The plugin MUST continue to host the access-gate and pairing UI from v0.6 unchanged (plan §"Open for modification → bot.rs", line 99). The §17 pairing model and the v0.6 `permissions.rs` + `channel_state.rs` modules MUST both be preserved as-is — Slice 6 does NOT migrate or consolidate them (plan Slice 6, lines 153–155).
+3. **FR-MAT-4.3:** The frankenstein 0.49 crate pin in `plugins/telegram-rs/Cargo.toml` MUST be preserved — no migration of the plugin to teloxide and no migration of the daemon to frankenstein (operator decision C1, plan line 19).
 
-#### FR-IHC-5: Dual-DB Reads — `search`, `list`, `random`, `gc`, `delete` (Slice 5)
+#### FR-MAT-5: Plugin's Outbound Tools Forward to Daemon over UDS (Slice 4, plan lines 139–144)
 
-1. **FR-IHC-5.1:** The following read subcommands MUST gain four new filter flags in `src/cli.rs`: `--tag <tag>` (repeatable; **OR / any-intersection semantics** — an insight carries many tags, and a result is returned if its tag set intersects the requested `--tag` set by AT LEAST ONE; `--tag nginx --tag docker` returns insights carrying nginx OR docker), `--category <c>`, `--project <slug>`, and two narrowing boolean flags `--general-only` / `--project-only`. (Operator decision 2026-05-27: OR, not AND. A future `--all-tags` flag for AND semantics is deferred.)
-2. **FR-IHC-5.2:** The default in-project posture for `insight search`, `insight list`, and `insight random` MUST be `merge(local-project + global-general)`, reusing the RRF fusion machinery at `main.rs:2548-2604` adapted to operate over two insight dbs rather than a books db and an insight db. Cross-project reads are walled off unless `--project <other-slug>` is supplied, in which case the project registry resolves the db path.
-3. **FR-IHC-5.3:** Tag filtering MUST be implemented as a single membership filter over the UNION of requested tags — `WHERE doc_id IN (SELECT doc_id FROM insight_tags WHERE tag IN (?, ?, ...))`, one parameterized placeholder per `--tag` value — applied after retrieval ranking to preserve RRF score ordering. This realizes the OR / any-intersection semantics of FR-IHC-5.1 (a per-tag intersect-all JOIN chain would wrongly implement AND).
-4. **FR-IHC-5.4:** `--general-only` MUST read ONLY the global db and MUST ignore the local-project db entirely.
-5. **FR-IHC-5.5:** `--project-only` MUST read ONLY the local-project db and MUST ignore the global db entirely.
-6. **FR-IHC-5.6:** `insight gc` with `--category general` MUST run GC against the global db. Without `--category`, GC MUST run against BOTH dbs sequentially and report combined `{deleted, freed_bytes}`.
-7. **FR-IHC-5.7:** `insight delete <id>` behavior is unchanged from §16 FR-AIB-8.3 for the local db; with `--category general`, the id is resolved against the global db.
-8. **FR-IHC-5.8:** Tests MUST cover: `--tag nginx` returns rows carrying the `nginx` tag (among possibly many); **`--tag nginx --tag docker` returns a nginx-only insight, a docker-only insight, AND a both-tagged insight (OR / any-intersection, NOT AND)**; `--category general` reads only global; default in-project returns both project and general insights and excludes a planted other-project row; `--general-only` excludes project rows; `--project-only` excludes general rows.
+1. **FR-MAT-5.1:** The plugin's four outbound MCP tools (`reply, react, edit_message, download_attachment`) MUST forward to the daemon over the existing v0.6 UDS framing (length-prefixed 4-byte big-endian header + UTF-8 JSON body) using a daemon-internal envelope method name (e.g. `internal.send_message`). The daemon-internal envelope is NOT a new CLI-facing MCP method — it is part of the plugin↔daemon UDS dispatch table only (plan §"Open for modification → handle_reply/handle_react/handle_edit_message/handle_download_attachment", line 100).
+2. **FR-MAT-5.2:** The CLI-facing tool names and required-parameter shapes of `reply, react, edit_message, download_attachment` MUST be unchanged from v0.6. The ONLY contract delta is the additive optional `message_thread_id` param on `reply` per FR-MAT-6 (plan §"Architectural Constraints → Frozen", points 2 and 4, lines 82–87).
 
-#### FR-IHC-6: Project Registry at `~/.claude/knowledge/projects.json` (Slice 6) — NEW FILE
+#### FR-MAT-6: `reply` Gains Optional `message_thread_id` Param (Slice 4, plan lines 143–144)
 
-1. **FR-IHC-6.1:** A new `src/registry.rs` module MUST define a `ProjectRegistry` with entries shaped as `{name: String, path: String, last_seen: u64}` (epoch seconds). The registry is persisted as a JSON array at `~/.claude/knowledge/projects.json`.
-2. **FR-IHC-6.2:** `upsert_project(root: &Path)` MUST: derive `name` from the canonical path basename; find an existing entry by canonical `path`; update `last_seen` if found; append a new entry if not found. The upsert MUST be keyed on canonical path to prevent duplicate entries for the same project under different relative representations.
-3. **FR-IHC-6.3:** The upsert MUST use an atomic write-then-rename pattern: write the updated JSON to a temp file in the same directory, then `rename` (which is atomic on POSIX and near-atomic on Windows) to the final path. This prevents corrupt registry state from concurrent `claudebase run` invocations.
-4. **FR-IHC-6.4:** `resolve_project_path(name: &str) -> Option<PathBuf>` MUST look up a project by name and return its path if found.
-5. **FR-IHC-6.5:** The `upsert_project` call MUST be placed at the TOP of `run_claude_with_preset` in `src/main.rs` (near line 154), BEFORE the `exec()` call on Unix (near line 199). The registry write MUST NOT be placed after `exec()` — `exec()` replaces the process and any code after it never runs.
-6. **FR-IHC-6.6:** Tests MUST cover: running `claudebase run` in a simulated test harness creates/updates the registry with the cwd project; upsert is idempotent on repeated calls with the same path; name→path lookup works; atomic write prevents partial reads.
+1. **FR-MAT-6.1:** The CLI-facing `reply` MCP tool params MUST gain a NEW OPTIONAL field `message_thread_id: Option<String>` (string per the v0.6 ID-as-string discipline). Old CLI clients omitting the field MUST continue to work — their replies land in the main chat / DM (plan §"Architecture" C3, line 21; plan §"Architectural Constraints → Frozen", point 4, lines 84–87).
+2. **FR-MAT-6.2:** When the plugin forwards the `reply` tool call to the daemon over the UDS envelope (per FR-MAT-5.1), the plugin MUST propagate the optional `message_thread_id` into the envelope unchanged. The daemon MUST parse the field and translate it to teloxide's `SendMessageSetters::message_thread_id` on the outbound `sendMessage` call (plan Slice 4 done-when, line 144).
+3. **FR-MAT-6.3:** When the `message_thread_id` field is absent on the inbound CLI tool call, the daemon MUST NOT call `SendMessageSetters::message_thread_id`. The outbound reply MUST land in the main chat / DM — preserving the v0.6 reply-without-thread behavior (plan §"Architecture" C3, line 21).
 
-#### FR-IHC-7: SessionStart "Read Insights on New Context" Hook (Slice 7) — NEW HOOK
+#### FR-MAT-7: `notifications/claude/channel` Meta Gains Optional `thread_id` Field (Slice 3, plan line 130)
 
-1. **FR-IHC-7.1:** Two new hook files MUST be added to the `hooks/` directory: `claudebase-read-insights-reminder.sh` (bash, Unix) and `claudebase-read-insights-reminder.ps1` (PowerShell, Windows). Both are SessionStart hooks that fire on `startup`, `resume`, and `compact` events.
-2. **FR-IHC-7.2:** The hook MUST emit `additionalContext` reminding the agent it is entering a fresh context window and SHOULD pull relevant insights: (a) call `claudebase insight tags --project <cwd-project>` to discover the available tag vocabulary; (b) call `claudebase insight search "<kw>" --tag <t>` (one or two representative calls) to load general and project insights by tag. The reminder MUST phrase the pull as conditional ("if entering fresh context") to avoid re-running on every message.
-3. **FR-IHC-7.3:** The `.ps1` hook MUST be ASCII-only with no BOM. Non-ASCII characters (including PowerShell help comments with non-ASCII) MUST NOT appear. This constraint is established by the failure mode documented in commit `2d5eb8d` (ASCII-only PowerShell hooks — PS 5.1 parse failure).
-4. **FR-IHC-7.4:** `install.sh` MUST wire the `claudebase-read-insights-reminder.sh` hook into `~/.claude/settings.json` under the `hooks.SessionStart` array using `jq`, keyed by the command string. The wiring MUST be idempotent — a second `install.sh` run MUST NOT add a duplicate entry.
-5. **FR-IHC-7.5:** `install.ps1` MUST perform the equivalent wiring using `ConvertFrom-Json` / `ConvertTo-Json`, also idempotent.
-6. **FR-IHC-7.6:** Tests MUST cover: `bash -n hooks/claudebase-read-insights-reminder.sh` exits 0; PowerShell parse of the `.ps1` exits 0; install wiring is idempotent (re-run = no-op); the hook text emits the reminder on a simulated SessionStart event.
+1. **FR-MAT-7.1:** The inbound `notifications/claude/channel` meta JSON object MUST gain a NEW OPTIONAL field `thread_id: Option<String>` (string-typed for symmetry with FR-MAT-6.1). The field MUST be present when the inbound message originated from a forum topic and MUST be absent (or `null`) when the inbound originated from a DM (plan §"Architecture" C3, line 21; plan §"Architectural Constraints → Frozen", point 4, lines 84–87).
+2. **FR-MAT-7.2:** No existing field on the `notifications/claude/channel` meta MUST be renamed, retyped, or removed. The notification method name `notifications/claude/channel` MUST remain bit-for-bit identical to v0.6 (plan §"Architectural Constraints → Frozen", point 1, line 81). The contract delta is purely additive per JSON-RPC backward-evolution convention.
+3. **FR-MAT-7.3:** v0.6 CLI clients (Claude Code with a v0.6 plugin) MUST continue to operate against a daemon emitting the `thread_id` field — unknown fields MUST be ignored per JSON-RPC convention (plan §"Architectural Constraints → Frozen", point 4 closing line, line 87).
 
-#### FR-IHC-8: Update All Callers — SDLC Blast Radius (Slice 8) — BREAKING CHANGE REMEDIATION
+#### FR-MAT-8: Bot Commands `/agents`, `/switch`, `/whoami`, `/here` — Topic-Aware (Slice 5, plan lines 146–151)
 
-1. **FR-IHC-8.1:** Every `insight create` invocation template or example in the SDLC agent prompt files (the ~22 files under `~/.claude/agents/*.md` or `src/agents/*.md`) MUST be updated to include `--category <value>` and `--tags <value>`. After this update, no bare `insight create` example lacking `--category` and `--tags` MUST remain in any agent prompt or rule file.
-2. **FR-IHC-8.2:** `~/.claude/rules/knowledge-base-tool.md` MUST be updated to: document the new `--category` (required) and `--tags` (required, ≥1) flags on `insight create`; document the `insight tags` subcommand and the read-on-new-context flow; document the global/project routing semantics.
-3. **FR-IHC-8.3:** `~/.claude/rules/knowledge-base.md` MUST be updated to reflect the new required flags in its CLI invocation contract section.
-4. **FR-IHC-8.4:** The UserPromptSubmit reminder hook text (in `claudebase-selfcheck-reminder.sh` / `.ps1`) MUST be updated to include `--category` and `--tags` in any `insight create` examples it shows to agents.
-5. **FR-IHC-8.5 (Done-when):** `grep -rE "insight create" ~/.claude/ src/agents/ ~/.claude/rules/` finds zero lines that lack `--category` AND zero lines that lack `--tag`. This grep-check is the acceptance gate for this slice.
+1. **FR-MAT-8.1:** The daemon's Dispatcher handler tree MUST dispatch the four bot commands `/agents`, `/switch <cli>`, `/whoami`, `/here` BEFORE the routing-key lookup runs. The commands MUST be handled server-side in the daemon — they are NOT CLI-facing MCP tools (plan Slice 5, line 147).
+2. **FR-MAT-8.2:** `/agents` MUST be topic-aware: when issued from forum topic α the command MUST list CLIs whose binding is `(chat_id, Some(α))`; when issued from forum topic β the command MUST list CLIs bound to `(chat_id, Some(β))`; when issued in a DM the command MUST list CLIs bound to `(chat_id, None)`. The Dispatcher handler MUST read `message.message_thread_id` from the COMMAND message itself when filtering (plan R8, line 210).
+3. **FR-MAT-8.3:** `/switch <cli>` MUST rebind the routing-key row in `agent_registry` to the named CLI. Two concurrent `/switch` taps targeting the same routing key MUST be serialized by SQLite's per-write transaction; the partial-unique index from FR-MAT-2.2 ensures only one binding persists. Default conflict-resolution policy: second tap wins (overwrites) with a TG confirmation reply (plan Slice 5 race-condition note, line 149).
+4. **FR-MAT-8.4:** `/whoami` MUST return the caller's current `(routing_chat_id, routing_thread_id)` binding and the bound CLI's `agent_id` / `agent_name` (plan Slice 5, line 148).
+5. **FR-MAT-8.5:** `/here` MUST return the bound CLI's host / cwd / process metadata from the registry (plan Slice 5, line 148).
+6. **FR-MAT-8.6 (Group-`/switch` security — OQ3 default policy, refined by red-team at bootstrap):** In a group, only the user whose `user_id` matches the existing binding's last user_id, OR a chat admin, MAY invoke `/switch`. Unauthorized callers MUST receive a TG denial reply. This is the default; the red-team agent MAY refine at bootstrap (plan OQ3, line 225; plan R3, line 205).
 
-#### FR-IHC-9: Docs and Release v0.7.0 (Slice 9)
+#### FR-MAT-9: Error Handling — teloxide / Token / Orphan Inbound (Slice 3, plan lines 131–136)
 
-1. **FR-IHC-9.1:** The claudebase `CHANGELOG.md` `[Unreleased]` section MUST gain entries: `Added` — hybrid corpus (global general-db at `~/.claude/knowledge/insights.db`, project registry at `~/.claude/knowledge/projects.json`, `insight tags` subcommand, tag and category filters on all read subcommands, read-on-new-context SessionStart hook); `Changed / BREAKING` — `insight create` now requires `--category` and `--tags` (missing either causes exit 2).
-2. **FR-IHC-9.2:** `README.md` MUST gain a "Hybrid Insights Corpus" subsection documenting the routing model (`general` → global db, `project` → local db), the `insight tags` discovery flow, the project registry, and the `--category`/`--tags` requirement.
-3. **FR-IHC-9.3:** The `/release` command MUST produce claudebase core release `v0.7.0` after `/merge-ready` reports MERGE READY.
+1. **FR-MAT-9.1:** When `TELEGRAM_BOT_TOKEN` is unset at daemon startup, the daemon MUST start WITHOUT Telegram support, log a WARN message and continue serving non-TG subsystems (chat, registry, plugin bridge). The daemon MUST NOT crash (plan Slice 3 error handling subpoint 1, line 132).
+2. **FR-MAT-9.2:** When teloxide returns HTTP 401 (invalid token) on bootstrap or mid-stream, the daemon MUST log an ERROR, gracefully terminate the Dispatcher task, and keep the rest of the daemon alive (plan Slice 3 error handling subpoint 2, line 133).
+3. **FR-MAT-9.3:** When teloxide returns HTTP 409 (another consumer holds the token), the daemon MUST log a WARN with an operator-facing instruction («kill any other claudebase daemon / TG plugin holding this token; the daemon is the sole owner in this build») and apply exponential backoff before retrying (plan Slice 3 error handling subpoint 3, line 134).
+4. **FR-MAT-9.4:** When an inbound message arrives without `message_thread_id` (DM case), the routing key MUST resolve to `(chat_id, None)` and routing MUST proceed normally (plan Slice 3 error handling subpoint 4, line 135).
+5. **FR-MAT-9.5 (Orphan inbound):** When an inbound message routing-key has no `state='alive'` binding in `agent_registry`, the daemon MUST log the orphan event AND apply the fallback policy decided at bootstrap (plan OQ3-related; plan Slice 3 error handling subpoint 5, line 136). Default plan: log + emit a TG reply «no CLI bound to this routing key» — architect refines the precise fallback at bootstrap (plan §"Verification" step 4, line 235).
+
+#### FR-MAT-10: Daemon-Restart Resilience (Slice 7, plan lines 157–162)
+
+1. **FR-MAT-10.1:** All `agent_registry` rows including the new `routing_chat_id` / `routing_thread_id` columns MUST persist in `chat.db` across daemon restart — using the existing v0.6 SQLite persistence layer (plan Slice 7, line 158).
+2. **FR-MAT-10.2:** On daemon restart, all `state='alive'` bindings MUST be restored to in-memory routing state without operator intervention. A subsequent inbound message MUST route to the correct CLI per the persisted binding (plan Slice 7 done-when, line 162).
+3. **FR-MAT-10.3:** A CLI that started BEFORE the daemon came up MUST continue to operate against the v0.6 `claudebase_daemon_status: { status: "down" }` sentinel and MUST automatically reconnect via the v0.6 `notifications/tools/list_changed` mechanism once the daemon is up. NO v0.8 session-cache, NO reconnect-replay, NO `ensure_daemon_running` is introduced (plan Slice 7 explicit-out, line 161; plan §"Open for modification → bridge.rs", line 101).
 
 ### 18.4 Non-Functional Requirements
 
-1. **NFR-IHC-1 (Backward compatibility — schema):** The v5 migration MUST be additive. No existing column on `documents` may be dropped or renamed. Books-corpus rows MUST remain valid after the migration. Existing v4 insights MUST be backfilled with non-empty `category` and `project_slug` values and at least one `insight_tags` row.
-2. **NFR-IHC-2 (Security backbone preserved):** The `resolve_project_root` cwd-containment gate MUST remain the only path-from-user-input gate for per-project db access. The `resolve_global_insights_db` bypass (FR-IHC-2.3) is explicitly exempt and documented. No other bypass is introduced.
-3. **NFR-IHC-3 (Registry concurrency safety):** Concurrent `claudebase run` invocations on the same machine MUST NOT corrupt `projects.json`. The atomic write-then-rename strategy (FR-IHC-6.3) is the required mechanism.
-4. **NFR-IHC-4 (Hook nag frequency):** The SessionStart hook fires on every `startup`, `resume`, and `compact` event. The hook text MUST be lightweight `additionalContext` (not a blocking prompt) and MUST NOT exceed 200 words of injected reminder text.
-5. **NFR-IHC-5 (Tag storage — normalized):** Tags are stored in a normalized `insight_tags(doc_id, tag)` table rather than a denormalized JSON/CSV column on `documents`. This enables efficient `GROUP BY tag` counts and an indexed `WHERE tag = ?` filter without full-table scans.
-6. **NFR-IHC-6 (CLI breaking change is intentional and fully remediated):** The breaking change to `insight create` (adding required `--category` and `--tags`) is operator-approved. All in-repository callers are updated in Slice 8 before v0.7.0 is released. External callers not maintained in this repository are warned via the `CHANGELOG.md` BREAKING entry.
-7. **NFR-IHC-7 (Single-binary constraint):** All new functionality (global resolver, registry, dual-db reads, hook scripts) MUST compile into the existing `claudebase` binary with no additional runtime dependencies. No Python, no Node.js, no new external binaries.
+1. **NFR-MAT-1 (Mixed library stack preserved):** The daemon MUST keep teloxide 0.17 as the TG client (`src/daemon/telegram.rs`) and the plugin MUST keep frankenstein 0.49 (`plugins/telegram-rs/`). No migration in either direction (operator decision C1, plan line 19; plan §"Architectural Constraints → Frozen", point 8, line 91).
+2. **NFR-MAT-2 (Zero CLI-observable contract renames):** The plugin's four outbound MCP tools (`reply, react, edit_message, download_attachment`), the root-crate daemon-bridge's ten MCP tools (`chat_post, chat_subscribe, chat_reply, chat_list, chat_list_threads, claudebase_daemon_status, agent_register, agent_unregister, agent_list_alive, agent_reap`), and the inbound `notifications/claude/channel` method name MUST remain bit-for-bit identical to v0.6. The only contract delta is the additive optional fields per FR-MAT-6 and FR-MAT-7 (plan §"Architectural Constraints → Frozen", points 1–3, lines 80–83).
+3. **NFR-MAT-3 (Installer behavior unchanged):** `install.sh` MUST patch the **official** `telegram@claude-plugins-official` plugin's `.mcp.json` per the v0.6 implementation at `install.sh:551-702` (Plan-Critic VERIFIED line range, plan §"Architectural Constraints → Frozen", point 6, line 89). No installer changes are required for this feature.
+4. **NFR-MAT-4 (`claudebase run` argv unchanged):** `claudebase run` MUST continue to exec `claude --channels plugin:telegram@claude-plugins-official` per the v0.6 implementation at `src/main.rs:177` (plan §"Architectural Constraints → Frozen", point 7, line 90).
+5. **NFR-MAT-5 (Single bot serves all three routing keys):** A single `TELEGRAM_BOT_TOKEN` MUST be sufficient to satisfy KP1, KP2 and KP3 — no per-CLI bot, no per-topic bot. The `agent_registry` partial-unique index from FR-MAT-2.2 is the load-bearing mechanism (plan §"Success Criteria" closing bullet, line 48).
+6. **NFR-MAT-6 (`src/plugin/bridge.rs` preserved bit-for-bit):** `src/plugin/bridge.rs` MUST remain the v0.6 692-line baseline. The v0.8 additions — session-cache, reconnect-replay, `ensure_daemon_running` — MUST NOT be ported (plan §"Open for modification → bridge.rs", line 101; plan §"Files Likely Affected → Preserved", line 190).
 
 ### 18.5 Acceptance Criteria
 
-1. **AC-IHC-1 (Schema v5 — fresh stamp):** `claudebase status --json` on a fresh post-install database returns `"schema_version": 5`.
-2. **AC-IHC-2 (Schema v5 — v4 migration additive):** On a v4 `insights.db` with existing insight rows and book rows in `index.db`, running any `claudebase insight` subcommand triggers the v4→v5 migration; `pragma_table_info(documents)` shows `category` and `project_slug` columns; the `insight_tags` table exists; book-corpus rows have `category = NULL` and zero `insight_tags` entries.
-3. **AC-IHC-3 (Backfill):** The 4 existing SDLC-repo insight rows (inserted at v4) each have `category = 'project'` and at least one row in `insight_tags` after migration.
-4. **AC-IHC-4 (Mandatory enforcement — tags):** `claudebase insight create "test" --category project` (no `--tags`) exits 2 and writes to neither db.
-5. **AC-IHC-5 (Mandatory enforcement — category):** `claudebase insight create "test" --tags foo` (no `--category`) exits 2 (clap error).
-6. **AC-IHC-6 (Routing — general):** `claudebase insight create "nginx lesson" --category general --tags nginx` inserts a row into `~/.claude/knowledge/insights.db` and NOT into the cwd local `insights.db`. Verified via `sqlite3 ~/.claude/knowledge/insights.db "SELECT count(*) FROM documents WHERE source_type='agent-learned'"` returning ≥ 1, and cwd local db count unchanged.
-7. **AC-IHC-7 (Routing — project):** `claudebase insight create "local lesson" --category project --tags myfeature` inserts a row into the cwd local `insights.db` and NOT into `~/.claude/knowledge/insights.db`.
-8. **AC-IHC-8 (Tags subcommand):** `claudebase insight tags --json` returns a JSON array with at least one element having `tag` and `count` fields after AC-IHC-6 and AC-IHC-7 complete.
-9. **AC-IHC-9 (Search — merged default):** In-project `claudebase insight search "lesson" --json` returns hits from BOTH the local db and the global db and excludes a row planted in a second unrelated project's db.
-10. **AC-IHC-10 (Search — tag filter):** `claudebase insight search "lesson" --tag nginx --json` returns only rows tagged `nginx`.
-11. **AC-IHC-11 (Search — general-only):** `claudebase insight search "lesson" --general-only --json` returns only global-db rows.
-12. **AC-IHC-12 (Registry — created on run):** After `claudebase run` executes (or the registry entry-point is triggered in a test harness), `~/.claude/knowledge/projects.json` exists and contains an entry for the cwd project with a non-null `last_seen` epoch.
-13. **AC-IHC-13 (Registry — idempotent):** Running the registry upsert twice with the same cwd produces exactly one entry for that project in `projects.json`, not two.
-14. **AC-IHC-14 (Hook — parse):** `bash -n hooks/claudebase-read-insights-reminder.sh` exits 0. PowerShell `-Command "& { . 'hooks/claudebase-read-insights-reminder.ps1' }"` exits 0 on a PS 5.1 engine.
-15. **AC-IHC-15 (Hook — install idempotent):** Running `bash install.sh --yes` twice does not produce duplicate entries for `claudebase-read-insights-reminder.sh` in `~/.claude/settings.json`.
-16. **AC-IHC-16 (Callers updated):** `grep -rE "insight create" ~/.claude/ src/agents/ ~/.claude/rules/ | grep -v "\-\-category" | wc -l` returns 0.
-17. **AC-IHC-17 (Release):** After `/merge-ready` reports MERGE READY and `/release` completes, `claudebase --version` returns `0.7.0` and `CHANGELOG.md` contains a versioned `[0.7.0]` section with a `Changed / BREAKING` entry for `insight create`.
+The QA-cycle MUST verify these three load-bearing criteria with concrete evidence on a live Telegram bot — they are copied verbatim from `.claude/plan.md` §"Success Criteria" (lines 37–48) and they are the only AC items for this section. KP1, KP2 and KP3 are non-negotiable; a build that fails any one is NOT shippable.
 
-### 18.6 Affected CLI Surface
+1. **AC-MAT-KP1 (DM routing):** Operator messages bot `@X` in **DM**. Routing key resolves to `(dm_chat_id, None)`. The inbound surfaces in **CLI A** as a `<channel source="plugin:telegram:telegram" chat_id="..." thread_id="" user="...">` event. CLI A's `reply` (no `message_thread_id`) lands in the same DM. Daemon log MUST contain the literal line `routed (chat_id=<N>, thread_id=None) -> cli_id=A`. SQL `SELECT cli_id, chat_id, thread_id FROM agent_registry WHERE state='alive'` MUST contain the row `(A, <dm_chat_id>, NULL)`. Evidence: OS-level screenshot `tc-kp1-dm-after.png` + terminal screenshot `tc-kp1-cli-a-channel.png` + daemon log line + SQL row output (plan §"Success Criteria" KP1 + evidence table, lines 39, 54).
+2. **AC-MAT-KP2 (Forum-topic α routing):** Operator messages the **same bot `@X`** in a **group with forum topics enabled**, topic α. Routing key resolves to `(group_chat_id, Some(thread_id_α))`. The inbound surfaces in **CLI B** (B ≠ A) as a `<channel>` event with `thread_id` set. CLI B's `reply` echoing back `message_thread_id` lands in topic α. Daemon log MUST contain `routed (chat_id=<G>, thread_id=Some(α_id)) -> cli_id=B`. SQL row `(B, <G>, α_id)` MUST exist. Evidence: screenshot `tc-kp2-topicα-after.png` + terminal screenshot + daemon log + SQL row (plan §"Success Criteria" KP2 + evidence table, lines 40, 55).
+3. **AC-MAT-KP3 (Forum-topic β routing):** Operator messages the **same bot `@X`** in the **same group**, topic β (a different topic from KP2). Routing key resolves to `(group_chat_id, Some(thread_id_β))`. The inbound surfaces in **CLI C** (C ≠ A, C ≠ B). CLI C's `reply` lands in topic β. Daemon log MUST contain `routed (chat_id=<G>, thread_id=Some(β_id)) -> cli_id=C`. SQL row `(C, <G>, β_id)` MUST exist. Three distinct CLIs MUST be visible side-by-side in `agent_registry`. Evidence: screenshot `tc-kp3-topicβ-after.png` + terminal screenshot + daemon log + SQL row (plan §"Success Criteria" KP3 + evidence table, lines 41, 56).
 
-**New flags on `insight create` (BREAKING — required):**
-- `--category <general|project>` — routing key; required; clap `value_enum`
-- `--tags <tag>` — repeatable; at least one required; empty list → exit 2
-- `--project <slug>` — optional; applicable only with `--category project`
+All three cases are **Mixed** Verification Class (UI/UX + CLI + DB) per the plan's evidence-required table (line 52). Screenshots are OS-level (PowerShell `Get-Screenshot` / Snipping Tool on Windows; `screencapture` on macOS; `gnome-screenshot` on Linux) because Playwright MCP cannot capture native Telegram Desktop (Plan-Critic finding #6, plan line 58). Telegram Web in a Playwright-driven browser is an acceptable alternate path.
 
-**New flags on `insight search`, `list`, `random`, `gc`, `delete`:**
-- `--tag <tag>` — repeatable; AND semantics
-- `--category <c>` — filter by category
-- `--project <slug>` — resolve cross-project db via registry
-- `--general-only` — read global db only
-- `--project-only` — read local db only
+### 18.6 Affected Components
 
-**New subcommand:**
-- `claudebase insight tags [--category <c>] [--project <slug>] [--json]`
+**Modified (daemon + plugin internals — open for change per plan §"Architectural Constraints → Open for modification", lines 95–101):**
 
-**Unchanged subcommands (interface):**
-- `insight search`, `insight list`, `insight random`, `insight get`, `insight gc`, `insight delete` — interface additive only (new filter flags); existing flags unchanged.
+- `src/daemon/telegram.rs` — teloxide `Dispatcher` rewrite of v0.6 `run_long_poll`, routing-key extraction, error handling (Slice 3, 5)
+- `src/daemon/agent_registry.rs` — additive schema columns (`routing_chat_id`, `routing_thread_id`) + partial-unique index + new `register_routing` API (Slice 2)
+- `src/daemon/server.rs` — UDS dispatch table grows daemon-internal envelopes for plugin-forwarded outbound (Slice 4)
+- `src/daemon/chat.rs` — broadcast bus filter by `(chat_id, thread_id)` routing key (Slice 3)
+- `src/daemon/mod.rs` — Dispatcher wiring
+- `src/daemon/migrations.rs` (or wherever v0.6 daemon migrations live) — additive schema migration (Slice 2)
+- `plugins/telegram-rs/src/telegram/bot.rs` — disable `getUpdates` poller; keep access-gate + pairing UI (Slice 4)
+- `plugins/telegram-rs/src/mcp/server.rs` — `handle_reply` / `handle_react` / `handle_edit_message` / `handle_download_attachment` forward to daemon over UDS (Slice 4)
+- `plugins/telegram-rs/src/mcp/notification.rs` — emit `thread_id` optional meta on inbound (Slice 3)
+- `plugins/telegram-rs/src/mcp/tools.rs` — `reply` tool schema gains optional `message_thread_id` (Slice 4)
+- `Cargo.lock` — regen
+
+**Preserved bit-for-bit (frozen contract per plan §"Architectural Constraints → Frozen", lines 78–91):**
+
+- `plugins/telegram-rs/src/mcp/protocol.rs`
+- `src/plugin/bridge.rs` — the v0.6 692-line version, NOT the v0.8 1066-line version
+- `src/plugin/mcp.rs` — v0.6 `TOOL_WHITELIST` exactly
+- `install.sh` Telegram plugin patching block at v0.6 lines 551–702
+
+**Created:**
+
+- `docs/use-cases/multi-agent-telegram-on-v0.6_use_cases.md`
+- `docs/qa/multi-agent-telegram-on-v0.6_test_cases.md`
+- `docs/qa/multi-agent-telegram-on-v0.6_smoke_runbook.md`
+- This PRD section (§18) appended to `docs/PRD.md`
 
 ### 18.7 Schema Changes
 
-All schema changes apply to `insights.db` only. `index.db` (books corpus) and `chat.db` (daemon) are unaffected.
-
-**`insights.db` — Schema v5 (additive on top of §16 v4):**
+The §17 `chat.db` (schema v6 with the `agent_registry` table) is extended additively in a new migration (schema v7 in `src/migrations.rs`, registered after the existing `apply_v6` per plan Slice 2 line 122):
 
 ```sql
--- New columns on the existing `documents` table:
-ALTER TABLE documents ADD COLUMN category TEXT;       -- 'general' | 'project' | NULL (books rows)
-ALTER TABLE documents ADD COLUMN project_slug TEXT;   -- cwd project basename; NULL for general insights
+-- additive migration on top of the §17 agent_registry table.
+-- Two nullable columns + one partial-unique index. No rows altered, no columns dropped.
+ALTER TABLE agent_registry ADD COLUMN routing_chat_id   INTEGER;
+ALTER TABLE agent_registry ADD COLUMN routing_thread_id INTEGER;
 
--- New index for category filtering:
-CREATE INDEX idx_documents_category ON documents(category);
-
--- New normalized tags table:
-CREATE TABLE IF NOT EXISTS insight_tags (
-    doc_id  INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-    tag     TEXT NOT NULL,
-    UNIQUE(doc_id, tag)
-);
-CREATE INDEX idx_insight_tags_tag ON insight_tags(tag);
+-- One-CLI-per-routing-key invariant: at most one state='alive' row for any
+-- given (routing_chat_id, routing_thread_id) tuple. NULL thread_id is the DM
+-- case and is treated as a distinct routing key from any non-NULL thread_id
+-- per SQLite's NULL-as-distinct semantics in UNIQUE indexes.
+CREATE UNIQUE INDEX IF NOT EXISTS agent_registry_routing_alive_uniq_idx
+    ON agent_registry(routing_chat_id, routing_thread_id)
+    WHERE state = 'alive';
 ```
 
-**Backfill for existing v4 insight rows (rows where `source_path LIKE 'agent:%'`):**
+Migration discipline (plan Slice 2 lines 122–123, plan R7 line 209):
 
-```sql
-UPDATE documents
-SET    category     = 'project',
-       project_slug = '<derived-from-db-path-basename>'
-WHERE  source_path LIKE 'agent:%' AND category IS NULL;
+- Idempotent — re-running on an already-migrated `chat.db` MUST be a no-op.
+- Tolerant of pre-existing v0.7/v0.8 leftover columns on operator dev boxes — leftover columns are NOT dropped, they become unused.
+- Forward-compatible rollback — both new columns are nullable so old INSERTs continue to be valid if a future revert removes only the new code.
 
--- One default tag row per existing insight, using feature_slug or 'untagged':
-INSERT OR IGNORE INTO insight_tags (doc_id, tag)
-SELECT id, COALESCE(NULLIF(feature_slug, ''), 'untagged')
-FROM   documents
-WHERE  source_path LIKE 'agent:%' AND category = 'project';
-```
+The §17 v6 `agent_registry_thread_name_alive_idx` index (FR-ACD-5.7 agent-name uniqueness within thread) remains in place and is orthogonal to the new routing-key index.
 
-**New file: `~/.claude/knowledge/projects.json`**
+### 18.8 UI Changes
 
-```json
-[
-  { "name": "<project-basename>", "path": "<canonical-absolute-path>", "last_seen": 1748376015 }
-]
-```
+**Telegram bot UX (server-handled, no CLI UI changes).** The bot's command surface gains four commands handled in the daemon's Dispatcher handler tree per FR-MAT-8:
 
-**New file: `~/.claude/knowledge/insights.db` (global)**
+- `/agents` — list CLIs bound to the current routing key (topic-aware: filters by the originating chat_id and message_thread_id of the command message itself per FR-MAT-8.2).
+- `/switch <cli>` — rebind the current routing key to the named CLI; conflict resolution = second tap wins (FR-MAT-8.3).
+- `/whoami` — show current binding `(routing_chat_id, routing_thread_id) -> agent_id, agent_name` (FR-MAT-8.4).
+- `/here` — show the bound CLI's host / cwd / process metadata (FR-MAT-8.5).
 
-Identical schema to the per-project `insights.db` (v5), but populated only with `category = 'general'` rows.
+In a group, `/switch` is restricted to the user whose `user_id` matches the binding's last user_id OR a chat admin (FR-MAT-8.6 default policy, refined by red-team at bootstrap per plan OQ3 line 225).
 
-### 18.8 File and FS Changes
+No Claude Code CLI-side UI changes are introduced. The inbound `<channel>` event surface gains an optional `thread_id` attribute when the source is a forum topic (per FR-MAT-7.1) but old CLIs ignore unknown fields per JSON-RPC convention so they continue to operate unchanged.
 
-**claudebase Rust binary (new or modified files):**
-- `src/store.rs` — `SCHEMA_V5_DELTA` constant + v4→v5 migration branch + v5 idempotent probe + backfill logic + `resolve_global_insights_db()`
-- `src/cli.rs` — `InsightCreateArgs` extended with `--category`, `--tags`, `--project`; new `InsightTagsArgs` + `InsightCmd::Tags`; read-subcommand filter flags
-- `src/main.rs` — `run_insight_create` dual-db routing (:895); `run_insight_search`, `run_insight_list`, `run_insight_random`, `run_insight_gc`, `run_insight_delete` dual-db + tag/category filters; new `run_insight_tags`; `run_claude_with_preset` registry hook (:154)
-- `src/registry.rs` — **NEW** — `ProjectRegistry`, `upsert_project`, `resolve_project_path`
-- `hooks/claudebase-read-insights-reminder.sh` — **NEW** — bash SessionStart hook
-- `hooks/claudebase-read-insights-reminder.ps1` — **NEW** — PowerShell SessionStart hook (ASCII-only, no BOM)
-- `install.sh` — wire new hook into `~/.claude/settings.json` idempotently
-- `install.ps1` — wire new hook into `~/.claude/settings.json` idempotently (ConvertFrom-Json / ConvertTo-Json)
-- `CHANGELOG.md` — `[Unreleased]` entries (Added + Changed/BREAKING)
-- `README.md` — "Hybrid Insights Corpus" subsection
+### 18.9 Risks and Dependencies
 
-**SDLC repo (caller blast radius — Slice 8):**
-- `~/.claude/agents/*.md` — ~22 agent prompt files with `insight create` examples updated
-- `~/.claude/rules/knowledge-base-tool.md` — CLI contract + surfacing protocol updated
-- `~/.claude/rules/knowledge-base.md` — CLI invocation contract updated
-- `hooks/claudebase-selfcheck-reminder.sh` / `.ps1` — UserPromptSubmit reminder hook updated
-
-**New persistent FS artifacts (created at runtime, not committed):**
-- `~/.claude/knowledge/insights.db` — global insights database (created on first `--category general` write)
-- `~/.claude/knowledge/projects.json` — project registry (created on first `claudebase run`)
-
-### 18.9 Out of Scope
-
-The following items are explicitly excluded from v0.7.0:
-
-1. **Content migration of existing project insights to the global db.** Hybrid storage keeps existing project insights local by design — zero content migration in v0.7.0.
-2. **Cross-project global search** (reading ALL project dbs). The registry enables this later; not in v0.7.0.
-3. **Category taxonomy beyond `{general, project}`.** The 2-value enum is extensible in a later release.
-4. **Tag synonyms, hierarchical tags, or tag-rename tooling.** Free-form tags are sufficient for v0.7.0; taxonomy features are deferred.
-5. **Auto-classification of category by content.** Agents supply `--category` explicitly; no ML-based routing in v0.7.0.
-6. **`sdlc-knowledge` embedded tag-scheme versioning.** Tag-scheme disambiguation at `/release` (per `auto-release.md`) is a release-engineer concern, not a PRD requirement.
-
-### 18.10 Risks and Dependencies
-
-1. **Shared `documents` table — category/project_slug columns on a books-corpus-shared table.** The v5 delta adds insight-only semantics to a table shared with books-corpus rows. Backfill MUST leave book rows with `category = NULL`. The architect must confirm this column-on-shared-table approach is acceptable vs. a dedicated insight table. Default: columns on shared table (consistent with the v4 metadata pattern). — Risk: medium.
-2. **`exec()` replaces the process — registry write must precede it.** `run_claude_with_preset` at main.rs:154 calls `exec()` at line 199 on Unix. A registry write placed after the `exec()` call never executes. Mitigation: FR-IHC-6.5 mandates placement at the TOP of the function, verified by the done-when test. — Risk: high (correctness); mitigation strong.
-3. **Breaking CLI change blast radius.** Every `insight create` call site breaks if `--category` and `--tags` are not added. Mitigation: Slice 8 updates all in-repository callers before v0.7.0 release; CHANGELOG BREAKING entry warns external callers. — Risk: medium.
-4. **Dual-db RRF fusion generalization.** The existing `--corpus all` machinery at main.rs:2548-2604 was designed for books+insights, not insight+insight. The corpus-label handling may be hardwired. Mitigation: Slice 5 reads `run_one_corpus_for_fusion` fully before reusing; if it does not generalize, a simplified union+re-sort is the fallback. — Risk: medium; must be verified before Slice 5 implementation.
-5. **Global-resolver cwd-gate bypass security.** `resolve_global_insights_db()` bypasses `resolve_project_root`. Safe because the path is a fixed `$HOME`-rooted constant with no user-input-derived component. Security-auditor MUST confirm during Slice 2. — Risk: low (path is fixed); confirmatory review required.
-6. **Registry concurrency.** Multiple concurrent `claudebase run` invocations race on `projects.json`. Mitigation: atomic write-then-rename (FR-IHC-6.3). — Risk: low with mitigation in place.
-7. **SessionStart hook frequency.** Fires on every compact, which may occur frequently during long sessions. Mitigation: hook text is lightweight additionalContext (≤200 words), phrased conditionally. — Risk: low.
-8. **Backfill of 4 existing SDLC-repo insights.** They are v4, tag-less; mandatory tags cannot be retroactive. Mitigation: backfill derives a default tag from `feature_slug` (or `'untagged'` when NULL). — Risk: low.
+1. **R-MAT-1 (Full v0.6 baseline = loss of v0.7 quality-of-life).** Branching from `claudebase-v0.6.0` cleanly drops v0.7 amenities (insights tag-filter, hooks, `/update-claudebase`, `prompts/` reorg). Selective port-forward of v0.7 Bucket-A items is deferred to a follow-up feature on top of the merged branch (plan R1 line 203; out-of-scope line 219).
+2. **R-MAT-2 (`reply` becoming an optional-additive contract change).** Strictly an additive contract change. Operator approved as C3 option (a). Backward-compat guaranteed by the field being optional + old consumers ignoring unknown fields (plan R2 line 204).
+3. **R-MAT-3 (`/switch` security in groups).** Default policy: per-tap user-check (only last user_id or chat admin). Red-team at bootstrap may refine (plan R3 line 205; plan OQ3 line 225).
+4. **R-MAT-4 (teloxide 0.17 `Message.message_thread_id` field existence).** Slice 1 architect call verifies the field exists in teloxide 0.17. If absent: fallback options (a) bump teloxide to 0.18+, (b) custom deser bypass, (c) downgrade to "topic routing unsupported, only DM works" with explicit operator approval to cut scope (plan R4 line 206; plan Slice 1 line 114).
+5. **R-MAT-5 (Plugin frankenstein polling disabled = no fallback if daemon dies).** v0.6 plugins could poll standalone. Mitigation: explicitly documented as deliberate architectural choice (operator-stated C2); v0.6 standalone mode preserved via `cfg(feature = "legacy-direct-poll")` emergency-revert escape-hatch (plan R5 line 207).
+6. **R-MAT-6 (v0.6's latent dual-poller 409 vulnerability).** Two pollers (daemon teloxide + plugin frankenstein) both reading the same `TELEGRAM_BOT_TOKEN` in v0.6 baseline is a known latent race. Resolved by FR-MAT-4.1 / Slice 4 disabling the plugin's poller — daemon becomes sole owner (plan R6 line 208).
+7. **R-MAT-7 (`chat.db` migration on a dev box that has v0.7/v0.8 leftovers).** Slice 2 migration is `ALTER TABLE ADD COLUMN` only; pre-existing leftover columns survive. New code reads only the new columns (plan R7 line 209).
+8. **R-MAT-8 (Topic-aware `/agents` in a group main thread).** Command sent in main group thread without a topic context — list all CLIs in that group. Filtering logic reads `message.message_thread_id` from the command message itself (plan R8 line 210).
+9. **R-MAT-9 (Symptom-only rebuild rather than v0.8 root-cause isolation).** The operator's decision to rollback rather than fix-forward v0.8 IS a symptom-only patch at the meta-level — root cause of v0.8 brokenness is NOT pursued because forward-debug cost exceeds rebuild cost. Tracked in Decisions → Symptom-only patches below. Operator-acknowledged trade-off (plan Symptom-only patches line 294).
 
 ## Facts
 
 ### Verified facts
 
-- `open_or_init_v2` at `src/store.rs:222` is the single insights/books DB-open+migrate entry point; v4→5 is the required new branch — source: `.claude/plan.md` lines 154 (Verified facts block, "open_or_init_v2 (store.rs:222) is the single insights/books DB-open+migrate entry point"), confirmed against the plan read this session. — salience: high
-- Insight metadata (`source_type`, `agent_name`, `session_id`, `feature_slug`, `salience`, `parent_artifact`) is stored as nullable columns on the SHARED `documents` table (SCHEMA_V4_DELTA, store.rs:197-207); books rows keep them NULL — so adding `category`/`project_slug` the same way is consistent with the existing pattern — source: plan.md Verified facts, lines 155-156, read this session. — salience: high
-- There is NO tags table and NO category column in v4; `feature_slug` is the only tag-ish field — source: plan.md Verified facts line 156 ("There is NO tags table and NO category column today"), read this session. — salience: high
-- `run_insight_create` is at main.rs:895; insight read handlers are at: `run_insight_search` (:1148), `run_insight_list` (:1315), `run_insight_random` (:1388), `run_insight_get` (:1417), `run_insight_gc` (:1466), `run_insight_delete` (:1557) — source: plan.md Verified facts line 157, read this session. — salience: high
-- Cross-corpus RRF fusion exists at `main.rs:2548-2604` (`run_one_corpus_for_fusion`) and is reusable for the local+general insight merge — source: plan.md Verified facts line 158, read this session. — salience: high
-- `claudebase run` dispatches to `run_claude_with_preset` at main.rs:154; `exec()` is called at main.rs:199 on Unix — registry write must precede exec — source: plan.md Verified facts line 159, read this session. — salience: high
-- `chat.db` already lives at `$HOME/.claude/knowledge/` (store.rs:1483) — precedent for HOME-rooted global db path — source: plan.md Verified facts line 160, read this session. — salience: medium
-- The `resolve_project_root` gate rejects targets not under cwd, so `--project-root $HOME` fails from a project subdir — global resolver MUST bypass this gate — source: plan.md Verified facts line 162 ("resolve_project_root rejects targets not under cwd ... this FALSIFIED the earlier 'global via --project-root $HOME' hypothesis"), read this session. — salience: high
-- Existing PRD has sections §1 through §17; §18 is the next available number — source: grep output this session showing `§15`, `§16`, `§17` headings; line count = 781. — salience: medium
-- Knowledge base corpus: `doc_count = 0` (empty) — confirmed via `claudebase status --json` this session. Corpus scope verdict: **No overlap** — empty corpus, topical queries skipped. — salience: low
-- Insights corpus query returned 0 hits for "hybrid corpus insights tags category routing" at `--salience high` — no prior session insights on this feature — confirmed via `claudebase insight search` this session. — salience: low
-- Commit `2d5eb8d` ("fix(infra): ASCII-only PowerShell hooks — Windows PS 5.1 parse failure") establishes the ASCII-only `.ps1` constraint — source: git log shown in session context at conversation start. — salience: medium
+- Plan at `.claude/plan.md` read in full this session (321 lines). Plan version v2, post Plan-Critic + post-operator C1/C2/C3 decisions (plan line 7). Salience: high.
+- KP1–KP3 acceptance criteria copied verbatim from `.claude/plan.md` §"Success Criteria" lines 37–48; routing key tuple `(chat_id, Option<message_thread_id>)` mandated by plan line 21. Salience: high.
+- v0.6 tag `claudebase-v0.6.0` is the branch-point; `Cargo.toml` workspace version `0.6.0`; members `[".", "plugins/telegram-rs"]`. Source: plan Facts line 242 (verified via `git show claudebase-v0.6.0:Cargo.toml`). Salience: high.
+- v0.6 ROOT `Cargo.toml` pins `teloxide = "0.17"` for the daemon's TG client; v0.6 plugin `Cargo.toml` pins `frankenstein = "0.49"` with `features = ["client-reqwest"]`. Source: plan Facts lines 243–244 (verified via `git show claudebase-v0.6.0:Cargo.toml:90` and `…:plugins/telegram-rs/Cargo.toml:23`). Salience: high.
+- v0.6 contains BOTH `src/daemon/telegram.rs` (teloxide) AND `plugins/telegram-rs/src/telegram/bot.rs` (frankenstein) — both with `getUpdates` polling reading `TELEGRAM_BOT_TOKEN` from env. Latent dual-poller vulnerability. Source: plan Facts line 245. Salience: high.
+- v0.6 already contains both `src/daemon/permissions.rs` AND `src/daemon/channel_state.rs` — Plan-Critic finding #11 correction. Source: plan Facts line 246. Salience: high.
+- v0.6 MCP protocol version `"2025-11-25"`; max frame size 1 MiB. v0.6 IPC framing: length-prefixed 4-byte big-endian + UTF-8 JSON, 16 MiB cap on the daemon UDS. Source: plan Facts lines 247, 250. Salience: high.
+- v0.6 notification literal `notifications/claude/channel` lives at `plugins/telegram-rs/src/mcp/notification.rs:59`. Source: plan Facts line 248 (Plan-Critic finding #12 correction). Salience: medium.
+- v0.6 root-crate `src/plugin/mcp.rs` `TOOL_WHITELIST` contains exactly the 10 chat/agent/status tools (`chat_post, chat_subscribe, chat_reply, chat_list, chat_list_threads, claudebase_daemon_status, agent_register, agent_unregister, agent_list_alive, agent_reap`); the 4 plugin tools (`reply, react, edit_message, download_attachment`) are exposed by `plugins/telegram-rs/src/mcp/server.rs:201-204` + `tools.rs:15,41,54,72`. Source: plan Facts line 249. Salience: high.
+- v0.6 `claudebase run` execs `claude --channels plugin:telegram@claude-plugins-official` per `src/main.rs:177`. Source: plan Facts line 251 (Plan Critic verified). Salience: high.
+- v0.6 installer patches the official `telegram@claude-plugins-official` plugin's `.mcp.json` at `install.sh:551-702`. Source: plan Facts line 252 (Plan Critic VERIFIED). Salience: high.
+- v0.6 `agent_registry` schema: `(agent_id, agent_name, connection_id, chat_thread_id: Option<String>, state, spawned_at, last_pinged_at)` with partial-unique index `(chat_thread_id, agent_name) WHERE state='alive'`. Source: plan Facts line 253 (`src/daemon/agent_registry.rs:92-138`). Salience: high.
+- v0.6 PRD §17 does NOT mention forum-topic support in scope. Source: plan Facts line 254 + this session's read of `docs/PRD.md` §17.7 schema block (lines 583–662). Salience: medium.
+- Existing `docs/PRD.md` ends at line 781 with §17 `## Decisions → Symptom-only patches` block. §18 appends after. Source: `wc -l` this session = 781 lines + `grep "^## "` showing §17 last. Salience: medium.
+- The companion design doc `docs/plans/multi-agent-telegram-on-v0.6.md` is 320 lines, byte-equivalent to `.claude/plan.md` body. Source: `wc -l` this session. Salience: low.
+- Knowledge-base / insights corpus NOT activated for this project — `<project>/.claude/knowledge/index.db` and `<project>/.claude/knowledge/insights.db` absent on this v0.6-branched workspace per Mira's spawn-prompt instruction. Corpus protocol silently skipped per `~/.claude/rules/knowledge-base.md` `## Activation sentinel`. Salience: low.
 
 ### External contracts
 
-- **`claudebase` CLI v0.6.0** — symbol: `insight create` flags today: `--type`, `--agent`, `--session`, `--feature`, `--salience`, `--source-artifact`, `--project-root`, `--db-name`; no `--category`, no `--tags` — source: plan.md External contracts block, read this session — verified: yes — salience: high
-- **`clap` derive macros** — symbol: `#[arg(long, value_enum)]` (required), `#[arg(long)]` (repeatable via `Vec<String>`) — used by existing `Salience`/`SearchMode` enums; new `--category` follows same `value_enum` pattern — source: plan.md External contracts, "cli.rs:732,767", read this session — verified: yes — salience: medium
-- **`rusqlite`** — symbol: `Connection::transaction`, `execute_batch`, `pragma_table_info`, `ALTER TABLE … ADD COLUMN` — the exact primitives the v4 migration uses; V5 reuses them — source: plan.md External contracts, "store.rs:234-341", read this session — verified: yes — salience: high
-- **SQLite FTS5 + `sqlite-vec`** — symbol: `chunks_fts`, `chunks_vec USING vec0(embedding float[384])` — both insight dbs share this schema; `insight_tags` is a plain table — source: plan.md External contracts, "store.rs:259-270", read this session — verified: yes — salience: medium
+- **teloxide 0.17 `Dispatcher` API** — symbol: `teloxide::dispatching::Dispatcher::builder`, `handler_tree!`, `teloxide::types::Message`, `Message.message_thread_id` (expected `Option<i32>` per Telegram Bot API) — source: `git show claudebase-v0.6.0:Cargo.toml:90` (PIN verified this session via plan Facts) — verified: **PIN yes; `message_thread_id` field-existence DEFERRED to Slice 1 architect verification (R-MAT-4)**. Salience: **high** (Slice 1 BLOCKING check).
+- **teloxide 0.17 `SendMessageSetters::message_thread_id`** — symbol: outbound builder method that targets a forum-topic on `sendMessage` — source: crates.io / docs.rs `teloxide` v0.17 (NOT opened this session) — verified: **no — assumption**. Risk: builder method may have a different name (e.g. `with_message_thread_id`, `set_message_thread_id`) or may require an HTTP-call-builder vs setter pattern. How to verify: Slice 1 / Slice 4 architect pre-review. Salience: high.
+- **frankenstein 0.49** — symbol: `Bot`, `Message`, `SendMessageParams`, `GetUpdatesParams`, `AsyncTelegramApi` — source: `git show claudebase-v0.6.0:plugins/telegram-rs/Cargo.toml:23` (verified this session via plan Facts line 243) — verified: yes (pinned + Slice 4 only DISABLES the polling loop, does not require new symbols). Salience: high.
+- **Telegram Bot API `message_thread_id` field** — symbol: optional integer on `Message` object; used in `sendMessage` outbound to target a specific forum topic — source: `https://core.telegram.org/bots/api#message` (NOT opened this session) — verified: **no — assumption**. Salience: high (Slice 1 architect verifies field-existence in teloxide deser).
+- **MCP `notifications/claude/channel` notification method** — symbol: notification with `meta` JSON object carrying source / content / target_agent_id and (new in this feature) optional `thread_id` — source: `plugins/telegram-rs/src/mcp/notification.rs:59` per plan Facts line 248 (NOT opened this session by me; cited via plan) — verified: **partial** (literal method name verified by plan Facts; meta JSON shape inherited from §17.3 FR-ACD-3.5 + FR-ACD-11.2). Salience: high.
+- **JSON-RPC 2.0 additive-evolution convention** — symbol: «consumers MUST ignore unknown fields» — source: JSON-RPC 2.0 spec § "Notification" + § "Extensions" (NOT opened this session) — verified: **no — assumption** (industry convention, broadly applied; v0.6 Claude Code client is the only consumer here and operator confirms its tolerance per plan Assumptions line 264). Salience: medium.
 
 ### Assumptions
 
-- Architect will accept `category`/`project_slug` as columns on the shared `documents` table (consistent with v4) rather than mandating a dedicated insight table — risk: a dedicated table would enlarge Slice 1 and ripple into all handlers — how to verify: architect review verdict at bootstrap Step 3. — salience: high
-- The `--corpus all` RRF fusion at main.rs:2548-2604 generalizes from books+insights to insight+insight by swapping the second corpus path/label — risk: corpus-label or schema assumption may be hardwired — how to verify: Slice 5 reads `run_one_corpus_for_fusion` fully before reusing; fallback is simplified union+re-sort. — salience: high
-- The SessionStart hook is the correct surface for read-on-new-context (vs. folding into the existing UserPromptSubmit reminder) — risk: SessionStart fires on every compact and may inject too frequently — how to verify: ba-analyst use-case + manual hook-fire test in Slice 7; hook text is capped at ≤200 words. — salience: medium
-- `main` is in a releasable state to branch from (agent-chat-daemon feature either merged or cleanly independent) — risk: branching off a dirty main — how to verify: `git status` + `git log main` at bootstrap Step 0. — salience: medium
-- Tags stored in normalized `insight_tags(doc_id, tag)` (rather than denormalized JSON on `documents`) provides efficient `GROUP BY tag` counts and indexed filter — architect to confirm — risk: if architect objects, denormalized approach is a fallback. — salience: medium
+- v0.6 worked «stably» for the operator because they ran ONE polling owner at a time in practice — either the daemon's teloxide loop OR the plugin's frankenstein loop, not both. The dual-poller is a latent vulnerability that v0.6 never hit in single-CLI use. Risk: «v0.6 was working» is operator shorthand; the architecture has a known race. Mitigation: FR-MAT-4.1 / Slice 4 explicitly resolves it by making daemon the sole owner. Source: plan Assumptions line 263. Salience: high.
+- Adding optional fields to existing JSON-RPC notification meta is non-breaking per JSON-RPC convention (consumers MUST ignore unknown fields). Risk: a strict consumer might reject. Mitigation: documented; v0.6 Claude Code client is the only consumer and is known-tolerant per plan. Source: plan Assumptions line 264. Salience: medium.
+- `chat.db` schema migration tolerates pre-existing v0.7/v0.8 columns left over on a dev box. Risk: SQLite `ALTER TABLE ADD COLUMN` is additive and does not conflict with existing columns; SQLite UNIQUE indexes on nullable columns treat NULL as distinct so DM-routed (`thread_id = NULL`) bindings do not collide with each other within the partial index. How to verify: Slice 2 unit tests exercise both fresh-DB and pre-populated-DB cases AND multiple-NULL-thread_id-DM rows. Source: plan Assumptions line 265 + FR-MAT-2.4 done-when. Salience: medium.
+- The operator's «one bot serves three CLIs» model presumes the Telegram Bot API permits a single bot to receive Updates from a DM and a group (with topics) simultaneously. Standard bot capability per Telegram docs; not session-verified. Risk: if the bot lacks Forum-Topics permission in the group, KP2/KP3 silently fail. How to verify: Slice 3 daemon doctor probe; QA runbook step «invite bot as admin, enable Forum Topics on the group». Salience: high.
 
 ### Open questions
 
-- Backfill default tag for the 4 existing tag-less v4 insights: `feature_slug` vs literal `'untagged'` — if `feature_slug` is NULL the fallback is `'untagged'`; this is the current plan default — needs: planner/architect confirmation in Slice 1 done-when. — salience: low
-- Whether v0.7.0 also touches the `sdlc-knowledge` embedded tag-scheme or only the claudebase-core scheme — needs: release-engineer at `/release` (tag-scheme disambiguation per auto-release.md). — salience: low
-- knowledge-base: corpus is empty (doc_count=0); task domain is CLI engineering + SQLite schema migration + cross-project insights routing; no overlap. Topical queries skipped per corpus-scope-relevance protocol. Corpus enrichment with Rust/SQLite/CLI engineering reference materials would benefit future similar tasks. — salience: low
+- **OQ-MAT-1 (Selective port-forward of v0.7 Bucket-A items).** Default: NO — strict v0.6 baseline + KP1–KP3 routing only. Operator may green-light Bucket-A as follow-up. Source: plan OQ1 line 223. Needs: operator decision. Salience: medium.
+- **OQ-MAT-2 (teloxide 0.17 `Message.message_thread_id` field existence).** Slice 1 architect call. If absent → fallback options per R-MAT-4. Source: plan OQ list + plan R4 line 206. Needs: architect call at Slice 1. Salience: **high** (Slice 1 BLOCKING).
+- **OQ-MAT-3 (`/switch` security in groups).** Default: per-tap user check (last binding's user_id OR chat admin). Red-team at bootstrap may refine. Source: plan OQ3 line 225. Needs: red-team refinement at bootstrap. Salience: medium.
+- **OQ-MAT-4 (Release version after merge — v0.7.0-rebuild vs v0.10.0 vs v0.6.1).** Plan recommendation: v0.10.0 (skip v0.9 entirely; v0.9 reserved for the fleet plan). Source: plan OQ4 line 226. Needs: operator decision at `/release` time. Salience: medium.
+- **OQ-MAT-5 (Orphan-inbound fallback policy precise shape).** Default: log + TG reply «no CLI bound to this routing key». Architect refines exact UX at bootstrap. Source: plan §"Verification" step 4 line 235 + FR-MAT-9.5. Needs: architect call at bootstrap. Salience: medium.
+- **OQ-MAT-6 (Slice 6 cooperation of `permissions.rs` and `channel_state.rs`).** Do the two modules cooperate or contend on access-grant state in v0.6? Architect inspects at Slice 6. Source: plan Open questions line 270. Needs: architect call at Slice 6 pre-review. Salience: medium.
 
 ## Decisions
 
 ### Inbound validation
 
-- Task received: append §18 PRD section to `docs/PRD.md` based on the approved plan at `.claude/plan.md`. Plan read in full (199 lines). The plan's "schema v5" for `insights.db` conflicts in name with §17's "Schema v5" for `chat.db` — investigated: these are independent SQLite files with independent schema version tracking; no actual conflict. Challenged: yes — surfaced the naming overlap; confirmed it is not a semantic conflict. Outcome: proceeded, noting in FR-IHC-1 that this is `insights.db` schema v5 to distinguish from `chat.db`'s own version history. — salience: medium
-- The plan's Deliverables checklist refers to "PRD section in claudebase/docs/PRD.md (prd-writer) — each FR with a Changelog: field". Checked: the Changelog field is a section-level field (not per-FR); the plan's phrasing is imprecise. The correct interpretation per the PRD format convention (visible in §15, §16, §17) is one `Changelog:` field at the top of the section. Proceeded with the section-level field. — challenged: yes — outcome: proceeded with correct placement. — salience: low
+- Inbound task: «append §N PRD section for `multi-agent-telegram-on-v0.6` based on `.claude/plan.md`», emit Facts + Decisions blocks, cite teloxide / frankenstein / Telegram API external contracts. Challenged: yes — verified that `.claude/plan.md` exists and is v2 (post-Plan-Critic), that `docs/PRD.md` last section is §17 (not §18 or higher), that the design doc `docs/plans/multi-agent-telegram-on-v0.6.md` is byte-equivalent (untracked, 320 lines vs `.claude/plan.md`'s 321 — diff is the trailing newline). No contradictions detected between the plan body and the spawn-prompt's FR-MAT enumeration. Outcome: proceeded as instructed. Salience: high.
+- Spawn-prompt instruction «KP1–KP3 are the ONLY AC items» challenged briefly against the §17 precedent of 15 AC items (AC-ACD-1 through AC-ACD-15). Outcome: kept to KP1–KP3 as instructed — the plan explicitly states «KP1-KP3 are the load-bearing acceptance criteria» (plan line 60) and the spawn-prompt confirms «AC count (should be 3 — KP1/KP2/KP3)». Additional verification depth lives in the QA test cases file (TC-1 through TC-9 per plan Deliverables Checklist line 71), not in the PRD AC list. Salience: medium.
+- Spawn-prompt date `2026-06-02` matches the session reminder `currentDate: 2026-06-02` and matches the plan's `Date drafted: 2026-06-02`. No drift. Salience: low.
 
 ### Decisions made
 
-- **Hybrid storage routing is the correct model** over single-global-db or per-project-only. Q1 hack? no — strictly more backward-compatible (zero content migration). Q2 sane? yes — matches operator's stated mental model and data locality. Q3 alternatives? single-global (rejected: forces migration); per-project-only (rejected: no cross-project sharing). Q4 symptom/cause? cause — the gap is structural. Q5 n/a. Source: plan.md Decisions block, read this session. — salience: high
-- **`category`/`project_slug` as columns on the shared `documents` table** (pending architect). Q1 hack? no — mirrors v4 pattern exactly. Q2 sane? yes — proportional. Q3 alternatives? dedicated insight table (cleaner but heavier; deferred to architect). Q4 cause. Q5 tracked in Open questions. Source: plan.md Decisions block, read this session. — salience: high
-- **`insight_tags` as a normalized table** (not denormalized JSON/CSV). Q1 hack? no — normalized enables efficient grouped counts and indexed filter joins. Q2 sane? yes. Q3 alternatives? JSON array on documents (rejected: no efficient GROUP BY, no indexed filter). Q4 cause. Q5 n/a. Architect to confirm. — salience: medium
-- **Registry write at the top of `run_claude_with_preset`, before exec.** Q1 hack? no — only correct placement given exec() semantics. Q2 sane? yes. Q3 alternatives? separate `claudebase register` subcommand (rejected: operator wants automatic at `run` startup). Q4 cause. Q5 n/a. Source: plan.md Decisions block, read this session. — salience: high
-- **Reuse existing `--corpus all` RRF fusion for local+general merge.** Q1 hack? no — reuses proven machinery. Q2 sane? yes. Q3 alternatives? naive union+re-sort (rejected: loses calibrated cross-corpus ranking). Q4 cause. Q5 generalization assumption tracked in Assumptions. Source: plan.md Decisions block, read this session. — salience: medium
+- Section numbered §18 because `grep "^## §" docs/PRD.md` shows the last existing section is §17 (line 407). Q1 hack? no | Q2 sane? yes | Q3 alternatives? skipping to §19 considered (rejected — wasteful, no §18 placeholder exists) | Q4 symptom-or-cause? cause | Q5 root-cause-tracked? n/a. Salience: medium.
+- 10 FR-MAT groups (FR-MAT-1 through FR-MAT-10) — one per directive from the spawn prompt's enumerated criteria (FR-MAT-1 routing key, FR-MAT-2 schema additive, FR-MAT-3 daemon-owns-TG, FR-MAT-4 plugin thin-bridge, FR-MAT-5 plugin outbound forward, FR-MAT-6 reply `message_thread_id`, FR-MAT-7 channel meta `thread_id`, FR-MAT-8 bot commands, FR-MAT-9 error handling, FR-MAT-10 daemon-restart resilience). Q1–Q5: passes all five cleanly — direct mapping from spawn-prompt requirements. Salience: medium.
+- 3 AC items (AC-MAT-KP1 / KP2 / KP3) only — matching the plan's stated load-bearing trio (plan line 60) and the spawn-prompt's explicit «AC count (should be 3)» instruction. Q1 hack? no | Q2 sane? yes (KP1-KP3 are the load-bearing criterion; deeper test coverage lives in QA test cases) | Q3 alternatives? add KP4 «`/agents` works» / KP5 «daemon restart resilience» — rejected per spawn-prompt instruction; deeper coverage in QA. Salience: high.
+- Optional `message_thread_id` / `thread_id` typed as `Option<String>` (not `Option<i64>`) per v0.6's «ID-as-string discipline» (plan §"Architectural Constraints → Frozen", point 4, line 86 — explicit «string per v0.6 ID-as-string discipline»). Q1 hack? no | Q2 sane? yes | Q3 alternatives? `Option<i64>` to match Telegram's native integer type — rejected per the documented v0.6 discipline; daemon parses/converts at the boundary. Salience: high.
+- All teloxide / Telegram Bot API contracts marked `verified: no — assumption` because no teloxide source / docs / API was opened in this session. The PIN itself (teloxide 0.17) is verified via the plan's Facts citation of `Cargo.toml:90`, but field-level symbols (`Dispatcher::builder`, `handler_tree!`, `Message.message_thread_id`, `SendMessageSetters::message_thread_id`) are explicitly deferred to Slice 1 architect verification per OQ-MAT-2 and R-MAT-4. This conservative labeling is correct per Protocol 1 and matches the spawn-prompt's directive («`verified: no — assumption` is the correct label for symbols you have NOT opened in this session»). Salience: high.
+- Q1-Q5 verdict on the operator's «rollback rather than fix-forward» decision (load-bearing meta-decision): Q1 hack? **yes — meta-level symptom-only patch** | Q2 sane? yes (operator-stated cost-benefit) | Q3 alternatives? fix-forward considered + rejected by operator | Q4 symptom-or-cause? **symptom** (root cause of v0.8 brokenness NOT isolated) | Q5 root-cause-tracked? **partial** — tracked under «Symptom-only patches» here AND in the plan's `### Symptom-only patches` block (plan line 294). Operator-acknowledged trade-off; flagged below for downstream visibility. Salience: high.
 
 ### Hacks acknowledged
 
-(none) — PRD authoring only; no implementation hacks introduced.
+- The `cfg(feature = "legacy-direct-poll")` feature-flag on the plugin's frankenstein poller (FR-MAT-4.1) is a deliberate fallback escape-hatch for «daemon unavailable but operator still wants TG in single-CLI mode». It is a workaround, not a long-term path. **Removal path:** drop the cfg gate once daemon-ownership has been proven stable across 2+ releases. Tracked in this PRD section's FR-MAT-4.1 + plan §"Decisions → Hacks acknowledged" line 291. Salience: medium.
 
 ### Symptom-only patches (with root-cause links)
 
-(none) — no symptom-only patches in this PRD section.
+- The operator's decision to **rollback v0.7/v0.8 entirely** rather than isolate the v0.7/v0.8 root cause IS a symptom-only patch at the meta-level — the empirical brokenness was the symptom, the root cause was not pursued because forward-debug cost exceeded rebuild cost. Symptom: «v0.7/v0.8 multi-CLI work was broken, root cause not isolated despite extended debugging». Root cause that remains: unknown — explicitly NOT pursued by operator decision. Tracked at: plan §"Symptom-only patches" line 294 AND an implicit obligation to log any specific v0.8 failure modes uncovered during the v0.6+ build into `docs/issues/`. Operator-acknowledged trade-off. Salience: high.
 
 ---
 
-## §19. Telegram Multi-CLI Orchestration — Chat-as-ID Routing, Bot Commands, Inline-Keyboard Questionnaires, and Plugin Cutover
+### §18.10 Slice 8 — `chat_ask` MCP Tool, Telegram Inline Keyboard, CallbackQuery Handling
 
-**Status:** [PLANNED]
-**Date:** 2026-05-30
+**Status:** SHIPPED 2026-06-04 (with AR-9 post-implementation amendment — see §18.10.9)
+**Date:** 2026-06-04
+**Implemented:** commits `5dfcf8d` (8a single-select), `86ab5ff` (8b multi-select), `4a65819` (live-fix AR-9 frame shape)
 **Priority:** High
-**Related:** §17 (Agent Chat Daemon + Telegram Bridge — this section extends the daemon's Telegram bridge at `src/daemon/telegram.rs`, the `ChatBus` at `src/daemon/chat.rs`, and the `agent_registry` at `src/daemon/agent_registry.rs` that shipped in §17; the `chat.db` schema v6 introduced in §17 is extended to v7 here). §18 (Insights Hybrid Corpus — no functional overlap; the `chat.db` version namespace is independent of `insights.db`). Plan source: `/Users/aleksandra/Documents/claude-code-sdlc/claudebase/.claude/plan.md` (198 lines, read in full this session, 2026-05-30).
+**Related:** §18.3 FR-MAT-1 through FR-MAT-10 (base routing layer this slice builds on); §18.7 Schema Changes (additive `pending_asks` migration runs after `apply_routing_migration`); §18.5 Acceptance Criteria (Slice 8 adds AC-MAT-CHA-1 through AC-MAT-CHA-3 below). Plan source: `.claude/plan.md` Slice 8 block (lines 312–399) + AR-1 through AR-8 blocks (lines 335–378) + Slice 8c block (lines 386–398) + operator OQ resolutions (lines 380–384), all read this session.
+
+> **⚠️ AR-9 Live-fix amendment (2026-06-04):** Initial Slice 8a/8b deploy did NOT surface chat_ask responses in the requesting CC's session despite daemon delivering frames to bridge UDS. Root cause discovered live: CC's `<channel>` surface renderer **silently drops** any frame whose `params.meta` contains keys outside the inbound-Telegram schema (`chat_id`/`message_id`/`user`/`user_id`/`ts`/`thread_id`/`target_agent_id`). The Slice 8 extras (`is_callback_response`, `ask_id`, `value`/`values`, `multi`, `question`, `options`, `originating_agent_id`) triggered the drop. **All meta-shape requirements in FR-MAT-11.5 and FR-MAT-11.6 below are SUPERSEDED by AR-9 (§18.10.11)** — Slice 8 round-trip data now lives in `params.content` as a parseable preamble. Original text below is retained for historical context.
+
+Changelog: Agents can now ask the operator a multi-option question that appears as native Telegram inline buttons; tapping a button routes the response back to the requesting agent automatically.
+
+#### §18.10.1 Feature Description
+
+Slice 8 adds the `chat_ask` MCP tool so that Claude Code CLI instances (e.g. Mira in plan-mode) can surface structured multi-option decisions to the operator as native Telegram inline keyboard buttons, and receive the operator's tap as a `<channel>` event routed back to the originating CC.
+
+The motivation is the operator's direct request: «опции которые cli предлагает в план моде не приходят в виде кнопок в тг» (the options Mira proposes in plan mode do not arrive as buttons in Telegram). Slice 8 closes this gap by making inline keyboard rendering a first-class daemon capability.
+
+The feature is split into three atomic sub-slices:
+
+- **8a (single-select MVP):** `chat_ask` tool, `pending_asks` SQLite table, `InlineKeyboardMarkup` send via new `OUTBOUND_TG_KEYBOARD` channel, CallbackQuery parsing + single-select response emit.
+- **8b (multi-select stateful toggle):** multi-select keyboard with toggle-tap ✓ marker updates via `Bot::edit_message_reply_markup`, Done-button finalization with `meta.values=[...]` array.
+- **8c (`chat_list_pending_asks` debug tool):** read-only MCP tool listing open pending asks for debugging.
+
+No user-facing changes to the operator's existing KP1–KP3 routing flows. The `OUTBOUND_TG_KEYBOARD` mpsc channel preserves the single-`Bot`-owner discipline from `telegram.rs:936–944` — no parallel `Bot::new` constructor is introduced.
+
+#### §18.10.2 User Stories
+
+- **UC-MAT-16 (single-select):** As Mira entering plan-mode, I want to call `chat_ask` with a question and 2–8 options so that the operator receives an inline keyboard in Telegram and tapping a button routes the response back to me as a `<channel>` event with `meta.value` set.
+- **UC-MAT-17 (multi-select):** As Mira, I want to call `chat_ask` with `multi=true` so that the operator can tap multiple options (each tap toggles a ✓ marker on the button) before tapping Done to finalize, delivering `meta.values=[...]` to me.
+- **UC-MAT-18 (debug list):** As Mira or the operator, I want to call `chat_list_pending_asks` to see which asks are still open, for debugging "why didn't my chat_ask response come through?".
+
+#### §18.10.3 Functional Requirements
+
+##### FR-MAT-11.1 — `chat_ask` added to `TOOL_WHITELIST` (Slices 8a + 8c)
+
+1. The string `"chat_ask"` MUST be added to `TOOL_WHITELIST` in both `src/plugin/mcp.rs` (SEC-7 whitelist gate) AND in `src/daemon/server.rs` `tools/list` enumeration and dispatch table. Adding the tool name to only one location is insufficient — both gates must be satisfied for Claude Code to discover and invoke the tool.
+2. The string `"chat_list_pending_asks"` MUST likewise be added to both `TOOL_WHITELIST` locations (Slice 8c).
+3. The v0.6 `TOOL_WHITELIST` of 10 existing chat/agent tools MUST remain unchanged — additions are strictly additive.
+
+##### FR-MAT-11.2 — `InlineKeyboardMarkup` via `OUTBOUND_TG_KEYBOARD` mpsc (Slice 8a)
 
-Changelog: The Telegram bot can now route messages from each chat to its own bound Claude Code instance — tap /switch to rebind, tap /agents to see who is alive, and answer agent questions directly from Telegram as inline buttons.
+1. A new `OnceLock<mpsc::UnboundedSender<(i64, Option<i64>, String, InlineKeyboardMarkup, oneshot::Sender<Result<i64>>)>>` named `OUTBOUND_TG_KEYBOARD` MUST be declared in `src/daemon/telegram.rs` parallel to the existing `OUTBOUND_TG` channel (`telegram.rs:79`).
+2. The channel receiver MUST be drained inside `run_long_poll`'s existing outbound-send loop (`telegram.rs:1040–1088`) so that inline-keyboard messages are issued by the SAME teloxide `Bot` instance that processes inbound `Update`s. Constructing a parallel `Bot::new(token)` in `server.rs` is PROHIBITED — it would break the single-owner discipline and diverge `TELOXIDE_API_URL` in test mode.
+3. The `chat_ask` handler in `server.rs` MUST enqueue a send request to `OUTBOUND_TG_KEYBOARD` and await the oneshot receiver for the returned `message_id`. INSERT of the `pending_asks` row MUST happen ONLY after the send succeeds (send-then-insert ordering — if send fails no orphan row is created).
+4. One keyboard button MUST be rendered per option. Maximum 8 options per ask. Requests with more than 8 options MUST be rejected with JSON-RPC error `-32602`.
+5. Single-select callback data format: `<ask_id>:<value>` (ask_id = UUID v4 = 36 chars; value ≤ 27 bytes — see FR-MAT-11.9 budget enforcement).
+6. Multi-select callback data format per option: `<ask_id>:toggle:<option_id>`. Done-button callback data: `<ask_id>:done`.
 
-### 19.1 Feature Description
+##### FR-MAT-11.3 — `Update` struct extended with `callback_query` (Slice 8a, AR-2)
 
-The operator runs multiple Claude Code CLI instances and needs ONE Telegram bot to serve all of them. Today the only Telegram path is the per-CLI plugin (`plugins/telegram-rs/`), which holds the bot token's `getUpdates` slot. Two CLI instances sharing the same token each attempt to poll `getUpdates`; Telegram enforces a single-consumer rule and the second poller receives 409 Conflict — the core pain that makes multi-CLI routing impossible with the current architecture.
+1. The daemon's `Update` struct in `src/daemon/telegram.rs` (line 108 in the v0.6 baseline) MUST be extended additively with the field `#[serde(default)] callback_query: Option<CallbackQuery>`. When `callback_query` is absent from the wire JSON, `serde(default)` yields `None` — the Slice 0 baseline wire shape is preserved bit-for-bit.
+2. A new `CallbackQuery` struct MUST be defined with the following fields, matching the Telegram Bot API `callbackQuery` object minimal required set as validated by the architect at AR-2: `id: String`, `from: User`, `chat_instance: String` (REQUIRED per Telegram Bot API — used for cache scoping), `#[serde(default)] data: Option<String>` (absent on game buttons), `#[serde(default)] message: Option<MessageRef>`.
+3. A new `MessageRef` struct MUST be defined: `{ message_id: i64, chat: Chat }`. This struct exists solely to allow the daemon to call `edit_message_reply_markup(chat_id, message_id)` without deserializing the full `Message` shape.
+4. The implementer MUST verify the field names `id`, `from`, `chat_instance`, `data`, `message` against the live Telegram Bot API docs at `https://core.telegram.org/bots/api#callbackquery` at implementation time and cite the result under `### External contracts` in the implementing agent's `## Facts` block.
+5. `User` and `Chat` structs reuse the existing definitions in `telegram.rs` — no new struct duplication.
 
-The daemon already contains a dormant server-centric Telegram bridge (`src/daemon/telegram.rs`, 68 KB) that defaults to `enabled: true` but has not yet been activated for production use because it lacks three capabilities: (1) a persistent chat-to-CLI binding so each Telegram chat consistently reaches the same CLI; (2) bot commands to inspect and switch that binding; (3) a mechanism for agents to surface multiple-choice questions as tappable inline keyboard buttons.
+##### FR-MAT-11.4 — CallbackQuery access gate (`gate_callback`) (Slice 8a, AR-3)
 
-This feature activates the daemon's Telegram bridge as the authoritative single poller, adds a **chat-as-id routing layer** (one Telegram chat = one CLI binding, keyed by `chat_id` alone — operator decision 2026-05-30, OQ-3 closed), adds bot commands (`/agents`, `/switch`, `/whoami`, `/here`), extends the outbound path with `reply_markup` support for inline keyboards, and introduces a new `chat_ask` MCP tool that renders multiple-choice agent questions as tappable Telegram buttons.
+1. A new helper function `gate_callback(access: &Access, sender_id: &str) -> bool` MUST be defined in `src/daemon/telegram.rs` (or `channel_state.rs`, per implementer). It returns `true` if and only if `access.allow_from.contains(sender_id)`.
+2. The existing `gate_dm` function (at `telegram.rs:534`) MUST NOT be reused for CallbackQuery dispatch. `gate_dm` issues pairing codes to non-allowed senders; applying it to callbacks would send a pairing code when an unknown user taps an inline button — incorrect UX and incorrect security posture.
+3. In `process_batch_with_pairing`, after extracting a `CallbackQuery` update, the daemon MUST call `gate_callback(access, &callback.from.id.to_string())`. On `false` (non-allowed sender): DROP the callback silently. No pairing code reply. No `answerCallbackQuery` call. No log at WARN or above (log at DEBUG only). Unit test `callback_from_disallowed_user_is_silently_dropped` MUST cover this path.
 
-The per-CLI plugin is preserved as a revert path behind the `[telegram] enabled` flag, and a conflict gate makes the 409-Conflict condition loud and non-crashing so the operator can stop the plugin poller cleanly before the daemon takes over.
+##### FR-MAT-11.5 — Single-select response emit (Slice 8a, AR-1 + AR-4 + AR-5)
 
-HTTP/WSS transport and cross-machine fleet routing are explicitly out of scope (deferred to a later feature); this feature operates entirely over the existing UDS daemon on a single machine.
+1. `Bot::answer_callback_query(callback_id)` MUST be called as the FIRST action in the CallbackQuery dispatch branch, before any SQLite read, before any `editMessageReplyMarkup`, before any channel-notification emit. This clears the Telegram "loading" spinner on the tapped button within the required ~15-second window (Telegram Bot API contract per AR-1).
+2. On a valid single-select tap, after `answerCallbackQuery` succeeds, the daemon MUST emit a `notifications/claude/channel` event with the following `meta` fields:
+   - `meta.is_callback_response = true`
+   - `meta.ask_id` — the UUID v4 from the `pending_asks` row
+   - `meta.value` — the option value from `callback_data` (single-select only)
+   - `meta.question` — the original question text (AR-5: CC-compaction resilience)
+   - `meta.options` — the full `[{label, value}]` JSON array (AR-5)
+   - `meta.multi = false`
+3. `target_agent_id` routing MUST follow the AR-4 dead-originating-agent fallback:
+   - If `requesting_agent_id` (from the `pending_asks` row) names an agent currently in `state='alive'` in `agent_registry`: set `meta.target_agent_id = requesting_agent_id`. The existing `bridge.rs:823–837` filter routes the response to that CC only.
+   - If `requesting_agent_id` is NOT alive: OMIT `meta.target_agent_id` AND ADD `meta.originating_agent_id = requesting_agent_id` (informational). A notification without `target_agent_id` is treated as an unaddressed broadcast by the bridge filter — all active CCs receive it. A compacted Mira reconstructs semantic context from `meta.question`, `meta.options`, `meta.ask_id`.
+4. Unit test `callback_response_unaddressed_when_originating_agent_dead` MUST cover the dead-agent broadcast path.
 
-### 19.2 User Story
+##### FR-MAT-11.6 — Multi-select state-machine (Slice 8b, AR-7)
 
-As the operator running multiple Claude Code CLIs, I want a single Telegram bot that routes each conversation to its designated CLI — and lets me answer agent questions from my phone by tapping buttons — so that I can manage a multi-agent workflow from Telegram without 409 Conflict errors or manual token juggling.
+1. Each option-tap in a multi-select ask MUST execute an atomic SQLite operation `UPDATE pending_asks SET selected_values_json = ? WHERE ask_id = ? RETURNING selected_values_json` to read post-state atomically. The write-lock is released before the network call to Telegram.
+2. After the atomic UPDATE, the daemon MUST call `Bot::edit_message_reply_markup` to redraw the inline keyboard with ✓ markers on the currently-selected options and a "Done" button at the bottom. The ✓ rendering appends `✓ ` to the option label in the `InlineKeyboardButton.text` field.
+3. The `answerCallbackQuery` call MUST precede `editMessageReplyMarkup` so the spinner clears immediately even if the subsequent edit lags or 429s.
+4. On HTTP 429 from `editMessageReplyMarkup`: retry ONCE after `retry_after` seconds (mirroring the inbound 429 handling at `telegram.rs:25–28`). On a second 429: give up silently. The SQLite row remains correct; the keyboard display is stale but data is not lost.
+5. A Done-button tap MUST finalize the ask: emit a `notifications/claude/channel` event with `meta.multi=true`, `meta.values=[...]` (JSON array of all selected option values), `meta.question`, `meta.options`, `meta.ask_id`, and the AR-4 `target_agent_id` / `originating_agent_id` routing logic from FR-MAT-11.5. Then DELETE the `pending_asks` row.
+6. Unit tests `multi_select_toggle_updates_pending_row`, `multi_select_done_emits_values_array_and_clears_pending`, `multi_select_concurrent_taps_serialize_via_sqlite`, `edit_message_reply_markup_called_with_correct_chat_message_pair` MUST all pass.
 
-### 19.3 Functional Requirements
+##### FR-MAT-11.7 — `pending_asks` table in `chat.db` (Slices 8a + 8b, AR-6)
 
-#### Schema v7 and Registry Helpers (Slice 1)
+1. A new helper `apply_pending_asks_migration(conn)` MUST be defined in `src/daemon/chat.rs` (or `src/daemon/migrations.rs`) and called from `chat::ensure_chat_db_schema` AFTER the existing `apply_routing_migration(conn)?;` call (chat.rs:343). The migration is additive — it MUST NOT modify existing tables.
+2. The `pending_asks` table schema is:
+   ```sql
+   CREATE TABLE IF NOT EXISTS pending_asks (
+     ask_id              TEXT PRIMARY KEY,
+     chat_id             INTEGER NOT NULL,
+     message_thread_id   INTEGER NULL CHECK (message_thread_id IS NULL OR message_thread_id > 0),
+     message_id          INTEGER NOT NULL,
+     requesting_agent_id TEXT NOT NULL,
+     question            TEXT NOT NULL,
+     options_json        TEXT NOT NULL,
+     multi               INTEGER NOT NULL DEFAULT 0,
+     selected_values_json TEXT NULL,
+     created_at          INTEGER NOT NULL,
+     expires_at          INTEGER NOT NULL
+   );
+   CREATE INDEX IF NOT EXISTS pending_asks_expires_idx ON pending_asks(expires_at);
+   ```
+3. The `question` column is mandatory (NOT NULL) for AR-5 CC-compaction resilience. The `message_id` column captures the Telegram message_id returned by `sendMessage` so `editMessageReplyMarkup` can target the correct message.
+4. INSERT of a row MUST occur ONLY after `Bot::send_message` returns successfully and the `message_id` has been captured from the response. If `send_message` fails, no row is inserted and `chat_ask` returns an error to the caller (send-then-insert ordering).
+5. TTL is 24 hours. `expires_at = created_at + 24 * 60 * 60 * 1000` (milliseconds). The GC predicate is `expires_at < now()` and applies unconditionally — abandoned multi-select asks also expire after 24h regardless of `selected_values_json` state.
+6. GC MUST run from the existing long-poll loop's per-batch tail hook via a single `DELETE FROM pending_asks WHERE expires_at < ?` SQL call (low overhead — one SQL per batch cycle).
+7. A new module `src/daemon/pending_asks.rs` MUST be created exposing these public helpers: `insert_pending`, `get_pending(ask_id)`, `update_selected_values`, `delete_pending`, `gc_expired`, `list_open(conn, optional_agent_id, optional_chat_id)`. This module parallels `agent_registry.rs` in structure.
 
-**FR-TMC-1.1 (chat.db schema v7 — `active_cli_per_chat` table):** The function `ensure_chat_db_schema` in `src/daemon/chat.rs` MUST be extended to apply a schema v7 migration that adds the following table if it does not already exist:
+##### FR-MAT-11.8 — `chat_list_pending_asks` debug MCP tool (Slice 8c)
 
-```sql
-CREATE TABLE IF NOT EXISTS active_cli_per_chat (
-    chat_id         INTEGER PRIMARY KEY,
-    active_cli_name TEXT NOT NULL,
-    active_agent_id TEXT NOT NULL,
-    set_at          INTEGER NOT NULL,
-    set_by          TEXT NOT NULL
-);
-```
+1. A new handler `handle_chat_list_pending_asks` MUST be added to `src/daemon/server.rs`. It calls `pending_asks::list_open(conn, optional_agent_id, optional_chat_id)` and returns a JSON object `{asks: [{ask_id, chat_id, message_thread_id, question, requesting_agent_id, multi, options, created_at, expires_at}]}`. The `selected_values_json` field MUST NOT be returned — it is internal toggle state, not a debug-relevant field.
+2. Two optional filter parameters are supported: `agent_id` (return only asks whose `requesting_agent_id` equals the supplied value), `thread` (return only asks whose Telegram thread matches the supplied thread string — parsed as `<chat_id>` or `telegram:<chat_id>`).
+3. The tool returns only OPEN asks: rows that have not been answered (no finalized channel notification emitted for them yet) AND have not expired (`expires_at >= now()`). Answered rows (deleted after response emit) and expired rows (deleted by GC) are excluded.
+4. This tool is read-only — calling it has NO side effects on Telegram state, on `pending_asks` rows, or on any outbound message.
+5. Unit test `list_open_returns_only_unanswered_and_unexpired` MUST pass.
 
-The migration MUST be additive and idempotent; all existing v6 rows MUST survive unchanged.
+##### FR-MAT-11.9 — `callback_data` 64-byte budget enforcement (Slice 8a, AR-1)
 
-**FR-TMC-1.2 (chat.db schema v7 — `tg_message_map` table):** The same migration MUST add:
+1. Telegram limits `callback_data` to 1–64 bytes (UTF-8). The `chat_ask` handler in `server.rs` MUST validate that each option's callback data fits within this budget at request time — before sending any message to Telegram.
+2. Single-select format `<ask_id>:<value>`: ask_id is UUID v4 = 36 bytes; separator `:` = 1 byte; value ≤ 27 bytes. Requests with a single-select option value exceeding 27 bytes MUST be rejected with JSON-RPC error `-32602` and a descriptive message explaining the 27-byte limit.
+3. Multi-select toggle format `<ask_id>:toggle:<option_id>`: 36 + 7 (`:toggle:`) = 43 bytes overhead; option_id ≤ 20 bytes. Done format `<ask_id>:done` = 41 bytes (always within budget). Requests with a multi-select option_id exceeding 20 bytes MUST be rejected with JSON-RPC error `-32602`.
+4. The validation function `validate_options_callback_data_budget(ask_id_len, format_overhead, max_option_id_len)` MUST be a standalone, unit-testable helper in `src/daemon/pending_asks.rs`.
+5. The `chat_ask` tool's JSON schema description MUST document the per-option byte budgets so callers (Mira, other agents) see the constraint in the tool's `inputSchema.description` field.
 
-```sql
-CREATE TABLE IF NOT EXISTS tg_message_map (
-    tg_msg_id       INTEGER NOT NULL,
-    chat_id         INTEGER NOT NULL,
-    sender_agent_id TEXT NOT NULL,
-    sent_at         INTEGER NOT NULL,
-    PRIMARY KEY (chat_id, tg_msg_id)
-);
-```
+#### §18.10.4 Non-Functional Requirements
 
-`tg_message_map` stores the mapping from a daemon-proxied outbound Telegram message ID to the CLI that sent it, enabling reply-quote routing back to the originating CLI.
+1. **NFR-MAT-11.1 (Single-Bot-owner invariant preserved):** The `OUTBOUND_TG_KEYBOARD` channel MUST route all keyboard send requests through the existing teloxide `Bot` instance in `run_long_poll`. No additional `Bot::new` construction is permitted anywhere in the call path for `chat_ask`.
+2. **NFR-MAT-11.2 (KP1–KP3 routing unchanged):** The addition of CallbackQuery dispatch in `process_batch_with_pairing` MUST NOT alter the routing logic for regular `Message` updates. The Slice 0 baseline wire shape for message inbound MUST be preserved bit-for-bit when `callback_query` is absent.
+3. **NFR-MAT-11.3 (Daemon-restart resilience for pending asks):** Open `pending_asks` rows MUST survive a daemon restart. After restart, a tap on a keyboard sent before the restart MUST still produce a valid `<channel>` response — the daemon re-reads the `pending_asks` row from SQLite on receipt of the CallbackQuery without requiring in-memory state.
+4. **NFR-MAT-11.4 (Security — ask_id unguessable):** `ask_id` MUST be a UUID v4 generated via a cryptographically-random source (not sequential, not predictable). An attacker who obtains a `chat_ask` keyboard URL cannot forge a response by guessing another `ask_id`. The debug tool `chat_list_pending_asks` lists ask_ids but this is behind the same SEC-7 whitelist as all other MCP tools.
+5. **NFR-MAT-11.5 (Multi-select concurrency via SQLite serializability):** Concurrent taps on multi-select buttons from the same operator (network lag) MUST serialize correctly via SQLite's write-lock on the `pending_asks` row. No two tap handlers must read-modify-write `selected_values_json` outside a transaction.
 
-**FR-TMC-1.3 (TTL purge of `tg_message_map`):** A background task (or purge triggered at startup and periodically thereafter) MUST delete rows from `tg_message_map` where `sent_at < (current_unix_seconds - 2592000)` (30-day TTL, 30 x 86400 = 2592000 seconds). Rows MUST NOT be purged sooner than 30 days after insertion.
+#### §18.10.5 Acceptance Criteria
 
-**FR-TMC-1.4 (`is_alive` helper in `agent_registry`):** `src/daemon/agent_registry.rs` MUST gain a new public function `is_alive(conn: &Connection, agent_id: &str) -> anyhow::Result<bool>` that returns `true` if and only if a row with the given `agent_id` exists in the `agent_registry` table with a non-orphaned status. Only `list_alive` exists today (verified at `agent_registry.rs:200`); `is_alive` is a new addition.
+The QA-cycle MUST verify these three criteria with concrete live evidence (TC-CHA-1, TC-CHA-2, TC-CHA-3 from `docs/qa/multi-agent-telegram-on-v0.6_test_cases.md`):
 
-**FR-TMC-1.5 (`first_alive` helper in `agent_registry`):** `src/daemon/agent_registry.rs` MUST gain a new public function `first_alive(conn: &Connection, thread: Option<&str>, prefer_role: Option<&str>) -> anyhow::Result<Option<AgentRow>>` that returns the first alive agent matching the given thread (if specified) and preferring an agent whose name contains `prefer_role` (e.g. `"orchestrator"`). If no match on `prefer_role`, any alive agent is returned; if no alive agents exist, `None` is returned. This is the default-CLI resolver used by the routing tree.
+1. **AC-MAT-CHA-1 (Single-select round-trip):** Mira calls `chat_ask` with `question="Which plan?"`, `options=[{label:"Plan A", value:"plan_a"}, {label:"Plan B", value:"plan_b"}, {label:"Plan C", value:"plan_c"}]`, `multi=false`. Operator's Telegram client shows an inline keyboard with 3 buttons. Operator taps "Plan B". The `<channel>` event arrives in Mira's CC with all of the following verified by evidence: `meta.is_callback_response=true`, `meta.value="plan_b"`, `meta.ask_id` (a UUID v4 string), `meta.question="Which plan?"`, `meta.options` (JSON array with 3 entries), `meta.multi=false`. Evidence: TC-CHA-1 screenshot `tc-cha-1-tg-buttons.png` (showing inline keyboard in TG before tap) + `tc-cha-1-channel-event.png` (showing terminal with channel event meta fields).
+2. **AC-MAT-CHA-2 (Multi-select toggle round-trip):** Mira calls `chat_ask` with `multi=true` and 3 options (labels: "Option 1", "Option 2", "Option 3"; values: "opt_1", "opt_2", "opt_3"). Operator taps "Option 1" (✓ marker appears on button 1 in TG). Operator taps "Option 3" (✓ marker appears on button 3). Operator taps "Done". The `<channel>` event arrives in Mira's CC with `meta.values=["opt_1","opt_3"]`, `meta.multi=true`, `meta.question`, `meta.options`. Evidence: TC-CHA-3 screenshots `tc-cha-3-tg-toggle-after-tap1.png` (✓ on Option 1), `tc-cha-3-tg-toggle-after-tap3.png` (✓ on Option 1 and Option 3), `tc-cha-3-channel-event.png` (meta.values in terminal).
+3. **AC-MAT-CHA-3 (Daemon-restart resilience):** Mira calls `chat_ask`. Daemon is restarted before operator taps. Operator taps a button after restart. The `<channel>` event arrives in Mira's CC with the correct `meta.value` / `meta.values`. Evidence: TC-CHA-7 daemon-log showing restart timestamp, then callback receipt timestamp after restart, then channel event in terminal.
 
-#### 5-Step Routing Decision Tree (Slice 2)
+All three cases are **Mixed** Verification Class (UI/UX + CLI + DB). Screenshots are OS-level (PowerShell `Get-Screenshot` / Snipping Tool on Windows; `screencapture` on macOS) because Playwright MCP cannot capture native Telegram Desktop. Telegram Web in a Playwright-driven browser is an acceptable alternate path.
 
-**FR-TMC-2.1 (routing tree replaces `@-mention` precursor):** The `@-mention`-only routing precursor at `telegram.rs:333` (`extract_first_mention` to `list_alive` to `meta.target_agent_id`) MUST be replaced by the following 5-step decision tree, evaluated in order for every inbound Telegram `message` update:
+#### §18.10.6 Affected Components (Slice 8 additions)
 
-1. **Bot command step:** If `msg.text` starts with `/` and matches one of `/agents`, `/switch`, `/whoami`, `/here`, `/start`, `/help`, `/status`, handle the command server-side (see FR-TMC-3.x), reply to the originating Telegram chat, and route NO message to any CLI. The routing tree terminates.
-2. **Reply-quote step:** If `msg.reply_to_message` is present, look up `(chat_id, msg.reply_to_message.message_id)` in `tg_message_map`. If a row is found, set `target_agent_id` to the `sender_agent_id` from that row. If `is_alive` returns `false` for that agent, log a diagnostic note (e.g., "original sender CLI is no longer alive; falling through to active binding") and fall through to step 4.
-3. *(Omitted under chat-as-id — no per-user "last addressed" state is maintained.)*
-4. **Active binding step:** Look up `chat_id` in `active_cli_per_chat`. If a row exists and `is_alive` returns `true` for its `active_agent_id`, set `target_agent_id` to that value. If no row exists or the bound agent is dead, call `first_alive(conn, thread=None, prefer_role="orchestrator")` and use the result as the target.
-5. **No CLI step:** If all preceding steps yield no alive target, reply to the Telegram chat with the message: "No CLIs online. Spawn one with `claudebase run`." Route no message to any CLI.
+**New files:**
 
-**FR-TMC-2.2 (target propagation):** After the routing tree resolves a `target_agent_id`, the daemon MUST tag the channel notification with `meta.target_agent_id` equal to the resolved agent's `agent_id`. This preserves the existing `ChatBus` publish-to-specific-subscriber behavior introduced in §17's `@-mention` precursor.
+- `src/daemon/pending_asks.rs` — `pending_asks` table schema, CRUD helpers (`insert_pending`, `get_pending`, `update_selected_values`, `delete_pending`, `gc_expired`, `list_open`), `validate_options_callback_data_budget`.
 
-**FR-TMC-2.3 (chat isolation):** A message arriving on `chat_id` A MUST NOT be routed to the CLI bound under `chat_id` B, even if B's binding is the only one in `active_cli_per_chat`. Each chat's binding is independent.
+**Modified files:**
 
-#### Bot Commands (Slice 3)
+- `src/daemon/telegram.rs` — `Update` struct extended with `#[serde(default)] callback_query: Option<CallbackQuery>`; new `CallbackQuery` and `MessageRef` structs; new `gate_callback` helper; `OUTBOUND_TG_KEYBOARD` `OnceLock<mpsc::UnboundedSender<...>>`; CallbackQuery dispatch branch in `process_batch_with_pairing`; `answerCallbackQuery` call; `editMessageReplyMarkup` for multi-select.
+- `src/daemon/server.rs` — `"chat_ask"` and `"chat_list_pending_asks"` added to `tools/list` + dispatch; `handle_chat_ask` handler (validates options, generates ask_id, enqueues to `OUTBOUND_TG_KEYBOARD`, awaits `message_id` oneshot, inserts `pending_asks` row, returns `{ask_id, status:"pending"}`); `handle_chat_list_pending_asks` handler.
+- `src/daemon/chat.rs` (or `src/daemon/migrations.rs`) — `apply_pending_asks_migration` called after `apply_routing_migration`.
+- `src/plugin/mcp.rs` — `"chat_ask"` and `"chat_list_pending_asks"` added to `TOOL_WHITELIST` (SEC-7 gate).
 
-**FR-TMC-3.1 (`/agents` command):** When the daemon receives `/agents` in a Telegram message, it MUST call `list_alive(conn, thread=None)` and reply with a formatted list of alive CLI names and their agent IDs. The reply MUST be sent to the originating `chat_id` via the existing Telegram outbound path. If no CLIs are alive, the reply MUST say "No CLIs currently online."
+**Unchanged (NFR-MAT-6):**
 
-**FR-TMC-3.2 (`/switch <name>` command):** When the daemon receives `/switch <name>`, it MUST:
-- Validate that `<name>` matches an alive agent name via `list_alive`; if not, reply with an error message identifying the unknown name and listing available names.
-- Write a row to `active_cli_per_chat` with `chat_id`, `active_cli_name = <name>`, `active_agent_id = <resolved agent_id>`, `set_at = current_unix_seconds`, `set_by = <telegram user_id or username>`. Use `INSERT OR REPLACE` so an existing binding is overwritten atomically.
-- Reply to the Telegram chat confirming the new binding. The reply MUST include a note that in group chats this rebinds the entire chat for all participants (chat-as-id semantics).
+- `src/plugin/bridge.rs` — v0.6 692-line version preserved. The `target_agent_id` filter added in commit `0ba2c41` is already present and handles the AR-4 routing semantics without further modification.
+- `plugins/telegram-rs/` — all plugin files unchanged.
+- `src/plugin/mcp.rs` existing whitelist entries — additive only.
 
-**FR-TMC-3.3 (`/whoami` command):** When the daemon receives `/whoami`, it MUST look up `active_cli_per_chat[chat_id]` and reply with the bound CLI name and agent ID. If no binding exists, the reply MUST name the default (the result of `first_alive(prefer_role="orchestrator")`) and indicate that no explicit binding is set.
+#### §18.10.7 Schema Changes (Slice 8 additions)
 
-**FR-TMC-3.4 (`/here` command):** When the daemon receives `/here`, it MUST look up the bound CLI's `AgentRow` in `agent_registry` and reply with the agent's `host` and `cwd` metadata fields. If the bound CLI is not found or those fields are absent, the reply MUST indicate the information is unavailable.
+The `pending_asks` table is a new additive migration in `chat.db` (the existing `chat.db` file at the v0.6 path — same security perimeter as `agent_registry`). The migration is registered as `apply_pending_asks_migration` called from `chat::ensure_chat_db_schema` AFTER `apply_routing_migration` (sequential migration ordering). Full schema reproduced in FR-MAT-11.7.
 
-**FR-TMC-3.5 (existing commands preserved):** The existing `/start`, `/help`, and `/status` handlers in the daemon Telegram bridge MUST remain functional and unmodified in behavior after this feature lands.
+The migration is idempotent — `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` guarantee re-running on an already-migrated `chat.db` is a no-op.
 
-**FR-TMC-3.6 (bot-command response latency):** All four new bot commands (`/agents`, `/switch`, `/whoami`, `/here`) MUST respond within approximately 1 second under normal load. They operate on local SQLite state only; no CLI roundtrip is required.
+No existing tables or columns are modified. No existing indexes are dropped. The `agent_registry` schema added in §18.7 is unaffected.
 
-#### Outbound Reply-Quote Tracking (Slice 4)
+#### §18.10.8 Risks and Dependencies
 
-**FR-TMC-4.1 (outbound message recording):** Every daemon-proxied outbound Telegram message (produced by the `enqueue_outbound_tg` path at `telegram.rs:81` or its successor) MUST, after the `sendMessage` API call succeeds and returns a Telegram `message_id`, insert a row into `tg_message_map`:
-- `tg_msg_id` = the `message_id` returned by the Telegram API.
-- `chat_id` = the `chat_id` the message was sent to.
-- `sender_agent_id` = the `agent_id` of the CLI that produced the message.
-- `sent_at` = current Unix seconds at the time of the API call.
+1. **R-MAT-10 (teloxide `Bot::answer_callback_query` symbol existence in v0.17).** The plan's architect pre-review (AR-1, AR-2) validated the Telegram Bot API surface conceptually. The implementer MUST verify that `teloxide::Bot::answer_callback_query(id)` and `teloxide::Bot::edit_message_reply_markup(chat_id, message_id, reply_markup)` exist with these exact signatures in teloxide 0.17 before coding. If either symbol is absent or has a different API shape: (a) check the `teloxide::requests::Requester` trait which may expose the method differently, (b) fall back to raw API calls via `teloxide::net::request_json`, (c) escalate to architect. Salience: high.
+2. **R-MAT-11 (Telegram 15-second `answerCallbackQuery` deadline).** If the daemon is under load and CallbackQuery processing is delayed beyond ~15 seconds, the operator sees a permanent spinner on the tapped button even if the response eventually routes correctly. Mitigation: `answerCallbackQuery` is the FIRST action in the dispatch branch (FR-MAT-11.5) with no blocking work before it. The risk is daemon startup lag after a restart, not steady-state. Salience: medium.
+3. **R-MAT-12 (Multi-select `editMessageReplyMarkup` 429 rate limit).** Rapid successive taps on a multi-select keyboard can trigger Telegram's rate limiter on `editMessageReplyMarkup`. Mitigation: AR-7 specifies retry-once after `retry_after`, then silent give-up. The SQLite row remains correct; only the keyboard display is stale. Salience: low.
+4. **R-MAT-13 (CC compaction between `chat_ask` and callback response).** If Mira's context window compacts after calling `chat_ask`, the in-session memory of the ask is lost. Mitigation: AR-5 embeds `meta.question`, `meta.options`, `meta.ask_id` in the callback response so a compacted Mira can reconstruct context from the channel event alone. Salience: medium.
+5. **R-MAT-14 (Dead originating agent at response time).** If the CC that called `chat_ask` has exited before the operator taps, the bridge filter would silently drop a `target_agent_id`-addressed notification. Mitigation: AR-4 fallback — when `requesting_agent_id` is not alive, omit `target_agent_id` and broadcast with `originating_agent_id` (informational). Salience: medium.
 
-**FR-TMC-4.2 (recording survives restart):** Because `tg_message_map` is persisted in `chat.db`, reply-quote routing MUST survive a daemon restart for any message inserted within the 30-day TTL window.
+#### §18.10.9 AR-9 — Post-implementation live-fix amendment (2026-06-04)
 
-**FR-TMC-4.3 (no double-recording):** A single outbound Telegram message MUST produce exactly one row in `tg_message_map`. Retry logic on API failure MUST NOT produce duplicate rows; the `PRIMARY KEY (chat_id, tg_msg_id)` constraint enforces uniqueness at the SQLite layer (`INSERT OR IGNORE` acceptable for retries).
+**Status:** SHIPPED in commit `4a65819`. Supersedes FR-MAT-11.5 ¶2-3 and FR-MAT-11.6 ¶5 (meta-shape requirements only — Slice 8a/8b code paths, state machine semantics, send-then-insert ordering, AR-4 dead-agent fallback, and AR-7 atomic UPDATE...RETURNING are all unchanged).
 
-#### Inline-Keyboard Questionnaire — `chat_ask` MCP Tool (Slice 5)
+**Discovery:** After Slice 8b deploy on 2026-06-04, operator's first multi-select probe (ask_id `1a2de8a1-...`) completed end-to-end on the daemon side — state machine ran, `pending_asks` row deleted, notification frame pushed to the broadcast bus, frame written to bridge UDS (684 bytes per daemon log at 22:40:18 UTC). But the `<channel>` event never surfaced in the requesting CC's session. Inbound TG messages on the same thread DID surface (304-byte frames), proving bus + UDS + bridge filter all worked. Difference between the two frames: meta payload shape.
 
-**FR-TMC-5.1 (`callback_query` update handling):** The `getUpdates` polling loop and `process_batch` function in `src/daemon/telegram.rs` MUST be extended to parse and handle `callback_query` update objects (currently only `message` updates are processed). On receipt of a `callback_query` update the daemon MUST:
-- Call `answerCallbackQuery` with the `callback_query_id` to dismiss the loading spinner on the operator's device.
-- Decode the `callback_data` field as `<question_id>:<option_idx>` (colon-delimited, both components are ASCII).
-- Route the decoded answer to the CLI bound to the originating `chat_id` via `active_cli_per_chat`.
+**Root cause:** Claude Code's `<channel>` surface renderer **silently drops** any `notifications/claude/channel` frame whose `params.meta` carries keys outside the inbound-Telegram schema. The schema CC accepts is exactly:
+- `chat_id` (string)
+- `message_id` (string)
+- `user` (string)
+- `user_id` (string)
+- `ts` (ISO 8601 string)
+- `thread_id` (string, optional)
+- `target_agent_id` (string, optional)
 
-**FR-TMC-5.2 (`callback_data` size discipline):** The `callback_data` string MUST be no greater than 64 bytes as required by the Telegram Bot API. The `question_id` component MUST be a compact opaque identifier (e.g., a short UUID prefix or a monotonic counter rendered as decimal) — NOT the full question text.
+Adding extra keys (Slice 8a/8b's original `is_callback_response`, `ask_id`, `value`/`values`, `multi`, `question`, `options[]`, `originating_agent_id`) caused CC to drop the entire frame before reaching the LLM input stream. This matches the long-standing comment at `src/daemon/chat.rs:244-250` describing the strict-shape behavior of the inbound builder — the live-fix work confirmed the strictness also rejects extra keys, not just wrong types.
 
-**FR-TMC-5.3 (`chat_ask` MCP tool — interface):** A new MCP tool `chat_ask` MUST be added to the daemon's `tools/list` response (dispatch at `src/daemon/server.rs`) with the following interface:
+**Decision:** Move all Slice 8 round-trip semantic data from `params.meta` into `params.content` as a single-line parseable preamble at the start of the channel body. Mira (and any other downstream consumer) parses the bracketed prefix:
 
-```json
-{
-  "name": "chat_ask",
-  "description": "Send a multiple-choice question to a Telegram chat as an inline keyboard. Returns the index and label of the option the operator taps.",
-  "inputSchema": {
-    "type": "object",
-    "properties": {
-      "thread":   { "type": "string", "description": "Thread id, e.g. telegram:<chat_id>" },
-      "question": { "type": "string", "description": "Question text displayed above the buttons" },
-      "options":  {
-        "type": "array",
-        "items": {
-          "type": "object",
-          "properties": {
-            "label":       { "type": "string" },
-            "description": { "type": "string" }
-          },
-          "required": ["label"]
-        },
-        "minItems": 2
-      }
-    },
-    "required": ["thread", "question", "options"]
-  }
-}
-```
+- Single-select: `[chat_ask kind=single ask_id=<uuid> value=<v>]`
+- Multi-select Done: `[chat_ask kind=multi ask_id=<uuid> values=v1,v2,...]`
+- Multi-select Done with zero selections: `[chat_ask kind=multi ask_id=<uuid> values=]` (trailing `=`, NOT `values=,`)
 
-**FR-TMC-5.4 (`chat_ask` MCP tool — behavior):** When an agent calls `chat_ask`, the daemon MUST:
-- Send a `sendMessage` to the Telegram `chat_id` resolved from `thread` with the `question` text and `reply_markup.inline_keyboard` containing one button per option, with `callback_data = "<question_id>:<option_index>"`.
-- Correlate the eventual `callback_query` (FR-TMC-5.1) back to the pending `chat_ask` call and return the tapped option's index and label to the calling agent.
-- The sync-vs-async correlation mechanism is an OPEN QUESTION deferred to the architect review at bootstrap Step 3 (see §19.10 Risks and Dependencies, risk #7). The deliverable contract is that the agent receives the answer; the internal wire is architect-determined.
+**FR-MAT-11.5 amendment (supersedes ¶2 and ¶3 meta keys):**
 
-**FR-TMC-5.5 (`chat_ask` honest scope — no native popup mirroring):** The `chat_ask` tool is an explicit agent-initiated call. The native harness `AskUserQuestion` popup CANNOT be automatically intercepted or mirrored to Telegram — there is no harness hook for that. The deliverable mechanism is that the agent (e.g., Mira in plan mode) explicitly calls `chat_ask` to render options as TG buttons when the operator is reachable on Telegram. Auto-mirroring of `AskUserQuestion` is out of scope for this feature.
+After `answerCallbackQuery`, the daemon emits a `notifications/claude/channel` event with:
 
-**FR-TMC-5.6 (`chat_ask` in plugin whitelist):** `chat_ask` MUST be added to `TOOL_WHITELIST` in `src/plugin/mcp.rs` so CLI instances accessing the daemon over the thin-client plugin bridge can call `chat_ask`. Today the whitelist contains 9 tools (verified at `mcp.rs:56-71` this session); `chat_ask` becomes the 10th entry.
+- `params.content` = the preamble string above (single-line, kept first so it parses cleanly even when followed by other content).
+- `params.meta.chat_id` = `pending_asks.chat_id` as STRING (v0.6 string discipline).
+- `params.meta.message_id` = the CallbackQuery's `cb.message.message_id` if present, else `pending_asks.message_id`, as STRING.
+- `params.meta.user` = `cb.from.username` if present, else `cb.from.id.to_string()`.
+- `params.meta.user_id` = `cb.from.id.to_string()`.
+- `params.meta.ts` = server-side `chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)` (CallbackQuery payloads do not carry a date field).
+- `params.meta.thread_id` = `pending_asks.message_thread_id` as STRING when Some, OMITTED when None.
+- `params.meta.target_agent_id` = AR-4 routing logic unchanged: present (string) iff `requesting_agent_id` is alive; OMITTED otherwise (frame becomes unaddressed broadcast).
 
-**FR-TMC-5.7 (single-select only):** The initial implementation MUST support single-select multiple-choice only — the operator taps exactly one button and the answer is returned. Free-text input and multi-select are out of scope for this feature.
+`params.meta.originating_agent_id` is **removed** — the AR-4 dead-agent fallback no longer carries it as an informational breadcrumb in meta. The ask_id in the content preamble is the breadcrumb a fresh / compacted Mira uses to call `chat_list_pending_asks` for older context. Removing the meta key is what makes the frame surface; preserving it kept reproducing the silent drop.
 
-#### Migration Flag and Conflict Gate (Slice 6)
+**FR-MAT-11.6 amendment (supersedes ¶5 emit shape):**
 
-**FR-TMC-6.1 (daemon poller gate):** The daemon Telegram bridge's `getUpdates` long-poller MUST check the `[telegram] enabled` flag in `daemon.toml` before starting. This flag already exists and defaults to `true` (`config.rs:100-123`). When `enabled = false`, the daemon MUST NOT start the long-poller, and the operator retains the per-CLI plugin path as the active Telegram receiver.
+Done-button finalization emits the SAME frame shape as FR-MAT-11.5 amended above, with the `kind=multi values=...` preamble form. No `meta.multi`, no `meta.values` array, no `meta.question`, no `meta.options` keys.
 
-**FR-TMC-6.2 (conflict gate — 409 detection):** On the first `getUpdates` call (and on each subsequent call that returns HTTP 409), the daemon MUST log a clear, operator-readable error message — for example: "Telegram daemon poller received 409 Conflict: the legacy telegram-plugin-rs poller is still running. Stop it before enabling the daemon poller." The daemon MUST NOT crash; polling attempts MUST cease gracefully until the operator takes corrective action (e.g., daemon restart after stopping the plugin).
+**AR-5 compaction-resilience revised:** Originally Slice 8 spec embedded `meta.question`, `meta.options`, `meta.ask_id` in the notification frame so a compacted Mira could reconstruct semantic context from the meta payload alone. AR-9 narrows this: only `ask_id` is preserved (in the content preamble). A compacted Mira reconstructs the question + options by calling `chat_list_pending_asks` filtered by `ask_id` — `pending_asks` row has already been deleted by Done, so this lookup returns empty; instead Mira must re-scan recent message history OR the operator re-states the question. Trade-off acknowledged.
 
-**FR-TMC-6.3 (no silent dual-poll):** The daemon MUST NEVER silently poll alongside the per-CLI plugin. Either the conflict gate surfaces the 409 loudly, or the operator has explicitly stopped the plugin. There is no scenario where both pollers hold the token concurrently without a logged error.
+**AC-MAT-CHA-1 / AC-MAT-CHA-2 / AC-MAT-CHA-3 amendment:** Evidence assertions on `meta.is_callback_response`, `meta.value`, `meta.values`, `meta.multi`, `meta.question`, `meta.options` are SUPERSEDED. New assertion: the `<channel>` body MUST contain the literal preamble substring matching the kind/ask_id/value(s) of the resolution. QA test cases `TC-CHA-1`, `TC-CHA-3`, `TC-CHA-7`, `TC-CHA-8` updated in sync — see `docs/qa/multi-agent-telegram-on-v0.6_test_cases.md` for new expected-result columns.
 
-**FR-TMC-6.4 (revert path):** Setting `[telegram] enabled = false` in `daemon.toml` and restarting the daemon MUST restore the per-CLI plugin as the sole Telegram receiver, with no code changes required.
+**Live-confirmed pass:** ask_id `3561a606-ae2f-46f2-aade-85a9887b25da` (multi-select) at 10:27 UTC + ask_id `7903663c-a65a-48f9-8858-9dfff662344c` (single-select) at 10:30 UTC, both surfacing in this Mira's session with the new content preamble.
 
-**FR-TMC-6.5 (installer channel-bridge wiring):** **(Amended 2026-05-31 — corrected cutover.)** The `install.sh` and `install.ps1` scripts MUST patch the official Anthropic Telegram plugin's `.mcp.json` so its `telegram` MCP server runs the claudebase **daemon bridge** (`claudebase plugin serve`, the GitHub-downloaded `~/.claude/tools/claudebase/claudebase` binary) — NOT the old direct-poll `server-rs` variant. The bridge only RELAYS the single daemon's channel notifications (it does not poll Telegram itself), so the daemon remains the sole `getUpdates` consumer (NFR-TMC-5 preserved) — there is no dual-poll. Launching `claude --channels plugin:telegram@claude-plugins-official` (the parameter `claudebase run` passes) then makes Claude Code inject the daemon's routed Telegram messages as `<channel>` turns into the live CLI session — this is the ONLY way real-time channel push reaches a live session (a plain `.mcp.json` mcpServers entry does NOT receive channel injection; only the approved `--channels` telegram slot does). The installer MUST back up the upstream `.mcp.json` to `.mcp.json.upstream-backup` and be idempotent. Documentation (README, RELEASING.md) MUST describe the `claudebase run` setup + the manual revert (restore the upstream backup). The earlier "stop auto-patching / server-rs" form of this requirement is superseded — `server-rs` (the per-CLI direct poller) is obsolete in the daemon architecture; the bridge replaces it.
-
-#### Thin-Client Wiring Verification and Docs (Slice 7)
-
-**FR-TMC-7.1 (CLI subscribes to chat-bound thread):** The thin-client bridge (`src/plugin/bridge.rs`) MUST be verified — via an end-to-end integration test — that a CLI subscribes to the `telegram:<chat_id>` thread via `ChatBus` and that inbound messages from the routing tree reach the CLI's message handler.
-
-**FR-TMC-7.2 (Mira persona guidance):** The SDLC repo's Mira persona (`src/agents/` or equivalent) MUST be updated to include guidance that in plan-mode questionnaires, when the operator is reachable on a TG-bound chat, Mira SHOULD call `chat_ask` with the multiple-choice options rather than relying solely on the CLI popup. Mira MUST register with a stable `agent_name` so `/switch` can target the orchestrator by name.
-
-**FR-TMC-7.3 (documentation):** `README.md` and `RELEASING.md` MUST gain a "Telegram Multi-CLI Setup" section documenting: (a) daemon cutover steps (stop the plugin poller, set `[telegram] enabled = true`, restart daemon), (b) `/switch` `/whoami` `/agents` `/here` command reference, (c) `chat_ask` tool usage guide for agent authors, (d) revert steps.
-
-### 19.4 Non-Functional Requirements
-
-1. **NFR-TMC-1 (chat-as-id isolation):** The routing tree MUST ensure that a message arriving in Telegram `chat_id` A is NEVER routed to the CLI bound under `chat_id` B, regardless of the order of evaluation or any concurrent `/switch` in progress. Binding updates use atomic `INSERT OR REPLACE` in SQLite to prevent partial-update races.
-
-2. **NFR-TMC-2 (schema additive):** The v6 to v7 migration MUST be additive. No existing column or table in `chat.db` at v6 may be dropped or renamed. All existing `agent_registry`, `messages`, `chat_sessions`, and other v6 rows MUST survive the migration untouched.
-
-3. **NFR-TMC-3 (conflict gate non-crashing):** The 409-Conflict detection MUST be handled gracefully — the daemon process MUST remain alive and responsive to UDS connections after a 409; only the Telegram poller loop is stopped. Other daemon capabilities (MCP dispatch, `ChatBus`, agent_registry, etc.) MUST remain unaffected.
-
-4. **NFR-TMC-4 (`callback_data` size):** The `callback_data` field MUST NOT exceed 64 bytes. Question IDs MUST be compact (e.g., a base-62 or UUID-prefix representation), not full question text.
-
-5. **NFR-TMC-5 (single `getUpdates` consumer):** After the cutover, only the daemon's long-poller holds the bot token's `getUpdates` slot. The installer (FR-TMC-6.5) and conflict gate (FR-TMC-6.2) together enforce this invariant.
-
-6. **NFR-TMC-6 (no HTTP/WSS dependency):** All routing, bot commands, and `chat_ask` MUST operate entirely over the existing UDS socket (`src/daemon/server.rs`). No HTTP or WebSocket listener is added in this feature.
-
-7. **NFR-TMC-7 (daemon auto-start prerequisite):** The feature presupposes that the daemon auto-starts via the service manager (launchd/systemd/SCM) installed in §17 Slice 2. The daemon MUST be running for routing to work. If the service manager registration is not confirmed active, the operator MUST be instructed to start the daemon manually before the cutover.
-
-### 19.5 Acceptance Criteria
-
-1. **AC-TMC-1 (schema v7 — fresh):** After the migration, `PRAGMA table_info(active_cli_per_chat)` on an upgraded `chat.db` returns columns `chat_id`, `active_cli_name`, `active_agent_id`, `set_at`, `set_by`. `PRAGMA table_info(tg_message_map)` returns columns `tg_msg_id`, `chat_id`, `sender_agent_id`, `sent_at`.
-
-2. **AC-TMC-2 (schema v7 — additive):** On a v6 `chat.db` with existing rows, running the v7 migration leaves all pre-existing rows intact (row count unchanged across all pre-v7 tables).
-
-3. **AC-TMC-3 (registry helpers):** Unit tests confirm `is_alive` returns `true` for a registered, non-orphaned agent and `false` for an unregistered or orphaned agent. `first_alive` returns the agent matching `prefer_role` when one exists and falls back to any alive agent otherwise; returns `None` when no alive agents exist.
-
-4. **AC-TMC-4 (routing — chat isolation):** Two CLIs registered; `chat_id` 111 bound to CLI-1 via `/switch`, `chat_id` 222 bound to CLI-2. A free-text message on `chat_id` 111 reaches only CLI-1; a message on `chat_id` 222 reaches only CLI-2; no cross-chat routing occurs.
-
-5. **AC-TMC-5 (routing — reply-quote):** CLI-1 sends an outbound message; the returned `message_id` is recorded in `tg_message_map`. When the operator sends a reply-to-message referencing that `message_id` in the same chat, the daemon routes the reply to CLI-1. Verified by inspecting `meta.target_agent_id` in the channel notification.
-
-6. **AC-TMC-6 (routing — reply-quote dead CLI fallback):** CLI-1 sends a message and is then unregistered. A subsequent reply-quote to CLI-1's message falls through to the active binding (CLI-2 if bound, or `first_alive` result). A diagnostic log entry is produced.
-
-7. **AC-TMC-7 (routing — no alive CLI):** When no CLIs are registered (or all are dead), a free-text message on any `chat_id` causes the daemon to reply "No CLIs online. Spawn one with `claudebase run`." and route nothing to any agent.
-
-8. **AC-TMC-8 (/agents command):** `/agents` sent in Telegram returns a formatted list naming all alive CLI instances; if none are alive, returns "No CLIs currently online."
-
-9. **AC-TMC-9 (/switch command):** `/switch <name>` with a valid alive CLI name writes a binding to `active_cli_per_chat` and confirms in the Telegram reply. `/switch <deadname>` is rejected with an error listing available names.
-
-10. **AC-TMC-10 (/whoami command):** `/whoami` returns the bound CLI name and agent ID for the sending `chat_id`, or names the default when no explicit binding exists.
-
-11. **AC-TMC-11 (/here command):** `/here` returns the bound CLI's `host` and `cwd` from `agent_registry` metadata, or a clear "information unavailable" message.
-
-12. **AC-TMC-12 (outbound tracking):** After CLI-1 sends a Telegram message via `chat_reply`, `sqlite3 chat.db "SELECT sender_agent_id FROM tg_message_map WHERE chat_id = <id>"` returns CLI-1's `agent_id`.
-
-13. **AC-TMC-13 (TTL purge):** Rows inserted with `sent_at` older than 30 days are absent from `tg_message_map` after a purge run. Rows inserted within 30 days are present.
-
-14. **AC-TMC-14 (`chat_ask` — buttons rendered):** An agent calls `chat_ask("telegram:111", "Pick one", [{label:"A"}, {label:"B"}, {label:"C"}])`; the daemon sends a Telegram message to `chat_id` 111 with an `inline_keyboard` containing 3 buttons labelled A, B, C; verified by inspecting the outbound `sendMessage` payload.
-
-15. **AC-TMC-15 (`chat_ask` — answer routed):** Tapping button B on the inline keyboard triggers a `callback_query` with `callback_data = "<qid>:1"` (index 1 = B); the daemon calls `answerCallbackQuery` to dismiss the spinner; the answer (index=1, label="B") is delivered to the calling agent on the chat-bound CLI.
-
-16. **AC-TMC-16 (`callback_data` size):** `callback_data` for a `chat_ask` with 3 options is no greater than 64 bytes. Verified by inspecting the serialized string length in a unit test.
-
-17. **AC-TMC-17 (conflict gate — 409):** With the per-CLI plugin running (holding `getUpdates`), starting the daemon with `[telegram] enabled = true` causes the daemon to log a clear conflict message containing "409" and the phrase "legacy telegram-plugin-rs poller still running", and NOT crash.
-
-18. **AC-TMC-18 (conflict gate — clean takeover):** After the per-CLI plugin is stopped, restarting the daemon causes it to successfully poll `getUpdates` and route messages.
-
-19. **AC-TMC-19 (revert path):** Setting `[telegram] enabled = false` and restarting the daemon causes the per-CLI plugin to resume receiving messages (verified by a message from Telegram arriving as `source="plugin:telegram:telegram"` rather than `source="claudebase"`).
-
-20. **AC-TMC-20 (plugin whitelist):** `TOOL_WHITELIST` in `src/plugin/mcp.rs` contains `"chat_ask"`.
-
-21. **AC-TMC-21 (bot commands don't leak to CLIs):** A `/switch` command sent in Telegram produces a daemon-side reply and does NOT produce a channel notification routed to any CLI.
-
-### 19.6 Affected CLI and MCP Surface
-
-**New MCP tool (added to daemon `tools/list` dispatch at `src/daemon/server.rs:632-727` and plugin `TOOL_WHITELIST` at `src/plugin/mcp.rs:56`):**
-- `chat_ask(thread, question, options)` — renders multiple-choice options as Telegram inline keyboard buttons; returns the tapped option's index and label.
-
-**Modified daemon Telegram path (`src/daemon/telegram.rs`):**
-- `process_batch`: extended with 5-step routing tree (FR-TMC-2.1) and `callback_query` handling (FR-TMC-5.1).
-- `enqueue_outbound_tg` (`:81`): extended to accept optional `reply_markup` and to record the returned `message_id` into `tg_message_map` (FR-TMC-4.1).
-- Bot command handlers: `/agents`, `/switch`, `/whoami`, `/here` added; `/start`, `/help`, `/status` preserved.
-
-**No changes to the public `claudebase` CLI binary interface** — no new subcommands; `chat_ask` is an MCP tool exposed through the daemon UDS socket.
-
-### 19.7 Schema Changes
-
-**`chat.db` — Schema v7 (additive on top of §17 v6):**
-
-The `ensure_chat_db_schema` function at `src/daemon/chat.rs:265` applies the following additions. Both tables are created with `IF NOT EXISTS` for idempotency.
-
-```sql
--- Chat-to-CLI binding (chat-as-id: one chat_id = one CLI)
-CREATE TABLE IF NOT EXISTS active_cli_per_chat (
-    chat_id         INTEGER PRIMARY KEY,
-    active_cli_name TEXT NOT NULL,
-    active_agent_id TEXT NOT NULL,
-    set_at          INTEGER NOT NULL,  -- Unix seconds
-    set_by          TEXT NOT NULL      -- Telegram user_id or username of /switch initiator
-);
-
--- Reply-quote routing map (30-day TTL purge)
-CREATE TABLE IF NOT EXISTS tg_message_map (
-    tg_msg_id       INTEGER NOT NULL,
-    chat_id         INTEGER NOT NULL,
-    sender_agent_id TEXT NOT NULL,
-    sent_at         INTEGER NOT NULL,  -- Unix seconds
-    PRIMARY KEY (chat_id, tg_msg_id)
-);
-```
-
-No columns are dropped, renamed, or altered on existing v6 tables. The `index.db` (books corpus) and `insights.db` (agent insights) files are unaffected.
-
-### 19.8 UI / Bot-Surface Changes
-
-The Telegram bot gains the following user-visible surface:
-
-**New bot commands:**
-- `/agents` — list alive CLI instances by name.
-- `/switch <name>` — bind this Telegram chat to the named CLI; rebinds for the whole chat in group chats.
-- `/whoami` — show the chat's current CLI binding.
-- `/here` — show the bound CLI's host and working directory.
-
-**Updated `/help` text:** MUST document the four new commands and note that `/switch` in a group chat rebinds for all participants.
-
-**Inline keyboard buttons:** Agent-initiated `chat_ask` calls render multiple-choice options as tappable buttons in the Telegram conversation. Tapping a button dismisses the spinner (via `answerCallbackQuery`) and delivers the answer to the bound CLI.
-
-**Outbound source label unchanged:** Daemon-proxied messages continue to carry `source="claudebase"` (distinct from the plugin's `"plugin:telegram:telegram"`) so the operator can identify the active poller.
-
-### 19.9 Out of Scope
-
-The following items are explicitly excluded from this feature:
-
-1. **HTTP/WSS `claudebase-server-foundation` + cross-machine fleet.** Routing over UDS on a single machine is sufficient; cross-machine routing is a separate future feature.
-2. **`.claudebase/identity.local` per-project CLI identity.** Routing works off `agent_registry` + `active_cli_per_chat` without a project-level identity file.
-3. **Auto-mirroring of the native `AskUserQuestion` popup.** There is no harness hook to intercept the popup. The deliverable is the explicit `chat_ask` MCP tool; agents call it intentionally.
-4. **Multi-select and free-text question types.** Single-select inline keyboard buttons only in this feature.
-5. **Per-user routing within a group chat.** The routing key is `chat_id` alone; all participants in a group share one CLI binding.
-6. **Anonymous or unauthenticated bot access.** Existing `access.json` allowlist and pairing flow (§17) govern who can interact with the bot; no changes to the authorization model in this feature.
-
-### 19.10 Risks and Dependencies
-
-1. **`AskUserQuestion` is not auto-interceptable.** The buttons-in-Telegram UX is delivered by the agent explicitly calling `chat_ask`, not by any automatic CLI popup interception. If the operator expects automatic mirroring of every CLI popup, that expectation must be corrected. Risk: medium (operator expectation gap); mitigated by FR-TMC-5.5 and Mira persona guidance in FR-TMC-7.2.
-
-2. **`callback_query` is a different update type than `message`.** Today `process_batch` only handles `message` updates (confirmed: no `callback_query` symbols in `telegram.rs` this session). Missing handling means inline keyboard buttons silently do nothing. Slice 5 adds it explicitly. Risk: high if Slice 5 is omitted; mitigated by Slice 5 being a required FR.
-
-3. **`callback_data` 64-byte Telegram limit.** The `question_id` must be compact. FR-TMC-5.2 mandates compact IDs; AC-TMC-16 verifies no greater than 64 bytes. Risk: low with discipline enforced.
-
-4. **Single `getUpdates` consumer rule.** The cutover MUST stop the plugin poller or the daemon receives 409. The conflict gate (FR-TMC-6.2) makes this loud. The installer change (FR-TMC-6.5) prevents auto-resurrection. Risk: high if either is omitted; mitigated by both being required FRs.
-
-5. **Daemon must be running and auto-started.** The daemon was not running at the start of this session (verified: `pgrep` empty). Service-install shipped in §17 Slice 2; the operator MUST confirm the service is active before the cutover. Risk: medium; mitigated by FR-TMC-7.1 end-to-end test requiring the daemon.
-
-6. **chat-as-id group-chat social surprise.** Any group participant's `/switch` rebinds the shared chat for everyone. This is intentional (operator decision 2026-05-30). FR-TMC-3.2 and the `/help` update (§19.8) make this visible. Risk: low (documented).
-
-7. **sync vs. async `chat_ask` correlation (open decision).** Sync (blocking tool call until button tap) is simpler for the agent but fragile for slow operators. Async (tool returns `question_id`; answer arrives later as a channel notification) is more robust. This decision shapes the `chat_ask` server-side implementation in `server.rs`. Risk: medium; architect decision required at bootstrap Step 3 before Slice 5 implementation begins.
-
-8. **`active_cli_per_chat` as SQLite table vs. JSON file.** The plan selects SQLite for consistency with `chat.db` + transactional updates. Architect review at bootstrap confirms. Risk: low; SQLite is the default (FR-TMC-1.1); JSON is the fallback if architect requires it.
-
-9. **teloxide v0.17 inline keyboard API.** The `InlineKeyboardMarkup`, `InlineKeyboardButton::callback`, and `CallbackQuery` symbols are present in teloxide's published API but have NOT been verified against the exact version pinned in `Cargo.toml` in this session. The implementer MUST verify symbol availability before coding Slice 5. Risk: medium; mitigation is pre-Slice-5 verification of the Cargo.lock pinned version.
+**Maintenance constraint (for future slices):** ANY future feature that wants to embed structured semantic context in a `notifications/claude/channel` frame MUST use `params.content` as the channel — adding meta keys outside the inbound-Telegram schema is a silent drop. This is a CC-side constraint claudebase cannot relax without modifying CC's plugin code.
 
 ## Facts
 
 ### Verified facts
 
-- `agent_registry.rs` at `src/daemon/agent_registry.rs` exposes these `pub fn` symbols: `validate_agent_name` (:102), `register` (:124), `unregister` (:173), `list_alive` (:200), `reap` (:232), `mark_connection_orphaned` (:255), `reap_on_boot` (:268). No `is_alive` or `first_alive` exist — verified by `grep "pub fn"` this session. — salience: high
-- `chat.db` is at schema v5+v6; the file-level comment at `src/daemon/chat.rs:1` reads "schema v5, message persistence, broadcast bus"; `chat.rs:254` reads "Apply schema v5 + v6 to a chat.db connection". Neither `active_cli_per_chat` nor `tg_message_map` are present — confirmed by grep returning no output this session. — salience: high
-- `TOOL_WHITELIST` in `src/plugin/mcp.rs:56-71` contains exactly 9 tools: `chat_post`, `chat_subscribe`, `chat_reply`, `chat_list`, `chat_list_threads`, `claudebase_daemon_status`, `agent_register`, `agent_unregister`, `agent_list_alive`, `agent_reap`. `chat_ask` is absent — verified by Read this session. — salience: high
-- No `callback_query`, `inline_keyboard`, `InlineKeyboardMarkup`, `answerCallbackQuery`, or `answer_callback` symbols exist in `src/daemon/telegram.rs` — confirmed by grep returning no output this session. — salience: high
-- The daemon Telegram bridge defaults `[telegram] enabled = true` at `config.rs:100-123` — verified from plan.md `## Facts` block, which sourced this from a direct file read in its own session. — salience: high
-- `enqueue_outbound_tg` is at `telegram.rs:81`; `extract_first_mention` routing precursor is at `telegram.rs:162`; `meta.target_agent_id` tagging is at `telegram.rs:333` — source: plan.md `## Facts`, read this session. — salience: high
-- `ChatBus` publish/subscribe is at `src/daemon/chat.rs:78-121`; MCP dispatch is at `src/daemon/server.rs:632-727` — source: plan.md `## Facts`, read this session. — salience: high
-- Operator decision 2026-05-30: routing key is `chat_id` alone (not `(user_id, chat_id)`); 1 chat = 1 CLI; `/switch` rebinds the whole chat — source: insight doc#30 (`sha=1a7e734c`, `agent=mira`, `type=operator-correction`), retrieved this session via `claudebase insight get 30 --json`. — salience: high
-- Books corpus `doc_count = 0` (empty). Corpus scope verdict: **No overlap** — empty corpus; topical queries skipped per corpus-scope-relevance protocol. — salience: low
-- PRD has sections §1 through §18; §19 is the next section — confirmed by `grep "^## §"` output this session showing last section is §18 at line 785. — salience: medium
-- insights-base: doc#30 sha=1a7e734c agent=mira type=operator-correction — query: "chat-as-id keying operator-correction" — verified: yes — salience: high
+- `.claude/plan.md` Slice 8 block (lines 312–334), AR-1 through AR-8 blocks (lines 335–378), Slice 8 OQ resolutions (lines 380–384), Slice 8c block (lines 386–398) all read in full this session. Plan version v2, 2026-06-04 operator additions. Salience: high.
+- `OUTBOUND_TG` OnceLock parallel pattern cited from plan AR-1 block (`.claude/plan.md:341`). New `OUTBOUND_TG_KEYBOARD` is the same pattern. Salience: high.
+- `telegram.rs:936–944` cited as source of single-Bot-owner discipline — not read directly this session; cited via plan AR-1 block line 341. Salience: high (DEFERRED to Slice 8a architect pre-review for exact line verification).
+- `bridge.rs:823–837` cited as the existing target_agent_id filter — commit `0ba2c41` (verified in git log this session). Salience: high.
+- `gate_dm` at `telegram.rs:534` issues pairing codes — cited from plan AR-3 block line 349. Not verified by direct Read this session; cited via plan. Salience: medium.
+- `process_batch_with_pairing` is the dispatch function name — cited from plan Slice 8 files-affected block line 321. Not verified by direct Read this session. Salience: medium.
+- `chat::ensure_chat_db_schema` call at `chat.rs:343` — cited from plan AR-6 block line 374. Not verified by direct Read this session. Salience: medium.
+- `apply_routing_migration` ordering constraint — cited from plan AR-6 block line 374. Not verified by direct Read this session. Salience: medium.
+- Operator OQ resolution: urgency parameter = NO, `chat_list_pending_asks` = YES (Slice 8c). Source: `.claude/plan.md` lines 382–383. Salience: high.
+- Insights corpus corrupt per spawn-prompt instruction — skipped silently per `~/.claude/rules/knowledge-base.md` § Fallback behavior. Salience: low.
+- Corpus scope relevance: No overlap — task is pure software-feature specification; `<project>/.claude/knowledge/index.db` absent (this claudebase workspace). Corpus protocol silently bypassed. Salience: low.
 
 ### External contracts
 
-- **Telegram Bot API — `getUpdates`** — symbol: single-consumer-per-token rule; a second concurrent caller receives HTTP 409 Conflict — source: Telegram Bot API docs (NOT opened this session) — verified: no — assumption. The implementer MUST verify the exact HTTP status code and response body before coding the conflict gate. — salience: high
-- **Telegram Bot API — `sendMessage` with `reply_markup.inline_keyboard`** — symbol: `reply_markup` field; `inline_keyboard` is an array of arrays of `InlineKeyboardButton` objects, each with `text` (string) and `callback_data` (string, max 64 bytes) — source: Telegram Bot API docs (NOT opened this session) — verified: no — assumption. Implementer MUST verify shape before Slice 5. — salience: high
-- **Telegram Bot API — `callback_query` update** — symbol: `callback_query` top-level field in an Update object; contains `id` (for `answerCallbackQuery`), `data` (the `callback_data` string), and `message.chat.id` (the originating chat) — source: Telegram Bot API docs (NOT opened this session) — verified: no — assumption. — salience: high
-- **Telegram Bot API — `answerCallbackQuery`** — symbol: POST method, required parameter `callback_query_id` (string); dismisses the loading spinner on the Telegram client — source: Telegram Bot API docs (NOT opened this session) — verified: no — assumption. — salience: high
-- **Telegram Bot API — `callback_data` max 64 bytes** — symbol: hard limit enforced server-side by Telegram; exceeding it causes the `sendMessage` call to fail — source: Telegram Bot API docs (NOT opened this session) — verified: no — assumption. — salience: high
-- **teloxide v0.17** — symbols: `Bot::get_updates` (confirmed in-use); `InlineKeyboardMarkup`, `InlineKeyboardButton::callback`, `CallbackQuery`, `answer_callback_query` (NOT verified against pinned Cargo.lock version this session) — verified: yes for `get_updates`; no — assumption for the inline-keyboard/callback symbols. Implementer MUST confirm symbol availability at the pinned version before Slice 5. — salience: high
-- **MCP `tools/list` / `tools/call` dispatch** — symbol: daemon dispatch at `src/daemon/server.rs:632-727`; plugin `TOOL_WHITELIST` at `src/plugin/mcp.rs:56-71` — adding `chat_ask` extends both — verified: yes (Read this session). — salience: medium
+- **Telegram Bot API `CallbackQuery` object** — symbol: required fields `id: String`, `from: User`, `chat_instance: String`; optional fields `data: Option<String>`, `message: Option<Message>`, `inline_message_id`, `game_short_name` — source: `https://core.telegram.org/bots/api#callbackquery` (AR-2 architect citation, `.claude/plan.md:347`) — verified: **no — assumption (cited by architect at AR-2; implementer MUST re-verify at impl time)** — salience: high.
+- **Telegram Bot API `callback_data` 64-byte budget** — symbol: `InlineKeyboardButton.callback_data` field max 1–64 bytes — source: `https://core.telegram.org/bots/api#inlinekeyboardbutton` (AR-1 architect citation, `.claude/plan.md:345`) — verified: **no — assumption (architect-cited; implementer MUST verify at impl time)** — salience: high.
+- **Telegram Bot API `answerCallbackQuery` ~15s deadline** — symbol: `answerCallbackQuery` must be called within ~15 seconds of CallbackQuery receipt — source: Telegram Bot API docs (AR-1 architect citation, `.claude/plan.md:343`) — verified: **no — assumption** — salience: high.
+- **teloxide 0.17 `Bot::answer_callback_query`** — symbol: method name and signature — source: `teloxide` crate docs.rs v0.17 (NOT opened this session) — verified: **no — assumption (R-MAT-10; implementer MUST verify before coding)** — salience: high.
+- **teloxide 0.17 `Bot::edit_message_reply_markup`** — symbol: method accepting `(chat_id, message_id, reply_markup)` — source: `teloxide` crate docs.rs v0.17 (NOT opened this session) — verified: **no — assumption (R-MAT-10)** — salience: high.
+
+---
+
+## §19. claudebase v0.9 cut — port-forward v0.7 insights surface
+
+**Status:** [PLANNED]
+**Date:** 2026-06-04
+**Priority:** High
+**Related:** §16 (Agent Insights Base — this section extends the insights corpus with schema v5, dual-DB routing, and tag vocabulary; the fundamental `insight create / search` CLI surface from §16 is extended, not replaced). §18 (Multi-Agent Telegram Routing on v0.6 Foundation — the 38 commits on `feat/multi-agent-on-v0.6` are the v0.9 baseline; this section documents the Wave A + Wave D additions on top of that baseline). Implementation plan: `.claude/plan.md` (v2, 265 lines, read in full this session). Product plan: `docs/plans/claudebase-v0.9-product-plan.md` (committed `15b9460`).
+
+Changelog: Cross-session insights now work again — the insights corpus tracks categories and tags, survives migration from any prior schema version, and two new Claude Code hooks remind agents to query the corpus on every new context and every prompt.
+
+### 19.1 Feature Description
+
+v0.7 and v0.8 were declared broken by the operator after extended debugging (`docs/plans/claudebase-v0.9-product-plan.md` §1 — root cause not isolated; forward-debug cost exceeded rebuild cost). The `feat/multi-agent-on-v0.6` branch rebuilt the Telegram product surface from scratch on the v0.6 baseline, live-verifying each delta. That branch is now the v0.9 release vehicle. This PRD section covers the two waves of additional work required before v0.9 ships: **Wave A** (port-forward v0.7's insights corpus and operational tooling) and **Wave D** (release infrastructure).
+
+Wave A is a code-reuse exercise, not a re-architecture. The v0.7 source code (commits `1161570`, `ff30d9f`, `c0eebca`, `2719e25`, `afddf71`, `cccef44`, `4bc9a9c`, `385efff`, `cb45b4d`, `0b92384`, `e43ca12`) is cherry-picked onto the v0.6+ baseline. The architect's pre-review focuses on compatibility with the 38 existing branch commits — not on re-deriving the v0.7 architecture which was already shipped upstream. Two BLOCKER files (`src/store.rs` wholesale rewrite and `src/cli.rs` breaking-change) require deliberate reconciliation; both are gated on architect pre-review before implementation.
+
+The load-bearing constraint for this entire section is the **backward-compatibility MANDATE** (operator directive 2026-06-04): any `insights.db` on the operator's box that was created by a prior v0.6 installation MUST continue to function after v0.9's schema v5 migration — without data loss, without `error: index database invalid` lockouts, and without requiring `claudebase ingest --reset`. Silent data loss is rejected. The migration MUST either repair the corrupt state in place, or exit cleanly with the documented `repair-required` message and a recovery path.
+
+Wave B (Telegram polish, KP2/KP3 live-evidence, bug #2 bridge reconnect, bug #8 daemon hang) and Wave C (multi-bot fleet, multi-bot long-poll, `/start` inline menu, `startproject`, `daemon setup`) are **deferred to v0.10** by operator decision 2026-06-04. The v0.6+ branch's KP1-verified Telegram work ships as-is in v0.9. The `CHANGELOG.md` entry MUST state that KP2/KP3 forum-topic routing is architecturally complete but live-evidence is pending v0.10.
+
+### 19.2 User Stories
+
+1. As the SDLC pipeline operator, I want `claudebase insight create --category project --tags v9-cut-smoke "Mira test"` to succeed so that agent insights persist across sessions without the `error: index database invalid` lockout that blocks cross-session learning today.
+2. As the SDLC pipeline operator, I want `claudebase insight search "Mira test" --tag v9-cut-smoke --salience high --top-k 3 --json` to return the insight I just created so that agents can retrieve prior-session observations by tag.
+3. As the SDLC pipeline operator, I want `claudebase insight tags --json` to return a merged tag vocabulary from both the local project DB and the global DB so that I can browse and filter the corpus across projects.
+4. As the SDLC pipeline operator, opening a new Claude Code session should automatically remind me to query the insights corpus so that I do not start sessions cold when prior-session observations are available.
+5. As the SDLC pipeline operator, submitting a prompt to Claude Code should inject a short cognitive self-check reminder so that agents habitually run the three protocols without me prompting them.
+6. As the SDLC pipeline operator, I want `claudebase run` to register the current project in `~/.claude/knowledge/projects.json` so that `insight search --project <slug>` can locate the project's local insights DB without me specifying a path.
+7. As the SDLC pipeline operator, I want `/update-claudebase` to update the installed binary and restart the daemon in one step so that I never have to manually stop the daemon, replace the binary, and restart it.
+8. As the SDLC pipeline operator with an existing `insights.db` from an older claudebase install, I want v0.9's schema v5 migration to preserve all my existing rows with correct `category` and `project_slug` backfill so that no historical observations are lost.
+9. As the SDLC pipeline operator, if my `insights.db` is in a corrupt state, I want v0.9 to exit with a clear `repair-required` message and a documented recovery path rather than silently corrupting data.
+
+### 19.3 Functional Requirements
+
+#### FR-V9-1: Schema v5 Migration + Global Resolver (Slice 1)
+
+1. **FR-V9-1.1 (schema v5 delta):** `src/store.rs` MUST apply the following additive schema delta when `open_or_init` is called against any insights DB at schema versions v1 through v4:
+   - `ALTER TABLE documents ADD COLUMN category TEXT NOT NULL DEFAULT 'project';`
+   - `ALTER TABLE documents ADD COLUMN project_slug TEXT;`
+   - `CREATE TABLE insight_tags(doc_id INTEGER NOT NULL, tag TEXT NOT NULL, PRIMARY KEY(doc_id, tag), FOREIGN KEY(doc_id) REFERENCES documents(id) ON DELETE CASCADE);`
+   - `CREATE INDEX insight_tags_tag_idx ON insight_tags(tag);`
+2. **FR-V9-1.2 (4-path migration semantics):** The migration MUST converge all four entry paths to schema v5: v1→v5, v2→v5, v3→v5, v4→v5. Each path applies the delta via `apply_v5_delta_and_backfill(tx, db_path)`. Schema version is updated to 5 after successful migration. Four synthetic fixture DBs (`tests/fixtures/synthetic-v{1,2,3,4}.db`, 3 rows each with known payload) MUST all pass migration with row-count preservation + `category`/`project_slug` backfill correct.
+3. **FR-V9-1.3 (v4→v5 backfill for agent rows):** After the schema DDL is applied, existing agent rows MUST be backfilled: `category = 'project'`, `project_slug` derived from `feature_slug` column (if present), a default tag inserted in `insight_tags` (one row per agent document using `feature_slug` as the tag value, or `'untagged'` when `feature_slug` is NULL). Books-corpus rows MUST remain untouched.
+4. **FR-V9-1.4 (backward-compat repair-required exit):** When the migration cannot repair a DB (schema version unrecognised, or structural corruption detected by `validate_schema_inner()` on versions `1..=5`), the binary MUST exit 1 with the literal stderr line `error: index database invalid; run \`claudebase ingest --reset\` to recover`. MUST NOT silently corrupt data. MUST NOT proceed with a partially-migrated DB.
+5. **FR-V9-1.5 (global resolver):** A new public function `resolve_global_insights_path() -> PathBuf` MUST return `~/.claude/knowledge/insights.db`. A corresponding `open_global_insights_db() -> Option<Connection>` MUST attempt to open that path; when the global DB is missing or unopenable, it MUST return `None` without error (the caller falls back to local-only operation).
+
+#### FR-V9-2: `insight create` Breaking-Change CLI Contract (Slices 2a + 2b)
+
+1. **FR-V9-2.1 (required flags):** `InsightCreateArgs` MUST add two REQUIRED flags: `--category <general|project>` (enum; exits 2 if absent) and `--tags <comma-separated>` (one or more tags; exits 2 if absent).
+2. **FR-V9-2.2 (optional project flag):** An optional `--project <slug>` flag MUST be added to allow explicit project scoping when the caller is not in the project's cwd.
+3. **FR-V9-2.3 (tag normalisation):** Tag values MUST be normalised before storage: strip leading `#`, lowercase, trim whitespace, deduplicate within the call. Example: `"#v9-cut-smoke, V9-cut-smoke, v9-cut-smoke "` normalises to a single tag `"v9-cut-smoke"`.
+4. **FR-V9-2.4 (dual-DB write routing):** `--category general` MUST write the insight to `~/.claude/knowledge/insights.db` (global DB). `--category project` MUST write to `<cwd>/.claude/knowledge/insights.db` (local DB). Existing exact-sha and semantic dedup MUST be preserved per-DB independently.
+5. **FR-V9-2.5 (tag row writes):** After inserting the document row, the handler MUST insert one row per normalised tag into `insight_tags(doc_id, tag)`. The insert MUST use `INSERT OR IGNORE` to be idempotent.
+
+#### FR-V9-3: `insight search` Dual-DB Read + Tag/Category/Project Filters (Slices 3a + 3b)
+
+1. **FR-V9-3.1 (`rrf_fuse_hits` function):** A new `pub fn rrf_fuse_hits(local: Vec<SearchHit>, general: Vec<SearchHit>, top_k: usize) -> Vec<SearchHit>` MUST be added to `src/search.rs`. The function fuses hits keyed on `(source_corpus, chunk_id)` using Reciprocal Rank Fusion (k=60). It MUST handle the case where the same `chunk_id` appears in both lists without panicking.
+2. **FR-V9-3.2 (dual-DB read):** `insight search` MUST query both the local DB and the global DB (if present), fuse results via `rrf_fuse_hits`, and return the top-K fused list. When the global DB is absent or corrupt, the search MUST fall back to local-only with a stderr warning — it MUST NOT exit 1.
+3. **FR-V9-3.3 (tag filter — parameterised SQL only):** The `--tag <t>` filter (repeatable, OR-semantics) MUST be implemented as a parameterised SQL `WHERE chunk_id IN (SELECT doc_id FROM insight_tags WHERE tag IN (?,?,...))` with bound parameters. Building the filter via `format!()` string interpolation is PROHIBITED — any such pattern is a SQL injection vector and a security violation.
+4. **FR-V9-3.4 (additional filters):** The following optional filters MUST be added to `insight search`, `insight list`, `insight random`: `--tag <repeatable>`, `--category <general|project>`, `--project <slug>`. The `insight gc` and `insight delete` subcommands MUST also gain `--category`.
+5. **FR-V9-3.5 (existing regression safety):** All 11 existing `cli_search_e2e` tests MUST continue to pass after the dual-DB changes.
+
+#### FR-V9-4: `insight tags` Subcommand (Slice 4)
+
+1. **FR-V9-4.1 (new subcommand):** A new `claudebase insight tags` subcommand MUST be added with `InsightTagsArgs` parsed by `src/cli.rs` and dispatched to `run_insight_tags()` in `src/main.rs`.
+2. **FR-V9-4.2 (merged semantics):** "Merged" output MUST mean: union of `(tag, count)` pairs from local DB and global DB, deduplicated by exact tag string, with `count` = sum of per-DB counts for that tag. Sort order MUST be `count DESC, tag ASC` (deterministic tie-breaking on alphabetical tag).
+3. **FR-V9-4.3 (missing global DB — no error):** When the global DB path does not exist, the global contribution is zero across all tags. The subcommand MUST NOT materialise an empty DB file, MUST NOT exit 1, and MUST NOT emit a warning — it silently omits the global contribution.
+4. **FR-V9-4.4 (JSON output shape):** `--json` MUST output a JSON array of `{"tag": string, "count": integer}` objects in the specified sort order.
+
+#### FR-V9-5: Project Registry (Slice 5)
+
+1. **FR-V9-5.1 (new file):** `src/registry.rs` MUST be added to the crate, declared via `pub mod registry;` in `src/lib.rs`.
+2. **FR-V9-5.2 (`upsert_project` semantics):** `pub fn upsert_project(root: &Path) -> Result<(), String>` MUST write or update a `ProjectEntry` for the given path in `~/.claude/knowledge/projects.json`. The `project_slug` MUST be the canonicalised basename of `root` — never derived from user-supplied input. Writes MUST be atomic: write to a temp file in the same directory, then rename (avoids partial-write corruption).
+3. **FR-V9-5.3 (`resolve_project_path` API):** `pub fn resolve_project_path(slug: &str) -> Option<PathBuf>` MUST read `projects.json` and return the `path` for the entry whose slug matches, or `None` if not found.
+4. **FR-V9-5.4 (`claudebase run` integration):** The `run_claude_with_preset` function in `src/main.rs` MUST call `upsert_project(&cwd)` as its first action, before spawning the child process. The call MUST be non-fatal — a registry write failure MUST log a warning and continue; it MUST NOT prevent `claudebase run` from launching the CLI.
+5. **FR-V9-5.5 (reconciliation with per-project config):** The project registry is the cross-cutting index of all projects. The per-project `.claudebase/config.json` (added in commit `25189bc`) is the per-project source of truth for `session_id` and `name`. These two files MUST NOT conflict; `upsert_project` reads neither `.claudebase/config.json` nor the global registry — it derives the slug from the filesystem path only.
+
+#### FR-V9-6: UserPromptSubmit Self-Check Hook (Slices 6a + 6b + 6c)
+
+1. **FR-V9-6.1 (hook scripts):** Two new hook scripts MUST be created: `hooks/claudebase-selfcheck-reminder.sh` and `hooks/claudebase-selfcheck-reminder.ps1`. Both MUST emit valid JSON `{"hookSpecificOutput": {"additionalContext": "..."}}` on stdout when invoked.
+2. **FR-V9-6.2 (ASCII-only PowerShell constraint):** All `.ps1` hook files shipped by this feature MUST contain ONLY ASCII bytes (codepoint ≤ 127). Non-ASCII glyphs (emoji, em-dashes, curly quotes, bullets) are PROHIBITED in `.ps1` files. Verification: `(Get-Content $f -Encoding Byte | Where-Object { $_ -gt 127 }).Count -eq 0` MUST return `True` for every `.ps1` hook file. This constraint exists because Windows PowerShell 5.1 parses no-BOM scripts in the local code page (not UTF-8); multi-byte UTF-8 sequences corrupt string literals.
+3. **FR-V9-6.3 (installer wiring — idempotent):** `install.sh` and `install.ps1` MUST wire both `.sh` and `.ps1` hooks into `~/.claude/settings.json` under `hooks.UserPromptSubmit`. Wiring MUST use dedup-by-command-string equality: the installer reads the existing array, extracts the `command` field from each entry, and skips appending if a matching `command` string is already present. Running the installer twice MUST produce zero new entries in the second run.
+4. **FR-V9-6.4 (`prompts/` repo-shipped directory):** The `prompts/rules/` directory IS the repo-shipped source for rule files. The installer MUST deploy these files to `~/.claude/rules/` using `cp -n` (shell) or `Copy-Item -ErrorAction SilentlyContinue` (PowerShell) so that operator-customised files in `~/.claude/rules/` are NOT overwritten.
+5. **FR-V9-6.5 (modification to `claudebase-insight-capture` hooks):** If `hooks/claudebase-insight-capture.{sh,ps1}` already exist on the branch, MUST apply the compact-reason update from commit `0b92384` and the ASCII-only fix from `e43ca12`. If they do not exist, MUST create them as new files ported from v0.7.
+
+#### FR-V9-7: SessionStart Read-Insights-on-New-Context Hook (Slice 7)
+
+1. **FR-V9-7.1 (hook scripts):** Two new hook scripts MUST be created: `hooks/claudebase-read-insights-reminder.sh` and `hooks/claudebase-read-insights-reminder.ps1`. Both MUST be ASCII-only (same constraint as FR-V9-6.2). Both MUST emit JSON with `additionalContext` containing the literal substring `claudebase insight tags`.
+2. **FR-V9-7.2 (installer wiring — idempotent):** `install.sh` and `install.ps1` MUST wire both hooks into `~/.claude/settings.json` under `hooks.SessionStart` using the same dedup-by-command-string pattern as FR-V9-6.3. Running the installer twice MUST produce zero new entries in the second run.
+3. **FR-V9-7.3 (firing condition):** The hook fires on session `start`, `resume`, and post-compact events. This is the standard `SessionStart` event type; no special-casing is required by the hook scripts themselves.
+
+#### FR-V9-8: `/update-claudebase` Skill + Daemon-State Preservation (Slice 8)
+
+1. **FR-V9-8.1 (skill file):** `prompts/commands/update-claudebase.md` MUST be created, containing a slash-command specification that instructs the agent to update the claudebase binary by reading the project's README first and running the appropriate install path.
+2. **FR-V9-8.2 (daemon-state preservation — 6-step contract):** The skill MUST instruct the agent to follow this exact sequence:
+   - Step 1: Run `claudebase daemon status --json` and capture the pre-update PID.
+   - Step 2: Verify that the fresh binary's version is GREATER than the running version (refuse downgrade).
+   - Step 3: Stop the daemon via `claudebase daemon stop`.
+   - Step 4: Replace the binary atomically (write to a temp path, then rename to final path).
+   - Step 5: Restart the daemon via `claudebase daemon start`.
+   - Step 6: Verify the new PID is different from the pre-update PID AND `claudebase daemon status` returns `running`.
+3. **FR-V9-8.3 (reads-README-first discipline):** The skill MUST instruct the agent to fetch and read the project README before executing any install command, so the install path used by the skill matches the README's documented install one-liner and never drifts from it.
+4. **FR-V9-8.4 (no downgrade):** The skill MUST abort with an error message if the fresh binary version is ≤ the currently-running version. It MUST NOT replace the binary in that case.
+
+#### FR-V9-9: `prompts/` Repo-Shipped Directory + Installer Deploy (Slice 6a)
+
+1. **FR-V9-9.1 (repo structure):** The `prompts/` directory MUST exist at the repo root after this feature lands. Subdirectory `prompts/rules/` MUST contain at minimum: `cognitive-self-check.md`, `knowledge-base.md`, `knowledge-base-tool.md`, `tool-limitations.md` (ported from v0.7 commit `cb45b4d`).
+2. **FR-V9-9.2 (content verification):** Content of these files MUST be byte-identical to their v0.7 counterparts (verified via `git show cb45b4d:<path>` diff at implementation time).
+3. **FR-V9-9.3 (installer deploy — no-clobber):** The installer MUST deploy `prompts/rules/*` → `~/.claude/rules/` and `prompts/commands/*` → `~/.claude/commands/` using no-clobber semantics (`cp -n` on shell; `Copy-Item -ErrorAction SilentlyContinue` on PowerShell). Existing operator customisations MUST NOT be overwritten.
+
+### 19.4 Non-Functional Requirements
+
+1. **NFR-V9-1 (backward-compat MANDATE — no silent data loss):** The schema v5 migration MUST NOT silently discard or corrupt any row that exists in an insights DB at any prior schema version (v1 through v4). This is an absolute constraint. A migration that silently loses data is a CRITICAL defect regardless of test coverage. The only permitted data-loss outcomes are (a) the explicit `claudebase ingest --reset` path chosen by the operator, or (b) GC of expired low/medium-salience rows. — salience: high.
+2. **NFR-V9-2 (ASCII-only `.ps1` hooks for Windows PowerShell 5.1):** Every `.ps1` file shipped by this feature MUST contain only ASCII bytes. Windows PowerShell 5.1 on operator's box (Windows 11 Home 10.0.26200) parses no-BOM scripts in the local ANSI code page, not UTF-8. Multi-byte UTF-8 sequences corrupt string literals — this caused a production breakage in v0.7 (commit `e43ca12` was the fix). — salience: high.
+3. **NFR-V9-3 (installer idempotency):** Running `install.sh --yes` or `install.ps1` more than once MUST be a no-op with respect to `~/.claude/settings.json` hook entries and `~/.claude/rules/` file state. No duplicate hook entries. No overwritten operator customisations. — salience: medium.
+4. **NFR-V9-4 (parameterised SQL — no injection vector):** Any SQL filter that incorporates user-supplied tag strings MUST use bound parameters (`?, ?, ...` placeholders). Building a SQL string via `format!()` or string concatenation with user input is PROHIBITED. This applies specifically to the `WHERE tag IN (?,?,...)` pattern in `insight search` and `insight tags`. — salience: high.
+5. **NFR-V9-5 (no new Cargo dependencies):** Wave A MUST introduce zero new entries in `Cargo.toml`. The implementation uses only existing dependencies (`rusqlite`, `serde_json`, `std::fs`). — salience: medium.
+
+### 19.5 Acceptance Criteria
+
+These four criteria are the v0.9 release gate. All must pass before `/merge-ready` is invoked.
+
+| ID | Criterion | Evidence Required |
+|---|---|---|
+| **AC-V9-1** | `claudebase insight create --category project --tags v9-cut-smoke --salience high "Mira test"` succeeds on operator's box AND writes a row to the cwd-local `insights.db`. | Shell stdout (exit 0) + SQL `SELECT count(*) FROM documents WHERE source_type LIKE 'agent-%'` returns ≥1 row after the call. Captured in `docs/qa/evidence/claudebase-v0.9/AC-V9-1-create-stdout.txt` and `AC-V9-1-sql-count.txt`. |
+| **AC-V9-2** | After AC-V9-1's row is inserted, `claudebase insight search "Mira test" --tag v9-cut-smoke --salience high --top-k 3 --json` exits 0 AND the JSON array contains the row inserted by AC-V9-1. | Shell stdout MUST be a non-empty JSON array; one element MUST contain the body substring `Mira test` AND `salience: "high"`; exit code MUST be 0; stderr MUST NOT contain `error: index database invalid`. Captured in `docs/qa/evidence/claudebase-v0.9/AC-V9-2-search-stdout.json`. |
+| **AC-V9-3** | `claudebase insight tags --json` returns the merged tag vocabulary from cwd-local + global DBs, where merged means: union by tag, count = sum across DBs, sorted by `count DESC, tag ASC`. | JSON array of `{"tag": string, "count": integer}` objects; MUST contain `{"tag": "v9-cut-smoke", "count": 1}` after AC-V9-1's row is inserted; sort order verified via jq assertion. Captured in `docs/qa/evidence/claudebase-v0.9/AC-V9-3-tags-stdout.json` and `AC-V9-3-merged-semantics-assertion.txt`. |
+| **AC-V9-4** | `claudebase --version` reports `0.9.0` after running `/update-claudebase` skill AND the `claudebase-v0.9.0` git tag exists with a GitHub release attached. | `git tag --list 'claudebase-v0.9.0'` returns the tag; `gh release view claudebase-v0.9.0` shows a non-draft release with Linux + macOS + Windows binary assets. |
+
+**Backward-compat MANDATE:** AC-V9-1 and AC-V9-2 MUST also pass against operator's existing `insights.db` at `C:\Users\madwh\.claude\knowledge\insights.db` in its current (corrupt) state. The migration MUST either (a) repair the DB in place with rows preserved, OR (b) exit with the literal stderr `error: index database invalid; run \`claudebase ingest --reset\` to recover`. Evidence captured in `docs/qa/evidence/claudebase-v0.9/TC-V9-5-pre-migration-rows.txt` and `TC-V9-5-post-migration-rows.txt`.
+
+### 19.6 Affected Components
+
+**Modified (port-forward — v0.7 source taken wholesale or near-wholesale):**
+
+- `src/store.rs` — BLOCKER: full rewrite of `open_or_init_v2` to the 4-path v1→v5 / v2→v5 / v3→v5 / v4→v5 converging migration (sourced from v0.7 commit `1161570`).
+- `src/cli.rs` — BLOCKER: `InsightCreateArgs` gains required `--category {general|project}` enum and required `--tags <comma-separated>` Vec<String>; new `InsightTagsArgs` + `Tags` enum variant added to `InsightSubcommand`; additional filter flags on `InsightSearchArgs`, `InsightListArgs`, `InsightRandomArgs` (sourced from v0.7 commits `c0eebca` + `afddf71` + `2719e25`).
+- `src/main.rs` — `upsert_project(&cwd)` call at top of `run_claude_with_preset`; new match arm `InsightSubcommand::Tags(a) => run_insight_tags(&a)`; dual-DB call sites for search/list/random/gc/delete.
+- `src/lib.rs` — `pub mod registry;` alphabetic insert.
+- `src/search.rs` — `pub fn rrf_fuse_hits(...)` extraction; `rrf_fuse_corpora()` refactored to 7-line wrapper; dual-DB search call sites (sourced from v0.7 commit `afddf71`).
+- `install.sh` + `install.ps1` — hook-wiring additions for UserPromptSubmit + SessionStart hooks; `prompts/` → `~/.claude/` deploy step.
+- `README.md` — `/update-claudebase` skill banner update.
+- `CHANGELOG.md` — NEW at repo root; `[0.9.0]` block with v0.6+ Telegram work summary + Wave A port-forward summary + KP2/KP3 deferred-evidence note.
+- `Cargo.toml` — version bump `0.6.0` → `0.9.0`.
+- `Cargo.lock` — regen after version bump.
+
+**Created:**
+
+- `src/registry.rs` — project registry (new file, sourced from v0.7 commit `cccef44`).
+- `hooks/claudebase-selfcheck-reminder.sh` + `hooks/claudebase-selfcheck-reminder.ps1`
+- `hooks/claudebase-read-insights-reminder.sh` + `hooks/claudebase-read-insights-reminder.ps1`
+- `hooks/claudebase-insight-capture.sh` + `hooks/claudebase-insight-capture.ps1` (if not already on branch; else modified)
+- `prompts/rules/cognitive-self-check.md`
+- `prompts/rules/knowledge-base.md`
+- `prompts/rules/knowledge-base-tool.md`
+- `prompts/rules/tool-limitations.md`
+- `prompts/commands/update-claudebase.md`
+- `tests/store_v5_test.rs` + `tests/store_global_resolver_test.rs` + `tests/fixtures/synthetic-v{1,2,3,4}.db`
+- `tests/cli_insight_create_args_test.rs` + `tests/cli_insight_create_routing_test.rs`
+- `tests/rrf_fuse_hits_test.rs` + `tests/cli_insight_dual_db_test.rs` + `tests/cli_insight_tags_test.rs`
+- `tests/registry_test.rs`
+- `docs/use-cases/claudebase-v0.9-cut_use_cases.md`
+- `docs/qa/claudebase-v0.9-cut_test_cases.md`
+- `docs/qa/evidence/claudebase-v0.9/` (evidence directory populated by Slice 10)
+- `.github/workflows/release.yml` (if missing)
+
+**Preserved bit-for-bit (frozen — operator directive 2026-06-04):**
+
+- All `src/daemon/*` files modified by the 38 v0.6+ branch commits.
+- `src/plugin/bridge.rs` (target_agent_id filter from commit `0ba2c41`).
+- `src/plugin/mcp.rs` (TOOL_WHITELIST with `chat_ask` + `chat_list_pending_asks`).
+- `src/project_config.rs` (`.claudebase/config.json` from commit `25189bc`).
+- `docs/PRD.md` §18 + §18.10 (multi-agent TG + Slice 8 AR-9 amendment).
+
+### 19.7 Schema Changes
+
+The following SQL DDL constitutes the complete v5 schema delta applied by `apply_v5_delta_and_backfill(tx, db_path)` in `src/store.rs`:
+
+```sql
+-- Column additions to documents table (applied via ALTER TABLE — additive)
+ALTER TABLE documents ADD COLUMN category TEXT NOT NULL DEFAULT 'project';
+ALTER TABLE documents ADD COLUMN project_slug TEXT;
+
+-- New tags table (ON DELETE CASCADE from documents.id)
+CREATE TABLE IF NOT EXISTS insight_tags (
+    doc_id  INTEGER NOT NULL,
+    tag     TEXT    NOT NULL,
+    PRIMARY KEY (doc_id, tag),
+    FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
+);
+
+-- Index on tag column for tag-filter queries
+CREATE INDEX IF NOT EXISTS insight_tags_tag_idx ON insight_tags(tag);
+```
+
+Backfill SQL semantics (executed within the same transaction as the DDL):
+
+```sql
+-- Backfill category for all existing rows (agent rows inherit 'project')
+UPDATE documents SET category = 'project' WHERE category IS NULL OR category = '';
+
+-- Backfill project_slug from feature_slug where available
+UPDATE documents SET project_slug = feature_slug
+WHERE feature_slug IS NOT NULL AND feature_slug != '';
+
+-- Insert one default tag per agent document using feature_slug as tag
+-- (rows whose feature_slug IS NULL receive tag 'untagged')
+INSERT OR IGNORE INTO insight_tags (doc_id, tag)
+SELECT id, COALESCE(feature_slug, 'untagged')
+FROM documents
+WHERE source_type LIKE 'agent-%';
+```
+
+These migrations are idempotent: the `ALTER TABLE` statements are guarded by `PRAGMA table_info` column-existence checks before execution; `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` are unconditionally idempotent; the `INSERT OR IGNORE` is idempotent by the primary key constraint.
+
+This schema change applies to `insights.db` files only (both local `<project>/.claude/knowledge/insights.db` and global `~/.claude/knowledge/insights.db`). The `index.db` books corpus, `chat.db`, and `claudebase.db` are unaffected.
+
+### 19.8 Risks and Dependencies
+
+**R-V9-CUT-1 (BLOCKER #1: `src/store.rs` open_or_init_v2 wholesale rewrite).** v0.7's migration logic replaces the v4-only init code with a 4-path v1→v5 converging migration. A line-by-line cherry-pick will not apply cleanly against the 38 v0.6+ branch commits that touch `store.rs`. The mitigation is to take v0.7's `store.rs` wholesale at Slice 1, immediately verify against a copy of operator's actual `insights.db` (NOT a synthetic test DB) as part of the Slice 1 done-condition. The backward-compat MANDATE is satisfied by this verification, not by code-reading the migration body. Salience: high.
+
+**R-V9-CUT-2 (BLOCKER #2: `src/cli.rs` InsightCreateArgs breaking-change).** v0.7 makes `--category` and `--tags` REQUIRED flags. Operator's SDLC config already mandates these flags via UserPromptSubmit hook reminders every prompt turn — the deployed binary is behind the contract agents already expect. The mitigation is that Slice 2 ships in the same release as Slices 6-7 (the hook scripts), so the binary and the hooks align simultaneously. No ecosystem-wide breakage window exists. Salience: high.
+
+**R-V9-CUT-3 (Operator's current `insights.db` is corrupt).** The current state returns `error: index database invalid; re-ingest required` on every `insight create` call (followup #7 from `docs/plans/claudebase-v0.9-product-plan.md` §2). The schema version on disk is unknown without a binary that handles the invalid state. The mitigation is Slice 1's done-condition: the implementer snapshots operator's actual DB to `tests/fixtures/operator-db-snapshot.db` (gitignored, local-only), runs the v0.9 migration against the snapshot, and verifies either (a) rows are preserved + tag/category backfill is correct, OR (b) the literal repair-required stderr message is emitted + exit code is 1. Silent data loss fails the done-condition. Salience: high.
+
+**R-V9-CUT-4 (install.ps1 hook-wiring reconciliation with our `a615d9c` Start-Process daemon block).** The Explore agent #2 verdict on this risk was ADDITIVE: v0.7's hook-wiring additions land in a separate section of `install.ps1` BEFORE the daemon-spawn block; there is no overlap. The mitigation is the Slice 6c implementer applying v0.7's hook-wiring patch on top of the current `install.ps1` and verifying the post-install daemon-spawn block still runs end-to-end. Salience: medium.
+
+**R-V9-CUT-5 (Schema-version assumption — operator's DB might be at v1, not v4).** The v0.6 baseline initialises fresh DBs at schema v4. If the operator's DB pre-dates that install, it could be at v1, v2, or v3. The v0.7 migration handles all four paths to v5, so this is not a real risk — only a verification step in Slice 1. The done-condition's synthetic-fixture pass (which exercises all four entry paths) covers this. Salience: low.
+
+**R-V9-CUT-6 (Wave A code-REUSE directive must not be interpreted as blind cherry-pick).** The operator's directive says "code REUSE, NOT a re-architecture." This means using v0.7's source code as the implementation, not re-deriving the design. However, R-V9-CUT-1 and R-V9-CUT-2 BOTH require deliberate reconciliation — the v0.7 commits cannot be applied mechanically without considering the 38 v0.6+ branch commits. The mitigation is that both BLOCKER slices (1 and 2a) spawn `architect` pre-review gates, so reconciliation is supervised. Salience: medium.
+
+**R-V9-CUT-7 (KP2/KP3 live evidence is pending and ships in v0.9 unverified).** Operator accepted this scope trade-off in the 2026-06-04 scope-cut decision: KP1 LIVE-verified is good enough for v0.9; KP2/KP3 require operator to set up a group with forum topics and 3 CC sessions, which is deferred to v0.10. The mitigation is that the `CHANGELOG.md` `[0.9.0]` entry MUST explicitly state "KP2/KP3 forum-topic routing architecturally complete; live-evidence capture deferred to v0.10." Salience: medium.
+
+## Facts
+
+### Verified facts
+
+- `.claude/plan.md` lines 1–265 read in full this session — source: Read tool call this session — salience: high.
+- `docs/plans/claudebase-v0.9-product-plan.md` lines 1–493 read in full this session — source: Read tool call this session — salience: high.
+- `docs/PRD.md` last top-level section is §18 (confirmed via Grep on `^## §` pattern this session); §19 is the next available section number — source: Grep output `## §18. Multi-Agent Telegram Routing...` at line 783 this session — salience: high.
+- PRD file ends at line 1299 (last content line) per Read offset=1290 limit=10 call this session — source: Read tool call this session — salience: medium.
+- v5 schema delta identifiers (column names, table name, FK constraint, index name) copied verbatim from `.claude/plan.md` §External contracts entry — source: plan.md lines 192–197 this session — salience: high.
+- 4 success criteria (AC-V9-1 through AC-V9-4) copied verbatim from `.claude/plan.md` §Success Criteria table — source: plan.md lines 22–31 this session — salience: high.
+- 7 risks (R-V9-CUT-1 through R-V9-CUT-7) ported from `.claude/plan.md` §Risks & Dependencies — source: plan.md lines 141–149 this session — salience: high.
+- Files Likely Affected list (Modified / Created / Preserved-bit-for-bit) ported from `.claude/plan.md` lines 108–139 this session — salience: medium.
+- The `--with-resources` and role-planner steps are NOT in scope for this PRD-writer invocation (prd-writer only) — source: task prompt from orchestrator this session — salience: low.
+- Knowledge base `index.db` exists at `<project>/.claude/knowledge/index.db` but contains 0 documents (verified via `claudebase status --json --project-root` call this session). Corpus scope relevance: No overlap — task is software-feature specification; no domain books are indexed. Topical queries silently skipped per `~/.claude/rules/knowledge-base-tool.md` § Corpus scope relevance protocol. — salience: low.
+- Insights corpus (`insights.db`) absent in this project workspace; `insight search` queries skipped silently per activation-sentinel rule — salience: low.
+
+### External contracts
+
+- **v5 schema identifiers (commit `1161570` via Explore agent #1 cited in `.claude/plan.md:192–197`):**
+  - column `documents.category TEXT NOT NULL DEFAULT 'project'` — source: `.claude/plan.md:197` — verified: yes (plan.md read this session) — salience: high.
+  - column `documents.project_slug TEXT` — source: `.claude/plan.md:197` — verified: yes — salience: high.
+  - table `insight_tags(doc_id INTEGER NOT NULL, tag TEXT NOT NULL, PRIMARY KEY(doc_id, tag), FOREIGN KEY(doc_id) REFERENCES documents(id) ON DELETE CASCADE)` — source: `.claude/plan.md:197` — verified: yes — salience: high.
+  - index `insight_tags_tag_idx ON insight_tags(tag)` — source: `.claude/plan.md:197` — verified: yes — salience: high.
+- **v0.7 `apply_v5_delta_and_backfill(tx, db_path)` symbol** — source: `.claude/plan.md:192` (Explore agent #1 citation of commit `1161570`) — verified: yes (plan.md read this session) — salience: high.
+- **v0.7 `validate_schema_inner()` extended to `1..=5`** — source: `.claude/plan.md:192` — verified: yes — salience: high.
+- **v0.7 `InsightCreateArgs` REQUIRED `--category <general|project>` + REQUIRED `--tags <comma-separated>` + optional `--project <slug>`** — source: `.clone/plan.md:193` (Explore agent #2 citation of commit `c0eebca`) — verified: yes — salience: high.
+- **v0.7 `src/registry.rs` API symbols:** `pub struct ProjectEntry`, `pub fn upsert_project(root: &Path) -> Result<(), String>`, `pub fn resolve_project_path(slug: &str) -> Option<PathBuf>` — source: `.claude/plan.md:194` (Explore agent #1 citation of commit `cccef44`) — verified: yes — salience: high.
+- **v0.7 hook script paths:** `hooks/claudebase-selfcheck-reminder.{sh,ps1}`, `hooks/claudebase-read-insights-reminder.{sh,ps1}`, `hooks/claudebase-insight-capture.{sh,ps1}` — source: `.claude/plan.md:195` (commits `cb45b4d` + `385efff` + `0b92384` + `e43ca12`) — verified: yes — salience: medium.
+- **v0.7 `/update-claudebase` skill spec** — symbol: skill name `update-claudebase`, protocol "read README → execute install → report version delta" — source: `.claude/plan.md:196` (commit `4bc9a9c`) — verified: yes — salience: medium.
+- **SQLite `INSERT OR IGNORE`** — symbol: `INSERT OR IGNORE INTO insight_tags(doc_id, tag) ...` — standard SQLite conflict-resolution clause — source: standard SQLite docs; idempotency via PRIMARY KEY constraint — verified: yes (standard SQL, no version dependency) — salience: medium.
+- **`rrf_fuse_hits` keyed on `(source_corpus, chunk_id)`** — source: `.claude/plan.md:80` (Slice 3a done-condition) — verified: yes — salience: high.
 
 ### Assumptions
 
-- `active_cli_per_chat` as a SQLite table (not a JSON file) is the correct choice — consistent with `chat.db` and enables atomic `INSERT OR REPLACE`. Risk: architect may prefer JSON. How to verify: architect review at bootstrap Step 3. Pending confirmation. — salience: medium
-- The daemon service-install (launchd/systemd/SCM) delivered in §17 Slice 2 is wired and auto-starts the daemon at boot. Risk: if not active, the feature does not work without manual daemon startup. How to verify: `claudebase daemon status` or `pgrep` before cutover. — salience: high
-- `chat_ask` sync-vs-async correlation is an open architect decision; the PRD captures the tool interface (FR-TMC-5.3) and behavior contract (FR-TMC-5.4) without prescribing the wire mechanism. Risk: architect may determine async-via-notification requires significant server.rs changes. How to verify: architect review at bootstrap Step 3. — salience: high
-- The operator wants single-select multiple-choice questionnaires as the initial deliverable (matches the `AskUserQuestion` shape). Risk: operator may request free-text or multi-select after seeing the buttons. How to verify: confirmed by plan Out of Scope block (plan.md read this session). — salience: low
+- The backfill SQL `COALESCE(feature_slug, 'untagged')` correctly handles the case where `feature_slug` column exists in the v1–v4 schema but some rows have NULL values. Risk: if `feature_slug` column does not exist in v1 schema, the backfill SELECT fails. How to verify: Slice 1 implementer inspects v1 schema via `PRAGMA table_info(documents)` against the synthetic-v1 fixture before running backfill. Salience: medium.
+- The six-step daemon-state preservation contract in FR-V9-8.2 is sufficient for the skill to reliably update the binary. Risk: the daemon `stop` → binary-replace → daemon `start` dance assumes `claudebase daemon stop` blocks until the old process terminates. How to verify: Slice 8 implementer adds a post-stop existence check (poll `daemon status` until it returns `stopped` before binary replace). Salience: medium.
+- The `cp -n` / `Copy-Item -ErrorAction SilentlyContinue` no-clobber semantics for the `prompts/` → `~/.claude/` deploy step will not silently fail on directories vs files. Risk: `cp -n` on a path that is a directory (not a file) may have different behaviour across BSD vs GNU coreutils. How to verify: Slice 6c implementer tests the deploy on both macOS (BSD cp) and Linux (GNU cp) to confirm `-n` works uniformly. Salience: low.
 
 ### Open questions
 
-- **Sync vs. async `chat_ask` answer correlation** — blocking tool call vs. async `question_id` + later channel notification. Needs: architect decision at bootstrap Step 3 before Slice 5 is implemented. — salience: high
-- **`[telegram] enabled` cutover default** — remains `true` (daemon-on by default) or flips to `false` (opt-in migration) for the release? Needs: operator/architect decision. — salience: medium
-- **Mira persona update: claudebase repo or SDLC repo?** The `chat_ask` usage guidance and stable `agent_name` registration live in the SDLC `src/agents/` persona, not the claudebase binary. Slice 7 is cross-repo. Needs: planner to confirm cross-repo branch strategy. — salience: medium
-- knowledge-base: corpus is empty (doc_count=0); task domain is Telegram Bot API + Rust daemon engineering + SQLite schema migration; no overlap. Topical queries skipped per corpus-scope-relevance protocol. — salience: low
+- OQ-V9-CUT-1 (resolved in plan): Slice 1 implementer copies operator's actual DB to `tests/fixtures/operator-db-snapshot.db` (gitignored) for local backward-compat verification. The resolution is recorded in `.claude/plan.md:248`. Salience: medium.
+- OQ-V9-CUT-2: Whether the SessionStart onboarding hook AND the subagent-onboarding hook are already deployed on operator's box. Slice 6 + 7 implementers verify before patching installers. Salience: low.
+- OQ-V9-CUT-3: Operator explicit sign-off that `v0.9.0` is the correct semver label (not `v0.7.0-rebuild` or `v1.0.0`). Recommendation in product plan §7 R-V9-1 is to keep `v0.9.0` and explain via CHANGELOG. Salience: low.
 
 ## Decisions
 
 ### Inbound validation
 
-- Task received: append §19 PRD section to `docs/PRD.md` based on the approved plan at `.claude/plan.md`. Plan read in full (198 lines). The plan explicitly names the "chat-as-id" operator decision (2026-05-30, OQ-3), verified independently via insights-corpus doc#30 (`operator-correction`, `mira`, sha=1a7e734c). No contradictions detected. Challenged: yes — verified operator-decision evidence from two independent sources (plan.md + insight doc#30) before authoring FR-TMC-2.1. Outcome: proceeded with chat-as-id routing as stated. — salience: high
-- The plan's Slice 5 frames `chat_ask` as having an honest scope boundary (no native AskUserQuestion mirroring). Protocol-1 check: correct — the harness provides no hook for intercepting the native popup, confirmed by plan.md:101 and absence of contrary harness documentation. Challenged: yes. Outcome: FR-TMC-5.5 captures this constraint explicitly. — salience: high
+- Task received: write PRD §19 from `.claude/plan.md` as source of truth. Challenged: no — the plan is coherent, approved by operator 2026-06-04, and the inbound task description maps 1:1 onto the plan's deliverables checklist entry for the PRD section. No contradiction with §18 found (§19 extends the insights corpus; §18 extends the Telegram routing; different subsystems). Outcome: proceeded. Salience: high.
+- The plan's `### Symptom-only patches` entry acknowledges that the v0.7/v0.8 root cause was not isolated. Protocol 3 check: does executing this PRD section amplify that unresolved root cause? No — the PRD documents the port-forward approach explicitly (FR-V9-1 through FR-V9-9 are all additive, not cover-ups). The risk is documented in R-V9-CUT-1 through R-V9-CUT-7 and in the `### Symptom-only patches` entry of the plan. Outcome: proceeded. Salience: high.
 
 ### Decisions made
 
-- **Chat-as-id routing (`chat_id` alone as the CLI binding key).** Q1 hack? no — operator-decided. Q2 sane? yes — simpler than `(user_id, chat_id)` and matches the operator's stated mental model. Q3 alternatives? per-user routing — rejected by operator on 2026-05-30 (OQ-3, insight doc#30). Q4 cause? yes. Q5 tracked? group-chat social consequence documented in FR-TMC-3.2, §19.9 #5, and §19.10 #6. — salience: high
-- **5-step routing tree omits step 3 (per-user "last addressed" state).** Q1 hack? no — structurally inapplicable under chat-as-id. Q2 sane? yes. Q3 alternatives? retain as dead no-op (rejected: confusing dead code). Q4 cause. Q5 n/a. — salience: medium
-- **`chat_ask` as an explicit MCP tool.** Q1 hack? no — only feasible mechanism. Q2 sane? yes. Q3 alternatives? harness interception (rejected: no hook exists). Q4 cause. Q5 n/a. — salience: high
-- **SQLite for `active_cli_per_chat` and `tg_message_map`** (architect confirmation pending). Q1 hack? no — consistent with all other `chat.db` tables; transactional. Q2 sane? yes. Q3 alternatives? JSON file (rejected: less transactional, consistency risks). Q4 cause. Q5 pending architect confirmation surfaced in Assumptions. — salience: medium
-- **Defer sync-vs-async `chat_ask` correlation to architect.** Q1 hack? no — both are valid with different trade-offs. Q2 sane? yes. Q3 alternatives? default to sync (rejected: fragile for slow human taps). Q4 cause. Q5 tracked in Open questions. — salience: high
+- Section number §19 chosen (next available after §18). Q1 hack? no | Q2 sane? yes | Q3 alternatives? — no other section numbers available — Q4 cause | Q5 n/a. Salience: low.
+- AC-V9-1 through AC-V9-4 copied verbatim from the implementation plan's `## Success Criteria` table, including the deterministic AC-V9-2 wording with `Mira test` + `v9-cut-smoke` tag. Decision: do not paraphrase ACs — verbatim copy is the only way to ensure the qa-engineer's `/qa-cycle` execution targets the same criterion the planner designed. Q1 hack? no | Q2 sane? yes | Q3 alternatives? paraphrase — rejected (drift risk) | Q4 cause | Q5 n/a. Salience: high.
+- Schema DDL in §19.7 presented as a full SQL block rather than prose description. Decision: implementers and reviewers need the exact DDL; a prose description of column types invites misreading. Q1 hack? no | Q2 sane? yes | Q3 alternatives? prose only — rejected (less precise) | Q4 cause | Q5 n/a. Salience: medium.
+- `COALESCE(feature_slug, 'untagged')` chosen as the backfill tag default for rows with NULL `feature_slug`. Decision: `'untagged'` is a safe explicit sentinel that survives in the tag vocabulary without misleading operators. Alternatives: `''` (empty tag — would contaminate tag vocabulary), `NULL` (impossible — `tag TEXT NOT NULL`), `project_slug` (circular — `project_slug` is also being backfilled in the same transaction). Q1 hack? no | Q2 sane? yes | Q3 alternatives? listed above, all rejected | Q4 cause | Q5 n/a. Salience: medium.
+- Waves B and C deferred to v0.10 per operator directive 2026-06-04. This is an operator scope decision, not a technical decision by prd-writer. Recorded here to make the deferral explicit and reviewable. Salience: high.
 
-### Hacks acknowledged
+### Hacks / workarounds acknowledged
 
-(none) — PRD authoring only; no implementation hacks introduced.
+(none — this PRD section documents a principled port-forward of already-shipped v0.7 architecture; no shortcuts taken in the requirements)
 
 ### Symptom-only patches (with root-cause links)
 
-(none) — no symptom-only patches in this PRD section.
+- The v0.7/v0.8 root cause of brokenness was not isolated (operator's `docs/plans/claudebase-v0.9-product-plan.md` §1). v0.9 ships from the rebuild branch with v0.7's insights surface ported on top. Symptom: operator's box returns `error: index database invalid; re-ingest required` on every `insight create`. Root cause that remains: unknown (possibly a migration interaction between v0.6 schema and a v0.7 partial-apply, or a pre-existing DB corruption). Tracked at: `.claude/plan.md` §Symptom-only patches + `docs/plans/claudebase-v0.9-product-plan.md` §2 open bug #7. The Slice 1 done-condition (test against operator's actual DB snapshot) is the only verification that the migration correctly handles this specific real-world state. Salience: high.

@@ -1,8 +1,9 @@
 //! Channel state model — 1:1 port of the official Anthropic telegram plugin.
 //!
-//! Lives at `~/.claude/channels/claudebase/` so any user-facing tooling
-//! (CLI subcommands, external operators, future skills) can read/write
-//! it without going through a daemon API. Schema mirrors
+//! Lives at `~/.claude/channels/claudebase/` so the user-facing skills
+//! (`.claude-plugin/skills/configure/SKILL.md`,
+//! `.claude-plugin/skills/access/SKILL.md`) can read/write it without going
+//! through any daemon API. Schema mirrors
 //! `claude-plugins-official/external_plugins/telegram/server.ts` verbatim:
 //!
 //! ```json
@@ -137,8 +138,20 @@ impl Default for Access {
 
 /// `~/.claude/channels/claudebase/` — root of channel state (matches
 /// `~/.claude/channels/telegram/` convention from the official plugin).
+///
+/// Windows compatibility: fall back to USERPROFILE when HOME is unset
+/// (mirrors `store.rs:1493` discipline). Without the fallback a Windows
+/// daemon process whose env lacks HOME silently fell back to `/tmp`,
+/// failed to locate `.env`, and ran chat-only with no TG long-poll —
+/// surfaced live 2026-06-04 by operator's `ав` / `/agents` messages
+/// arriving with no daemon response. `spawn_daemon_detached` now
+/// injects HOME, but the fallback stays as defense-in-depth so any
+/// future spawn site that forgets HOME injection still resolves the
+/// real user dir on Windows.
 pub fn channel_state_dir() -> PathBuf {
-    let home = std::env::var_os("HOME").unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
     PathBuf::from(home)
         .join(".claude")
         .join("channels")
@@ -244,129 +257,28 @@ pub enum GateAction {
     Pair { code: String, is_resend: bool },
 }
 
-/// Read-only allowlist predicate for inline-keyboard `callback_query` taps
-/// (telegram-multi-cli Slice 5, security defense-in-depth).
+/// Slice 8 of multi-agent-telegram-on-v0.6 — access gate for Telegram
+/// CallbackQuery inbounds (per architect AR-3). DISTINCT from `gate_dm`:
+/// callback senders MUST NOT receive a pairing code as the reply to a
+/// disallowed button tap (would be confusing UX, would reveal bot
+/// identity, would expose pairing code surface to anyone in the group).
+/// We return a simple `bool` for the dispatch path:
+///   - `true`  ⇒ caller proceeds to `answerCallbackQuery` + `pending_asks`
+///     lookup + emit response notification.
+///   - `false` ⇒ caller drops the callback SILENTLY — no
+///     `answerCallbackQuery` (don't acknowledge unknown senders), no
+///     pairing code, no log entry beyond the dispatch-level info trace.
 ///
-/// Unlike the inbound MESSAGE path, a button tap must NEVER emit a pairing
-/// code or mutate `access.pending` — a callback is an answer to a question
-/// the operator was already asked, not a fresh contact attempt. So this is a
-/// pure, side-effect-free predicate that returns `true` only for the exact
-/// senders `gate_dm` would `Deliver`:
-///
-/// - `Disabled` → `false` (the message path drops Disabled DMs at
-///   `gate_dm` line `Disabled → Drop`; the callback path mirrors it).
-/// - `allow_from` hit → `true` (the message path's `Deliver` arm).
-/// - otherwise (`Allowlist`/`Pairing` without an allow_from hit) → `false`
-///   (the message path would `Drop`/`Pair` — neither is a route).
-///
-/// This is the callback-side sibling of `permissions::check_allowed`, scoped
-/// to the `channel_state::Access` type the production update loop carries.
-pub fn is_callback_allowed(access: &Access, sender_id: &str) -> bool {
+/// The `disabled` DM policy still matters: if the operator has set
+/// `dmPolicy: "disabled"`, ALL callbacks are dropped regardless of
+/// allowFrom membership. This matches the inbound-message gate's
+/// `disabled` semantics (defense-in-depth — the operator may set this
+/// to lock the bot down entirely, including its button surfaces).
+pub fn gate_callback(access: &Access, sender_id: &str) -> bool {
     if access.dm_policy == DmPolicy::Disabled {
         return false;
     }
     access.allow_from.iter().any(|id| id == sender_id)
-}
-
-/// Outcome of `redeem_pairing_code`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RedeemError {
-    /// Code format invalid (length / charset). Same surface treatment as
-    /// `Unknown` to avoid leaking which check failed.
-    InvalidFormat,
-    /// Code not present in `pending`. Note: caller's error message MUST
-    /// NOT distinguish this from `InvalidFormat` per SEC-16.
-    Unknown,
-    /// Code present but `expires_at <= now`.
-    Expired,
-}
-
-impl std::fmt::Display for RedeemError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RedeemError::Expired => write!(f, "pairing code expired"),
-            // SEC-16: same message for unknown / invalid format so timing
-            // and string-content do not distinguish them.
-            RedeemError::Unknown | RedeemError::InvalidFormat => {
-                write!(f, "unknown or invalid pairing code")
-            }
-        }
-    }
-}
-
-impl std::error::Error for RedeemError {}
-
-/// Constant-time byte comparison. Equivalent to `a == b` semantically but
-/// runs in O(len) regardless of where the first mismatch is — defeats
-/// timing-side-channel attacks on the pending-code lookup (SEC-16).
-///
-/// Returns `true` iff both slices have the same length AND all bytes match.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
-/// Validate a candidate pairing code is well-formed: 6 lowercase hex chars.
-/// Matches channel_state's `generate_pairing_code` format.
-pub fn is_valid_pairing_format(code: &str) -> bool {
-    if code.len() != 6 {
-        return false;
-    }
-    code.bytes()
-        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-}
-
-/// Redeem a pairing code: look it up via constant-time compare across the
-/// pending map, check expiry, move the sender into `allow_from`, and drop the
-/// pending entry. Returns the sender_id (String) that was just added to allow_from on
-/// success.
-///
-/// On failure the access struct is NOT mutated — caller can safely retry.
-pub fn redeem_pairing_code(
-    access: &mut Access,
-    code: &str,
-    now_ms: i64,
-) -> std::result::Result<String, RedeemError> {
-    if !is_valid_pairing_format(code) {
-        return Err(RedeemError::InvalidFormat);
-    }
-
-    // Constant-time scan over every pending key. We collect the match in a
-    // separate variable rather than short-circuiting on first hit so the
-    // running time depends only on the total number of pending entries,
-    // not on which entry matches.
-    let code_bytes = code.as_bytes();
-    let mut matched: Option<(String, PendingEntry)> = None;
-    for (k, v) in access.pending.iter() {
-        if constant_time_eq(k.as_bytes(), code_bytes) {
-            matched = Some((k.clone(), v.clone()));
-            // Do NOT break — keep scanning in constant time.
-        }
-    }
-
-    let (matched_code, entry) = matched.ok_or(RedeemError::Unknown)?;
-
-    if entry.expires_at <= now_ms {
-        // Drop the expired entry as a courtesy so it doesn't pollute future
-        // lookups, but reject the redeem.
-        access.pending.remove(&matched_code);
-        return Err(RedeemError::Expired);
-    }
-
-    // Move to allow_from. De-dup so re-pairing an already-allowed user
-    // doesn't accumulate duplicate ids.
-    let sender_id = entry.sender_id.clone();
-    if !access.allow_from.contains(&sender_id) {
-        access.allow_from.push(sender_id.clone());
-    }
-    access.pending.remove(&matched_code);
-    Ok(sender_id)
 }
 
 /// Evaluate a Telegram DM under the current access policy. Mutates
@@ -475,167 +387,6 @@ pub fn load_bot_token_from_env(path: &Path) -> Result<Option<String>> {
         }
     }
     Ok(None)
-}
-
-/// Outcome of the legacy access.json (File A) → canonical access.json (File B)
-/// migration. Returned by `migrate_from_legacy_access()`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MigrationOutcome {
-    /// Migration succeeded: File A was read and merged into File B.
-    Migrated,
-    /// No File A present — already migrated or fresh install.
-    NoOpAbsent,
-    /// File A is malformed JSON — skipped for manual inspection, File A NOT
-    /// renamed, File B unchanged.
-    SkippedMalformed,
-    /// File A already renamed to .migrated — idempotent, File B unchanged.
-    NoOpAlreadyMigrated,
-}
-
-impl std::fmt::Display for MigrationOutcome {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            MigrationOutcome::Migrated => write!(f, "migrated"),
-            MigrationOutcome::NoOpAbsent => write!(f, "no-op (file absent)"),
-            MigrationOutcome::SkippedMalformed => write!(f, "skipped (malformed JSON)"),
-            MigrationOutcome::NoOpAlreadyMigrated => write!(f, "no-op (already migrated)"),
-        }
-    }
-}
-
-/// Migrate legacy access.json (File A at `~/.config/claudebase/access.json`)
-/// to the canonical channel state file (File B at `~/.claude/channels/claudebase/access.json`).
-///
-/// **Behavior:**
-/// 1. If File A.migrated exists → return `Ok(NoOpAlreadyMigrated)` (idempotent, check first).
-/// 2. If File A does not exist → return `Ok(NoOpAbsent)`.
-/// 3. Parse File A leniently as `serde_json::Value` (NOT a typed struct —
-///    the old permissions schema is gone). Handle `allowFrom` both as numeric
-///    (i64) and string forms, stringify numerics, skip malformed entries with
-///    a warn.
-/// 4. If File A cannot be parsed → log a WARN, return `Ok(SkippedMalformed)`,
-///    do NOT rename File A (leave it for operator inspection).
-/// 5. Load File B via `load_access()` (defaults to empty if absent).
-/// 6. **UNION allow_from (dedupe):** For each ID in File A's allowFrom:
-///    stringify numerics, add to File B's allow_from ONLY if not already present.
-/// 7. **Policy merge (no downgrade):** If File B has a non-default dm_policy,
-///    keep it; else take File A's dm_policy if non-default. Never downgrade
-///    from a stricter policy.
-/// 8. **Prune expired pending:** Drop any pending entries from File B that have
-///    expired (expires_at <= now). Do NOT migrate File A's pending (incompatible
-///    code format; new codes will be issued).
-/// 9. Save File B atomically.
-/// 10. Rename File A → `File A.migrated` (idempotent marker for future runs).
-/// 11. Return `Ok(Migrated)` with count of merged IDs.
-///
-/// **Returns** `Ok(outcome)` on success (migration ran, skipped, or no-op).
-/// Returns `Err(...)` only on unrecoverable I/O errors (save failed, rename failed).
-/// The daemon MUST still start on any error (fail-open to daemon-functional,
-/// fail-closed to access-unchanged — never fail-open-to-widened).
-pub fn migrate_from_legacy_access(legacy_path: &Path, canonical_path: &Path) -> Result<MigrationOutcome> {
-    // Step 1: Check if File A.migrated already exists (idempotent marker).
-    // This check FIRST, before checking File A existence, so second runs
-    // correctly return NoOpAlreadyMigrated even though File A no longer exists.
-    let migrated_marker = legacy_path.with_extension("json.migrated");
-    if migrated_marker.exists() {
-        return Ok(MigrationOutcome::NoOpAlreadyMigrated);
-    }
-
-    // Step 2: Check if File A exists.
-    if !legacy_path.exists() {
-        return Ok(MigrationOutcome::NoOpAbsent);
-    }
-
-    // Step 3: Parse File A leniently as serde_json::Value.
-    let legacy_body = match fs::read_to_string(legacy_path) {
-        Ok(body) => body,
-        Err(e) => {
-            return Err(anyhow!(
-                "failed to read legacy access.json at {}: {e}",
-                legacy_path.display()
-            ));
-        }
-    };
-
-    let legacy_json: serde_json::Value = match serde_json::from_str(&legacy_body) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(
-                path = %legacy_path.display(),
-                error = %e,
-                "legacy access.json is malformed JSON; skipping migration (file left intact for inspection)"
-            );
-            return Ok(MigrationOutcome::SkippedMalformed);
-        }
-    };
-
-    // Step 4: Load File B (canonical). Defaults to empty Access if absent.
-    let mut canonical = load_access(canonical_path)?;
-
-    // Step 5: Extract allowFrom from File A and stringify.
-    let mut merged_count = 0;
-    if let Some(allow_from_val) = legacy_json.get("allowFrom") {
-        if let Some(allow_from_arr) = allow_from_val.as_array() {
-            for v in allow_from_arr.iter() {
-                let id_str = if let Some(n) = v.as_i64() {
-                    n.to_string()
-                } else if let Some(s) = v.as_str() {
-                    s.to_string()
-                } else {
-                    tracing::warn!(
-                        value = %v,
-                        "allowFrom entry is neither number nor string; skipping"
-                    );
-                    continue;
-                };
-
-                // Dedupe: only add if not already present.
-                if !canonical.allow_from.contains(&id_str) {
-                    canonical.allow_from.push(id_str);
-                    merged_count += 1;
-                }
-            }
-        }
-    }
-
-    // Step 6: dm_policy is INTENTIONALLY NOT migrated (security-auditor MAJOR,
-    // Slice 4). `gate_dm` checks `dm_policy == Disabled` BEFORE the allow_from
-    // membership check (channel_state gate_dm), so a Disabled policy drops ALL
-    // DMs — including from allowlisted ids. Adopting File A's policy on an
-    // unattended boot could therefore silently lock the operator out of the
-    // very channel this migration just granted them access to. We migrate
-    // GRANTS (allow_from) only; File B's existing dm_policy is preserved
-    // untouched. An operator who wants File A's policy re-sets it in-band
-    // (non-destructive, and recoverable — unlike a boot-time lockout).
-
-    // Step 7: Prune expired pending from File B.
-    let now = now_ms();
-    let _ = prune_expired(&mut canonical, now);
-
-    // Step 8: Save File B atomically.
-    save_access(canonical_path, &canonical).with_context(|| {
-        format!(
-            "failed to save canonical access.json at {} during migration",
-            canonical_path.display()
-        )
-    })?;
-
-    // Step 9: Rename File A → File A.migrated (idempotent marker).
-    fs::rename(legacy_path, &migrated_marker).with_context(|| {
-        format!(
-            "failed to rename legacy access.json to .migrated at {}",
-            legacy_path.display()
-        )
-    })?;
-
-    tracing::info!(
-        migrated_ids = merged_count,
-        legacy_path = %legacy_path.display(),
-        canonical_path = %canonical_path.display(),
-        "legacy access.json migrated to canonical channel state file"
-    );
-
-    Ok(MigrationOutcome::Migrated)
 }
 
 #[cfg(test)]
@@ -837,91 +588,48 @@ mod tests {
         assert_eq!(parsed.pending.get("101b06").unwrap().sender_id, "434566766");
     }
 
-    #[test]
-    fn redeem_pairing_code_valid_code_succeeds() {
-        let mut access = Access::default();
-        let now = now_ms();
-        access.pending.insert(
-            "abc123".to_string(),
-            PendingEntry {
-                sender_id: "12345".to_string(),
-                chat_id: "12345".to_string(),
-                created_at: now,
-                expires_at: now + PAIRING_CODE_TTL_MS,
-                replies: 1,
-            },
-        );
-        let sender_id = redeem_pairing_code(&mut access, "abc123", now).unwrap();
-        assert_eq!(sender_id, "12345");
-        assert!(access.allow_from.contains(&"12345".to_string()));
-        assert!(!access.pending.contains_key("abc123"));
+    // ----------------------------------------------------------------
+    // Slice 8 — gate_callback (architect AR-3)
+    // ----------------------------------------------------------------
+
+    fn allowlist_access(ids: &[&str]) -> Access {
+        let mut a = Access::default();
+        a.allow_from = ids.iter().map(|s| s.to_string()).collect();
+        a.dm_policy = DmPolicy::Allowlist;
+        a
     }
 
     #[test]
-    fn redeem_pairing_code_expired_rejects() {
-        let mut access = Access::default();
-        let now = now_ms();
-        access.pending.insert(
-            "abc123".to_string(),
-            PendingEntry {
-                sender_id: "12345".to_string(),
-                chat_id: "12345".to_string(),
-                created_at: now - PAIRING_CODE_TTL_MS - 1000,
-                expires_at: now - 1,
-                replies: 1,
-            },
-        );
-        let err = redeem_pairing_code(&mut access, "abc123", now).unwrap_err();
-        assert_eq!(err, RedeemError::Expired);
-        assert!(!access.pending.contains_key("abc123"));
+    fn slice8_gate_callback_allows_known_sender() {
+        let a = allowlist_access(&["111", "222"]);
+        assert!(gate_callback(&a, "111"));
+        assert!(gate_callback(&a, "222"));
     }
 
     #[test]
-    fn redeem_pairing_code_unknown_rejects() {
-        let mut access = Access::default();
-        let now = now_ms();
-        let err = redeem_pairing_code(&mut access, "ffffff", now).unwrap_err();
-        assert_eq!(err, RedeemError::Unknown);
+    fn slice8_gate_callback_drops_unknown_sender() {
+        let a = allowlist_access(&["111"]);
+        assert!(!gate_callback(&a, "222"), "non-allowed must drop");
     }
 
     #[test]
-    fn redeem_pairing_code_invalid_format_rejects() {
-        let mut access = Access::default();
-        let now = now_ms();
-        let err = redeem_pairing_code(&mut access, "BADCODE", now).unwrap_err();
-        assert_eq!(err, RedeemError::InvalidFormat);
+    fn slice8_gate_callback_drops_everyone_when_dm_policy_disabled() {
+        // Defense-in-depth: dmPolicy=disabled hard-locks the bot,
+        // including its callback surface, even for previously allowed
+        // users.
+        let mut a = allowlist_access(&["111"]);
+        a.dm_policy = DmPolicy::Disabled;
+        assert!(!gate_callback(&a, "111"));
     }
 
     #[test]
-    fn redeem_pairing_code_sec16_constant_time_display() {
-        // SEC-16: Unknown and InvalidFormat return the same error message
-        let unknown_err = RedeemError::Unknown;
-        let invalid_err = RedeemError::InvalidFormat;
-        assert_eq!(unknown_err.to_string(), invalid_err.to_string());
-        assert_eq!(unknown_err.to_string(), "unknown or invalid pairing code");
-        assert_ne!(unknown_err.to_string(), RedeemError::Expired.to_string());
-    }
-
-    #[test]
-    fn redeem_pairing_code_deduplicates() {
-        let mut access = Access {
-            allow_from: vec!["12345".to_string()],
-            ..Default::default()
-        };
-        let now = now_ms();
-        access.pending.insert(
-            "abc123".to_string(),
-            PendingEntry {
-                sender_id: "12345".to_string(),
-                chat_id: "12345".to_string(),
-                created_at: now,
-                expires_at: now + PAIRING_CODE_TTL_MS,
-                replies: 1,
-            },
-        );
-        let sender_id = redeem_pairing_code(&mut access, "abc123", now).unwrap();
-        assert_eq!(sender_id, "12345");
-        // Should still be 1 (no duplicate added)
-        assert_eq!(access.allow_from.iter().filter(|id| *id == &"12345".to_string()).count(), 1);
+    fn slice8_gate_callback_does_not_mutate_access() {
+        // Critical: unlike gate_dm which can mutate access.pending to
+        // issue pairing codes, gate_callback MUST never emit a pairing
+        // code. Verify by taking `&Access` not `&mut`.
+        let a = allowlist_access(&["111"]);
+        // type signature is `&Access -> bool` so this is enforced at
+        // compile time; the assertion below is a smoke check.
+        let _: bool = gate_callback(&a, "111");
     }
 }

@@ -1,9 +1,0 @@
-{
-  "_comment": "The 'claudebase' binary is installed at this absolute path by the install.sh / install.ps1 scripts at the root of this repo. It is NOT bundled with the github-sourced plugin (target/ is gitignored). Run `bash install.sh` (Unix) or `pwsh install.ps1` (Windows) once before launching the plugin for the first time. ${HOME} is expanded by Claude Code's MCP server launcher.",
-  "mcpServers": {
-    "claudebase": {
-      "command": "${HOME}/.claude/tools/claudebase/claudebase",
-      "args": ["plugin", "serve"]
-    }
-  }
-}

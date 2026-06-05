@@ -1,0 +1,2 @@
+{"id":1,"jsonrpc":"2.0","result":{"capabilities":{"experimental":{"claude/channel":{},"claude/channel/permission":{}},"tools":{"listChanged":true}},"protocolVersion":"2025-11-25","serverInfo":{"name":"telegram-plugin-rs","version":"0.1.0"}}}
+{"jsonrpc":"2.0","method":"notifications/claude/channel","params":{"content":"baseline-smoke-v0.6","meta":{"chat_id":"8791871989","message_id":"37","ts":"2026-06-02T20:43:49.000Z","user":"gubernatorcalifornii","user_id":"8791871989"}}}

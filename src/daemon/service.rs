@@ -152,6 +152,79 @@ pub fn mcp_json_path() -> Result<PathBuf> {
         .join(".mcp.json"))
 }
 
+/// `~/.claude/logs/claudebase-daemon.log` — canonical detached-daemon
+/// stdout/stderr sink. Same path install.ps1 + `claudebase run`'s
+/// auto-spawn use, so the operator has ONE log to tail regardless of who
+/// started the daemon. Created lazily in append mode.
+pub fn daemon_log_path() -> Result<PathBuf> {
+    Ok(home_dir()?
+        .join(".claude")
+        .join("logs")
+        .join("claudebase-daemon.log"))
+}
+
+/// Spawn `<current_exe> daemon serve` as a detached background process
+/// with stdout/stderr redirected to `daemon_log_path()` (append). Mirrors
+/// install.ps1's `Start-Process -WindowStyle Hidden ...` path so the
+/// detached daemon survives the parent's exit and runs under the current
+/// user's profile (NOT LocalService — see commit a615d9c rationale).
+///
+/// Used by:
+///   - `main.rs::ensure_daemon_running` (re-spawn on `claudebase run`
+///     when pipe is unreachable)
+///   - `platform::start()` on Windows (CLI `claudebase daemon start`)
+///
+/// HOME / USERPROFILE env is explicitly injected so the detached daemon
+/// can resolve `~/.claude/channels/claudebase/.env` (Telegram bot token
+/// source) even when launched from a context that has USERPROFILE but
+/// not HOME — the v0.6 silent-token-loss bug operator hit on 2026-06-03.
+pub fn spawn_daemon_detached() -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+    let exe = std::env::current_exe()?;
+
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .unwrap_or_else(|| std::ffi::OsString::from("."));
+    let log_dir = std::path::PathBuf::from(&home).join(".claude").join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_path = log_dir.join("claudebase-daemon.log");
+    let log_handle = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .ok();
+
+    let mut cmd = Command::new(&exe);
+    cmd.args(["daemon", "serve"]);
+    cmd.stdin(Stdio::null());
+
+    if let Some(home) = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+    {
+        cmd.env("HOME", home);
+    }
+    if let Some(lf) = log_handle {
+        let lf_dup = lf.try_clone()?;
+        cmd.stdout(Stdio::from(lf));
+        cmd.stderr(Stdio::from(lf_dup));
+    } else {
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+
+    cmd.spawn()?;
+    Ok(())
+}
+
 /// `~/.config/systemd/user/claudebase.service`.
 #[cfg(target_os = "linux")]
 pub fn systemd_unit_path() -> Result<PathBuf> {
@@ -185,9 +258,13 @@ fn data_paths_full_wipe() -> Result<Vec<PathBuf>> {
         home.join(".config")
             .join("claudebase")
             .join("daemon.toml"),
-        home.join(".config")
-            .join("claudebase")
-            .join("access.json"),
+        // Note: the runtime access.json lives at
+        // `~/.claude/channels/claudebase/access.json` (owned by the
+        // `/claudebase:access pair` skill) and is OUTSIDE this wipe
+        // list by design — uninstalling the daemon must not clobber
+        // the operator's chat-platform pairings. The legacy
+        // `~/.config/claudebase/access.json` written by the removed
+        // `claudebase daemon access pair` CLI was wiped in Slice 5.
     ])
 }
 
@@ -338,15 +415,17 @@ pub fn ensure_install_parent(dir: &Path, required_mode: u32) -> Result<()> {
             );
         }
         let existing = meta.permissions().mode() & 0o777;
-        if existing != required_mode && (existing & !required_mode) != 0 {
-            bail!(
-                "refuse to install into {}: existing mode {:o} has bits not in required {:o}",
-                dir.display(),
-                existing,
-                required_mode
-            );
-        }
         if existing != required_mode {
+            // Normalize the directory to EXACTLY the required mode. A dir
+            // left by an older install may be looser than required (e.g.
+            // 0o755 on a now-0o700 logs/plugins dir). The previous behaviour
+            // REFUSED in that case, which broke `claudebase daemon install`
+            // on every upgrade and forced the operator to chmod by hand.
+            // These are claudebase-owned private dirs, so chmod-to-required
+            // is a security *tightening* (0o755 -> 0o700), not a relaxation;
+            // the symlink refusal above still blocks the real attack (install
+            // target swapped for a symlink). No elevation is needed — the
+            // dirs live under $HOME and are owned by the invoking user.
             fs::set_permissions(dir, fs::Permissions::from_mode(required_mode)).with_context(
                 || format!("chmod {:o} on {}", required_mode, dir.display()),
             )?;
@@ -747,8 +826,31 @@ mod platform {
 
         write_mcp_descriptor(binary)?;
 
-        // `launchctl load` then optionally `kickstart`.
-        let _ = Command::new("launchctl").arg("load").arg(&path).status();
+        // `launchctl load` is NOT idempotent — re-loading an already
+        // bootstrapped agent exits non-zero with "Load failed: 5: Input/
+        // output error". Unload first (best-effort; stderr silenced — it is
+        // noisy when nothing was loaded) so a re-run (install.sh on every
+        // upgrade) reliably (re)loads the agent instead of printing a scary
+        // error while the user-level agent quietly fails to load.
+        let _ = Command::new("launchctl")
+            .arg("unload")
+            .arg(&path)
+            .stderr(std::process::Stdio::null())
+            .status();
+        let load_ok = Command::new("launchctl")
+            .arg("load")
+            .arg(&path)
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !load_ok {
+            eprintln!(
+                "warning: launchctl could not load the agent; start it with \
+                 `claudebase daemon start` (plist: {})",
+                path.display()
+            );
+        }
         if !args.no_start {
             let _ = Command::new("launchctl")
                 .arg("kickstart")
@@ -784,8 +886,16 @@ mod platform {
 
     pub fn start() -> Result<()> {
         let path = launchd_plist_path()?;
-        let s = Command::new("launchctl").arg("load").arg(&path).status();
-        let _ = s;
+        // `load` ensures the agent is bootstrapped, but when it already is
+        // (the common case right after `daemon install`) launchctl prints
+        // "Load failed: 5: Input/output error" to stderr. Silence it — the
+        // `kickstart` below is what actually (re)starts the service and is
+        // idempotent whether or not the load was a no-op.
+        let _ = Command::new("launchctl")
+            .arg("load")
+            .arg(&path)
+            .stderr(std::process::Stdio::null())
+            .status();
         let _ = Command::new("launchctl")
             .arg("kickstart")
             .arg(format!("gui/{}/dev.codefather.claudebase", uid()))
@@ -864,7 +974,7 @@ mod platform {
     use std::ffi::OsString;
 
     use windows_service::{
-        service::{ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceState, ServiceType},
+        service::{ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType},
         service_manager::{ServiceManager, ServiceManagerAccess},
     };
 
@@ -939,69 +1049,155 @@ mod platform {
         Ok(())
     }
 
-    pub fn start() -> Result<()> {
-        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-            .context("open SCM")?;
-        let svc = manager
-            .open_service(SERVICE_NAME, ServiceAccess::START)
-            .context("open service for start")?;
-        let _ = svc.start(&[] as &[&str]);
-        println!("claudebase daemon started");
-        Ok(())
+    /// Discover currently-running `claudebase.exe daemon serve` PIDs via
+    /// PowerShell CIM query. Returns an empty Vec when no daemon process
+    /// is found. Excludes `claudebase.exe run` (CLI launcher) and
+    /// `claudebase.exe plugin serve` (per-CC MCP bridge) by matching the
+    /// command line against `daemon serve`.
+    fn find_daemon_pids() -> Result<Vec<u32>> {
+        let out = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process -Filter \"Name='claudebase.exe'\" | \
+                 Where-Object { $_.CommandLine -match 'daemon serve' } | \
+                 ForEach-Object { $_.ProcessId }",
+            ])
+            .output()
+            .context("enumerate claudebase daemon processes via powershell")?;
+        if !out.status.success() {
+            bail!(
+                "process enumeration failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let txt = String::from_utf8_lossy(&out.stdout);
+        let pids: Vec<u32> = txt
+            .lines()
+            .filter_map(|l| l.trim().parse::<u32>().ok())
+            .collect();
+        Ok(pids)
     }
 
+    /// Migrated 2026-06-04 from SCM service to detached current-user
+    /// process. The SCM path (`OpenService START`) failed with
+    /// `error: open service for start` whenever install.ps1 had NOT
+    /// registered the service (the default after commit `a615d9c`),
+    /// breaking `claudebase daemon start` on every fresh install. We
+    /// now reuse `super::spawn_daemon_detached()` — the same helper
+    /// `main.rs::ensure_daemon_running` calls — so a fresh-installed
+    /// box and a `claudebase run` auto-spawn produce semantically
+    /// identical daemon processes.
+    pub fn start() -> Result<()> {
+        if super::pipe_is_alive() {
+            println!("claudebase daemon already running");
+            return Ok(());
+        }
+        super::spawn_daemon_detached().context("spawn detached daemon")?;
+        // Poll the named-pipe for up to 3s so `daemon start` exits with
+        // success only when the spawned daemon has actually bound its
+        // IPC surface. Matches install.ps1's post-spawn liveness check.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if super::pipe_is_alive() {
+                println!("claudebase daemon started");
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+        bail!(
+            "daemon spawn issued but named-pipe not reachable within 3s — check {}",
+            super::daemon_log_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "~/.claude/logs/claudebase-daemon.log".to_string())
+        );
+    }
+
+    /// Migrated 2026-06-04 from SCM `svc.stop()` to `taskkill /PID /F`
+    /// per matched PID. find_daemon_pids() is cmdline-filtered so we
+    /// kill ONLY `daemon serve` processes — `claudebase run` and
+    /// `plugin serve` siblings are left alone.
     pub fn stop() -> Result<()> {
-        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-            .context("open SCM")?;
-        let svc = manager
-            .open_service(SERVICE_NAME, ServiceAccess::STOP)
-            .context("open service for stop")?;
-        let _ = svc.stop();
+        let pids = find_daemon_pids()?;
+        if pids.is_empty() {
+            println!("no daemon process found (already stopped)");
+            return Ok(());
+        }
+        for pid in &pids {
+            let s = Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/F"])
+                .status()
+                .context("invoke taskkill")?;
+            if !s.success() {
+                eprintln!("warn: taskkill exited non-zero ({}) for pid {}", s, pid);
+            }
+        }
+        println!(
+            "claudebase daemon stopped ({} process{})",
+            pids.len(),
+            if pids.len() == 1 { "" } else { "es" }
+        );
         Ok(())
     }
 
     pub fn restart() -> Result<()> {
         stop()?;
+        // Give the killed process a moment to release its named-pipe
+        // before the new spawn tries to bind it. Without the sleep,
+        // pipe-probe races can wrongly report "already running" on
+        // start() and skip the spawn.
+        std::thread::sleep(std::time::Duration::from_millis(500));
         start()?;
         Ok(())
     }
 
+    /// Migrated 2026-06-04 from SCM `query_status` to process-discovery.
+    /// The outer wrapper at `service::status()` still falls back to
+    /// `pipe_is_alive()` so a daemon found via process scan but with
+    /// a broken pipe (mid-shutdown) still surfaces correctly.
     pub fn status() -> Result<StatusOutput> {
-        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-            .context("open SCM")?;
-        let svc = match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
-            Ok(s) => s,
-            Err(_) => {
-                return Ok(StatusOutput {
-                    state: "not-installed".to_string(),
-                    pid: None,
-                });
-            }
-        };
-        let s = svc.query_status().context("query service status")?;
-        let state = match s.current_state {
-            ServiceState::Running => "running",
-            ServiceState::Stopped => "stopped",
-            ServiceState::Paused => "stopped",
-            _ => "stopped",
-        };
+        let pids = find_daemon_pids().unwrap_or_default();
+        if pids.is_empty() {
+            return Ok(StatusOutput {
+                state: "stopped".to_string(),
+                pid: None,
+            });
+        }
         Ok(StatusOutput {
-            state: state.to_string(),
-            pid: None,
+            state: "running".to_string(),
+            pid: Some(pids[0]),
         })
     }
 
-    pub fn logs(_lines: u32, _follow: bool) -> Result<()> {
-        // Windows: invoke `powershell.exe Get-WinEvent` (arg-vector form
-        // per SEC-2-10 — NOT via cmd /c).
+    /// Migrated 2026-06-04 from Windows Event Log (`Get-WinEvent`) to
+    /// file-tail of `~/.claude/logs/claudebase-daemon.log` — the
+    /// canonical sink for the detached daemon's stdout/stderr (matches
+    /// install.ps1 + `spawn_daemon_detached()`). Honours `--lines N`
+    /// and `--follow` via PowerShell's `Get-Content -Tail -Wait`.
+    pub fn logs(lines: u32, follow: bool) -> Result<()> {
+        let log = super::daemon_log_path()?;
+        if !log.exists() {
+            println!(
+                "no daemon log yet at {} (daemon not started by detached-spawn path, or not run since install)",
+                log.display()
+            );
+            return Ok(());
+        }
+        let log_str = log.display().to_string().replace('\'', "''");
+        let ps_cmd = if follow {
+            format!(
+                "Get-Content -Path '{}' -Tail {} -Wait",
+                log_str, lines
+            )
+        } else {
+            format!("Get-Content -Path '{}' -Tail {}", log_str, lines)
+        };
         let s = Command::new("powershell.exe")
-            .arg("-NoProfile")
-            .arg("-Command")
-            .arg("Get-WinEvent -LogName Application -MaxEvents 50 | Where-Object {$_.ProviderName -like 'claudebase*'} | Format-Table -AutoSize")
+            .args(["-NoProfile", "-Command", &ps_cmd])
             .status()
-            .context("invoke powershell Get-WinEvent")?;
+            .context("invoke powershell Get-Content")?;
         if !s.success() {
-            bail!("daemon logs: Get-WinEvent exit {s}");
+            bail!("daemon logs: powershell exit {}", s);
         }
         Ok(())
     }
@@ -1082,7 +1278,34 @@ pub fn restart() -> Result<()> {
 }
 
 pub fn status() -> Result<StatusOutput> {
-    platform::status()
+    let mut out = platform::status()?;
+    // Pipe-probe fallback for the v0.6 SCM-blind bug: when the service
+    // manager reports stopped/not-installed/inactive/failed BUT a daemon
+    // process is actually listening on the UDS / named-pipe (because the
+    // operator started it via `daemon serve` outside the service
+    // manager, or `claudebase run` auto-spawned it), surface that as
+    // "running" so callers observing this state behave correctly.
+    if out.state != "running" && pipe_is_alive() {
+        out.state = "running".to_string();
+        // pid stays None — we don't know it from a pipe probe.
+    }
+    Ok(out)
+}
+
+/// Sync pipe-probe used by `status()` and by the `claudebase run`
+/// ensure-daemon helper. Returns true when a blocking connect to the
+/// daemon's UDS / named-pipe accepts.
+fn pipe_is_alive() -> bool {
+    use interprocess::local_socket::{prelude::*, GenericFilePath, Stream, ToFsName};
+    let path = match crate::daemon::server::socket_path() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let name = match path.to_fs_name::<GenericFilePath>() {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    Stream::connect(name).is_ok()
 }
 
 pub fn logs(lines: u32, follow: bool) -> Result<()> {
@@ -1121,7 +1344,6 @@ fn confirm_destructive(keep_data: bool) -> Result<bool> {
         println!("  - chat.db");
         println!("  - secrets.toml");
         println!("  - daemon.toml");
-        println!("  - access.json");
     }
     print!("Proceed? [y/N] ");
     let _ = std::io::stdout().flush();

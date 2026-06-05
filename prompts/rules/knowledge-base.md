@@ -147,41 +147,35 @@ the CLI rejects out-of-range values with the literal stderr line
 
 ## `insight` subcommand — the agent-written cognitive corpus
 
-Companion to the books-corpus subcommands above. As of v0.7.0 the `insight`
-tree is **hybrid**: `--category project` routes to the cwd-project's LOCAL
-db (`<project>/.claude/knowledge/insights.db`), `--category general` routes
-to the GLOBAL db (`~/.claude/knowledge/insights.db`, shared across every
-project). A project registry at `~/.claude/knowledge/projects.json` maps
-`name → path` for cross-project reads. Both dbs are opt-in (created lazily on
-first write). The full WHEN / WHAT / HOW protocol lives in
+Companion to the books-corpus subcommands above. The `insight` tree
+operates against `<project>/.claude/knowledge/insights.db` exclusively
+(opt-in per project; created on first `insight create`). The full
+WHEN / WHAT / HOW protocol lives in
 `~/.claude/rules/knowledge-base-tool.md` § Insights corpus — this section
 documents the CLI contract only.
 
-Eight subcommands:
+Seven subcommands:
 
-- `claudebase insight create "<body>" --type <kind> --agent <agent> --category <general|project> --tags <tag1,...> [--session ID] [--feature SLUG] [--salience high|medium|low] [--source-artifact REF] [--json]`
-  - **`--category <general|project>` and `--tags <tag1,...>` (≥1 tag) are REQUIRED — omitting either exits 2.** `--category` is the routing key (project → local db, general → global db).
+- `claudebase insight create "<body>" --type <kind> --agent <agent> [--session ID] [--feature SLUG] [--salience high|medium|low] [--source-artifact REF] [--json]`
   - Persists one insight. Body via positional, `-`, or piped stdin (TTY refused).
   - Exact-sha dedup: same `(agent, sha256)` within 30 days → `status: deduped`.
   - Semantic dedup: cosine > 0.92 paraphrase from same agent within 30 days → `status: near-duplicate`.
   - Cross-agent agreement on same body is intentionally NOT deduped (load-bearing signal).
-- `claudebase insight search "<query>" [--mode hybrid|dense|lexical] [--top-k N] [--type T] [--agent A] [--salience S] [--feature F] [--tag T]... [--category general|project] [--project NAME] [--general-only] [--project-only] [--since <Nd|Nh|Nm|Nw>] [--json]`
-  - Hybrid retrieval. Default in-project read merges local-project + global-general dbs (RRF-fused). Default mode `hybrid` (BM25 ⊕ dense RRF k=60).
-  - `--tag` repeatable, OR / any-intersection (a hit carrying ANY queried tag is returned). `--category` filters by routing bucket. `--general-only` / `--project-only` open a single db; together → exit 2. `--project NAME` reads another registered project's local db.
+- `claudebase insight search "<query>" [--mode hybrid|dense|lexical] [--top-k N] [--type T] [--agent A] [--salience S] [--feature F] [--since <Nd|Nh|Nm|Nw>] [--json]`
+  - Hybrid retrieval against `insights.db`. Default mode `hybrid` (BM25 ⊕ dense RRF k=60).
   - Metadata filters apply after ranking (over-fetch x4, capped at 100).
   - `--since` format: `<integer><unit>` where unit ∈ {s,m,h,d,w}.
-- `claudebase insight tags [--category general|project] [--project NAME] [--general-only] [--project-only] [--json]` — lists the tag vocabulary as `[{tag, count}]` sorted by count descending; merged default sums counts across local + global; both-empty → `[]`; global absent → local-only without error.
-- `claudebase insight list [--offset N] [--page-size N] [filters incl. --tag/--category/--general-only/--project-only] [--json]` — newest-first paginated summaries; default page size 10.
-- `claudebase insight random [filters incl. --tag/--category/--general-only/--project-only] [--json]` — uniform-sample one insight; exit 1 on empty corpus / no match.
+- `claudebase insight list [--offset N] [--page-size N] [filters] [--json]` — newest-first paginated summaries; default page size 10.
+- `claudebase insight random [filters] [--json]` — uniform-sample one insight; exit 1 on empty corpus / no match.
 - `claudebase insight get <ident> [--json]` — integer `documents.id` OR hex sha prefix (≥4 chars, matched as `LIKE 'prefix%'`).
-- `claudebase insight gc [--dry-run] [--category general|project] [--json]` — TTL purge (high=∞ / medium=365d / low=90d) + VACUUM across both dbs (cascades `insight_tags`). Reports `{medium_deleted, low_deleted, chunks_vec_orphans_cleared, freed_bytes}`.
-- `claudebase insight delete <id> [--category general|project] [--json]` — single-row delete with chunks + chunks_vec cascade. `--category general` resolves the id against the global db. Refuses non-insight rows (books-corpus protection).
+- `claudebase insight gc [--dry-run] [--json]` — TTL purge (high=∞ / medium=365d / low=90d) + VACUUM. Reports `{medium_deleted, low_deleted, chunks_vec_orphans_cleared, freed_bytes}`.
+- `claudebase insight delete <id> [--json]` — single-row delete with chunks + chunks_vec cascade. Refuses non-insight rows (books-corpus protection).
 
 Exit codes are uniform across the family:
 
 - `0` — success (including `deduped` and `near-duplicate` statuses on `create`).
 - `1` — runtime error (DB open failure, query failure, unknown id, empty corpus on `random`, etc.).
-- `2` — usage error (empty body, missing `--category`, missing/empty `--tags`, `--general-only` + `--project-only` together, TTY without body, malformed `--since`, sha prefix < 4 chars, non-hex ident on `get`, attempt to `delete` a books-corpus row).
+- `2` — usage error (empty body, TTY without body, malformed `--since`, sha prefix < 4 chars, non-hex ident on `get`, attempt to `delete` a books-corpus row).
 
 Path-canonicalization: same `cli::resolve_project_root` gate as the books corpus subcommands. The corpus file selector for the `insight` family is hardcoded to `insights.db` — `--db-name` is accepted on subcommands for test/admin overrides but agents SHOULD always use the default.
 

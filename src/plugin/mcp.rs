@@ -58,11 +58,6 @@ pub const TOOL_WHITELIST: &[&str] = &[
     "chat_subscribe",
     "chat_reply",
     "chat_list",
-    // telegram-multi-cli Slice 5 — chat_ask (inline-keyboard questionnaires).
-    // 3-surface parity: this whitelist entry + server.rs dispatch arm +
-    // build_tools_list_response descriptor MUST all carry "chat_ask" or the
-    // plugin SEC-7-gates the call to -32601 before the daemon sees it.
-    "chat_ask",
     // Slice 7.x — thread-discovery helper (parity with server.rs dispatch
     // case + tools/list descriptor); without this entry the plugin gates
     // on SEC-7 and returns -32601 BEFORE the daemon ever sees the call.
@@ -73,6 +68,12 @@ pub const TOOL_WHITELIST: &[&str] = &[
     "agent_unregister",
     "agent_list_alive",
     "agent_reap",
+    // Slice 8 — chat_ask + chat_list_pending_asks (SEC-7 whitelist parity
+    // with daemon dispatch). chat_ask renders a Telegram inline keyboard
+    // and returns {ask_id, status: "pending"}; chat_list_pending_asks is
+    // a read-only debug surface that returns open asks.
+    "chat_ask",
+    "chat_list_pending_asks",
 ];
 
 /// Build the Parse Error response per JSON-RPC 2.0 (SEC-3).

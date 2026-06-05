@@ -16,6 +16,7 @@ pub mod output;
 pub mod parser;
 pub mod pdf;
 pub mod plugin;
+pub mod project_config;
 pub mod registry;
 pub mod search;
 pub mod store;

@@ -195,10 +195,14 @@ pub fn build_channel_notification_routed(
 /// field names + types.
 #[derive(Debug, Clone)]
 pub struct TelegramMessageMeta {
-    /// `msg.chat.id` — i64 internally, but serialised into the channel meta
-    /// as a STRING (Claude Code's channel-surface parser expects all numeric
-    /// IDs as strings, per the official telegram plugin; a numeric chat_id is
-    /// silently dropped).
+    /// `msg.chat.id` — i64 number, serialised as **JSON string** in the
+    /// channel meta to match the Slice 0 baseline plugin-emit shape
+    /// (verified against `docs/qa/evidence/slice-0-baseline-v0.6/
+    /// plugin-stdout.jsonl` on 2026-06-03). The official Anthropic
+    /// telegram plugin's server.ts emits `String(msg.chat.id)`; CC's
+    /// channel-surface renderer is strict and silently drops frames
+    /// whose `meta.chat_id` is a JSON Number — the live-confirmed root
+    /// cause of the multi-agent-telegram-on-v0.6 KP1 regression.
     pub chat_id: i64,
     /// `msg.message_id` — i64 number, serialised as STRING per
     /// server.ts:1268 `String(msgId)`.
@@ -212,6 +216,13 @@ pub struct TelegramMessageMeta {
     /// ISO 8601 UTC string derived from `msg.date * 1000` per
     /// server.ts:1271 `new Date((ctx.message?.date ?? 0) * 1000).toISOString()`.
     pub ts_iso8601: String,
+    /// Slice 2 of multi-agent-telegram-on-v0.6 — Telegram forum-topic id.
+    /// When `Some`, `build_channel_notification_telegram` emits it as
+    /// `meta.thread_id` (string, per v0.6 ID-as-string discipline).
+    /// When `None`, the field is OMITTED from the meta object so the
+    /// downstream `<channel>` surface stays bit-for-bit identical for
+    /// DM / topic-less group inbound (the Slice 0 baseline shape).
+    pub thread_id: Option<i64>,
 }
 
 /// Build the `notifications/claude/channel` frame with the official
@@ -230,13 +241,13 @@ pub fn build_channel_notification_telegram(
     params.insert("content".into(), Value::String(content.to_string()));
 
     let mut meta = serde_json::Map::new();
-    // chat_id MUST be a STRING, not a JSON number — Claude Code's
-    // channel-surface parser follows the official telegram plugin's
-    // "all numeric IDs serialized as strings" rule (frankenstein
-    // notification.rs::channel_message). A numeric chat_id is silently
-    // dropped by the parser, so the routed <channel ...> tag never reaches
-    // the LLM and inbound push appears broken. (Confirmed live 2026-05-31:
-    // demo agent received `"chat_id":434566766` and Claude Code discarded it.)
+    // PRD A18 frozen-contract: chat_id is a STRING in the channel meta
+    // (matches Slice 0 baseline plugin-emit shape — verified against
+    // docs/qa/evidence/slice-0-baseline-v0.6/plugin-stdout.jsonl 2026-06-03).
+    // Emitting as Number causes CC's channel-surface renderer to silently
+    // drop the frame so `<channel ...>` events never reach the session —
+    // a regression introduced in the daemon-emit path that this branch
+    // depends on. Keep both forms in lockstep: string everywhere.
     meta.insert(
         "chat_id".into(),
         Value::String(tg_meta.chat_id.to_string()),
@@ -249,6 +260,14 @@ pub fn build_channel_notification_telegram(
     meta.insert("user_id".into(), Value::String(tg_meta.user_id.clone()));
     meta.insert("ts".into(), Value::String(tg_meta.ts_iso8601.clone()));
 
+    // Slice 2 additive optional field per PRD §18 FR-MAT-7 (C3 wire
+    // contract). Forum-topic-id emitted as string to match the v0.6
+    // chat_id/message_id/user_id-as-string discipline. When None, the
+    // key is OMITTED so DM / topic-less inbound preserves Slice 0
+    // baseline meta shape bit-for-bit.
+    if let Some(tid) = tg_meta.thread_id {
+        meta.insert("thread_id".into(), Value::String(tid.to_string()));
+    }
     if let Some(id) = target_agent_id {
         meta.insert("target_agent_id".into(), Value::String(id.to_string()));
     }
@@ -261,7 +280,131 @@ pub fn build_channel_notification_telegram(
     })
 }
 
-/// Apply schema v5 + v6 + v7 to a chat.db connection. Idempotent — all
+/// Slice 8 of multi-agent-telegram-on-v0.6 — build the `<channel>`
+/// notification frame the daemon emits when a Telegram CallbackQuery
+/// resolves a pending `chat_ask` (single-select on any tap; multi-select
+/// on Done). Per architect AR-4 + AR-5:
+///
+/// - `meta.target_agent_id` is set to `originating_agent_id` ONLY when
+///   the caller's `is_originator_alive` returns `true`. When the
+///   originating CC has exited, the field is OMITTED — the bridge filter
+///   in `src/plugin/bridge.rs::should_relay_channel_notification`
+///   treats absent `target_agent_id` as unaddressed broadcast and
+///   relays to every active CC. The new `meta.originating_agent_id`
+///   field (informational, NOT gated) carries the breadcrumb so any
+///   receiving CC can see "this was originally for agent X".
+///
+/// - The frame also carries `meta.question`, `meta.options`, and
+///   `meta.multi` so a CC that has been compacted between the original
+///   `chat_ask` and this response can reconstruct semantic context
+///   without an in-session memory lookup (compaction-resilience).
+///
+/// Caller passes either `Single(value)` for one-shot single-select or
+/// `Multi(values)` for the array form. The frame encodes them under
+/// `meta.value` (string) or `meta.values` (JSON array of strings)
+/// respectively. The split-enum keeps the type signature self-
+/// documenting at the call site.
+pub fn build_channel_notification_callback_response(
+    ask_id: &str,
+    answer: CallbackAnswer<'_>,
+    originating_agent_id: &str,
+    is_originator_alive: bool,
+    _question: &str,
+    _options_json: &str,
+    multi: bool,
+    tg_meta: &TelegramMessageMeta,
+) -> Value {
+    // Slice 8b live-fix iteration 2 (2026-06-04): CC's channel-surface
+    // renderer drops the frame when `params.meta` carries keys outside
+    // the inbound-Telegram schema (chat_id / message_id / user / user_id
+    // / ts / optional thread_id / optional target_agent_id). Iteration 1
+    // added the missing v0.6 string-shape keys but kept Slice 8 extras
+    // (is_callback_response, ask_id, value/values, multi, question,
+    // options[], originating_agent_id) — daemon log on 22:40:18 showed
+    // the frame written to the bridge's UDS (684 bytes) but it never
+    // surfaced in the requesting CC. The inbound pizza message (304
+    // bytes, plain meta) DID surface in the same session via the same
+    // path — confirming the size/shape difference is the gate, not
+    // transport. Iteration 2: keep `meta` BIT-FOR-BIT identical to the
+    // inbound Telegram shape; encode Slice 8 round-trip data inside
+    // `content` as a parseable single-line preamble Mira reads at the
+    // start of the `<channel>` body. Trade-off: `meta.is_callback_
+    // response` / structured options[] no longer accessible to other
+    // CC consumers — but the chat_ask round-trip is THE load-bearing
+    // path and operator-visibility wins over machine-cleanness.
+    let mut params = serde_json::Map::new();
+
+    let answers_str = match answer {
+        CallbackAnswer::Single(v) => v.to_string(),
+        CallbackAnswer::Multi(values) => values.join(","),
+    };
+    // Preamble shape — single line so a glance at the channel surface
+    // tells Mira (or any other consumer reading the rendered XML body)
+    // what ask resolved, with what answer(s), and the multi/single
+    // discriminator. Keep keys lowercase + `=` separated for cheap
+    // regex/split parsing. Mira parses by looking for
+    // `[chat_ask kind=multi ask_id=<uuid> values=v1,v2,...]` /
+    // `[chat_ask kind=single ask_id=<uuid> value=<v>]` on line 1 of
+    // the channel body.
+    let preamble = if multi {
+        format!(
+            "[chat_ask kind=multi ask_id={} values={}]",
+            ask_id, answers_str
+        )
+    } else {
+        format!(
+            "[chat_ask kind=single ask_id={} value={}]",
+            ask_id, answers_str
+        )
+    };
+    params.insert("content".into(), Value::String(preamble));
+
+    let mut meta = serde_json::Map::new();
+    // BIT-FOR-BIT inbound Telegram meta shape (see
+    // build_channel_notification_telegram lines 244-273). chat_id /
+    // message_id / user / user_id / ts are MANDATORY; thread_id and
+    // target_agent_id are present-or-absent (no `null`).
+    meta.insert(
+        "chat_id".into(),
+        Value::String(tg_meta.chat_id.to_string()),
+    );
+    meta.insert(
+        "message_id".into(),
+        Value::String(tg_meta.message_id_str.clone()),
+    );
+    meta.insert("user".into(), Value::String(tg_meta.user.clone()));
+    meta.insert("user_id".into(), Value::String(tg_meta.user_id.clone()));
+    meta.insert("ts".into(), Value::String(tg_meta.ts_iso8601.clone()));
+    if let Some(tid) = tg_meta.thread_id {
+        meta.insert("thread_id".into(), Value::String(tid.to_string()));
+    }
+    // AR-4 — dead-agent fallback. target_agent_id present iff alive
+    // (drives src/plugin/bridge.rs::should_relay_channel_notification).
+    if is_originator_alive {
+        meta.insert(
+            "target_agent_id".into(),
+            Value::String(originating_agent_id.to_string()),
+        );
+    }
+
+    params.insert("meta".into(), Value::Object(meta));
+    json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/claude/channel",
+        "params": Value::Object(params),
+    })
+}
+
+/// Slice 8 helper type — the answer payload the callback handler
+/// passes to `build_channel_notification_callback_response`. Split-enum
+/// distinguishes single-select (one value) from multi-select (array)
+/// at the type level.
+pub enum CallbackAnswer<'a> {
+    Single(&'a str),
+    Multi(&'a [String]),
+}
+
+/// Apply schema v5 + v6 to a chat.db connection. Idempotent — all
 /// statements use `IF NOT EXISTS` / `INSERT OR IGNORE`. Wrapped in a
 /// BEGIN/COMMIT transaction so partial-failure recovery is clean.
 ///
@@ -272,17 +415,6 @@ pub fn build_channel_notification_telegram(
 ///            target_agent_id lookups). The CHECK constraint on `state`
 ///            is enforced at the DB layer per STRUCTURAL-5-2 — a buggy
 ///            Rust caller or a sqlite3 CLI edit cannot corrupt state.
-/// v7 tables (telegram-multi-cli Slice 1): three additive tables for
-///            chat-as-id routing —
-///            - `active_cli_per_chat` — the active CLI bound to a chat.
-///            - `tg_message_map` — reply-quote tracking (composite PK +
-///              `sent_at` index for the 30-day TTL purge, architect
-///              action item 4).
-///            - `pending_questions` — durable pending `chat_ask` state
-///              that survives daemon restart (F-1 red-team revision;
-///              replaces the in-memory map originally planned for Slice 5).
-///            chat.db has no `user_version` gate — the migration is
-///            additive-by-construction (all `CREATE TABLE IF NOT EXISTS`).
 pub fn ensure_chat_db_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         r#"
@@ -325,64 +457,97 @@ CREATE UNIQUE INDEX IF NOT EXISTS agent_registry_thread_name_alive_idx
 CREATE INDEX IF NOT EXISTS agent_registry_thread_alive_idx
     ON agent_registry(chat_thread_id, state)
     WHERE state = 'alive';
-CREATE TABLE IF NOT EXISTS active_cli_per_chat (
-  chat_id         INTEGER PRIMARY KEY,
-  active_cli_name TEXT NOT NULL,
-  active_agent_id TEXT NOT NULL,
-  set_at          INTEGER NOT NULL,
-  set_by          TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS tg_message_map (
-  tg_msg_id       INTEGER NOT NULL,
-  chat_id         INTEGER NOT NULL,
-  sender_agent_id TEXT NOT NULL,
-  sent_at         INTEGER NOT NULL,
-  PRIMARY KEY (chat_id, tg_msg_id)
-);
-CREATE INDEX IF NOT EXISTS tg_message_map_sent_at_idx
-  ON tg_message_map(sent_at);
-CREATE TABLE IF NOT EXISTS pending_questions (
-  question_id        TEXT PRIMARY KEY,
-  chat_id            INTEGER NOT NULL,
-  requesting_agent_id TEXT NOT NULL,
-  options_json       TEXT NOT NULL,
-  created_at         INTEGER NOT NULL,
-  expires_at         INTEGER NOT NULL
-);
 COMMIT;
 "#,
     )?;
+    // Slice 1 of multi-agent-telegram-on-v0.6: additive routing-key
+    // migration. Idempotent — re-runs are no-ops via pragma_table_info
+    // probe + `IF NOT EXISTS` on the index. Tolerates pre-existing
+    // v0.7/v0.8 leftover columns (additive-only, never drops).
+    apply_routing_migration(conn)?;
+    // Slice 8 — `pending_asks` table for `chat_ask` MCP tool. Additive,
+    // idempotent. Architect AR-6: chat.db single-database discipline.
+    crate::daemon::pending_asks::apply_pending_asks_migration(conn)?;
     Ok(())
 }
 
-/// Startup TTL eviction for the two time-bounded v7 tables. Run once at
-/// daemon boot AFTER `ensure_chat_db_schema` applies (the tables must
-/// exist before the DELETEs run). Separated from `ensure_chat_db_schema`
-/// because schema-application is data-preserving by contract; the purges
-/// intentionally delete stale rows and so are a distinct concern.
+/// Slice 1 of multi-agent-telegram-on-v0.6 — additive migration adding
+/// the per-CLI Telegram routing key columns and the partial-UNIQUE
+/// expression-index that enforces the one-CLI-per-`(chat_id, thread_id)`
+/// invariant (FR-MAT-2 of PRD §18 + KP1-KP3 acceptance).
 ///
-/// - `tg_message_map`: rows older than 30 days (2 592 000 s) are dropped
-///   (FR-TMC-1.3 — reply-quote tracking is only useful while the Telegram
-///   message is recent enough to be replied to).
-/// - `pending_questions`: rows whose `expires_at` is in the past are
-///   evicted (F-1/F-8 — an unanswered `chat_ask` that has expired must not
-///   linger and route a stale callback after daemon restart).
+/// The expression-index uses `COALESCE(routing_thread_id, -1)` so that
+/// two DM rows with `routing_thread_id IS NULL` collide on the index
+/// key (`-1`) — closes the red-team C2 SQLite-NULL-distinct bug.
 ///
-/// All timestamps in these two tables are UNIX **seconds** (the
-/// `strftime('%s','now')` convention), distinct from the `now_millis()`
-/// convention used by `agent_registry`. The cutoff arithmetic stays in
-/// SQL so the unit is unambiguous and matches whatever the producer wrote.
-pub fn purge_expired_chat_state(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute(
-        "DELETE FROM tg_message_map \
-         WHERE sent_at < (strftime('%s','now') - 2592000)",
-        [],
+/// The `routing_thread_id > 0` CHECK constraint reflects the
+/// architect/security defense-in-depth recommendation: Telegram forum
+/// `message_thread_id` is always positive in practice, so rejecting
+/// non-positive values prevents the (theoretical) collision between
+/// the `-1` index sentinel and a malformed Update.
+///
+/// Architect placed this in `chat.rs` (the v0.6 schema locus) rather
+/// than a new `migrations.rs` module — disproportionate to introduce a
+/// module pattern the project does not have for ~30 LOC of additive
+/// ALTERs.
+fn apply_routing_migration(conn: &Connection) -> rusqlite::Result<()> {
+    // Each (column, type+constraints) pair. `DEFAULT NULL` explicit per
+    // architect MINOR for clarity-of-intent even though it's the SQLite
+    // ALTER TABLE ADD COLUMN default.
+    //
+    // routing_thread_id carries an inline CHECK constraint so any
+    // future caller (e.g. a buggy Slice 2 implementer or a sqlite3 CLI
+    // edit) cannot insert a non-positive value that would collide with
+    // the COALESCE(-1) sentinel inside the index.
+    //
+    // chat.db is dev-machine local with no migrated users — see plan v4
+    // R7. The probe-before-ADD pattern below still safely tolerates a
+    // pre-existing v0.7/v0.8 leftover column with the same name (in
+    // practice none of these names existed before this feature, but
+    // the probe is the principled idempotency primitive either way).
+    let columns: &[(&str, &str)] = &[
+        ("routing_chat_id", "INTEGER DEFAULT NULL"),
+        (
+            "routing_thread_id",
+            "INTEGER DEFAULT NULL CHECK (routing_thread_id IS NULL OR routing_thread_id > 0)",
+        ),
+        ("last_user_id", "INTEGER DEFAULT NULL"),
+        ("host", "TEXT DEFAULT NULL"),
+        ("cwd", "TEXT DEFAULT NULL"),
+        ("pid", "INTEGER DEFAULT NULL"),
+    ];
+
+    // Wrap migration in its own transaction so a daemon crash mid-ALTER
+    // leaves the schema either fully pre-migration or fully post — no
+    // partial-state recovery path needed.
+    conn.execute_batch("BEGIN")?;
+    for (col, decl) in columns {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('agent_registry') WHERE name = ?1)",
+            [col],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            // Column declarations are source literals (the slice above)
+            // and contain NO user input, so the format!() is safe from
+            // SQL injection. Wrapping the table+column names in a
+            // parameterised query is not possible (SQLite parameters
+            // bind values, never identifiers).
+            conn.execute_batch(&format!(
+                "ALTER TABLE agent_registry ADD COLUMN {col} {decl}"
+            ))?;
+        }
+    }
+    // Expression-index. `WHERE state='alive' AND routing_chat_id IS NOT NULL`
+    // is load-bearing (security T8): without the IS NOT NULL clause every
+    // legacy row (routing_chat_id default = NULL) would enter the index
+    // at key `(NULL, COALESCE(NULL, -1)) = (NULL, -1)` and collide.
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS agent_registry_routing_alive_uniq_idx \
+         ON agent_registry(routing_chat_id, COALESCE(routing_thread_id, -1)) \
+         WHERE state = 'alive' AND routing_chat_id IS NOT NULL",
     )?;
-    conn.execute(
-        "DELETE FROM pending_questions \
-         WHERE expires_at < strftime('%s','now')",
-        [],
-    )?;
+    conn.execute_batch("COMMIT")?;
     Ok(())
 }
 
@@ -399,6 +564,19 @@ pub fn open_chat_db() -> anyhow::Result<Connection> {
         &path,
         rusqlite::OpenFlags::SQLITE_OPEN_CREATE | rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
     )?;
+    // Slice 1 T5 hardening: restrict chat.db to user-only (0o600). The
+    // file holds the bot token (in `daemon_state`) plus the new
+    // `host`/`cwd`/`pid` process-metadata columns; on multi-user Linux
+    // boxes the umask-default 0o644 would leak both. Parent dir is
+    // already 0o700 from `server.rs::ensure_runtime_dir`. Windows ACLs
+    // are user-owned by default; no equivalent chmod primitive — the
+    // gate is `#[cfg(unix)]` per the security-auditor verdict.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(&path, perms)?;
+    }
     ensure_chat_db_schema(&conn)?;
     Ok(conn)
 }
@@ -670,34 +848,6 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
 
-    /// Regression (live 2026-05-31): chat_id MUST serialize as a STRING in the
-    /// channel meta. Claude Code's channel-surface parser drops a numeric
-    /// chat_id, so the routed `<channel ...>` tag never reaches the LLM and
-    /// inbound Telegram push appears broken. The official frankenstein plugin
-    /// serializes all IDs as strings — this builder must match.
-    #[test]
-    fn channel_meta_chat_id_serializes_as_string() {
-        let tg_meta = TelegramMessageMeta {
-            chat_id: 434566766,
-            message_id_str: "15".to_string(),
-            user: "codefather_dev".to_string(),
-            user_id: "434566766".to_string(),
-            ts_iso8601: "2026-05-31T10:00:00.000Z".to_string(),
-        };
-        let frame = build_channel_notification_telegram("hi", &tg_meta, Some("mira-live"));
-        let meta = &frame["params"]["meta"];
-        assert!(
-            meta["chat_id"].is_string(),
-            "chat_id must be a JSON string, got {:?}",
-            meta["chat_id"]
-        );
-        assert_eq!(meta["chat_id"].as_str(), Some("434566766"));
-        assert!(meta["user_id"].is_string());
-        assert!(meta["message_id"].is_string());
-        assert_eq!(meta["target_agent_id"].as_str(), Some("mira-live"));
-        assert_eq!(frame["method"].as_str(), Some("notifications/claude/channel"));
-    }
-
     fn fresh_db() -> Connection {
         let conn = Connection::open_in_memory().expect("in-memory db");
         ensure_chat_db_schema(&conn).expect("schema applied");
@@ -777,215 +927,513 @@ mod tests {
         assert_eq!(n_undelivered, 0);
     }
 
-    // ---- telegram-multi-cli Slice 1: schema v7 + startup purges ----
+    // ---------------------------------------------------------------
+    // Slice 1 of multi-agent-telegram-on-v0.6 — apply_routing_migration
+    // tests. The 11 cases below cover:
+    //
+    //   (a) fresh DB has all 6 new columns + the new expression-index
+    //   (b) idempotency: 2nd ensure_chat_db_schema call is a no-op
+    //   (c) insert with a routing key triple succeeds and round-trips
+    //   (d) two distinct routing keys coexist (different chat OR different topic)
+    //   (e) duplicate (chat_id, non-NULL thread_id) raises UNIQUE
+    //   (f) two topics in the SAME group both succeed (KP2/KP3 scenario)
+    //   (g) C2 fix proof: duplicate (dm_chat_id, NULL) raises UNIQUE
+    //   (h) i64::MIN / i64::MAX routing_chat_id round-trip cleanly
+    //   (i) v0.6 register() API still works post-migration (architect i)
+    //   (j) legacy partial-unique index agent_registry_thread_name_alive_idx
+    //       survived the migration intact (architect j)
+    //   (k) CHECK constraint rejects routing_thread_id=0 and routing_thread_id=-1
+    //
+    // All tests use raw INSERT against the migrated table — Slice 1
+    // does NOT add a new Rust API (per architect: register() stays
+    // unchanged, the routing-binding setter is Slice 2 work).
+    // ---------------------------------------------------------------
 
-    /// Helper: column names of a table via PRAGMA table_info, in cid order.
-    fn table_cols(conn: &Connection, table: &str) -> Vec<String> {
-        let mut stmt = conn
-            .prepare(&format!("PRAGMA table_info({table})"))
-            .unwrap();
-        let cols: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(1))
-            .unwrap()
-            .map(|c| c.unwrap())
-            .collect();
-        cols
+    /// Convenience: insert a row directly into agent_registry with the
+    /// fields the new-columns tests care about. Returns the rusqlite
+    /// Result so error-path tests can introspect the SQLite error.
+    fn raw_insert_routing(
+        conn: &Connection,
+        agent_id: &str,
+        agent_name: &str,
+        connection_id: &str,
+        state: &str,
+        routing_chat_id: Option<i64>,
+        routing_thread_id: Option<i64>,
+    ) -> rusqlite::Result<usize> {
+        conn.execute(
+            "INSERT INTO agent_registry \
+             (agent_id, agent_name, connection_id, chat_thread_id, spawned_at, last_pinged_at, state, routing_chat_id, routing_thread_id) \
+             VALUES (?1, ?2, ?3, NULL, 1, 1, ?4, ?5, ?6)",
+            rusqlite::params![
+                agent_id,
+                agent_name,
+                connection_id,
+                state,
+                routing_chat_id,
+                routing_thread_id,
+            ],
+        )
     }
 
-    /// TC-TMC-1.1(a): active_cli_per_chat has exactly the 5 spec columns.
     #[test]
-    fn v7_active_cli_per_chat_has_5_columns() {
+    fn slice1_a_fresh_db_has_new_columns_and_index() {
         let conn = fresh_db();
-        let cols = table_cols(&conn, "active_cli_per_chat");
-        assert_eq!(
-            cols,
-            vec![
-                "chat_id",
-                "active_cli_name",
-                "active_agent_id",
-                "set_at",
-                "set_by"
-            ]
-        );
-    }
-
-    /// TC-TMC-1.1(b): tg_message_map has exactly the 4 spec columns AND a
-    /// composite PK on (chat_id, tg_msg_id).
-    #[test]
-    fn v7_tg_message_map_has_4_columns_and_composite_pk() {
-        let conn = fresh_db();
-        let cols = table_cols(&conn, "tg_message_map");
-        assert_eq!(
-            cols,
-            vec!["tg_msg_id", "chat_id", "sender_agent_id", "sent_at"]
-        );
-        // Composite PK: the two PK members per PRAGMA (pk column index > 0).
-        let mut stmt = conn.prepare("PRAGMA table_info(tg_message_map)").unwrap();
-        // row: (cid, name, type, notnull, dflt, pk)
-        let pk_members: Vec<(String, i64)> = stmt
-            .query_map([], |r| {
-                Ok((r.get::<_, String>(1)?, r.get::<_, i64>(5)?))
-            })
-            .unwrap()
-            .map(|x| x.unwrap())
-            .filter(|(_, pk)| *pk > 0)
-            .collect();
-        assert_eq!(pk_members.len(), 2, "expected composite PK of 2 columns");
-        // PRAGMA reports PK order via the pk index: chat_id=1, tg_msg_id=2.
-        let names: Vec<&str> = pk_members.iter().map(|(n, _)| n.as_str()).collect();
-        assert!(names.contains(&"chat_id"));
-        assert!(names.contains(&"tg_msg_id"));
-    }
-
-    /// tg_message_map_sent_at_idx index exists (architect action item 4).
-    #[test]
-    fn v7_tg_message_map_sent_at_index_exists() {
-        let conn = fresh_db();
-        let n: i64 = conn
+        // 6 new columns
+        for col in [
+            "routing_chat_id",
+            "routing_thread_id",
+            "last_user_id",
+            "host",
+            "cwd",
+            "pid",
+        ] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('agent_registry') WHERE name = ?1)",
+                    [col],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(exists, "expected new column `{col}` to exist post-migration");
+        }
+        // Expression-index present and contains COALESCE(routing_thread_id, -1)
+        let sql: String = conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master \
-                 WHERE type='index' AND name='tg_message_map_sent_at_idx'",
+                "SELECT sql FROM sqlite_master WHERE name='agent_registry_routing_alive_uniq_idx'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 1);
-    }
-
-    /// pending_questions has exactly the 6 spec columns.
-    #[test]
-    fn v7_pending_questions_has_6_columns() {
-        let conn = fresh_db();
-        let cols = table_cols(&conn, "pending_questions");
-        assert_eq!(
-            cols,
-            vec![
-                "question_id",
-                "chat_id",
-                "requesting_agent_id",
-                "options_json",
-                "created_at",
-                "expires_at"
-            ]
+        assert!(
+            sql.contains("COALESCE(routing_thread_id, -1)"),
+            "expected COALESCE sentinel in index sql, got: {sql}"
+        );
+        assert!(
+            sql.contains("routing_chat_id IS NOT NULL"),
+            "expected IS NOT NULL filter in index sql (security T8), got: {sql}"
         );
     }
 
-    /// TC-TMC-1.2: ensure_chat_db_schema is idempotent — a second call on
-    /// an already-v7 db returns Ok and changes no row counts.
     #[test]
-    fn v7_schema_is_idempotent() {
+    fn slice1_b_migration_is_idempotent() {
         let conn = fresh_db();
-        // Plant one row in each v7 table.
-        conn.execute(
-            "INSERT INTO active_cli_per_chat \
-             (chat_id, active_cli_name, active_agent_id, set_at, set_by) \
-             VALUES (1, 'cli-a', 'agent-a', 100, 'op')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO tg_message_map \
-             (tg_msg_id, chat_id, sender_agent_id, sent_at) \
-             VALUES (5, 1, 'agent-a', 9999999999)",
-            [],
-        )
-        .unwrap();
-        // Second schema call must succeed and preserve the planted rows.
-        ensure_chat_db_schema(&conn).expect("second ensure_chat_db_schema call Ok");
-        let n_cli: i64 = conn
-            .query_row("SELECT COUNT(*) FROM active_cli_per_chat", [], |r| r.get(0))
+        // The 1st ensure already ran via fresh_db(). Run a 2nd one and
+        // confirm it returns Ok without ADD-COLUMN duplicate errors.
+        ensure_chat_db_schema(&conn).expect("2nd ensure should be no-op");
+        // And a 3rd, just to be sure.
+        ensure_chat_db_schema(&conn).expect("3rd ensure should be no-op");
+        // Column count for agent_registry hasn't grown beyond expected.
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('agent_registry')",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        let n_map: i64 = conn
-            .query_row("SELECT COUNT(*) FROM tg_message_map", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(n_cli, 1);
-        assert_eq!(n_map, 1);
+        // Original v6 had 9 columns + 6 new = 15.
+        assert_eq!(n, 15, "agent_registry should have exactly 15 columns post-migration");
     }
 
-    /// Existing v6 rows survive a re-open: insert a chat_threads row and
-    /// run ensure_chat_db_schema again; the row count is unchanged.
     #[test]
-    fn v6_rows_survive_schema_reapply() {
+    fn slice1_c_insert_with_routing_key_round_trips() {
         let conn = fresh_db();
-        insert_message(&conn, "telegram:42", "agent-a", "hello", None).unwrap();
-        let before: i64 = conn
-            .query_row("SELECT COUNT(*) FROM chat_threads", [], |r| r.get(0))
+        raw_insert_routing(&conn, "a1", "alice", "c1", "alive", Some(100), Some(7))
+            .expect("insert with routing key");
+        let (cid, tid): (i64, i64) = conn
+            .query_row(
+                "SELECT routing_chat_id, routing_thread_id FROM agent_registry WHERE agent_id='a1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
-        let msg_before: i64 = conn
-            .query_row("SELECT COUNT(*) FROM chat_messages", [], |r| r.get(0))
-            .unwrap();
-        ensure_chat_db_schema(&conn).unwrap();
-        let after: i64 = conn
-            .query_row("SELECT COUNT(*) FROM chat_threads", [], |r| r.get(0))
-            .unwrap();
-        let msg_after: i64 = conn
-            .query_row("SELECT COUNT(*) FROM chat_messages", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(before, after);
-        assert_eq!(msg_before, msg_after);
-        assert_eq!(after, 1);
+        assert_eq!(cid, 100);
+        assert_eq!(tid, 7);
     }
 
-    /// Startup eviction: an expired pending_questions row (expires_at in
-    /// the past) is deleted by purge_expired_chat_state; a future-expiry
-    /// row survives.
     #[test]
-    fn purge_evicts_expired_pending_questions() {
+    fn slice1_d_two_distinct_routing_keys_coexist() {
         let conn = fresh_db();
-        conn.execute(
-            "INSERT INTO pending_questions \
-             (question_id, chat_id, requesting_agent_id, options_json, created_at, expires_at) \
-             VALUES ('q-expired', 1, 'agent-a', '[]', 0, 1)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO pending_questions \
-             (question_id, chat_id, requesting_agent_id, options_json, created_at, expires_at) \
-             VALUES ('q-future', 1, 'agent-a', '[]', 0, strftime('%s','now') + 3600)",
-            [],
-        )
-        .unwrap();
-        purge_expired_chat_state(&conn).unwrap();
-        let remaining: i64 = conn
-            .query_row("SELECT COUNT(*) FROM pending_questions", [], |r| r.get(0))
+        // Different chat_id → distinct rows
+        raw_insert_routing(&conn, "a1", "alice", "c1", "alive", Some(100), None).unwrap();
+        raw_insert_routing(&conn, "a2", "bob", "c2", "alive", Some(200), None)
+            .expect("different chat_id should not collide");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM agent_registry WHERE state='alive'", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(remaining, 1, "only the future-expiry row should survive");
-        let id: String = conn
-            .query_row("SELECT question_id FROM pending_questions", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(id, "q-future");
+        assert_eq!(n, 2);
     }
 
-    /// Startup eviction: a tg_message_map row older than the 30-day TTL is
-    /// deleted; a recent row survives.
     #[test]
-    fn purge_evicts_old_tg_message_map_rows() {
+    fn slice1_e_duplicate_non_null_thread_raises_unique() {
         let conn = fresh_db();
-        // sent_at far in the past (epoch second 1) → older than 30 days.
-        conn.execute(
-            "INSERT INTO tg_message_map \
-             (tg_msg_id, chat_id, sender_agent_id, sent_at) \
-             VALUES (1, 1, 'agent-a', 1)",
-            [],
-        )
-        .unwrap();
-        // Recent row (now) → survives.
-        conn.execute(
-            "INSERT INTO tg_message_map \
-             (tg_msg_id, chat_id, sender_agent_id, sent_at) \
-             VALUES (2, 1, 'agent-a', strftime('%s','now'))",
-            [],
-        )
-        .unwrap();
-        purge_expired_chat_state(&conn).unwrap();
-        let remaining: i64 = conn
-            .query_row("SELECT COUNT(*) FROM tg_message_map", [], |r| r.get(0))
+        raw_insert_routing(&conn, "a1", "alice", "c1", "alive", Some(100), Some(7)).unwrap();
+        let err = raw_insert_routing(&conn, "a2", "bob", "c2", "alive", Some(100), Some(7))
+            .expect_err("duplicate (chat, thread) must violate UNIQUE");
+        assert!(
+            err.to_string().contains("UNIQUE"),
+            "expected UNIQUE-constraint violation, got: {err}"
+        );
+    }
+
+    #[test]
+    fn slice1_f_same_group_two_topics_both_succeed() {
+        let conn = fresh_db();
+        // KP2/KP3 scenario: same group chat_id, topic α (7) and topic β (8).
+        raw_insert_routing(&conn, "a-b", "bob", "c1", "alive", Some(500), Some(7))
+            .expect("topic α insert");
+        raw_insert_routing(&conn, "a-c", "carol", "c2", "alive", Some(500), Some(8))
+            .expect("topic β insert (different thread)");
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_registry WHERE routing_chat_id=500 AND state='alive'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(remaining, 1, "only the recent row should survive");
-        let id: i64 = conn
-            .query_row("SELECT tg_msg_id FROM tg_message_map", [], |r| r.get(0))
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn slice1_g_c2_fix_null_null_dm_collision_raises_unique() {
+        let conn = fresh_db();
+        // KP1 DM-collision: two CLIs both try to bind to the same DM
+        // chat with no topic. Pre-C2-fix this would silently succeed
+        // because SQLite treats NULL as DISTINCT in UNIQUE constraints.
+        // The COALESCE(routing_thread_id, -1) expression-index closes
+        // that hole — second insert MUST raise UNIQUE.
+        raw_insert_routing(&conn, "a1", "alice", "c1", "alive", Some(42), None).unwrap();
+        let err = raw_insert_routing(&conn, "a2", "bob", "c2", "alive", Some(42), None)
+            .expect_err("C2 fix proof: duplicate (chat, NULL) must violate UNIQUE");
+        assert!(
+            err.to_string().contains("UNIQUE"),
+            "expected UNIQUE violation for NULL-NULL DM collision, got: {err}"
+        );
+    }
+
+    #[test]
+    fn slice1_h_i64_extremes_round_trip() {
+        let conn = fresh_db();
+        raw_insert_routing(&conn, "a-min", "x", "c1", "alive", Some(i64::MIN), Some(1)).unwrap();
+        raw_insert_routing(&conn, "a-max", "y", "c2", "alive", Some(i64::MAX), Some(1)).unwrap();
+        let (min_back, max_back): (i64, i64) = conn
+            .query_row(
+                "SELECT \
+                 (SELECT routing_chat_id FROM agent_registry WHERE agent_id='a-min'), \
+                 (SELECT routing_chat_id FROM agent_registry WHERE agent_id='a-max')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
-        assert_eq!(id, 2);
+        assert_eq!(min_back, i64::MIN);
+        assert_eq!(max_back, i64::MAX);
+    }
+
+    #[test]
+    fn slice1_i_v06_register_api_still_works_post_migration() {
+        // Architect's added test (i): the legacy register() function
+        // signature is untouched by Slice 1; verify a register round-trip
+        // still works against the migrated schema. The new columns stay
+        // at their NULL default for the rows the v0.6 API inserts.
+        let conn = fresh_db();
+        crate::daemon::agent_registry::register(
+            &conn,
+            "legacy-a",
+            "legacy",
+            "conn-x",
+            Some("telegram:thread-1"),
+            None,
+        )
+        .expect("legacy v0.6 register() round-trip must still work");
+        // New columns are NULL on a row inserted via the legacy API.
+        let (rcid, rtid): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT routing_chat_id, routing_thread_id FROM agent_registry WHERE agent_id='legacy-a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(rcid.is_none(), "legacy insert should leave routing_chat_id NULL");
+        assert!(rtid.is_none(), "legacy insert should leave routing_thread_id NULL");
+    }
+
+    #[test]
+    fn slice1_j_legacy_index_survives_migration() {
+        // Architect's added test (j): the migration does not drop the
+        // legacy partial-unique index agent_registry_thread_name_alive_idx.
+        let conn = fresh_db();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='index' AND name='agent_registry_thread_name_alive_idx'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "legacy partial-unique index must survive the migration");
+        // And the other legacy index too.
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='index' AND name='agent_registry_thread_alive_idx'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "legacy routing-lookup index must survive the migration");
+    }
+
+    #[test]
+    fn slice1_k_check_constraint_rejects_non_positive_thread_id() {
+        // Defense-in-depth: routing_thread_id = 0 or -1 must be rejected
+        // at the DB layer so a malformed Update (or buggy caller) cannot
+        // collide with the COALESCE(-1) sentinel inside the expression
+        // index.
+        let conn = fresh_db();
+        let err_zero = raw_insert_routing(&conn, "a-0", "x", "c1", "alive", Some(7), Some(0))
+            .expect_err("routing_thread_id=0 must fail CHECK");
+        assert!(
+            err_zero.to_string().contains("CHECK"),
+            "expected CHECK-constraint violation for thread_id=0, got: {err_zero}"
+        );
+        let err_neg = raw_insert_routing(&conn, "a-neg", "y", "c2", "alive", Some(7), Some(-1))
+            .expect_err("routing_thread_id=-1 must fail CHECK");
+        assert!(
+            err_neg.to_string().contains("CHECK"),
+            "expected CHECK-constraint violation for thread_id=-1, got: {err_neg}"
+        );
+        // Sanity: positive thread_id still works.
+        raw_insert_routing(&conn, "a-pos", "z", "c3", "alive", Some(7), Some(1))
+            .expect("routing_thread_id=1 should succeed");
+    }
+
+    // ---------------------------------------------------------------
+    // Slice 2 of multi-agent-telegram-on-v0.6 —
+    // build_channel_notification_telegram thread_id additive-field
+    // emission tests.
+    //
+    // Per PRD §18 FR-MAT-7 (C3 wire contract): when the inbound message
+    // carries a forum-topic id, the channel notification meta object
+    // gains a `thread_id` string field. When None (DM / topic-less),
+    // the field is OMITTED so DM inbound stays bit-for-bit identical
+    // to the Slice 0 baseline meta shape.
+    // ---------------------------------------------------------------
+
+    fn slice2_sample_tg_meta(thread_id: Option<i64>) -> TelegramMessageMeta {
+        TelegramMessageMeta {
+            chat_id: 42,
+            message_id_str: "100".to_string(),
+            user: "alice".to_string(),
+            user_id: "8791871989".to_string(),
+            ts_iso8601: "2026-06-03T00:00:00.000Z".to_string(),
+            thread_id,
+        }
+    }
+
+    #[test]
+    fn slice2_meta_emits_thread_id_when_some() {
+        let tg_meta = slice2_sample_tg_meta(Some(7));
+        let frame = build_channel_notification_telegram("hi", &tg_meta, None);
+        let meta = frame
+            .pointer("/params/meta")
+            .and_then(|v| v.as_object())
+            .expect("meta object");
+        let thread_id_value = meta
+            .get("thread_id")
+            .expect("meta.thread_id present when Some");
+        assert_eq!(
+            thread_id_value.as_str(),
+            Some("7"),
+            "thread_id must be emitted as string per v0.6 ID-as-string discipline"
+        );
+    }
+
+    #[test]
+    fn slice2_meta_omits_thread_id_when_none() {
+        let tg_meta = slice2_sample_tg_meta(None);
+        let frame = build_channel_notification_telegram("hi", &tg_meta, None);
+        let meta = frame
+            .pointer("/params/meta")
+            .and_then(|v| v.as_object())
+            .expect("meta object");
+        assert!(
+            !meta.contains_key("thread_id"),
+            "meta.thread_id MUST be omitted (not set to null) when None — \
+             preserves Slice 0 baseline shape for DM / topic-less inbound"
+        );
+    }
+
+    #[test]
+    fn slice2_meta_thread_id_independent_of_target_agent_id() {
+        // Both routing-key (thread_id) and @-mention (target_agent_id)
+        // can coexist in the same meta. This proves additive layering.
+        let tg_meta = slice2_sample_tg_meta(Some(99));
+        let frame = build_channel_notification_telegram("@bob hi", &tg_meta, Some("bob-uuid"));
+        let meta = frame.pointer("/params/meta").unwrap().as_object().unwrap();
+        assert_eq!(meta.get("thread_id").unwrap().as_str(), Some("99"));
+        assert_eq!(
+            meta.get("target_agent_id").unwrap().as_str(),
+            Some("bob-uuid")
+        );
+        // Existing fields still there
+        assert_eq!(meta.get("user").unwrap().as_str(), Some("alice"));
+        assert_eq!(meta.get("user_id").unwrap().as_str(), Some("8791871989"));
+    }
+
+    // ----------------------------------------------------------------
+    // Slice 8 — build_channel_notification_callback_response
+    // ----------------------------------------------------------------
+
+    fn cb_tg_meta_stub() -> TelegramMessageMeta {
+        TelegramMessageMeta {
+            chat_id: 100,
+            message_id_str: "200".to_string(),
+            user: "alice".to_string(),
+            user_id: "300".to_string(),
+            ts_iso8601: "2026-06-04T00:00:00.000Z".to_string(),
+            thread_id: None,
+        }
+    }
+
+    #[test]
+    fn slice8_callback_single_alive_originator_emits_target_agent_id() {
+        let frame = build_channel_notification_callback_response(
+            "ask-uuid-1",
+            CallbackAnswer::Single("yes"),
+            "mira",
+            true, // alive
+            "Approve plan?",
+            r#"[{"label":"Yes","value":"yes"},{"label":"No","value":"no"}]"#,
+            false,
+            &cb_tg_meta_stub(),
+        );
+        let meta = frame.pointer("/params/meta").unwrap().as_object().unwrap();
+        // Iteration 2 — meta is BIT-FOR-BIT inbound shape; Slice 8 data
+        // lives in `content` preamble, NOT in meta. Asserting on the
+        // absence of the extras catches accidental regression to the
+        // verbose meta shape that CC's renderer dropped.
+        assert!(!meta.contains_key("is_callback_response"));
+        assert!(!meta.contains_key("ask_id"));
+        assert!(!meta.contains_key("value"));
+        assert!(!meta.contains_key("values"));
+        assert!(!meta.contains_key("question"));
+        assert!(!meta.contains_key("options"));
+        assert!(!meta.contains_key("originating_agent_id"));
+        // Required inbound-shape meta keys — strings, no nulls.
+        assert_eq!(meta.get("chat_id").unwrap().as_str(), Some("100"));
+        assert_eq!(meta.get("message_id").unwrap().as_str(), Some("200"));
+        assert_eq!(meta.get("user").unwrap().as_str(), Some("alice"));
+        assert_eq!(meta.get("user_id").unwrap().as_str(), Some("300"));
+        assert_eq!(meta.get("ts").unwrap().as_str(), Some("2026-06-04T00:00:00.000Z"));
+        // AR-4 alive → target_agent_id present (bridge filter gate).
+        assert_eq!(meta.get("target_agent_id").unwrap().as_str(), Some("mira"));
+        // content preamble carries Slice 8 round-trip data.
+        let content = frame.pointer("/params/content").unwrap().as_str().unwrap();
+        assert_eq!(content, "[chat_ask kind=single ask_id=ask-uuid-1 value=yes]");
+    }
+
+    #[test]
+    fn slice8_callback_single_dead_originator_omits_target_agent_id() {
+        let frame = build_channel_notification_callback_response(
+            "ask-uuid-2",
+            CallbackAnswer::Single("no"),
+            "ghost",
+            false, // NOT alive — AR-4 fallback
+            "?",
+            "[]",
+            false,
+            &cb_tg_meta_stub(),
+        );
+        let meta = frame.pointer("/params/meta").unwrap().as_object().unwrap();
+        assert!(
+            !meta.contains_key("target_agent_id"),
+            "AR-4: target_agent_id MUST be omitted when originator is not alive"
+        );
+        // Dead originator does NOT leak via originating_agent_id either —
+        // iteration 2 stripped it from meta. Round-trip context lives
+        // exclusively in content; the ask_id is the breadcrumb a fresh
+        // Mira can use to chat_list_pending_asks for older context.
+        assert!(!meta.contains_key("originating_agent_id"));
+        let content = frame.pointer("/params/content").unwrap().as_str().unwrap();
+        assert_eq!(content, "[chat_ask kind=single ask_id=ask-uuid-2 value=no]");
+    }
+
+    #[test]
+    fn slice8_callback_multi_emits_values_in_content_preamble() {
+        let values = vec!["a".to_string(), "c".to_string()];
+        let frame = build_channel_notification_callback_response(
+            "ask-uuid-3",
+            CallbackAnswer::Multi(&values),
+            "mira",
+            true,
+            "Pick:",
+            r#"[{"label":"A","value":"a"},{"label":"B","value":"b"},{"label":"C","value":"c"}]"#,
+            true,
+            &cb_tg_meta_stub(),
+        );
+        // values gone from meta — now CSV in content preamble.
+        let meta = frame.pointer("/params/meta").unwrap().as_object().unwrap();
+        assert!(!meta.contains_key("values"));
+        assert!(!meta.contains_key("multi"));
+        let content = frame.pointer("/params/content").unwrap().as_str().unwrap();
+        assert_eq!(content, "[chat_ask kind=multi ask_id=ask-uuid-3 values=a,c]");
+    }
+
+    #[test]
+    fn slice8_callback_multi_empty_values_renders_as_empty_csv() {
+        // Done with no selections — empty list path. Preamble shape MUST
+        // stay parseable (trailing `=`, not `values=,`).
+        let empty: Vec<String> = Vec::new();
+        let frame = build_channel_notification_callback_response(
+            "ask-uuid-7",
+            CallbackAnswer::Multi(&empty),
+            "mira",
+            true,
+            "?",
+            "[]",
+            true,
+            &cb_tg_meta_stub(),
+        );
+        let content = frame.pointer("/params/content").unwrap().as_str().unwrap();
+        assert_eq!(content, "[chat_ask kind=multi ask_id=ask-uuid-7 values=]");
+    }
+
+    #[test]
+    fn slice8_callback_frame_method_matches_baseline_contract() {
+        // Slice 0 baseline preservation: the notification method name is
+        // `notifications/claude/channel` (same as regular TG messages).
+        let frame = build_channel_notification_callback_response(
+            "ask-uuid-5",
+            CallbackAnswer::Single("x"),
+            "mira",
+            true,
+            "?",
+            "[]",
+            false,
+            &cb_tg_meta_stub(),
+        );
+        assert_eq!(
+            frame.get("method").unwrap().as_str(),
+            Some("notifications/claude/channel")
+        );
+    }
+
+    #[test]
+    fn slice8b_callback_meta_includes_thread_id_when_present() {
+        // Slice 2 thread_id additive — same shape as inbound TG meta.
+        let mut tg_meta = cb_tg_meta_stub();
+        tg_meta.thread_id = Some(42);
+        let frame = build_channel_notification_callback_response(
+            "ask-uuid-6",
+            CallbackAnswer::Single("x"),
+            "mira",
+            true,
+            "?",
+            "[]",
+            false,
+            &tg_meta,
+        );
+        let meta = frame.pointer("/params/meta").unwrap().as_object().unwrap();
+        assert_eq!(meta.get("thread_id").unwrap().as_str(), Some("42"));
     }
 }

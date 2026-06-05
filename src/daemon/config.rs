@@ -386,55 +386,6 @@ mod tests {
         }
     }
 
-    // telegram-multi-cli Slice 6 — the `[telegram] enabled` flag is the
-    // cutover/revert switch read by server.serve(). These tests pin: (a) the
-    // default is `true` (cutover-on-by-default); (b) explicit true/false parse
-    // correctly; (c) a daemon.toml with NO `[telegram]` block (or an absent
-    // `enabled` key) falls back to the `true` default via serde. The
-    // missing/malformed-FILE -> true behaviour lives in server.serve()'s load
-    // wrapper (a file read error there defaults true so a bad config never
-    // silently kills Telegram); here we cover the parse-level default.
-    #[test]
-    fn telegram_enabled_defaults_true() {
-        assert!(default_telegram_enabled());
-        assert!(Config::default().telegram.enabled);
-    }
-
-    #[test]
-    fn telegram_enabled_parses_true_and_false() {
-        let on: Config = toml::from_str("[telegram]\nenabled = true\n").unwrap();
-        assert!(on.telegram.enabled);
-        let off: Config = toml::from_str("[telegram]\nenabled = false\n").unwrap();
-        assert!(!off.telegram.enabled);
-    }
-
-    #[test]
-    fn telegram_enabled_absent_key_or_section_yields_true_default() {
-        // `[telegram]` block present but no `enabled` key -> serde default true.
-        let partial: Config = toml::from_str("[telegram]\npoll_interval_secs = 25\n").unwrap();
-        assert!(partial.telegram.enabled);
-        // No `[telegram]` block at all -> TelegramConfig::default() -> true.
-        let none: Config = toml::from_str("[asr]\nbackend = \"whisper\"\n").unwrap();
-        assert!(none.telegram.enabled);
-        // Empty document -> all defaults.
-        let empty: Config = toml::from_str("").unwrap();
-        assert!(empty.telegram.enabled);
-    }
-
-    #[test]
-    fn telegram_enabled_roundtrips_through_toml() {
-        let off = Config {
-            telegram: TelegramConfig {
-                enabled: false,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let s = toml::to_string(&off).unwrap();
-        let back: Config = toml::from_str(&s).unwrap();
-        assert!(!back.telegram.enabled);
-    }
-
     #[test]
     fn contains_bot_token_detects_nested() {
         let v: toml::Value = toml::from_str(

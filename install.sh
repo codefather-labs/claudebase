@@ -23,48 +23,10 @@ set -u
 # ============================================================================
 # Constants
 # ============================================================================
+CLAUDEBASE_VERSION="0.7.0"
 CLAUDEBASE_PDFIUM_VERSION="chromium/7802"
 REPO_URL="https://github.com/codefather-labs/claudebase.git"
 RELEASE_BASE="https://github.com/codefather-labs/claudebase/releases/download"
-
-# Fallback version used only when the remote tag lookup below fails
-# (air-gapped machine, GitHub unreachable, etc). NOT authoritative —
-# the actual version installed is whatever `detect_claudebase_version`
-# resolves at runtime. Bump on each release as a courtesy for cold-start
-# installs without network, but absence of bump no longer breaks anything.
-CLAUDEBASE_FALLBACK_VERSION="0.8.0"
-
-# Authoritative version resolution (v0.7.1+): authoritative source is
-# the latest `claudebase-v*` tag on origin, fetched via `git ls-remote`.
-# Eliminates the chronic "bump install.sh manually on every release"
-# trap that caused v0.7.0 to silently no-op for upgrading users.
-#
-# Priority order:
-#   1. Operator override: CLAUDEBASE_VERSION=0.7.0 bash install.sh
-#      (for pinning / downgrade / repeatable CI installs).
-#   2. Latest claudebase-v* tag from origin via `git ls-remote`
-#      (no GitHub API rate limit, no jq dep, semver-sorted via sort -V).
-#   3. CLAUDEBASE_FALLBACK_VERSION baked above (offline / GH down).
-detect_claudebase_version() {
-  if [ -n "${CLAUDEBASE_VERSION:-}" ]; then
-    echo "$CLAUDEBASE_VERSION"
-    return 0
-  fi
-  if command -v git >/dev/null 2>&1; then
-    local latest
-    latest=$(git ls-remote --tags --refs "$REPO_URL" 'refs/tags/claudebase-v*' 2>/dev/null \
-      | awk -F/ '{print $NF}' \
-      | sed 's/^claudebase-v//' \
-      | sort -V \
-      | tail -1)
-    if [ -n "$latest" ]; then
-      echo "$latest"
-      return 0
-    fi
-  fi
-  echo "$CLAUDEBASE_FALLBACK_VERSION"
-}
-CLAUDEBASE_VERSION="$(detect_claudebase_version)"
 
 CLAUDE_DIR="$HOME/.claude"
 SCRIPT_DIR=""
@@ -109,7 +71,8 @@ WHAT GETS INSTALLED:
   ~/.claude/rules/knowledge-base.md         CLI contract + citation discipline
   ~/.claude/rules/knowledge-base-tool.md    Usage mandate + insights protocol
   ~/.claude/rules/tool-limitations.md       Read/grep/bash truncation gotchas
-  ~/.claude/hooks/claudebase-selfcheck-reminder.sh UserPromptSubmit hook — self-check protocols + insight-capture
+  ~/.claude/hooks/claudebase-insight-capture.sh   Stop hook — insight-capture reflection
+  ~/.claude/hooks/claudebase-selfcheck-reminder.sh UserPromptSubmit hook — self-check reminder
   ~/.claude/commands/knowledge-ingest.md    /knowledge-ingest skill
   ~/.claude/commands/reflect.md             /reflect skill (DMN observation)
   ~/.claude/commands/consolidate.md         /consolidate skill (drift detection)
@@ -161,8 +124,7 @@ get_source_dir() {
 }
 
 # ============================================================================
-# Install prompts/{rules,commands,agents}/ into ~/.claude/{rules,commands,agents}/
-# (source layout: prompts/ dir at repo root; install destination: global ~/.claude/)
+# Install prompts/rules/commands/agents into ~/.claude/
 # ============================================================================
 install_prompts() {
   mkdir -p "$CLAUDE_DIR/rules" "$CLAUDE_DIR/commands" "$CLAUDE_DIR/agents"
@@ -215,6 +177,40 @@ install_binary() {
   esac
 
   local target_bin="$target_dir/claudebase${exe_ext}"
+
+  # --local builds the binary from THIS checkout and installs it, never
+  # downloading a release asset (which may be older, different, or absent
+  # after a tag was deleted). Requires a rust toolchain. On macOS the
+  # freshly-copied Mach-O is re-signed ad-hoc so Gatekeeper does not
+  # SIGKILL it on first exec: a plain cp of a signed binary invalidates
+  # the signature and the kernel kills the process with code 137.
+  if [ "$LOCAL_MODE" = true ]; then
+    if ! command -v cargo >/dev/null 2>&1; then
+      log_error "--local binary build needs cargo (install the rust toolchain via rustup)"
+      return 1
+    fi
+    log_info "building claudebase from local checkout ($SCRIPT_DIR) via cargo build --release"
+    if ! ( cd "$SCRIPT_DIR" && cargo build --release ); then
+      log_error "local 'cargo build --release' failed; binary not installed"
+      return 1
+    fi
+    local local_bin="$SCRIPT_DIR/target/release/claudebase${exe_ext}"
+    if [ ! -x "$local_bin" ]; then
+      log_error "local build produced no binary at $local_bin"
+      return 1
+    fi
+    cp "$local_bin" "$target_bin"
+    chmod +x "$target_bin"
+    if [ "$(uname -s)" = "Darwin" ] && command -v codesign >/dev/null 2>&1; then
+      if codesign --force --sign - "$target_bin" >/dev/null 2>&1; then
+        log_ok "re-signed local binary (macOS Gatekeeper)"
+      else
+        log_warn "codesign failed; if the binary is Killed:9 on exec, run: codesign --force --sign - $target_bin"
+      fi
+    fi
+    log_ok "tools/claudebase/claudebase (local build, $platform)"
+    return 0
+  fi
 
   if [ -x "$target_bin" ]; then
     local existing_ver
@@ -348,20 +344,17 @@ EOF
 }
 
 # ============================================================================
-# Install the claudebase UserPromptSubmit hook into ~/.claude/hooks/ and wire
-# it into ~/.claude/settings.json:
+# Install claudebase hooks into ~/.claude/hooks/ and wire them into
+# ~/.claude/settings.json. Two hooks, both part of the cognitive-infra layer:
 #
+#   - Stop -> claudebase-insight-capture.sh — fires after every agent turn,
+#     prompts a reflection; if the agent learned something axis-worthy it
+#     persists an insight via `claudebase insight create`, else stops silently.
+#     Loop-safe via stop_hook_active.
 #   - UserPromptSubmit -> claudebase-selfcheck-reminder.sh — fires before the
-#     agent responds, injects a SHORT agent-only reminder covering (1) the three
-#     cognitive-self-check protocols and (2) insight-capture: persist any
-#     genuine insight from the PREVIOUS turn via `claudebase insight create`.
-#
-# Migration: a prior version shipped a Stop hook (claudebase-insight-capture)
-# that forced reflection via `decision: block` — Claude Code renders that to the
-# operator as "Stop hook error: ..." (alarming, looks like a failure) and forces
-# an extra turn every response. That approach is RETIRED; insight-capture now
-# folds into the UserPromptSubmit reminder (no operator bubble, no "error", no
-# extra turn). This installer actively removes the stale Stop wiring + files.
+#     agent responds, injects a SHORT agent-only reminder of the three
+#     cognitive-self-check protocols (the rule it reminds about,
+#     cognitive-self-check.md, ships from claudebase too).
 #
 # Idempotent — jq merge is by command-string equality, so re-running never
 # duplicates an entry.
@@ -397,6 +390,7 @@ install_claudebase_hooks() {
 
   if ! command -v jq >/dev/null 2>&1; then
     log_warn "jq required for settings.json hook merge — add manually:"
+    log_warn '  hooks.Stop[*].hooks[*].command = ~/.claude/hooks/claudebase-insight-capture.sh'
     log_warn '  hooks.UserPromptSubmit[*].hooks[*].command = ~/.claude/hooks/claudebase-selfcheck-reminder.sh'
     log_warn '  hooks.SessionStart[*].hooks[*].command = ~/.claude/hooks/claudebase-read-insights-reminder.sh'
     log_warn '  (and remove any hooks.Stop entry pointing at claudebase-insight-capture.sh)'
@@ -422,7 +416,13 @@ install_claudebase_hooks() {
       --arg readins_cmd "$readins_cmd" \
       '
       .hooks //= {}
+      | .hooks.Stop //= []
       | .hooks.UserPromptSubmit //= []
+      | .hooks.Stop |=
+          (if any(.[]?; (.hooks // []) | any(.command == $stop_cmd))
+           then .
+           else . + [{"hooks": [{"type": "command", "command": $stop_cmd}]}]
+           end)
       | .hooks.UserPromptSubmit |=
           (if any(.[]?; (.hooks // []) | any(.command == $selfcheck_cmd))
            then .
@@ -476,10 +476,7 @@ install_pdfium() {
     local platform asset
     case "$(uname -s)/$(uname -m)" in
       Darwin/arm64)   platform=darwin-arm64;  asset=pdfium-mac-arm64.tgz   ;;
-      # Darwin/x86_64 dropped as of v0.7.1 — falls through to the catch-all
-      # warning below; the upstream pdfium binary release still has it, but
-      # since we don't ship the claudebase binary for Intel Mac there's no
-      # consumer.
+      Darwin/x86_64)  platform=darwin-x64;    asset=pdfium-mac-x64.tgz     ;;
       Linux/x86_64)   platform=linux-x64;     asset=pdfium-linux-x64.tgz   ;;
       Linux/aarch64)  platform=linux-arm64;   asset=pdfium-linux-arm64.tgz ;;
       *)
@@ -544,6 +541,33 @@ install_pdfium() {
     return 0
   )
   return 0
+}
+
+# ============================================================================
+# Cleanup legacy claudebase-dev plugin + marketplace from prior installs
+# ============================================================================
+# The v0.6 baseline used to register a `claudebase-dev` Claude Code
+# plugin marketplace and install `claudebase@claudebase-dev` as a channel
+# plugin (the "daemon-as-channel-plugin" architecture that v0.7 then
+# removed and that docs/issues/002-channel-surface-not-firing-2.1.144.md
+# documents as broken on CC 2.1.144). The multi-agent-telegram-on-v0.6
+# rebuild uses the OFFICIAL Anthropic `telegram@claude-plugins-official`
+# plugin slot only — server-rs replaces its TSX server via
+# install_telegram_plugin below.
+#
+# This function removes the legacy plugin + marketplace from operators
+# who installed an earlier claudebase version, so the system does not
+# carry dead registrations. Idempotent: if the plugin / marketplace are
+# already absent, the underlying CLI commands no-op gracefully.
+cleanup_legacy_claudebase_plugin() {
+  if ! command -v claude >/dev/null 2>&1; then
+    return 0
+  fi
+  # Uninstall the plugin first; marketplace removal then succeeds without
+  # 'plugin still installed from this source' rejections.
+  claude plugin uninstall claudebase@claudebase-dev >/dev/null 2>&1 || true
+  claude plugin marketplace remove codefather-labs/claudebase >/dev/null 2>&1 || true
+  log_ok "legacy claudebase-dev plugin + marketplace cleaned (idempotent)"
 }
 
 # ============================================================================
@@ -649,52 +673,62 @@ install_whisper_stack() {
 }
 
 # ============================================================================
-# Install Telegram channel bridge wiring (Slice 6 v0.8.0)
+# Install the Rust port of the official Anthropic Telegram plugin.
 # ============================================================================
-# The daemon now owns the single Telegram `getUpdates` poller (one bot -> many CLIs).
-# This function patches the official Telegram plugin's .mcp.json to run the
-# daemon bridge (`claudebase plugin serve`) as the MCP server for the channel.
-# The bridge only relays the daemon's notifications (does not poll), so there
-# is no dual-poll and NFR-TMC-5 is preserved.
+# Strategy (per operator brief — always download from GH release):
+#   1. install the OFFICIAL upstream plugin (telegram@claude-plugins-official)
+#   2. download our pre-built Rust binary from the matching claudebase
+#      release asset (telegram-plugin-rs-<platform>); never cargo-build
+#   3. copy it into the plugin cache as `server-rs` alongside upstream `server.ts`
+#   4. patch `.mcp.json` with a bash toggle that defaults to Rust (server-rs)
+#      and falls back to bun (TSX) if env var TELEGRAM_USE_TSX_SERVER=1 OR
+#      if the Rust binary is missing
 #
-# Best-effort: if `claude` CLI is not on PATH or the plugin install fails,
-# the function logs and returns 0 (does not abort the installer).
+# Skipped (best-effort):
+#   - `claude` CLI not on PATH → log + return 0 (no plugin to patch into)
+#   - CLAUDEBASE_SKIP_TELEGRAM=1 → silent skip (for headless CI)
+#   - download fails → log warn + leave upstream TSX plugin in place; no
+#     cargo-build fallback (operator must wait for a release or build
+#     manually if they want Rust before release artifacts exist)
 #
-# The function is idempotent: re-running rewrites the same .mcp.json.
-# To revert, restore .mcp.json from .mcp.json.upstream-backup, or run
-# `claude plugin install telegram@claude-plugins-official` to restore
-# the upstream version.
-install_telegram_channel_bridge() {
+# Idempotent: re-running re-downloads, recopies, re-patches.
+# Backup of upstream `.mcp.json` is preserved at `.mcp.json.upstream-backup`.
+# ============================================================================
+install_telegram_plugin() {
   if [ "${CLAUDEBASE_SKIP_TELEGRAM:-0}" = "1" ]; then
-    log_info "CLAUDEBASE_SKIP_TELEGRAM=1 — skipping telegram channel bridge wiring"
+    log_info "CLAUDEBASE_SKIP_TELEGRAM=1 — skipping telegram plugin install"
     return 0
   fi
 
   if ! command -v claude >/dev/null 2>&1; then
-    log_info "claude CLI not on PATH; skipping telegram channel bridge setup"
+    log_info "claude CLI not on PATH; skipping telegram plugin install"
     log_info "  to install manually after Claude Code is installed:"
     log_info "    claude plugin install telegram@claude-plugins-official"
-    log_info "    then re-run this installer to wire the bridge"
+    log_info "    then re-run this installer to patch the Rust binary"
     return 0
   fi
 
   # ----- 1. Install official plugin if not already -----
-  log_info "Installing telegram@claude-plugins-official (idempotent)..."
-  if ! claude plugin install telegram@claude-plugins-official 2>&1 | tail -2; then
-    log_warn "telegram plugin install failed; skipping bridge wiring"
-    return 0
+  local marketplace_already=false
+  if claude plugin marketplace list 2>/dev/null | grep -q "claude-plugins-official"; then
+    marketplace_already=true
   fi
+  if [ "$marketplace_already" = false ]; then
+    log_info "Adding marketplace anthropics/claude-plugins-official..."
+    claude plugin marketplace add anthropics/claude-plugins-official 2>&1 | tail -2 || true
+  fi
+  log_info "Installing telegram@claude-plugins-official (idempotent)..."
+  claude plugin install telegram@claude-plugins-official 2>&1 | tail -2 || true
 
   # ----- 2. Locate the installed plugin dir -----
   # Prefer installed_plugins.json (authoritative — points to the currently
-  # ACTIVE version). Fall back to newest-version glob if jq/python3 absent
-  # or manifest unreadable.
+  # ACTIVE version, not whatever orphan dirs leftover in cache). Fall back
+  # to newest-version glob if jq/python3 absent or manifest unreadable.
   local plugin_root="$CLAUDE_DIR/plugins/cache/claude-plugins-official/telegram"
   if [ ! -d "$plugin_root" ]; then
-    log_warn "official telegram plugin not found at $plugin_root after install — skipping bridge wiring"
+    log_warn "official telegram plugin not found at $plugin_root after install — skipping Rust patch"
     return 0
   fi
-
   local plugin_dir=""
   local installed_manifest="$CLAUDE_DIR/plugins/installed_plugins.json"
   if [ -f "$installed_manifest" ]; then
@@ -704,52 +738,104 @@ install_telegram_channel_bridge() {
       plugin_dir=$(python3 -c "import json,sys; d=json.load(open('$installed_manifest')); p=d.get('plugins',{}).get('telegram@claude-plugins-official',[]); print(p[0]['installPath'] if p else '')" 2>/dev/null)
     fi
   fi
-
   if [ -z "$plugin_dir" ] || [ ! -d "$plugin_dir" ]; then
     # Fallback: newest version subdir (semver-sortable).
     local version_dir
     version_dir=$(ls -1 "$plugin_root" 2>/dev/null | sort -V | tail -1)
     if [ -z "$version_dir" ] || [ ! -d "$plugin_root/$version_dir" ]; then
-      log_warn "no version subdir found under $plugin_root — skipping bridge wiring"
+      log_warn "no version subdir found under $plugin_root — skipping Rust patch"
       return 0
     fi
     plugin_dir="$plugin_root/$version_dir"
     log_info "manifest lookup unavailable; falling back to newest-version glob: $plugin_dir"
   fi
-  log_info "wiring daemon bridge at $plugin_dir"
+  log_info "patching plugin at $plugin_dir"
 
-  # ----- 3. Back up upstream .mcp.json and patch with daemon bridge -----
+  # ----- 3. Resolve binary: download from GH release first; fall back to
+  #         cargo build only if download fails (e.g. offline, asset missing
+  #         for this platform, claudebase version with no telegram-plugin-rs
+  #         artifacts yet). Cargo fallback requires `cargo` on PATH AND the
+  #         repo's plugins/telegram-rs/ source tree (present in local-mode
+  #         install or fresh clone). -----
+  local platform=""
+  local exe_ext=""
+  case "$(uname -ms)" in
+    "Darwin arm64")  platform="darwin-arm64"  ;;
+    "Darwin x86_64") platform="darwin-x64"    ;;
+    "Linux x86_64")  platform="linux-x64"     ;;
+    "Linux aarch64") platform="linux-arm64"   ;;
+    MINGW*|MSYS*|CYGWIN*)
+      case "$(uname -m)" in
+        x86_64) platform="windows-x64"; exe_ext=".exe" ;;
+        *)      log_warn "unsupported Windows arch: $(uname -m); skipping telegram-plugin-rs"; return 0 ;;
+      esac
+      ;;
+    *) log_warn "telegram-plugin-rs binary unavailable for $(uname -ms); skipping"; return 0 ;;
+  esac
+
+  local target_bin="$plugin_dir/server-rs${exe_ext}"
+  local url="${RELEASE_BASE}/claudebase-v${CLAUDEBASE_VERSION}/telegram-plugin-rs-${platform}${exe_ext}"
+  local downloaded=false
+  local tmp_download
+  tmp_download="$(mktemp)"
+
+  log_info "downloading telegram-plugin-rs binary from GH release for $platform..."
+  if command -v curl >/dev/null 2>&1; then
+    if curl --proto '=https' --tlsv1.2 -fsSL --max-redirs 5 --max-time 120 "$url" -o "$tmp_download" 2>/dev/null; then
+      downloaded=true
+    fi
+  elif command -v wget >/dev/null 2>&1; then
+    if wget --https-only --secure-protocol=TLSv1_2 --max-redirect=5 --timeout=120 -q -O "$tmp_download" "$url" 2>/dev/null; then
+      downloaded=true
+    fi
+  fi
+
+  if [ "$downloaded" = true ] && [ -s "$tmp_download" ]; then
+    mv "$tmp_download" "$target_bin"
+    chmod 0755 "$target_bin"
+    log_ok "server-rs downloaded ($(wc -c <"$target_bin" | tr -d ' ') bytes) → $target_bin"
+  else
+    rm -f "$tmp_download"
+    log_warn "telegram-plugin-rs download failed for $platform from $url"
+    log_warn "  the upstream TSX plugin will run unchanged via bun"
+    log_warn "  to force a build from source locally: cargo build --release -p telegram-plugin-rs"
+    log_warn "  then copy target/release/telegram-plugin-rs${exe_ext} → $target_bin"
+    return 0
+  fi
+
+  # ----- 5. Patch .mcp.json with toggle (backup upstream version first) -----
   local mcp_json="$plugin_dir/.mcp.json"
   local mcp_backup="$plugin_dir/.mcp.json.upstream-backup"
-
   if [ -f "$mcp_json" ] && [ ! -f "$mcp_backup" ]; then
     cp "$mcp_json" "$mcp_backup"
     log_ok ".mcp.json.upstream-backup preserved"
   fi
-
-  # Write .mcp.json to run the daemon bridge as the MCP server for the
-  # telegram channel. The bridge relays the daemon (does not poll), so
-  # there is no dual-poll and NFR-TMC-5 is preserved.
-  cat > "$mcp_json" <<'EOF'
+  # multi-agent-telegram-on-v0.6 architecture decision (operator
+  # 2026-06-03): TG comms via daemon. Plugin slot wired to
+  # `claudebase plugin serve` (the daemon-bridge from
+  # src/plugin/bridge.rs) instead of `server-rs` (standalone TG
+  # poller). Daemon owns the bot connection; bridge subscribes to the
+  # daemon's chat bus and forwards notifications/claude/channel frames
+  # to CC's stdin → input stream. server-rs is left in the plugin dir
+  # but unused (backward-compat fallback — restore the upstream
+  # backup or hand-edit .mcp.json to revert if needed).
+  local claudebase_bin="$CLAUDE_DIR/tools/claudebase/claudebase"
+  cat > "$mcp_json" <<EOF
 {
   "mcpServers": {
     "telegram": {
-      "command": "${HOME}/.claude/tools/claudebase/claudebase",
+      "command": "$claudebase_bin",
       "args": ["plugin", "serve"]
     }
   }
 }
 EOF
   chmod 0644 "$mcp_json"
-  log_ok ".mcp.json patched (daemon bridge relays the daemon poller, no dual-poll)"
+  log_ok ".mcp.json patched (wired to claudebase daemon-bridge — daemon owns TG inbound)"
 
   log_info "to enable: launch Claude Code with"
   log_info "  claude --channels plugin:telegram@claude-plugins-official"
-  log_info "or use the shorthand:"
-  log_info "  claudebase run"
-  log_info "to revert: restore .mcp.json from .mcp.json.upstream-backup, or"
-  log_info "  claude plugin install telegram@claude-plugins-official"
-  return 0
+  log_info "Rust binary stderr → /tmp/telegram-rs.log"
 }
 
 # ============================================================================
@@ -765,7 +851,7 @@ echo "    tools/claudebase/   (binary + pdfium + e5 model)"
 echo "    rules/              (4 files — cognitive-self-check, knowledge-base, knowledge-base-tool, tool-limitations)"
 echo "    commands/           (4 files — knowledge-ingest, reflect, consolidate, update-claudebase)"
 echo "    agents/             (2 files — reflection, consolidator)"
-echo "    hooks/              (1 hook — UserPromptSubmit[self-check + insight-capture])"
+echo "    hooks/              (2 hooks — Stop[insight-capture] + UserPromptSubmit[self-check])"
 echo ""
 
 if ! confirm "Proceed with installation?"; then
@@ -778,25 +864,52 @@ install_prompts
 install_binary
 register_alias
 register_bash_allowlist
-install_claudebase_hooks
 install_pdfium
 install_whisper_stack
 preload_encoder
-install_telegram_channel_bridge
+cleanup_legacy_claudebase_plugin
+install_telegram_plugin
 
 # ============================================================================
-# Optional post-install daemon hook (Slice 2 — STRUCTURAL-2-3)
+# Post-install daemon-as-service (default-on, idempotent full lifecycle)
 # ============================================================================
-# Opt-in via `CLAUDEBASE_INSTALL_DAEMON=1`. Fails soft: the post-install
-# step never aborts the installer when it errors. `--no-start` keeps the
-# install pre-reboot — the service comes up on the next login (systemd
-# user unit + WantedBy=default.target).
-if [ "${CLAUDEBASE_INSTALL_DAEMON:-0}" = "1" ]; then
-  log_info "CLAUDEBASE_INSTALL_DAEMON=1 detected; installing daemon service unit..."
-  if claudebase daemon install --no-start --yes; then
-    log_ok "Daemon service unit installed (start at next login or via 'claudebase daemon start')"
+# Always-on by default: replace any existing daemon service unit with the
+# fresh one and start it. Opt-out via `CLAUDEBASE_SKIP_DAEMON=1`.
+#
+# launchd (macOS) and systemd-user (Linux) both run user-scope — no root
+# required. The 'stop || true / uninstall || true' prelude makes the
+# whole block idempotent even on a fresh box where there's no existing
+# service to stop or uninstall.
+#
+# Linux: systemd user units only auto-start when the user is logged in
+# OR `loginctl enable-linger $USER` has been run. We surface that hint
+# but do not auto-enable linger (would change system PAM state).
+if [ "${CLAUDEBASE_SKIP_DAEMON:-0}" = "1" ]; then
+  log_info "CLAUDEBASE_SKIP_DAEMON=1 — skipping daemon service install"
+else
+  log_info "Installing claudebase daemon as user service (idempotent)..."
+  # Stop and uninstall any prior service before reinstalling the plist.
+  # CRITICAL: --keep-data. A bare `daemon uninstall --yes` FULL-WIPES the
+  # operator's bot token (secrets.toml), daemon config (daemon.toml) AND
+  # chat history (chat.db) — running that inside the installer means every
+  # upgrade silently destroys the user's setup. An install/upgrade MUST be
+  # non-destructive, so we keep data and only swap the service definition.
+  # Silenced + '|| true' so a clean box with no prior service still works.
+  claudebase daemon stop >/dev/null 2>&1 || true
+  claudebase daemon uninstall --yes --keep-data >/dev/null 2>&1 || true
+  if claudebase daemon install --yes >/dev/null 2>&1; then
+    if claudebase daemon start; then
+      log_ok "Daemon installed and started (auto-starts on next user session)"
+      if [ "$(uname -s)" = "Linux" ]; then
+        log_info "  Tip (Linux): for boot-time start without login, run once:"
+        log_info "    loginctl enable-linger \"$USER\""
+      fi
+    else
+      log_warn "Daemon installed but failed to start. Try 'claudebase daemon start' manually."
+    fi
   else
-    log_warn "Daemon install failed; continuing without daemon (re-run later with 'claudebase daemon install')"
+    log_warn "Daemon install failed; continuing without daemon."
+    log_warn "  Re-run later: claudebase daemon install && claudebase daemon start"
   fi
 fi
 

@@ -1,0 +1,24 @@
+# Slice 0b spike — whisper-rs cross-platform build verification subcrate.
+#
+# Standalone Cargo project (NOT added to claudebase's workspace — claudebase's
+# root Cargo.toml has no `[workspace]` section, so this subdir is correctly
+# isolated). Exists solely to validate that `whisper-rs ~0.13` compiles
+# cleanly on linux-x64, macos-arm64, and windows-x64 via each platform's
+# CMake + clang toolchain.
+#
+# DO NOT depend on this crate from production code. Delete after Slice 6-MVP
+# (agent-chat-daemon ASR feature) ships and the dep is in claudebase's main
+# Cargo.toml under a feature flag.
+
+[package]
+name = "whisper-build-test"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+whisper-rs = "0.13"
+
+[[bin]]
+name = "whisper-build-test"
+path = "src/main.rs"

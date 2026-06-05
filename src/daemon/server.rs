@@ -126,7 +126,13 @@ fn reap_on_boot_stub() -> anyhow::Result<()> {
     // chat.db lives under ~/.claude/knowledge/ — independent of the
     // daemon runtime dir. Best-effort: if HOME is unset (extremely
     // unusual), skip rather than fail daemon startup.
-    let home = match std::env::var_os("HOME") {
+    // HOME fallback to USERPROFILE matches store.rs:1493 chat.db path
+    // discipline so reap_on_boot_stub on Windows targets the same file
+    // store.rs writes to (rather than silently no-op'ing when only
+    // USERPROFILE is set, as it did pre 2026-06-04).
+    let home = match std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+    {
         Some(h) => h,
         None => return Ok(()),
     };
@@ -159,13 +165,6 @@ fn reap_on_boot_stub() -> anyhow::Result<()> {
         // Don't return — the agent_registry probe is independent and may
         // still succeed; the daemon as a whole should not refuse to start
         // because schema-application hiccupped.
-    }
-
-    // telegram-multi-cli Slice 1: evict stale tg_message_map rows
-    // (30-day TTL) and expired pending_questions at startup. Non-fatal —
-    // a failed purge leaves stale rows but must not block daemon boot.
-    if let Err(e) = chat::purge_expired_chat_state(&conn) {
-        tracing::warn!(error = %e, "chat startup TTL purge failed (non-fatal)");
     }
 
     // Probe sqlite_master rather than catching a "no such table" error —
@@ -298,31 +297,6 @@ pub async fn serve(_args: &DaemonServeArgs) -> anyhow::Result<()> {
 
     // Reap-on-boot stub (Slice 1a — no-op until Slice 5 adds agent_registry).
     reap_on_boot_stub()?;
-
-    // Slice 4 — Migrate legacy access.json (File A at ~/.config/claudebase/access.json)
-    // to the canonical channel state file (File B at ~/.claude/channels/claudebase/access.json).
-    // This is a one-shot migration for operators with existing grants in the old location.
-    // Non-fatal: migration errors are logged as warnings; the daemon starts regardless
-    // (fail-open to daemon-functional, fail-closed to access-unchanged).
-    let legacy_access_path = config::user_level_config_dir().join("access.json");
-    match channel_state::migrate_from_legacy_access(&legacy_access_path, &channel_state::access_json_path()) {
-        Ok(outcome) => {
-            if outcome != channel_state::MigrationOutcome::NoOpAbsent && outcome != channel_state::MigrationOutcome::NoOpAlreadyMigrated {
-                tracing::info!(
-                    outcome = %outcome,
-                    legacy_path = %legacy_access_path.display(),
-                    canonical_path = %channel_state::access_json_path().display(),
-                    "access.json migration complete"
-                );
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "access.json migration failed (non-fatal); daemon continuing with current access.json state"
-            );
-        }
-    }
 
     // Best-effort: remove any stale socket file before bind. The
     // interprocess crate does NOT auto-unlink on Unix when the previous
@@ -463,44 +437,9 @@ pub async fn serve(_args: &DaemonServeArgs) -> anyhow::Result<()> {
             }
         };
 
-        // telegram-multi-cli Slice 6 — gate the daemon poller behind
-        // `[telegram] enabled`. This is the cutover/revert switch: the daemon
-        // poller and the legacy per-cli plugin share ONE getUpdates slot per
-        // bot token, so the operator reverts to the plugin path by setting
-        // `enabled=false` here. Default is `true` (cutover-on-by-default); the
-        // 409 conflict gate in telegram.rs makes a dual-poll situation loud
-        // but safe rather than requiring opt-in. A missing OR malformed
-        // daemon.toml falls back to the `true` default — a config read error
-        // must NOT silently kill Telegram (that would be a worse failure than
-        // the loud-409 path the conflict gate handles).
-        let telegram_enabled: bool = {
-            let toml_path = crate::daemon::config::user_level_daemon_toml_path();
-            if toml_path.exists() {
-                match crate::daemon::config::load_daemon_toml(&toml_path) {
-                    Ok(cfg) => cfg.telegram.enabled,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "daemon.toml load failed in serve(); defaulting [telegram] enabled=true"
-                        );
-                        true
-                    }
-                }
-            } else {
-                true
-            }
-        };
-
-        if telegram_enabled {
-            let _ =
-                crate::daemon::telegram::spawn_long_poll(token, bus_for_tg, asr_opt);
-            tracing::info!("telegram long-poll spawned");
-        } else {
-            tracing::info!(
-                "telegram daemon poller disabled via [telegram] enabled=false — not starting \
-                 getUpdates loop (legacy plugin path remains active if installed)"
-            );
-        }
+        let _ =
+            crate::daemon::telegram::spawn_long_poll(token, bus_for_tg, asr_opt);
+        tracing::info!("telegram long-poll spawned");
     }
 
     // Accept loop. We never return Ok(()) from here in Slice 1a — the
@@ -753,18 +692,6 @@ where
                     .await;
                     let _ = outbound_tx.send(resp);
                 }
-                "chat_ask" => {
-                    // telegram-multi-cli Slice 5 — render a plan-mode
-                    // questionnaire as Telegram inline buttons. Validates +
-                    // inserts the durable pending_questions row + enqueues the
-                    // keyboard send, then returns {"question_id": ...}
-                    // IMMEDIATELY (async ruling A). The ANSWER arrives later,
-                    // out-of-band, via the telegram callback_query path which
-                    // broadcasts to this CLI's thread with
-                    // meta.target_agent_id = the requesting agent.
-                    let resp = handle_chat_ask(echo_id, &args).await;
-                    let _ = outbound_tx.send(resp);
-                }
                 "chat_list" => {
                     let resp = handle_chat_list(echo_id, &args).await;
                     let _ = outbound_tx.send(resp);
@@ -787,6 +714,14 @@ where
                 }
                 "agent_reap" => {
                     let resp = handle_agent_reap(echo_id, &args).await;
+                    let _ = outbound_tx.send(resp);
+                }
+                "chat_ask" => {
+                    let resp = handle_chat_ask(echo_id, &args, connection_id).await;
+                    let _ = outbound_tx.send(resp);
+                }
+                "chat_list_pending_asks" => {
+                    let resp = handle_chat_list_pending_asks(echo_id, &args).await;
                     let _ = outbound_tx.send(resp);
                 }
                 _ => {
@@ -849,13 +784,14 @@ fn build_tools_list_response(id: serde_json::Value) -> serde_json::Value {
                 },
                 {
                     "name": "chat_reply",
-                    "description": "Reply to a message in a chat thread",
+                    "description": "Reply to a message in a chat thread. For Telegram threads (telegram:<chat_id>), pass message_thread_id (echoed verbatim from the inbound <channel ... thread_id=...> meta) so the reply lands in the correct forum topic; omit it for DM / topic-less group inbound.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "thread": {"type": "string"},
                             "content": {"type": "string"},
-                            "reply_to": {"type": ["string", "null"]}
+                            "reply_to": {"type": ["string", "null"]},
+                            "message_thread_id": {"type": ["string", "null"]}
                         },
                         "required": ["thread", "content"]
                     }
@@ -871,42 +807,6 @@ fn build_tools_list_response(id: serde_json::Value) -> serde_json::Value {
                             "limit": {"type": ["integer", "null"]}
                         },
                         "required": ["thread"]
-                    }
-                },
-                {
-                    "name": "chat_ask",
-                    "description": "Ask a Telegram DM operator a multiple-choice question, rendered as inline-keyboard buttons. ASYNC: returns a question_id immediately; the operator's tapped answer arrives later as an out-of-band channel notification (content {type:'chat_ask_answer', question_id, index, label}) targeted at the asking agent. The pending question is durable (survives a daemon restart) with a 1-hour TTL — if no answer arrives before the TTL lapses the question expires and you must call chat_ask again. DM-ONLY in v1: thread must be a telegram:<chat_id> DM (positive chat_id); group chats (negative chat_id) are rejected. Provide at least 2 options.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "thread": {
-                                "type": "string",
-                                "description": "telegram:<chat_id> DM thread (positive chat_id only)"
-                            },
-                            "question": {
-                                "type": "string",
-                                "description": "The question text shown above the buttons"
-                            },
-                            "from": {
-                                "type": "string",
-                                "description": "The asking agent's agent_id — the answer is routed back to this agent; it must be an alive registered agent at tap time"
-                            },
-                            "options": {
-                                "type": "array",
-                                "minItems": 2,
-                                "maxItems": crate::daemon::telegram::MAX_CHAT_ASK_OPTIONS,
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "label": {"type": "string"},
-                                        "description": {"type": ["string", "null"]}
-                                    },
-                                    "required": ["label"]
-                                },
-                                "description": "Between 2 and 10 answer options; each rendered as one inline button"
-                            }
-                        },
-                        "required": ["thread", "question", "options"]
                     }
                 },
                 {
@@ -959,6 +859,42 @@ fn build_tools_list_response(id: serde_json::Value) -> serde_json::Value {
                         "type": "object",
                         "properties": {
                             "older_than_secs": {"type": ["integer", "null"]}
+                        }
+                    }
+                },
+                {
+                    "name": "chat_ask",
+                    "description": "Present a multi-option question to the operator via Telegram inline keyboard. Returns {ask_id, status: \"pending\"}; the operator's tap arrives later as a separate <channel> event with meta.is_callback_response=true and meta.ask_id matching the returned id. Use when Mira needs operator approval / single-select decision (e.g. plan-mode approval, AskUserQuestion-style choice). Pass multi=true for multi-select with toggleable ✓ markers + Done button. Telegram limits callback_data to 64 bytes total — single-select option `value` <= 27 bytes (overhead = 36-byte UUID + ':'); multi-select option `value` <= 20 bytes (overhead = 36 + ':toggle:'). Server rejects overflow with -32602.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "thread": {"type": "string", "description": "Target Telegram thread, e.g. telegram:8791871989"},
+                            "question": {"type": "string"},
+                            "options": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": {"type": "string"},
+                                        "value": {"type": "string"}
+                                    },
+                                    "required": ["label", "value"]
+                                }
+                            },
+                            "multi": {"type": "boolean", "description": "false=single-select (any tap finalizes), true=multi-select with Done button"},
+                            "message_thread_id": {"type": ["string", "null"], "description": "Forum topic id when posting into a group topic; omit for DM / main-thread groups"}
+                        },
+                        "required": ["thread", "question", "options"]
+                    }
+                },
+                {
+                    "name": "chat_list_pending_asks",
+                    "description": "List open chat_ask questions awaiting operator response. Read-only debug surface. Optionally filter by agent_id (default: all) or thread (telegram:<chat_id>).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "agent_id": {"type": ["string", "null"]},
+                            "thread": {"type": ["string", "null"]}
                         }
                     }
                 }
@@ -1030,15 +966,22 @@ async fn handle_chat_post(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    // Slice 3 of multi-agent-telegram-on-v0.6 — optional Telegram
+    // forum-topic id echoed back from the inbound <channel ...
+    // thread_id="..."> meta. Parsed as string-on-wire per the v0.6
+    // ID-as-string discipline; widened to i64 for the OUTBOUND_TG
+    // mpsc tuple. Invalid / non-positive strings silently degrade to
+    // None (the outbound lands in the main thread / DM) so a buggy CLI
+    // can never collide with the COALESCE(-1) routing sentinel.
+    let outbound_thread_id: Option<i64> = args
+        .get("message_thread_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|n| *n > 0);
+
     if thread.is_empty() {
         return (tool_error_response(id, -32602, "thread is required"), None);
     }
-
-    // Clone the sender identity for the outbound-TG path BEFORE `from_agent`
-    // is moved into the spawn_blocking closure below. Slice 4 records this
-    // into tg_message_map so an operator replying to this CLI's Telegram
-    // message routes back to it (reply-quote, Slice 2 step 2).
-    let from_agent_outbound = from_agent.clone();
 
     let persisted = tokio::task::spawn_blocking(move || -> anyhow::Result<chat::ChatMessage> {
         let conn = chat::open_chat_db()?;
@@ -1091,14 +1034,23 @@ async fn handle_chat_post(
         if let Some(rest) = msg.thread_id.strip_prefix("telegram:") {
             match rest.parse::<i64>() {
                 Ok(chat_id) => {
-                    match crate::daemon::telegram::enqueue_outbound_tg_with_sender(
+                    // Guaranteed-delivery 2026-06-05: pass msg.id so the
+                    // long-poll send loop marks chat_messages.delivered_at
+                    // on successful TG send. A daemon crash between enqueue
+                    // and send leaves delivered_at=NULL; on next startup
+                    // `drain_pending_outbound_tg` re-enqueues the row.
+                    // Routing-key state (which agent is /switch-bound) is
+                    // intentionally NOT considered — outbound is unconditional.
+                    match crate::daemon::telegram::enqueue_outbound_tg_tracked(
                         chat_id,
+                        outbound_thread_id,
                         msg.content.clone(),
-                        Some(from_agent_outbound.clone()),
+                        Some(msg.id.clone()),
                     ) {
                         Ok(_) => tracing::info!(
                             chat_id,
                             thread = %msg.thread_id,
+                            outbound_thread_id = ?outbound_thread_id,
                             "chat_reply queued for telegram outbound"
                         ),
                         Err(e) => tracing::warn!(
@@ -1123,117 +1075,6 @@ async fn handle_chat_post(
         tool_text_response(id, &response_payload),
         Some((thread_id, notif)),
     )
-}
-
-/// telegram-multi-cli Slice 5 — handle the `chat_ask` MCP tool.
-///
-/// Renders a multiple-choice question as Telegram inline-keyboard buttons.
-/// The async ASK is decoupled from the answer (ruling A): this handler
-/// validates, inserts the durable `pending_questions` row, enqueues the
-/// `sendMessage` (with the inline keyboard), and returns `{"question_id": ...}`
-/// to the agent IMMEDIATELY. The operator's button tap arrives later as a
-/// `callback_query` update in the telegram long-poll loop, which broadcasts
-/// the chosen option to this CLI's thread (`meta.target_agent_id`).
-///
-/// SECURITY / F-4: the DM-only gate (chat_id < 0 → error, NO side-effects) and
-/// the callback_data ≤ 64-byte guard live in `telegram::handle_chat_ask_inner`,
-/// the pure synchronous core unit-tested directly. This async wrapper does the
-/// spawn_blocking DB write (durability BEFORE the Telegram send) + the outbound
-/// enqueue.
-async fn handle_chat_ask(
-    id: serde_json::Value,
-    args: &serde_json::Value,
-) -> serde_json::Value {
-    let thread = args
-        .get("thread")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let question = args
-        .get("question")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    // `from` carries the requesting CLI's agent_id (same convention as
-    // chat_post). It is the routing key the callback path uses to deliver the
-    // answer back (meta.target_agent_id), and the liveness key for SECURITY
-    // step 4 (is_alive). Default to "unknown" — a chat_ask whose `from` never
-    // becomes alive simply has its answer dropped at tap time (TC-TMC-14.3).
-    let from_agent = args
-        .get("from")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-    let options: Vec<serde_json::Value> = args
-        .get("options")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    if thread.is_empty() {
-        return tool_error_response(id, -32602, "thread is required");
-    }
-    if question.is_empty() {
-        return tool_error_response(id, -32602, "question is required");
-    }
-
-    // Validate + durable INSERT inside spawn_blocking (no Connection across an
-    // .await). handle_chat_ask_inner runs the F-4 gate + minItems + ≤64-byte
-    // checks and returns either the outcome (row already inserted) or a typed
-    // error — none of which touch Telegram.
-    let inner = tokio::task::spawn_blocking(
-        move || -> anyhow::Result<std::result::Result<crate::daemon::telegram::ChatAskOutcome, crate::daemon::telegram::ChatAskError>> {
-            let conn = chat::open_chat_db()?;
-            crate::daemon::telegram::handle_chat_ask_inner(
-                &conn,
-                &thread,
-                &question,
-                &from_agent,
-                &options,
-            )
-        },
-    )
-    .await;
-
-    let outcome = match inner {
-        Ok(Ok(Ok(o))) => o,
-        Ok(Ok(Err(e))) => {
-            // Validation / gate rejection (TC-TMC-13.4/13.5, F-4 group-chat,
-            // TC-TMC-S3 oversized). NO Telegram message was sent and (for the
-            // gate cases) NO pending_questions row was written — the inner
-            // function returns BEFORE the INSERT on every error.
-            return tool_error_response(id, -32602, &e.message());
-        }
-        Ok(Err(e)) => {
-            tracing::error!(error = %e, "chat_ask inner failed");
-            return tool_error_response(id, -32603, "persist failed");
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "chat_ask spawn_blocking panicked");
-            return tool_error_response(id, -32603, "internal error");
-        }
-    };
-
-    // Enqueue the outbound sendMessage with the inline keyboard. The row is
-    // already durable (inserted above) so even if the enqueue fails (telegram
-    // task not running) the answer-routing state survives — the operator just
-    // won't see buttons until a resend. We log but do not fail the MCP call.
-    if let Err(e) = crate::daemon::telegram::enqueue_outbound_tg_with_keyboard(
-        outcome.chat_id,
-        outcome.question_text.clone(),
-        outcome.buttons.clone(),
-    ) {
-        tracing::warn!(
-            chat_id = outcome.chat_id,
-            error = %e,
-            "chat_ask keyboard enqueue failed (pending_questions row still durable)"
-        );
-    }
-
-    // Async ruling A — return the question_id immediately; the answer arrives
-    // later via the callback_query path.
-    let payload = serde_json::json!({ "question_id": outcome.question_id });
-    tool_text_response(id, &payload)
 }
 
 /// Handle `chat_subscribe`. Spawns a forwarding task that pumps the
@@ -1585,6 +1426,253 @@ async fn handle_agent_reap(
         Ok(Err(e)) => tool_error_response(id, -32603, &e.to_string()),
         Err(e) => {
             tracing::error!(error = %e, "agent_reap spawn_blocking panicked");
+            tool_error_response(id, -32603, "internal error")
+        }
+    }
+}
+
+/// Slice 8 — `chat_ask` MCP tool handler. Validates input, generates an
+/// unguessable ask_id (uuid v4), enforces the FR-MAT-11.9 callback_data
+/// 64-byte budget, enqueues the keyboard outbound, AWAITS the send round-
+/// trip via the per-call oneshot, and (on success) INSERTs the
+/// `pending_asks` row with the captured Telegram message_id. Send-then-
+/// insert ordering per architect AR-1 — failed sends NEVER leave orphan
+/// rows. Returns `{ask_id, status: "pending"}` on success; -32602 on
+/// schema/budget violation; -32603 on send/IO failure.
+async fn handle_chat_ask(
+    id: serde_json::Value,
+    args: &serde_json::Value,
+    connection_id: Uuid,
+) -> serde_json::Value {
+    use crate::daemon::pending_asks;
+    use crate::daemon::telegram::enqueue_outbound_tg_keyboard;
+
+    let thread = args.get("thread").and_then(|v| v.as_str()).unwrap_or("");
+    let question = args
+        .get("question")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let multi = args
+        .get("multi")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let options_value = args.get("options").cloned().unwrap_or(serde_json::Value::Null);
+    let message_thread_id_str = args
+        .get("message_thread_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    if !thread.starts_with("telegram:") {
+        return tool_error_response(id, -32602, "thread must start with 'telegram:'");
+    }
+    let chat_id_str = thread.trim_start_matches("telegram:");
+    let chat_id: i64 = match chat_id_str.parse() {
+        Ok(n) => n,
+        Err(_) => return tool_error_response(id, -32602, "thread chat_id must be integer"),
+    };
+    if question.trim().is_empty() {
+        return tool_error_response(id, -32602, "question must be non-empty");
+    }
+    let options_arr = match options_value.as_array() {
+        Some(a) if !a.is_empty() && a.len() <= 8 => a.clone(),
+        Some(_) => {
+            return tool_error_response(id, -32602, "options must be a non-empty array of up to 8 entries")
+        }
+        None => return tool_error_response(id, -32602, "options must be an array"),
+    };
+
+    let mut pairs: Vec<(String, String)> = Vec::with_capacity(options_arr.len());
+    let mut seen_values = std::collections::HashSet::new();
+    for entry in &options_arr {
+        let label = match entry.get("label").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return tool_error_response(id, -32602, "each option needs a non-empty 'label'"),
+        };
+        let value = match entry.get("value").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return tool_error_response(id, -32602, "each option needs a non-empty 'value'"),
+        };
+        if !seen_values.insert(value.clone()) {
+            return tool_error_response(id, -32602, "option values must be unique");
+        }
+        pairs.push((label, value));
+    }
+
+    let ask_id = Uuid::new_v4().to_string();
+    if let Err(e) =
+        pending_asks::validate_callback_data_budget(ask_id.len(), multi, &pairs)
+    {
+        return tool_error_response(id, -32602, &e.to_string());
+    }
+
+    let cid_str = connection_id.to_string();
+    let agent_id_lookup = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        let conn = crate::daemon::chat::open_chat_db()?;
+        let row: Option<String> = conn
+            .query_row(
+                "SELECT agent_id FROM agent_registry WHERE connection_id=?1 AND state='alive' LIMIT 1",
+                rusqlite::params![cid_str],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(row)
+    })
+    .await;
+    let requesting_agent_id = match agent_id_lookup {
+        Ok(Ok(Some(s))) => s,
+        Ok(Ok(None)) => {
+            return tool_error_response(
+                id,
+                -32603,
+                "no alive agent_registry row for this connection — call agent_register first",
+            );
+        }
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "chat_ask agent_id lookup failed");
+            return tool_error_response(id, -32603, "registry lookup failed");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "chat_ask spawn_blocking panicked");
+            return tool_error_response(id, -32603, "internal error");
+        }
+    };
+
+    let buttons: Vec<(String, String)> = pairs
+        .iter()
+        .map(|(label, value)| {
+            let data = if multi {
+                format!("{}:toggle:{}", ask_id, value)
+            } else {
+                format!("{}:{}", ask_id, value)
+            };
+            (label.clone(), data)
+        })
+        .collect();
+
+    let message_thread_id_i64 =
+        message_thread_id_str.as_deref().and_then(|s| s.parse::<i64>().ok());
+
+    let ack_rx = match enqueue_outbound_tg_keyboard(
+        chat_id,
+        message_thread_id_i64,
+        question.to_string(),
+        buttons,
+    ) {
+        Ok(rx) => rx,
+        Err(e) => {
+            tracing::warn!(error = %e, "chat_ask enqueue failed");
+            return tool_error_response(id, -32603, "telegram outbound not initialised");
+        }
+    };
+
+    let message_id = match ack_rx.await {
+        Ok(Ok(mid)) => mid,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "chat_ask send failed");
+            return tool_error_response(id, -32603, &format!("telegram send failed: {}", e));
+        }
+        Err(_) => {
+            tracing::warn!("chat_ask ack channel dropped");
+            return tool_error_response(id, -32603, "telegram send ack lost");
+        }
+    };
+
+    let now = crate::daemon::chat::now_millis();
+    let ask = pending_asks::PendingAsk {
+        ask_id: ask_id.clone(),
+        chat_id,
+        message_thread_id: message_thread_id_i64,
+        message_id,
+        requesting_agent_id,
+        question: question.to_string(),
+        options_json: serde_json::to_string(&options_arr).unwrap_or_else(|_| "[]".to_string()),
+        multi,
+        selected_values_json: None,
+        created_at: now,
+        expires_at: now + pending_asks::DEFAULT_TTL_MS,
+    };
+    let insert_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let conn = crate::daemon::chat::open_chat_db()?;
+        pending_asks::insert_pending(&conn, &ask)?;
+        Ok(())
+    })
+    .await;
+    match insert_result {
+        Ok(Ok(())) => {
+            let payload = serde_json::json!({"ask_id": ask_id, "status": "pending"});
+            tool_text_response(id, &payload)
+        }
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "chat_ask insert_pending failed");
+            tool_error_response(id, -32603, "pending_asks insert failed")
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "chat_ask insert spawn_blocking panicked");
+            tool_error_response(id, -32603, "internal error")
+        }
+    }
+}
+
+/// Slice 8c — read-only debug surface listing open chat_asks.
+async fn handle_chat_list_pending_asks(
+    id: serde_json::Value,
+    args: &serde_json::Value,
+) -> serde_json::Value {
+    let agent_id_filter = args
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let chat_id_filter = match args.get("thread").and_then(|v| v.as_str()) {
+        None => None,
+        Some(t) if t.starts_with("telegram:") => match t
+            .trim_start_matches("telegram:")
+            .parse::<i64>()
+        {
+            Ok(n) => Some(n),
+            Err(_) => return tool_error_response(id, -32602, "malformed thread"),
+        },
+        Some(_) => return tool_error_response(id, -32602, "thread must start with 'telegram:'"),
+    };
+
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn = crate::daemon::chat::open_chat_db()?;
+        let now = crate::daemon::chat::now_millis();
+        let rows = crate::daemon::pending_asks::list_open(
+            &conn,
+            now,
+            agent_id_filter.as_deref(),
+            chat_id_filter,
+        )?;
+        let json_rows: Vec<serde_json::Value> = rows
+            .into_iter()
+            .map(|r| {
+                let options =
+                    serde_json::from_str::<serde_json::Value>(&r.options_json).unwrap_or_default();
+                serde_json::json!({
+                    "ask_id": r.ask_id,
+                    "chat_id": r.chat_id.to_string(),
+                    "message_thread_id": r.message_thread_id.map(|x| x.to_string()),
+                    "requesting_agent_id": r.requesting_agent_id,
+                    "question": r.question,
+                    "options": options,
+                    "multi": r.multi,
+                    "created_at": r.created_at,
+                    "expires_at": r.expires_at,
+                })
+            })
+            .collect();
+        Ok(json_rows)
+    })
+    .await;
+    match result {
+        Ok(Ok(rows)) => tool_text_response(id, &serde_json::json!({"asks": rows})),
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "chat_list_pending_asks failed");
+            tool_error_response(id, -32603, "list failed")
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "chat_list_pending_asks spawn_blocking panicked");
             tool_error_response(id, -32603, "internal error")
         }
     }

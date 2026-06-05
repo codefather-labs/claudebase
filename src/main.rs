@@ -128,10 +128,6 @@ fn main() -> std::process::ExitCode {
                 cli::DaemonConfigSubcommand::Edit(a) => run_daemon_config_edit(&a),
                 cli::DaemonConfigSubcommand::Show(a) => run_daemon_config_show(&a),
             },
-            cli::DaemonSubcommand::Access(access_args) => match access_args.sub {
-                cli::DaemonAccessSubcommand::Pair(a) => run_daemon_access_pair(&a),
-                cli::DaemonAccessSubcommand::List(a) => run_daemon_access_list(&a),
-            },
             cli::DaemonSubcommand::Doctor(a) => run_daemon_doctor(&a),
             cli::DaemonSubcommand::Warmup(a) => run_daemon_warmup(&a),
             cli::DaemonSubcommand::Install(a) => run_daemon_install(&a),
@@ -186,10 +182,43 @@ fn run_claude_with_preset(args: &cli::RunArgs) -> std::process::ExitCode {
         }
     };
 
+    // Ensure daemon is alive BEFORE spawning claude so the plugin bridge's
+    // first handshake sees a real tools/list. Skipped when --no-telegram
+    // (plain claude, no MCP plugin slot needed). Best-effort: a timeout
+    // here does NOT block claude startup — the bridge falls back to
+    // daemon-down mode and emits tools/list_changed on reconnect.
+    //
+    // Pipe-probe (not SCM query) so we are immune to the v0.6 Windows
+    // service::status() lying-success bug — see ensure_daemon_running.
+    if !args.no_telegram {
+        ensure_daemon_running();
+        // Ensure <cwd>/.claudebase/config.json exists so the plugin
+        // bridge (spawned later by CC) finds a stable per-project
+        // session_id when it auto-registers. The bridge READS this
+        // file but never CREATES it — only `claudebase run` does, so
+        // a CC session launched from a non-project cwd (e.g. desktop
+        // shortcut) silently falls back to cwd-basename / UUID per
+        // bridge::derive_agent_id. Per-project persistence makes
+        // /switch <id> stable across CC restarts from the same dir.
+        ensure_project_config();
+    }
+
     let mut argv: Vec<OsString> = vec![claude_path.clone().into()];
     if !args.no_telegram {
         argv.push("--channels".into());
         argv.push("plugin:telegram@claude-plugins-official".into());
+    }
+    // Operator-requested default-on bypass of Claude Code permission prompts
+    // (multi-agent-telegram-on-v0.6 side-quest, scope-creep on plan v4 R3a
+    // from the v0.9 fleet plan — operator wants this now for ergonomics).
+    // Verified flag name against `claude --help` this session:
+    // `--dangerously-skip-permissions  Bypass all permission checks.`
+    // SECURITY TRADE-OFF: a prompt-injected channel notification reaching a
+    // skip-permissions CLI has higher blast radius than a normal session.
+    // Acceptable for the operator's single-user setup but worth re-evaluating
+    // before multi-user rollout (mirror of the v0.9 plan's red-team flag).
+    if !args.no_skip_permissions {
+        argv.push("--dangerously-skip-permissions".into());
     }
     for a in &args.args {
         argv.push(OsString::from(a));
@@ -229,6 +258,96 @@ fn run_claude_with_preset(args: &cli::RunArgs) -> std::process::ExitCode {
                 std::process::ExitCode::from(126)
             }
         }
+    }
+}
+
+/// Pipe-probe liveness check for the daemon. Returns true when a blocking
+/// connect to the UDS / named-pipe path succeeds. Does NOT rely on
+/// `service::status()` (SCM-only on Windows; blind to `daemon serve`
+/// processes started outside the service manager — the v0.6 lying-success
+/// bug operator hit on 2026-06-03).
+fn is_daemon_alive() -> bool {
+    use interprocess::local_socket::{prelude::*, GenericFilePath, Stream, ToFsName};
+    let path = match claudebase::daemon::server::socket_path() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let name = match path.to_fs_name::<GenericFilePath>() {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    Stream::connect(name).is_ok()
+}
+
+/// Spawn `<current_exe> daemon serve` as a detached background process.
+/// Delegate to the canonical helper in `claudebase::daemon::service` so
+/// the CLI's `claudebase daemon start` (Windows platform module) and
+/// `claudebase run`'s auto-spawn produce semantically identical daemon
+/// processes (same log file, same HOME env injection, same detached
+/// flags). Slice 6 followup 2026-06-04 moved the body to service.rs.
+fn spawn_daemon_detached() -> std::io::Result<()> {
+    claudebase::daemon::service::spawn_daemon_detached()
+}
+
+/// Ensure the daemon is reachable before claude exec. If pipe-probe says
+/// down, spawn `daemon serve` detached and poll up to 3s for the pipe to
+/// accept. Timeout warns but does NOT abort claude startup — the bridge
+/// already has daemon-down fallback + reconnect logic.
+fn ensure_daemon_running() {
+    if is_daemon_alive() {
+        return;
+    }
+    eprintln!("claudebase run: daemon not reachable, starting in background...");
+    if let Err(e) = spawn_daemon_detached() {
+        eprintln!(
+            "claudebase run: failed to spawn daemon ({}) - claude will run with bridge in daemon-down mode",
+            e
+        );
+        return;
+    }
+    // Poll up to 3 seconds (30 x 100 ms) for the pipe to come alive.
+    // 3s covers tokio runtime construction + secrets/daemon-toml load +
+    // server::serve bind on every supported OS we have measured.
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if is_daemon_alive() {
+            eprintln!("claudebase run: daemon up");
+            return;
+        }
+    }
+    eprintln!(
+        "claudebase run: daemon start timed out after 3s - claude continuing; bridge will retry"
+    );
+}
+
+/// Ensure `<cwd>/.claudebase/config.json` exists before exec'ing claude.
+/// On first invocation from a project dir it creates the file with a
+/// UUID v4 `session_id` and cwd-basename `name`; subsequent runs are a
+/// no-op (the existing file is just re-read). Best-effort — a write
+/// failure here logs a warning but does NOT block claude startup; the
+/// bridge has a UUID fallback in `derive_agent_id` so the worst-case
+/// outcome is "no per-project persistence today" rather than "claude
+/// won't start".
+fn ensure_project_config() {
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "claudebase run: cwd unavailable, skipping .claudebase/config.json bootstrap ({})",
+                e
+            );
+            return;
+        }
+    };
+    match claudebase::project_config::load_or_create(&cwd) {
+        Ok(cfg) => eprintln!(
+            "claudebase run: project config ready (session_id={}, name={})",
+            cfg.session_id, cfg.name
+        ),
+        Err(e) => eprintln!(
+            "claudebase run: failed to create .claudebase/config.json ({}) - bridge will fall back to cwd-basename / UUID",
+            e
+        ),
     }
 }
 
@@ -598,102 +717,6 @@ fn run_daemon_config_show(args: &cli::DaemonConfigShowArgs) -> std::process::Exi
         }
     }
 
-    std::process::ExitCode::SUCCESS
-}
-
-/// `claudebase daemon access pair <code>` (Slice 4).
-///
-/// Loads access.json, redeems the code via constant-time compare
-/// (SEC-16), saves atomically (SEC-12). The error message for unknown /
-/// invalid format is generic — the operator does NOT learn which check
-/// failed, defeating timing + content side-channels.
-fn run_daemon_access_pair(args: &cli::DaemonAccessPairArgs) -> std::process::ExitCode {
-    use claudebase::daemon::channel_state;
-
-    let path = channel_state::access_json_path();
-    let mut access = match channel_state::load_access(&path) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("error: failed to load access.json: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-
-    let now = channel_state::now_ms();
-    match channel_state::redeem_pairing_code(&mut access, &args.code, now) {
-        Ok(sender_id) => {
-            if let Err(e) = channel_state::save_access(&path, &access) {
-                eprintln!("error: failed to save access.json: {e}");
-                return std::process::ExitCode::FAILURE;
-            }
-            println!("paired sender_id={sender_id}");
-            std::process::ExitCode::SUCCESS
-        }
-        Err(e) => {
-            // Display impl returns the same string for `Unknown` and
-            // `InvalidFormat` (SEC-16). `Expired` surfaces distinctly so
-            // operators can re-issue a code.
-            eprintln!("error: {e}");
-            std::process::ExitCode::FAILURE
-        }
-    }
-}
-
-/// `claudebase daemon access list` (Slice 2).
-///
-/// Prints authorized users + pending-code count. Pending codes themselves
-/// are NEVER printed (SEC-16 — leaking active codes defeats the
-/// constant-time-pair flow). `allowFrom` user ids are shown verbatim (now strings).
-fn run_daemon_access_list(args: &cli::DaemonAccessListArgs) -> std::process::ExitCode {
-    use claudebase::daemon::channel_state;
-
-    let path = channel_state::access_json_path();
-    let access = match channel_state::load_access(&path) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("error: failed to load access.json: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-
-    if args.json {
-        // Build JSON summary inline (channel_state schema uses strings for allow_from)
-        let now = channel_state::now_ms();
-        let pending_view: Vec<serde_json::Value> = access
-            .pending
-            .values()
-            .map(|e| {
-                let remaining_ms = (e.expires_at - now).max(0);
-                serde_json::json!({
-                    "sender_id": e.sender_id,
-                    "expires_in_ms": remaining_ms,
-                })
-            })
-            .collect();
-        let summary = serde_json::json!({
-            "dmPolicy": access.dm_policy,
-            "allowFrom": access.allow_from,
-            "pending_count": access.pending.len(),
-            "pending": pending_view,
-        });
-        println!("{}", summary);
-    } else {
-        let policy = match access.dm_policy {
-            claudebase::daemon::channel_state::DmPolicy::Pairing => "pairing",
-            claudebase::daemon::channel_state::DmPolicy::Allowlist => "allowlist",
-            claudebase::daemon::channel_state::DmPolicy::Disabled => "disabled",
-        };
-        println!("dmPolicy = {policy}");
-        print!("allowFrom = [");
-        for (i, u) in access.allow_from.iter().enumerate() {
-            if i > 0 {
-                print!(", ");
-            }
-            print!("{u}");
-        }
-        println!("]");
-        println!("pending = {}", access.pending.len());
-    }
     std::process::ExitCode::SUCCESS
 }
 
@@ -1443,24 +1466,11 @@ fn tag_filter_doc_ids(
     let mut set = std::collections::HashSet::new();
     let params: Vec<&dyn rusqlite::ToSql> =
         tags.iter().map(|t| t as &dyn rusqlite::ToSql).collect();
-    match conn.prepare(&sql) {
-        Ok(mut stmt) => {
-            if let Ok(rows) = stmt.query_map(params.as_slice(), |r| r.get::<_, i64>(0)) {
-                for id in rows.flatten() {
-                    set.insert(id);
-                }
+    if let Ok(mut stmt) = conn.prepare(&sql) {
+        if let Ok(rows) = stmt.query_map(params.as_slice(), |r| r.get::<_, i64>(0)) {
+            for id in rows.flatten() {
+                set.insert(id);
             }
-        }
-        Err(e) => {
-            // Surface a diagnostic so an operator whose insight_tags table is
-            // absent (partial migration, corrupt db) doesn't see silently empty
-            // results with no indication of why. Returning Some(empty_set) here
-            // would drop every candidate hit at the caller's retain() — that
-            // is the silent-failure mode code-reviewer (Gate 2) flagged.
-            eprintln!(
-                "warning: tag filter SQL prepare failed ({e}); returning no \
-                 tag-matched hits — verify insight_tags table exists"
-            );
         }
     }
     Some(set)
@@ -1783,15 +1793,6 @@ fn run_insight_tags(
     root: &std::path::Path,
     args: &cli::InsightTagsArgs,
 ) -> std::process::ExitCode {
-    // SECURITY (security-auditor Gate-3 MEDIUM finding): same root cause as the
-    // Slice 6 resolve_registry_project_db gap fixed in commit 6fbc7cf — the
-    // local_path / project_db joins below use args.db_name without validation.
-    // Reject path-traversal / separators / hidden-file prefixes up front via
-    // the canonical db-name gate (same gate open_and_validate uses).
-    if let Err(e) = cli::validate_db_name(&args.db_name) {
-        eprintln!("error: {e}");
-        return std::process::ExitCode::from(2);
-    }
     // Aggregate `tag -> count` over the union of the selected db legs. A leg is
     // a db path that may or may not exist; a missing/failed-open leg simply
     // contributes nothing.
@@ -1905,18 +1906,6 @@ fn resolve_registry_project_db(
     slug: &str,
     db_name: &str,
 ) -> Result<std::path::PathBuf, std::process::ExitCode> {
-    // SECURITY (security-auditor advisory on Slice 6 — pre-existing gap
-    // inherited from Slice 4's inline read): the `db_name` join below is
-    // on a registry-trusted root, but `db_name` itself is a user-supplied
-    // CLI arg — without validation a caller could pass `../../etc/passwd.db`
-    // and have it joined into the resolved path. Reject path-traversal /
-    // separators / hidden-file prefixes up front via the canonical db-name
-    // gate (same gate `open_and_validate` uses for the root-relative open
-    // path at main.rs:2292).
-    if let Err(e) = cli::validate_db_name(db_name) {
-        eprintln!("error: {e}");
-        return Err(std::process::ExitCode::from(2));
-    }
     // Slice 6 (FR-IHC-6.1..6.6): registry lookup is now centralised in
     // `registry::resolve_project_path`. `None` collapses missing-registry,
     // malformed-json, and unknown-slug into one operator-facing message —
@@ -2077,14 +2066,6 @@ fn run_insight_gc(
     root: &std::path::Path,
     args: &cli::InsightGcArgs,
 ) -> std::process::ExitCode {
-    // SECURITY (security-auditor Gate-3 MEDIUM finding): same root cause as
-    // run_insight_tags above — the local_path join below uses args.db_name
-    // without validation. Reject path-traversal up front via the canonical
-    // db-name gate.
-    if let Err(e) = cli::validate_db_name(&args.db_name) {
-        eprintln!("error: {e}");
-        return std::process::ExitCode::from(2);
-    }
     let now: i64 = {
         use std::time::{SystemTime, UNIX_EPOCH};
         SystemTime::now()

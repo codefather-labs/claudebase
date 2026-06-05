@@ -423,6 +423,14 @@ pub struct RunArgs {
     #[arg(long)]
     pub no_telegram: bool,
 
+    /// Opt out of the default-on `--dangerously-skip-permissions` flag
+    /// that `claudebase run` adds for ergonomics. The flag bypasses
+    /// Claude Code's per-action permission prompts; opt out when you
+    /// want the normal prompts back (e.g., running in a less-trusted
+    /// context with channel notifications coming in).
+    #[arg(long)]
+    pub no_skip_permissions: bool,
+
     /// Additional arguments forwarded verbatim to `claude`. Use `--` to
     /// separate them from claudebase's own flags:
     ///   `claudebase run -- --debug --add-dir /some/path`
@@ -492,9 +500,6 @@ pub enum DaemonSubcommand {
     Serve(DaemonServeArgs),
     /// `daemon config edit` / `daemon config show` — manage daemon.toml.
     Config(DaemonConfigArgs),
-    /// `daemon access pair <code>` / `daemon access list` — manage access.json
-    /// (telegram permission/pairing flow, Slice 4).
-    Access(DaemonAccessArgs),
     /// `daemon doctor [--asr]` — health-check runtime backends without
     /// performing actual work. Exit 0 = healthy, 1 = unhealthy. The
     /// `--asr` flag scopes to the ASR backend (the only doctor target
@@ -509,8 +514,9 @@ pub enum DaemonSubcommand {
     Install(DaemonInstallArgs),
     /// Remove the installed service unit. Preserves user data unless
     /// `--keep-data` is omitted (in which case chat.db / secrets.toml /
-    /// daemon.toml / access.json are deleted; the books and insights
-    /// corpora under `~/.claude/knowledge/` are preserved regardless).
+    /// daemon.toml are deleted; the books and insights corpora under
+    /// `~/.claude/knowledge/` and the runtime access.json under
+    /// `~/.claude/channels/claudebase/` are preserved regardless).
     Uninstall(DaemonUninstallArgs),
     /// Start the installed daemon service.
     Start,
@@ -541,8 +547,8 @@ pub struct DaemonUninstallArgs {
     /// Skip the destructive-delete confirmation prompt.
     #[arg(long)]
     pub yes: bool,
-    /// Preserve user data (chat.db, secrets.toml, daemon.toml,
-    /// access.json). The books corpus and insights corpus under
+    /// Preserve user data (chat.db, secrets.toml, daemon.toml).
+    /// The books corpus and insights corpus under
     /// `~/.claude/knowledge/` are preserved regardless.
     #[arg(long)]
     pub keep_data: bool,
@@ -619,45 +625,6 @@ pub struct DaemonConfigShowArgs {
     #[arg(long)]
     pub project_root: Option<PathBuf>,
     /// Emit JSON instead of TOML.
-    #[arg(long)]
-    pub json: bool,
-}
-
-/// `claudebase daemon access ...` — access.json management subcommands.
-#[derive(Args, Debug)]
-pub struct DaemonAccessArgs {
-    #[command(subcommand)]
-    pub sub: DaemonAccessSubcommand,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum DaemonAccessSubcommand {
-    /// `daemon access pair <CODE>` — redeem a pairing code emitted by the
-    /// bot in response to `/start`. On success the corresponding telegram
-    /// user id is added to access.json `allowFrom` and the pending entry
-    /// is removed. SEC-16: code lookup uses constant-time compare; the
-    /// error message does NOT distinguish "invalid format" from "unknown
-    /// code" (both surface the same generic message).
-    Pair(DaemonAccessPairArgs),
-    /// `daemon access list` — print authorized users + pending-code count.
-    /// Pending codes themselves are NEVER printed (would defeat SEC-16's
-    /// constant-time compare). Output is JSON when `--json` is set.
-    List(DaemonAccessListArgs),
-}
-
-#[derive(Args, Debug)]
-pub struct DaemonAccessPairArgs {
-    /// The 6-char pairing code the user received from the bot. Must match
-    /// the base32-no-confusables alphabet `^[A-HJ-NP-Z2-9]{6}$`.
-    pub code: String,
-    #[arg(long)]
-    pub project_root: Option<PathBuf>,
-}
-
-#[derive(Args, Debug)]
-pub struct DaemonAccessListArgs {
-    #[arg(long)]
-    pub project_root: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
 }

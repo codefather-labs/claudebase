@@ -48,103 +48,9 @@ use crate::daemon::server::socket_path;
 use crate::plugin::mcp::{
     self, classify, daemon_status_down_call_response, error_response, initialize_response,
     parse_error_response, tools_list_changed_notification, tools_list_daemon_down_response,
-    validate_tool_name, Inbound, ERROR_INTERNAL, ERROR_METHOD_NOT_FOUND,
+    validate_tool_name, Inbound, ERROR_INTERNAL, ERROR_INVALID_PARAMS, ERROR_METHOD_NOT_FOUND,
     MAX_MCP_FRAME_SIZE, SUPPORTED_PROTOCOL_VERSION,
 };
-
-/// Cache for session-establishing tool calls so the bridge can replay them
-/// after a reconnect. The daemon tracks subscriptions per-connection; when
-/// the bridge reconnects, it gets a NEW connection_id and the old subscriptions
-/// are lost. The replay mechanism restores them.
-struct SessionCache {
-    /// Latest `agent_register` call params (agent_name, optionally thread/metadata).
-    agent_register_params: Option<Value>,
-    /// Set of thread_ids from `chat_subscribe` calls.
-    subscribed_threads: Vec<String>,
-}
-
-impl SessionCache {
-    fn new() -> Self {
-        SessionCache {
-            agent_register_params: None,
-            subscribed_threads: Vec::new(),
-        }
-    }
-
-    /// Record an agent_register call for later replay.
-    fn cache_agent_register(&mut self, params: Value) {
-        self.agent_register_params = Some(params);
-    }
-
-    /// Record a chat_subscribe thread for later replay.
-    fn cache_chat_subscribe(&mut self, thread: String) {
-        if !self.subscribed_threads.contains(&thread) {
-            self.subscribed_threads.push(thread);
-        }
-    }
-
-    /// Build replay frames with synthetic request ids (non-colliding with Claude Code's).
-    /// Returns a Vec of (frame, is_subscribe) tuples for convenience.
-    fn build_replay_frames(&self, id_gen: &mut ReplayIdGenerator) -> Vec<(Value, &str)> {
-        let mut frames = Vec::new();
-
-        // Replay agent_register first (it should happen before subscribes).
-        if let Some(params) = &self.agent_register_params {
-            let replay_id = id_gen.next();
-            let frame = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": replay_id,
-                "method": "tools/call",
-                "params": {
-                    "name": "agent_register",
-                    "arguments": params
-                }
-            });
-            frames.push((frame, "agent_register"));
-        }
-
-        // Replay each subscribed thread.
-        for thread in &self.subscribed_threads {
-            let replay_id = id_gen.next();
-            let frame = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": replay_id,
-                "method": "tools/call",
-                "params": {
-                    "name": "chat_subscribe",
-                    "arguments": {
-                        "thread": thread
-                    }
-                }
-            });
-            frames.push((frame, "chat_subscribe"));
-        }
-
-        frames
-    }
-}
-
-/// Generates non-colliding request IDs for internal replay frames.
-/// Uses a high negative range (i32::MIN + 1000 downward) to avoid colliding
-/// with Claude Code's typically positive or small ids.
-struct ReplayIdGenerator {
-    next_id: i32,
-}
-
-impl ReplayIdGenerator {
-    fn new() -> Self {
-        // Start at i32::MIN + 1000 (very negative) and decrement.
-        ReplayIdGenerator {
-            next_id: i32::MIN + 1000,
-        }
-    }
-
-    fn next(&mut self) -> i32 {
-        let current = self.next_id;
-        self.next_id = self.next_id.saturating_sub(1);
-        current
-    }
-}
 
 /// Cap on in-flight requests waiting for a daemon reply. Per SEC-4 from
 /// Vault — beyond this we refuse new requests with `-32603` instead of
@@ -172,20 +78,32 @@ struct DaemonChannel {
 pub async fn run() -> anyhow::Result<()> {
     let socket = socket_path().context("compute daemon socket path")?;
 
-    // FIX B — ensure the daemon is running before attempting to connect.
-    // This is a one-shot startup check; if the daemon is already running
-    // (fslock prevents duplicates), this is a no-op. Best-effort: if spawn
-    // fails or times out, we proceed to connect_with_retries which has its
-    // own retry logic.
-    ensure_daemon_running(&socket).await;
-
     // Attempt initial connection. We do 3 quick retries (FR-ACD-3.3)
     // before falling back to daemon-down mode.
     let mut daemon = connect_with_retries(&socket, INITIAL_RETRY_COUNT, INITIAL_RETRY_DELAY_MS).await;
 
-    // FIX A — session cache for replaying subscriptions on reconnect.
-    let mut session_cache = SessionCache::new();
-    let mut replay_id_gen = ReplayIdGenerator::new();
+    // Capture this bridge's own agent_id at startup so we can filter
+    // routing-key broadcasts on the way OUT to the CC. Daemon publishes
+    // every `notifications/claude/channel` frame to every subscriber of
+    // the thread; without this filter every CC subscribed to the chat
+    // would see every message and operators would see "the bot sent
+    // to both CCs even though /switch is bound to one of them"
+    // (operator report 2026-06-04 multi-CC test).
+    //
+    // The id is read from .claudebase/config.json via derive_identity
+    // and is updated in-place when the user renames via the
+    // `agent_register` MCP tool — same persistence layer that
+    // persist_rename_if_changed already touches, kept in lock-step.
+    // Empty agent_id (unrecoverable identity) degrades to "relay all"
+    // so a misconfigured bridge never silently swallows messages.
+    let mut self_agent_id: String = derive_identity().agent_id;
+
+    // Bridge self-bootstrap on initial daemon connect. Also fires on
+    // every successful try_reconnect — see the tools/list / tools/call
+    // reconnect paths below.
+    if let Some(d) = daemon.as_ref() {
+        bootstrap_after_connect(d).await;
+    }
 
     // Pending requests map: id → oneshot::Sender for the response.
     // Held only for SEC-4 cap discipline — Slice 3 still uses the
@@ -253,9 +171,24 @@ pub async fn run() -> anyhow::Result<()> {
                     match frame {
                         Some(f) => {
                             if f.get("id").is_none() {
-                                // Notification — relay to stdout.
-                                trace_line("UDS→STDOUT notif", &f.to_string());
-                                write_mcp_line(&mut stdout, &f).await?;
+                                // Notification — relay to stdout, but
+                                // filter `notifications/claude/channel`
+                                // frames whose `meta.target_agent_id`
+                                // names a DIFFERENT CLI. Daemon-side
+                                // fanout is unfiltered (publish-to-all-
+                                // subscribers); this bridge owns the
+                                // last-mile addressee gate so the
+                                // operator's /switch routing surfaces
+                                // ONLY in the CC the binding names.
+                                if should_relay_channel_notification(&f, &self_agent_id) {
+                                    trace_line("UDS→STDOUT notif", &f.to_string());
+                                    write_mcp_line(&mut stdout, &f).await?;
+                                } else {
+                                    trace_line(
+                                        "UDS→DROP notif (target_agent_id mismatch)",
+                                        &f.to_string(),
+                                    );
+                                }
                             } else {
                                 // Unexpected response while idle —
                                 // log and drop. This shouldn't happen
@@ -402,7 +335,7 @@ pub async fn run() -> anyhow::Result<()> {
                     "tools/list" => {
                         if let Some(d) = daemon.as_mut() {
                             // Daemon-up: forward.
-                            match forward_to_daemon(d, &parsed, &mut stdout).await {
+                            match forward_to_daemon(d, &parsed, &mut stdout, &self_agent_id).await {
                                 Ok(response) => {
                                     write_mcp_line(&mut stdout, &response).await?;
                                 }
@@ -422,15 +355,18 @@ pub async fn run() -> anyhow::Result<()> {
                         } else {
                             // Daemon-down: try a quick reconnect first.
                             daemon = try_reconnect(&socket).await;
-                            // FIX A — replay session cache on successful reconnect.
-                            if daemon.is_some() {
-                                replay_session_cache(&mut daemon, &mut session_cache, &mut replay_id_gen)
-                                    .await;
-                            }
                             if let Some(d) = daemon.as_mut() {
-                                // Came back up. Emit notifications/tools/list_changed
-                                // BEFORE sending the new tools/list response so
-                                // Claude Code re-fetches.
+                                // Came back up. Re-fire the bridge self-
+                                // bootstrap so the new daemon connection
+                                // gets agent_register + chat_subscribe — a
+                                // daemon bounce otherwise silently drops
+                                // subscription state. Operator request
+                                // 2026-06-04, follow-up to the original
+                                // bootstrap-at-initial-connect patch.
+                                bootstrap_after_connect(d).await;
+                                // Emit notifications/tools/list_changed
+                                // BEFORE sending the new tools/list response
+                                // so Claude Code re-fetches.
                                 if daemon_down {
                                     write_mcp_line(
                                         &mut stdout,
@@ -439,7 +375,7 @@ pub async fn run() -> anyhow::Result<()> {
                                     .await?;
                                     daemon_down = false;
                                 }
-                                match forward_to_daemon(d, &parsed, &mut stdout).await {
+                                match forward_to_daemon(d, &parsed, &mut stdout, &self_agent_id).await {
                                     Ok(response) => {
                                         write_mcp_line(&mut stdout, &response).await?;
                                     }
@@ -480,38 +416,25 @@ pub async fn run() -> anyhow::Result<()> {
                             continue;
                         }
 
-                        // FIX A — cache session-establishing calls for replay on reconnect.
-                        if tool_name == "agent_register" {
-                            if let Some(agent_args) = params.get("arguments") {
-                                session_cache.cache_agent_register(agent_args.clone());
-                            }
-                        } else if tool_name == "chat_subscribe" {
-                            if let Some(thread) = params
-                                .get("arguments")
-                                .and_then(|a| a.get("thread"))
-                                .and_then(|t| t.as_str())
-                            {
-                                session_cache.cache_chat_subscribe(thread.to_string());
-                            }
-                        }
-
                         // Daemon-down: only claudebase_daemon_status is
                         // valid; everything else → -32601.
                         if daemon.is_none() {
                             // Try a quick reconnect.
                             daemon = try_reconnect(&socket).await;
-                            // FIX A — replay session cache on successful reconnect.
-                            if daemon.is_some() {
-                                replay_session_cache(&mut daemon, &mut session_cache, &mut replay_id_gen)
-                                    .await;
-                            }
-                            if daemon.is_some() && daemon_down {
-                                write_mcp_line(
-                                    &mut stdout,
-                                    &tools_list_changed_notification(),
-                                )
-                                .await?;
-                                daemon_down = false;
+                            if let Some(d) = daemon.as_ref() {
+                                // Re-fire bridge self-bootstrap on the
+                                // new daemon connection so subscription
+                                // state survives daemon bounce (see the
+                                // matching block in tools/list above).
+                                bootstrap_after_connect(d).await;
+                                if daemon_down {
+                                    write_mcp_line(
+                                        &mut stdout,
+                                        &tools_list_changed_notification(),
+                                    )
+                                    .await?;
+                                    daemon_down = false;
+                                }
                             }
                         }
 
@@ -550,9 +473,54 @@ pub async fn run() -> anyhow::Result<()> {
                             .await?;
                             continue;
                         }
+                        // Capture rename intent BEFORE forwarding so we can
+                        // persist `.claudebase/config.json` after the daemon
+                        // confirms the new id landed. Only matters when the
+                        // tool call is `agent_register`; for every other tool
+                        // these locals stay None and the persist hook is a
+                        // no-op.
+                        let rename_target: Option<(String, Option<String>)> = if tool_name
+                            == "agent_register"
+                        {
+                            params.get("arguments").and_then(|a| {
+                                let new_id = a
+                                    .get("agent_id")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string())?;
+                                let new_name = a
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
+                                Some((new_id, new_name))
+                            })
+                        } else {
+                            None
+                        };
+
                         let d = daemon.as_mut().expect("daemon checked Some above");
-                        match forward_to_daemon(d, &parsed, &mut stdout).await {
+                        match forward_to_daemon(d, &parsed, &mut stdout, &self_agent_id).await {
                             Ok(response) => {
+                                // Daemon-confirmed success path. We persist
+                                // ONLY when the response carries no `error`
+                                // field — a failed agent_register (e.g.
+                                // UNIQUE-constraint clash) must NOT rewrite
+                                // the on-disk config or the file and daemon
+                                // diverge silently.
+                                if response.get("error").is_none() {
+                                    if let Some((new_id, new_name)) = rename_target {
+                                        persist_rename_if_changed(&new_id, new_name.as_deref());
+                                        // Keep the bridge's in-memory
+                                        // self-identity in lock-step with
+                                        // the on-disk file so subsequent
+                                        // channel-notification filters
+                                        // recognize the renamed id as
+                                        // "this CLI" without waiting for
+                                        // the next bridge restart.
+                                        if !new_id.trim().is_empty() {
+                                            self_agent_id = new_id;
+                                        }
+                                    }
+                                }
                                 write_mcp_line(&mut stdout, &response).await?;
                             }
                             Err(_) => {
@@ -729,6 +697,256 @@ fn spawn_daemon_channel(stream: interprocess::local_socket::tokio::Stream) -> Da
     }
 }
 
+/// Identity used by `autoregister_self` and by post-rename persistence.
+/// `agent_id` is the daemon-side registry key (used by `/switch <id>` and
+/// `agent_register`); `name` is the human-friendly display field.
+struct AgentIdentity {
+    agent_id: String,
+    name: String,
+}
+
+/// Derive this CLI's identity at bridge startup. Priority order:
+///
+///   1. `<cwd>/.claudebase/config.json` if it exists — operator-vision
+///      per-project persistence (2026-06-03/04). The file is written by
+///      `claudebase run`'s `ensure_project_config` AND rewritten by the
+///      `tools/call` rename interception below when the user renames
+///      via the `agent_register` MCP tool. Bridge never CREATES this
+///      file — only reads it — so a CC session launched from a random
+///      cwd (e.g. desktop shortcut) does not pollute that cwd.
+///   2. cwd basename — stable across CC restarts from the same cwd
+///      even without a config file (matches the 2026-06-03 initial
+///      bridge self-bootstrap behaviour).
+///   3. UUID v4 — last-resort fallback when cwd is undetermined.
+fn derive_identity() -> AgentIdentity {
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(cfg) = crate::project_config::load(&cwd) {
+            return AgentIdentity {
+                agent_id: cfg.session_id,
+                name: cfg.name,
+            };
+        }
+        if let Some(name) = cwd.file_name() {
+            let name_str = name.to_string_lossy().trim().to_string();
+            if !name_str.is_empty() {
+                return AgentIdentity {
+                    agent_id: name_str.clone(),
+                    name: name_str,
+                };
+            }
+        }
+    }
+    let uuid = uuid::Uuid::new_v4().to_string();
+    AgentIdentity {
+        agent_id: uuid.clone(),
+        name: uuid,
+    }
+}
+
+/// Run BOTH self-bootstrap steps in their canonical order:
+///
+///   1. `autoregister_self` — `agent_register(agent_id, name)` so this
+///      CLI shows up in `/agents` and `/switch <id>` can bind chats to
+///      it without the operator calling agent_register by hand.
+///   2. `autosubscribe_from_access` — `chat_subscribe` per Telegram
+///      thread paired in access.json so notifications flow without a
+///      manual chat_subscribe call.
+///
+/// Register first: by the time daemon broadcasts a frame after a
+/// /switch we already have a stamped alive row. Called both at INITIAL
+/// connect AND on every successful `try_reconnect` — without the
+/// reconnect re-fire, a daemon bounce silently drops subscription state
+/// because the new connection has no chat_subscribe registrations
+/// (operator request 2026-06-04, closes the bridge-bootstrap-on-
+/// reconnect followup parked end of 2026-06-03 session).
+async fn bootstrap_after_connect(daemon: &DaemonChannel) {
+    autoregister_self(daemon).await;
+    autosubscribe_from_access(daemon).await;
+}
+
+/// Fire-and-forget auto-register: announce this CLI as alive in the
+/// daemon's agent_registry so the operator's `/switch <agent_id>` and
+/// `/agents` commands can find it. Without this, every CC session would
+/// require a manual `agent_register` tool call before the routing-key
+/// flow works — the gap operator hit on 2026-06-03 when /agents reported
+/// "No CLIs are bound" until manual re-registration. Fire-and-forget —
+/// response dropped by the idle drain (matches `autosubscribe_from_access`
+/// discipline).
+async fn autoregister_self(daemon: &DaemonChannel) {
+    let id = derive_identity();
+    let frame = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "bridge-autoregister",
+        "method": "tools/call",
+        "params": {
+            "name": "agent_register",
+            "arguments": {
+                "agent_id": id.agent_id,
+                "name": id.name,
+            }
+        }
+    });
+    let body = match serde_json::to_vec(&frame) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "autoregister: serialize failed");
+            return;
+        }
+    };
+    let mut wh = daemon.write_half.lock().await;
+    if let Err(e) = write_frame(&mut *wh, &body).await {
+        tracing::warn!(error = %e, agent_id = %id.agent_id, "autoregister: write_frame failed");
+        return;
+    }
+    tracing::info!(agent_id = %id.agent_id, name = %id.name, "autoregister: sent agent_register");
+}
+
+/// Decide whether a daemon-pushed notification frame should be relayed
+/// to the CC stdout. Filters `notifications/claude/channel` frames
+/// whose `meta.target_agent_id` names a DIFFERENT CLI — those are
+/// addressed to another bridge subscribed to the same thread and
+/// must NOT surface in this CC (operator report 2026-06-04: "should
+/// have gone only to fbscout, not both"). All other frame methods
+/// (e.g. `tools/list_changed`, `chat_subscribe` acks) pass through
+/// unfiltered.
+///
+/// Degraded-mode discipline: when `self_agent_id` is empty (e.g. the
+/// bridge could not derive its own identity at startup) the filter
+/// is bypassed and every frame is relayed. The trade-off is "loud
+/// over silent" — better to surface possibly-mis-addressed events
+/// than to silently swallow operator's traffic.
+///
+/// When `meta.target_agent_id` is ABSENT, the frame is treated as
+/// broadcast-to-all (no addressee filter) and relayed unconditionally.
+fn should_relay_channel_notification(frame: &Value, self_agent_id: &str) -> bool {
+    // Non-channel notifications pass through unchanged.
+    let is_channel = frame
+        .get("method")
+        .and_then(|v| v.as_str())
+        .map(|m| m == "notifications/claude/channel")
+        .unwrap_or(false);
+    if !is_channel {
+        return true;
+    }
+    // Empty self-id ⇒ degraded mode (relay everything).
+    if self_agent_id.trim().is_empty() {
+        return true;
+    }
+    // Frame is a channel notification — inspect addressee.
+    let target = frame
+        .pointer("/params/meta/target_agent_id")
+        .and_then(|v| v.as_str());
+    match target {
+        None => true,                       // unaddressed broadcast
+        Some(t) => t == self_agent_id,      // addressed → relay iff it's us
+    }
+}
+
+/// Persist an `agent_register` rename back to `<cwd>/.claudebase/config.json`
+/// so the next CC restart from the same dir reuses the new id. Called from
+/// the `tools/call` handler after the daemon has confirmed the rename
+/// landed (we never rewrite the file on a failed rename, otherwise the
+/// file and the daemon would diverge — the named drift this slice is
+/// designed to prevent). Best-effort: errors are logged and swallowed,
+/// they never break the user-facing tool response.
+fn persist_rename_if_changed(new_agent_id: &str, new_name: Option<&str>) {
+    if new_agent_id.trim().is_empty() {
+        return;
+    }
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "persist_rename: cwd unavailable");
+            return;
+        }
+    };
+    // Only rewrite when the file ALREADY exists. The bridge does not
+    // create the file from random cwds — that contract is owned by
+    // `claudebase run`. If the file isn't there, the user is in a
+    // CC session that was launched outside `claudebase run` and the
+    // rename is daemon-only (next CC restart will get a fresh id).
+    if crate::project_config::load(&cwd).is_none() {
+        return;
+    }
+    if let Err(e) = crate::project_config::write_session_id(&cwd, new_agent_id, new_name) {
+        tracing::warn!(
+            error = %e,
+            new_agent_id = %new_agent_id,
+            "persist_rename: write_session_id failed"
+        );
+        return;
+    }
+    tracing::info!(
+        new_agent_id = %new_agent_id,
+        new_name = ?new_name,
+        "persist_rename: wrote new session_id to .claudebase/config.json"
+    );
+}
+
+/// Fire-and-forget auto-subscribe: after the daemon link is up, read
+/// `access.json` and issue a `chat_subscribe` for every Telegram thread
+/// the operator has paired (DM senders + configured group IDs). This
+/// closes the gap where notifications are dropped because no subscriber
+/// exists for a thread until Mira explicitly calls chat_subscribe.
+///
+/// "Fire-and-forget" — we don't wait for responses. Each call carries
+/// a unique `bridge-autosub-<n>` id; the main loop's idle drain catches
+/// the daemon's response and discards it with a warn. The subscription
+/// registration happens daemon-side immediately on receipt, so backlog
+/// drain + bus pump start before this helper returns. If the access
+/// file is missing or empty, the helper is a no-op.
+async fn autosubscribe_from_access(daemon: &DaemonChannel) {
+    use crate::daemon::channel_state::{access_json_path, load_access};
+
+    let path = access_json_path();
+    let access = match load_access(&path) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "autosubscribe: load_access failed; skipping");
+            return;
+        }
+    };
+
+    let mut threads: Vec<String> = Vec::new();
+    for sender_id in &access.allow_from {
+        threads.push(format!("telegram:{}", sender_id));
+    }
+    for group_id in access.groups.keys() {
+        threads.push(format!("telegram:{}", group_id));
+    }
+
+    if threads.is_empty() {
+        tracing::info!("autosubscribe: access.json has no paired senders / groups; skipping");
+        return;
+    }
+
+    for (idx, thread) in threads.iter().enumerate() {
+        let id = format!("bridge-autosub-{}", idx);
+        let frame = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "chat_subscribe",
+                "arguments": { "thread": thread },
+            }
+        });
+        let body = match serde_json::to_vec(&frame) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "autosubscribe: serialize failed");
+                continue;
+            }
+        };
+        let mut wh = daemon.write_half.lock().await;
+        if let Err(e) = write_frame(&mut *wh, &body).await {
+            tracing::warn!(error = %e, thread = %thread, "autosubscribe: write_frame failed");
+            return;
+        }
+        tracing::info!(thread = %thread, "autosubscribe: sent chat_subscribe");
+    }
+}
+
 /// Forward one MCP request to the daemon via UDS and read the response,
 /// relaying any notifications encountered along the way to stdout.
 ///
@@ -739,6 +957,7 @@ async fn forward_to_daemon(
     daemon: &mut DaemonChannel,
     request: &Value,
     stdout: &mut tokio::io::Stdout,
+    self_agent_id: &str,
 ) -> anyhow::Result<Value> {
     let body = serde_json::to_vec(request).context("serialize MCP request")?;
     {
@@ -753,9 +972,13 @@ async fn forward_to_daemon(
             Some(v) => v,
             None => anyhow::bail!("daemon inbound channel closed"),
         };
-        // Notifications (no `id`) → relay to stdout, keep reading.
+        // Notifications (no `id`) → relay to stdout subject to the
+        // target_agent_id filter (mirrors the idle-drain branch in
+        // `run()`), keep reading.
         if frame.get("id").is_none() {
-            write_mcp_line(stdout, &frame).await?;
+            if should_relay_channel_notification(&frame, self_agent_id) {
+                write_mcp_line(stdout, &frame).await?;
+            }
             continue;
         }
         if let Some(exp) = expected_id.as_ref() {
@@ -821,246 +1044,70 @@ fn truncate(s: &str, max: usize) -> String {
     s[..end].to_string()
 }
 
-/// FIX A helper — replay cached session-establishing calls on a newly
-/// reconnected daemon. Sends agent_register (if cached) followed by
-/// chat_subscribe calls (one per subscribed thread). Responses are read
-/// from the inbound_rx but discarded (internal bookkeeping, Claude Code
-/// didn't ask for them). Non-blocking — doesn't hold locks across .await.
-async fn replay_session_cache(
-    daemon: &mut Option<DaemonChannel>,
-    session_cache: &mut SessionCache,
-    replay_id_gen: &mut ReplayIdGenerator,
-) {
-    let Some(d) = daemon else { return };
-    let frames = session_cache.build_replay_frames(replay_id_gen);
-
-    for (frame, tool_name) in frames {
-        let body = match serde_json::to_vec(&frame) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(error = %e, "replay frame serialize failed; skipping");
-                continue;
-            }
-        };
-
-        // Send the replay frame to the daemon.
-        {
-            let mut wh = d.write_half.lock().await;
-            if let Err(e) = write_frame(&mut *wh, &body).await {
-                tracing::warn!(error = %e, "replay frame write failed; closing connection");
-                return;
-            }
-        }
-
-        // Drain the inbound_rx until we receive the response (id matches the
-        // synthetic replay id) or until the channel closes. Relay any
-        // notifications (frames without id) to... wait, we don't have stdout
-        // here. This is async context inside the select! loop, so we CAN'T
-        // write to stdout (would need mutable access and might block the loop).
-        // Instead, drop the response and any intervening notifications — they're
-        // internal bookkeeping and Claude Code didn't request them.
-        let expected_id = frame.get("id").cloned();
-        loop {
-            match d.inbound_rx.recv().await {
-                Some(resp_frame) => {
-                    let resp_id = resp_frame.get("id").cloned();
-                    // If id matches, we got our response — break and continue to next frame.
-                    if resp_id == expected_id {
-                        tracing::debug!(tool = %tool_name, "replay response received");
-                        break;
-                    }
-                    // No id (notification) or mismatched id — drop and continue reading.
-                    if resp_id.is_none() {
-                        tracing::debug!(tool = %tool_name, "replay: dropped intervening notification");
-                    }
-                }
-                None => {
-                    // Inbound channel closed — daemon link is gone during replay.
-                    tracing::warn!(tool = %tool_name, "daemon inbound closed during replay");
-                    return;
-                }
-            }
-        }
-    }
-
-    tracing::info!("session cache replay complete");
-}
-
-/// FIX B — ensure the daemon is running. Check if the UDS socket is
-/// connectable (quick ~100ms attempt). If not, spawn the daemon detached
-/// in the background and wait briefly (~500ms) for the socket to appear.
-///
-/// Idempotency: relies on the daemon's own fslock (server.rs:274-296)
-/// to prevent duplicate spawns. If a 2nd `daemon serve` is attempted
-/// while the 1st is still starting, the fslock will cause the 2nd to bail
-/// "already running" harmlessly.
-///
-/// Non-blocking: spawns the daemon and waits for socket appearance, but
-/// returns quickly if the socket is already available or if the spawn/wait
-/// timeout expires. The bridge's connect_with_retries() has its own retries.
-///
-/// Best-effort: if spawn or socket-wait fails, we log and return; the
-/// connect_with_retries() logic handles the failure.
-async fn ensure_daemon_running(socket: &std::path::Path) {
-    // Quick check: is the socket connectable right now?
-    if try_connect(socket).await.is_some() {
-        tracing::debug!("daemon socket already reachable");
-        return;
-    }
-
-    tracing::info!("daemon socket not reachable; attempting auto-start");
-
-    // Spawn the daemon detached. On Unix, use process_group(0) to make it
-    // immune to parent process signals. On Windows, the behavior is
-    // different but we'll start with Unix-focused implementation.
-    let spawn_result = {
-        let mut cmd = std::process::Command::new("claudebase");
-        cmd.arg("daemon");
-        cmd.arg("serve");
-
-        // Close stdio so the daemon runs independently.
-        cmd.stdin(std::process::Stdio::null());
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
-
-        // Unix-specific: detach from parent process group.
-        // setsid is not directly exposed by CommandExt, so we rely on stdio closure
-        // for independence. Daemon process will continue running even if parent dies
-        // (not guaranteed by tokio::spawn alone, but std::process::Command::spawn()
-        // spawns a real OS process that persists). A cleaner approach would wrap the
-        // Command in a proper daemonize call, but that requires an external crate.
-        // For this iteration, we accept the limitation and note it as a future enhancement.
-
-        cmd.spawn()
-    };
-
-    match spawn_result {
-        Ok(mut child) => {
-            tracing::info!(
-                pid = child.id(),
-                "daemon spawned; waiting for socket to appear (~500ms)"
-            );
-            // Spawn a task to detach the child process (prevent zombies on Unix).
-            // We don't wait for it — just let it run in the background.
-            tokio::spawn(async move {
-                let _ = child.wait();
-            });
-
-            // Wait for the socket to appear (up to 500ms). Poll every 50ms.
-            let start = tokio::time::Instant::now();
-            let timeout = Duration::from_millis(500);
-            loop {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                if try_connect(socket).await.is_some() {
-                    tracing::info!("daemon socket appeared");
-                    return;
-                }
-                if start.elapsed() > timeout {
-                    tracing::warn!("daemon socket did not appear within 500ms; proceeding with connect retries");
-                    return;
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "failed to spawn daemon; proceeding with connect retries"
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
-    #[test]
-    fn replay_cache_caches_agent_register() {
-        let mut cache = SessionCache::new();
-        let params = serde_json::json!({ "agent_name": "test_agent" });
-        cache.cache_agent_register(params.clone());
-        assert_eq!(cache.agent_register_params, Some(params));
-    }
-
-    #[test]
-    fn replay_cache_caches_chat_subscribe() {
-        let mut cache = SessionCache::new();
-        cache.cache_chat_subscribe("thread_1".to_string());
-        cache.cache_chat_subscribe("thread_2".to_string());
-        assert_eq!(cache.subscribed_threads, vec!["thread_1", "thread_2"]);
-    }
-
-    #[test]
-    fn replay_cache_dedupes_subscribe_threads() {
-        let mut cache = SessionCache::new();
-        cache.cache_chat_subscribe("thread_1".to_string());
-        cache.cache_chat_subscribe("thread_1".to_string());
-        assert_eq!(cache.subscribed_threads.len(), 1);
-    }
-
-    #[test]
-    fn build_replay_frames_replays_agent_register_first() {
-        let mut cache = SessionCache::new();
-        let agent_params = serde_json::json!({ "agent_name": "test_agent" });
-        cache.cache_agent_register(agent_params);
-        cache.cache_chat_subscribe("thread_1".to_string());
-
-        let mut id_gen = ReplayIdGenerator::new();
-        let frames = cache.build_replay_frames(&mut id_gen);
-
-        // Should have 2 frames: agent_register + chat_subscribe.
-        assert_eq!(frames.len(), 2);
-        // First frame is agent_register.
-        assert_eq!(frames[0].1, "agent_register");
-        // Second frame is chat_subscribe.
-        assert_eq!(frames[1].1, "chat_subscribe");
-    }
-
-    #[test]
-    fn build_replay_frames_uses_noncoliding_ids() {
-        let mut cache = SessionCache::new();
-        cache.cache_agent_register(serde_json::json!({}));
-        cache.cache_chat_subscribe("thread_1".to_string());
-        cache.cache_chat_subscribe("thread_2".to_string());
-
-        let mut id_gen = ReplayIdGenerator::new();
-        let frames = cache.build_replay_frames(&mut id_gen);
-
-        // Extract the ids from the replay frames.
-        let ids: Vec<i32> = frames
-            .iter()
-            .map(|(f, _)| f.get("id").and_then(|v| v.as_i64()).unwrap_or(0) as i32)
-            .collect();
-
-        // All ids should be negative (in the reserved range).
-        for id in &ids {
-            assert!(*id < 0, "replay id {} is not negative", id);
+    fn channel_frame(target: Option<&str>) -> Value {
+        let mut meta = serde_json::Map::new();
+        meta.insert("chat_id".into(), json!("8791871989"));
+        if let Some(t) = target {
+            meta.insert("target_agent_id".into(), json!(t));
         }
-
-        // All ids should be unique.
-        let mut sorted = ids.clone();
-        sorted.sort();
-        for i in 1..sorted.len() {
-            assert_ne!(sorted[i - 1], sorted[i], "duplicate replay id");
-        }
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/claude/channel",
+            "params": {"content": "hi", "meta": meta}
+        })
     }
 
     #[test]
-    fn replay_id_generator_decrements() {
-        let mut gen = ReplayIdGenerator::new();
-        let id1 = gen.next();
-        let id2 = gen.next();
-        let id3 = gen.next();
-        // Each call should decrement (return more negative).
-        assert!(id1 > id2);
-        assert!(id2 > id3);
+    fn relay_channel_with_matching_target_id() {
+        let frame = channel_frame(Some("mira"));
+        assert!(should_relay_channel_notification(&frame, "mira"));
     }
 
     #[test]
-    fn build_replay_frames_empty_cache() {
-        let cache = SessionCache::new();
-        let mut id_gen = ReplayIdGenerator::new();
-        let frames = cache.build_replay_frames(&mut id_gen);
-        assert_eq!(frames.len(), 0);
+    fn drop_channel_when_target_id_is_different() {
+        let frame = channel_frame(Some("fbscout"));
+        assert!(!should_relay_channel_notification(&frame, "mira"));
+    }
+
+    #[test]
+    fn relay_channel_when_target_id_absent() {
+        let frame = channel_frame(None);
+        assert!(should_relay_channel_notification(&frame, "mira"));
+    }
+
+    #[test]
+    fn relay_non_channel_notifications_unconditionally() {
+        let other = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/tools/list_changed"
+        });
+        assert!(should_relay_channel_notification(&other, "mira"));
+        assert!(should_relay_channel_notification(&other, "fbscout"));
+        assert!(should_relay_channel_notification(&other, ""));
+    }
+
+    #[test]
+    fn degraded_mode_relays_when_self_agent_id_is_empty() {
+        // Empty self-id: degrade to "relay all" so a misconfigured
+        // bridge never silently swallows operator traffic.
+        let addressed = channel_frame(Some("mira"));
+        assert!(should_relay_channel_notification(&addressed, ""));
+        let addressed_other = channel_frame(Some("fbscout"));
+        assert!(should_relay_channel_notification(&addressed_other, ""));
+        let unaddressed = channel_frame(None);
+        assert!(should_relay_channel_notification(&unaddressed, ""));
+    }
+
+    #[test]
+    fn whitespace_self_id_is_treated_as_empty() {
+        let addressed = channel_frame(Some("mira"));
+        // Whitespace-only id treated same as empty per is_empty check
+        // on trimmed value — degraded "relay all" branch.
+        assert!(should_relay_channel_notification(&addressed, "   "));
     }
 }

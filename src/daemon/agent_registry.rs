@@ -118,6 +118,26 @@ pub fn validate_agent_name(name: &str) -> anyhow::Result<()> {
 /// SQLITE_CONSTRAINT_UNIQUE; we map the rusqlite error string to the
 /// friendly TC-5.9 error.
 ///
+/// **Rename-as-cleanup (operator vision 2026-06-03/04):** when this call
+/// arrives on a `connection_id` that already has an alive row under a
+/// DIFFERENT `agent_id`, the old row is marked `state='dead'` in the
+/// SAME transaction as the new INSERT. This is the daemon-side half of
+/// the "register as mira" rename UX — without it, the auto-registered
+/// UUID/cwd-basename row stays alive alongside the new `mira` row and
+/// `/agents` displays both as available, which surprised operator on
+/// 2026-06-03. The bridge-side half (rewriting `.claudebase/config.json`
+/// on success) lives in `src/plugin/bridge.rs::persist_rename_if_changed`.
+///
+/// Same-id re-call is a no-op for the cleanup (predicate excludes
+/// `agent_id = ?2`); cross-connection_id rows are untouched (other CLIs'
+/// alive rows are not the caller's to bury).
+///
+/// The transaction uses `unchecked_transaction` because the rusqlite
+/// `transaction()` API requires `&mut Connection` and all callers pass
+/// `&Connection` (open_chat_db owns the conn locally). Daemon
+/// serializes writes via the WAL boundary so the "unchecked" caveat
+/// (re-entry on the same connection) cannot fire here.
+///
 /// The `metadata` JSON value (if any) is serialised to TEXT for storage;
 /// SQLite's JSON1 hint type is intentionally not used (TEXT + serde
 /// round-trip is the canonical pattern).
@@ -132,7 +152,35 @@ pub fn register(
     validate_agent_name(agent_name).context("agent_register: validate name")?;
     let now = now_millis();
     let metadata_text = metadata.map(|v| v.to_string());
-    let result = conn.execute(
+
+    let tx = conn
+        .unchecked_transaction()
+        .context("agent_register: begin tx")?;
+
+    // Rename-as-cleanup sweep: any alive row on THIS connection_id with
+    // a DIFFERENT agent_id AND THE SAME chat_thread_id is a prior
+    // register on the same identity slot (typically the bridge's auto-
+    // register UUID before the user renamed via Mira). Bury it so
+    // `/agents` shows only the current intended id.
+    //
+    // The chat_thread_id match uses SQLite's NULL-safe `IS` operator
+    // so `(thread=NULL)` matches `(thread=NULL)` (the bridge auto-
+    // register case) without burying a SIBLING agent that the same
+    // connection registered into a DIFFERENT thread (e.g. a
+    // permission_relayer pattern where one connection manages multiple
+    // per-thread sub-agents — list_alive_filters_by_thread covers it).
+    let stale_dead = tx
+        .execute(
+            "UPDATE agent_registry SET state='dead' \
+             WHERE connection_id = ?1 \
+               AND agent_id != ?2 \
+               AND state = 'alive' \
+               AND chat_thread_id IS ?3",
+            params![connection_id, agent_id, chat_thread_id],
+        )
+        .context("agent_register: rename-cleanup UPDATE")?;
+
+    let result = tx.execute(
         "INSERT INTO agent_registry \
          (agent_id, agent_name, connection_id, chat_thread_id, \
           permission_relayer, spawned_at, last_pinged_at, state, metadata) \
@@ -147,8 +195,22 @@ pub fn register(
         params![agent_id, agent_name, connection_id, chat_thread_id, now, metadata_text],
     );
     match result {
-        Ok(_) => Ok(RegisterOutcome { spawned_at: now }),
+        Ok(_) => {
+            tx.commit().context("agent_register: commit tx")?;
+            if stale_dead > 0 {
+                tracing::info!(
+                    %connection_id,
+                    new_agent_id = %agent_id,
+                    dropped_rows = stale_dead,
+                    "agent_register rename-cleanup marked old rows dead"
+                );
+            }
+            Ok(RegisterOutcome { spawned_at: now })
+        }
         Err(e) => {
+            // tx auto-rolls back on drop, so the rename-cleanup UPDATE is
+            // also reverted — the file and daemon stay consistent under
+            // failure: if the INSERT fails we leave the old row alive.
             let msg = e.to_string();
             if msg.contains("UNIQUE constraint failed") {
                 anyhow::bail!(
@@ -220,102 +282,40 @@ pub fn list_alive(conn: &Connection, thread: Option<&str>) -> anyhow::Result<Vec
     Ok(rows?)
 }
 
-/// Return `true` iff `agent_id` names an alive (state='alive') row.
+/// Slice 2 of multi-agent-telegram-on-v0.6 — resolve the CLI bound to
+/// a specific Telegram routing key `(routing_chat_id, routing_thread_id)`.
+/// Returns the bound CLI's `agent_id` when an alive binding exists,
+/// `Ok(None)` otherwise.
 ///
-/// Parameterised query — `agent_id` is bound, never interpolated, so an
-/// empty string or a SQL-injection payload (UC-TMC-2-EC1) is matched as
-/// a literal value and simply finds no row (returns `false`) rather than
-/// altering the table. Orphaned and dead rows return `false` because the
-/// WHERE clause pins `state='alive'`.
-pub fn is_alive(conn: &Connection, agent_id: &str) -> anyhow::Result<bool> {
-    let found: Option<i64> = conn
-        .query_row(
-            "SELECT 1 FROM agent_registry WHERE agent_id=?1 AND state='alive' LIMIT 1",
-            params![agent_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(found.is_some())
-}
-
-/// Pick a single alive agent to route to when a chat has no explicit
-/// binding (Slice 2 routing-tree step 4 fallback). Two-pass:
+/// The COALESCE(-1) sentinel pattern is symmetric with the expression
+/// index `agent_registry_routing_alive_uniq_idx` created in Slice 1 so
+/// the SQLite optimiser can use the index for the lookup. The
+/// `state = 'alive'` predicate excludes orphaned and dead rows; the
+/// implicit `routing_chat_id IS NOT NULL` (via the equality match on
+/// the parameter) excludes legacy chat-bus rows that never bound a
+/// Telegram routing key.
 ///
-/// 1. **prefer_role pass** — if `prefer_role` is `Some(role)`, return the
-///    first alive row whose `agent_name` contains `role` as a substring.
-///    The `agent_registry` table has no dedicated `role` column (the
-///    `AgentRow` struct exposes `agent_id, agent_name, chat_thread_id,
-///    spawned_at, last_pinged_at` only); the role is carried in the
-///    `agent_name` by convention (e.g. "orchestrator-main"), which the QA
-///    cases TC-TMC-3.1/3.2/3.4 assert against directly. We therefore match
-///    `prefer_role` against `agent_name` via a parameterised `LIKE
-///    '%'||?||'%'` predicate. The LIKE wildcards `%`/`_` inside `role`
-///    are NOT escaped — `prefer_role` is an internal caller-supplied
-///    constant ("orchestrator"), never user input, so wildcard injection
-///    is not a threat surface here.
-/// 2. **any-alive fallback** — if the prefer_role pass finds nothing (or
-///    `prefer_role` is `None`), return the first alive row regardless of
-///    name.
-///
-/// Both passes order by `agent_id ASC` so the tiebreak between two
-/// equally-eligible agents is **deterministic** (UC-TMC-3-EC1 /
-/// TC-TMC-3.4 require two consecutive calls to return the same row).
-/// `agent_id` is the primary key, hence total-ordered and stable across
-/// calls; `spawned_at` was rejected as the sort key because two agents
-/// can share a millisecond timestamp, reintroducing nondeterminism.
-///
-/// Returns `None` when no alive row exists (UC-TMC-3-A2 / TC-TMC-3.3).
-/// `thread`, when `Some`, scopes both passes to that `chat_thread_id`.
-pub fn first_alive(
+/// Called from `daemon::telegram::process_batch_with_pairing` BEFORE
+/// the @-mention fallback so explicit `(chat_id, thread_id)` bindings
+/// win over text-based @mention resolution.
+pub fn resolve_routing(
     conn: &Connection,
-    thread: Option<&str>,
-    prefer_role: Option<&str>,
-) -> anyhow::Result<Option<AgentRow>> {
-    let map_row = |row: &rusqlite::Row| -> rusqlite::Result<AgentRow> {
-        Ok(AgentRow {
-            agent_id: row.get(0)?,
-            agent_name: row.get(1)?,
-            chat_thread_id: row.get(2)?,
-            spawned_at: row.get(3)?,
-            last_pinged_at: row.get(4)?,
-        })
-    };
-
-    // Pass 1 — prefer_role substring match on agent_name.
-    if let Some(role) = prefer_role {
-        let like = format!("%{role}%");
-        let hit: Option<AgentRow> = conn
-            .query_row(
-                "SELECT agent_id, agent_name, chat_thread_id, spawned_at, last_pinged_at \
-                 FROM agent_registry \
-                 WHERE state='alive' \
-                   AND (?1 IS NULL OR chat_thread_id = ?1) \
-                   AND agent_name LIKE ?2 \
-                 ORDER BY agent_id ASC \
-                 LIMIT 1",
-                params![thread, like],
-                map_row,
-            )
-            .optional()?;
-        if hit.is_some() {
-            return Ok(hit);
-        }
+    routing_chat_id: i64,
+    routing_thread_id: Option<i64>,
+) -> rusqlite::Result<Option<String>> {
+    let result: rusqlite::Result<String> = conn.query_row(
+        "SELECT agent_id FROM agent_registry \
+         WHERE routing_chat_id = ?1 \
+           AND COALESCE(routing_thread_id, -1) = COALESCE(?2, -1) \
+           AND state = 'alive'",
+        params![routing_chat_id, routing_thread_id],
+        |row| row.get(0),
+    );
+    match result {
+        Ok(agent_id) => Ok(Some(agent_id)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
     }
-
-    // Pass 2 — any alive row, deterministic by agent_id.
-    let any: Option<AgentRow> = conn
-        .query_row(
-            "SELECT agent_id, agent_name, chat_thread_id, spawned_at, last_pinged_at \
-             FROM agent_registry \
-             WHERE state='alive' \
-               AND (?1 IS NULL OR chat_thread_id = ?1) \
-             ORDER BY agent_id ASC \
-             LIMIT 1",
-            params![thread],
-            map_row,
-        )
-        .optional()?;
-    Ok(any)
 }
 
 /// Reap orphaned rows older than `older_than_secs` seconds. Default
@@ -344,6 +344,146 @@ pub fn reap(conn: &Connection, older_than_secs: Option<i64>) -> anyhow::Result<R
         reaped_count: reaped,
         remaining_orphaned: remaining as usize,
     })
+}
+
+/// Slice 4a of multi-agent-telegram-on-v0.6 — bind a CLI to a Telegram
+/// routing key `(routing_chat_id, routing_thread_id)`. If another ALIVE
+/// CLI is already bound to this routing key, that binding is FIRST
+/// cleared (its `routing_*` columns set to NULL) so the partial-UNIQUE
+/// expression-index `(chat_id, COALESCE(thread_id, -1)) WHERE
+/// state='alive'` invariant is preserved.
+///
+/// The clear + set runs inside a single `BEGIN IMMEDIATE` transaction
+/// so concurrent `/switch` calls serialize at the SQLite layer (the
+/// IMMEDIATE behavior takes a write lock on entry instead of upgrading
+/// from DEFERRED on the first write, removing the SQLITE_BUSY retry
+/// window). Second-tap-wins is the deterministic outcome — exactly the
+/// FR-MAT-8.3 / TC-14 contract.
+///
+/// Orphaned/dead rows are not touched (their routing_* columns may
+/// remain populated from before they went orphaned — they're excluded
+/// from the partial-UNIQUE index by the `WHERE state='alive'` clause).
+///
+/// Idempotent: re-binding the same agent to the same routing key
+/// produces no observable change.
+pub fn bind_routing_key(
+    conn: &mut Connection,
+    agent_id: &str,
+    routing_chat_id: i64,
+    routing_thread_id: Option<i64>,
+) -> rusqlite::Result<()> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    bind_routing_key_in_tx(&tx, agent_id, routing_chat_id, routing_thread_id)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Slice 4c — internal-tx variant of `bind_routing_key`. Used by
+/// `/switch` handler dispatched inside `process_batch_with_pairing`
+/// which already holds a rusqlite Transaction. Within a single Update
+/// batch, multiple `/switch` taps serialize naturally via sequential
+/// processing; cross-batch concurrency is guarded by run_long_poll's
+/// sequential batch loop. The caller is responsible for committing
+/// the parent transaction.
+pub fn bind_routing_key_in_tx(
+    tx: &rusqlite::Transaction,
+    agent_id: &str,
+    routing_chat_id: i64,
+    routing_thread_id: Option<i64>,
+) -> rusqlite::Result<()> {
+    // Clear any OTHER alive CLI's binding on this routing key (the
+    // `agent_id != ?3` clause keeps a same-agent rebind idempotent).
+    tx.execute(
+        "UPDATE agent_registry \
+         SET routing_chat_id = NULL, routing_thread_id = NULL \
+         WHERE state = 'alive' \
+           AND routing_chat_id = ?1 \
+           AND COALESCE(routing_thread_id, -1) = COALESCE(?2, -1) \
+           AND agent_id != ?3",
+        params![routing_chat_id, routing_thread_id, agent_id],
+    )?;
+    // Bind THIS agent. UPDATE 0 rows when the agent doesn't exist or is
+    // not alive — the caller (Slice 4c `/switch` handler) is responsible
+    // for surfacing that case to the user with a helpful error.
+    tx.execute(
+        "UPDATE agent_registry \
+         SET routing_chat_id = ?1, routing_thread_id = ?2 \
+         WHERE agent_id = ?3 AND state = 'alive'",
+        params![routing_chat_id, routing_thread_id, agent_id],
+    )?;
+    Ok(())
+}
+
+/// Slice 4a — clear a CLI's routing-key binding without touching other
+/// columns (state, host, cwd, pid, last_user_id stay). Used by `/switch`
+/// to unbind the old CLI when the operator names a different one, and
+/// by agent shutdown paths. Returns Ok(()) even when the agent has no
+/// binding (no-op UPDATE 0 rows).
+pub fn unbind_routing_key(conn: &Connection, agent_id: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE agent_registry \
+         SET routing_chat_id = NULL, routing_thread_id = NULL \
+         WHERE agent_id = ?1",
+        params![agent_id],
+    )?;
+    Ok(())
+}
+
+/// Slice 4a — stamp `last_user_id` on a CLI's binding row. Called from
+/// the inbound routing path (Slice 4b wire-up) on every successful
+/// `resolve_routing` hit so `/switch` has the FR-MAT-8.6 authorization
+/// signal: only the last_user_id OR a chat admin may rebind the
+/// routing key. The stamp targets ALIVE rows only (orphaned bindings
+/// don't have an in-flight operator and shouldn't grant `/switch`
+/// authority retroactively).
+///
+/// Idempotent: stamping the same user_id is a no-op write.
+pub fn stamp_last_user_id(
+    conn: &Connection,
+    agent_id: &str,
+    last_user_id: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE agent_registry SET last_user_id = ?1 \
+         WHERE agent_id = ?2 AND state = 'alive'",
+        params![last_user_id, agent_id],
+    )?;
+    Ok(())
+}
+
+/// Slice 4a — list all alive CLIs bound to a specific routing key
+/// `(chat_id, thread_id)`. Under the current 1-CLI-per-key invariant
+/// (Slice 1 partial-UNIQUE index) the Vec contains 0 or 1 entries; the
+/// signature returns a Vec for future extensibility (e.g., if multiple
+/// CLIs can fan out from the same key).
+///
+/// Used by Slice 4b's `/agents` command to enumerate the active CLI on
+/// the requesting (chat, topic) tuple, and by Slice 4c's `/whoami` /
+/// `/here` commands to look up the binding's metadata.
+pub fn list_routings_for(
+    conn: &Connection,
+    routing_chat_id: i64,
+    routing_thread_id: Option<i64>,
+) -> rusqlite::Result<Vec<AgentRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT agent_id, agent_name, chat_thread_id, spawned_at, last_pinged_at \
+         FROM agent_registry \
+         WHERE state = 'alive' \
+           AND routing_chat_id = ?1 \
+           AND COALESCE(routing_thread_id, -1) = COALESCE(?2, -1)",
+    )?;
+    let rows: rusqlite::Result<Vec<AgentRow>> = stmt
+        .query_map(params![routing_chat_id, routing_thread_id], |row| {
+            Ok(AgentRow {
+                agent_id: row.get(0)?,
+                agent_name: row.get(1)?,
+                chat_thread_id: row.get(2)?,
+                spawned_at: row.get(3)?,
+                last_pinged_at: row.get(4)?,
+            })
+        })?
+        .collect();
+    Ok(rows?)
 }
 
 /// Bulk-UPDATE all rows where connection_id matches and state='alive'
@@ -472,6 +612,141 @@ mod tests {
     }
 
     #[test]
+    fn rename_cleanup_marks_old_row_dead_when_same_connection_id_renames() {
+        // Bridge auto-registers as UUID; user later asks Mira "register
+        // as mira" which calls agent_register on the SAME connection_id.
+        // The UUID row must transition to dead so /agents shows only
+        // "mira" — the operator-vision rename UX from 2026-06-03.
+        let conn = open_test_conn();
+        register(&conn, "uuid-abc", "uuid-abc", "conn-shared", None, None).unwrap();
+        register(&conn, "mira", "mira", "conn-shared", None, None).unwrap();
+        // old row: dead
+        let old_state: String = conn
+            .query_row(
+                "SELECT state FROM agent_registry WHERE agent_id='uuid-abc'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_state, "dead", "old agent_id row must be dead after rename");
+        // new row: alive
+        let new_state: String = conn
+            .query_row(
+                "SELECT state FROM agent_registry WHERE agent_id='mira'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_state, "alive");
+        // only ONE alive row on this connection_id
+        let alive_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_registry \
+                 WHERE connection_id='conn-shared' AND state='alive'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(alive_count, 1);
+    }
+
+    #[test]
+    fn rename_cleanup_does_not_touch_same_id_reregister() {
+        // Same connection_id, same agent_id, second register call
+        // (e.g. bridge auto-register after a daemon bounce + reconnect).
+        // The cleanup predicate excludes agent_id = ?2 so no rows are
+        // marked dead — pure idempotent re-bind.
+        let conn = open_test_conn();
+        register(&conn, "uuid-abc", "uuid-abc", "conn-x", None, None).unwrap();
+        register(&conn, "uuid-abc", "uuid-abc", "conn-x", None, None).unwrap();
+        let alive_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_registry \
+                 WHERE agent_id='uuid-abc' AND state='alive'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(alive_count, 1);
+        let dead_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_registry \
+                 WHERE agent_id='uuid-abc' AND state='dead'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dead_count, 0, "no rows should be marked dead on same-id re-register");
+    }
+
+    #[test]
+    fn rename_cleanup_does_not_bury_sibling_agent_in_different_thread() {
+        // Same connection_id manages multiple sub-agents, each scoped
+        // to its own chat_thread_id (permission_relayer pattern). When
+        // one of them renames, the cleanup must use NULL-safe
+        // `chat_thread_id IS ?` matching so it ONLY buries the row in
+        // the SAME thread, not the sibling in a different thread.
+        let conn = open_test_conn();
+        register(&conn, "uuid-1", "uuid-1", "conn-shared", Some("t-1"), None).unwrap();
+        register(&conn, "uuid-2", "uuid-2", "conn-shared", Some("t-2"), None).unwrap();
+        // Rename the t-1 occupant
+        register(&conn, "mira", "mira", "conn-shared", Some("t-1"), None).unwrap();
+        // t-1 occupant: dead (was uuid-1)
+        let s1: String = conn
+            .query_row(
+                "SELECT state FROM agent_registry WHERE agent_id='uuid-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(s1, "dead", "uuid-1 must be dead (rename swept it)");
+        // t-2 occupant: alive (uuid-2 must NOT have been touched)
+        let s2: String = conn
+            .query_row(
+                "SELECT state FROM agent_registry WHERE agent_id='uuid-2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            s2, "alive",
+            "uuid-2 in t-2 must stay alive — cleanup is per-thread"
+        );
+        // mira: alive
+        let sm: String = conn
+            .query_row(
+                "SELECT state FROM agent_registry WHERE agent_id='mira'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sm, "alive");
+    }
+
+    #[test]
+    fn rename_cleanup_does_not_bury_other_connections_alive_rows() {
+        // Two CLIs each auto-register on their own connection_ids. One
+        // CLI renames; the OTHER CLI's row must stay alive — the cleanup
+        // is scoped by connection_id and must not touch siblings.
+        let conn = open_test_conn();
+        register(&conn, "uuid-1", "uuid-1", "conn-1", None, None).unwrap();
+        register(&conn, "uuid-2", "uuid-2", "conn-2", None, None).unwrap();
+        // conn-1 renames to "mira"
+        register(&conn, "mira", "mira", "conn-1", None, None).unwrap();
+        let state_other: String = conn
+            .query_row(
+                "SELECT state FROM agent_registry WHERE agent_id='uuid-2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            state_other, "alive",
+            "rename on conn-1 must not bury conn-2's alive row"
+        );
+    }
+
+    #[test]
     fn unregister_marks_dead_and_releases_index_slot() {
         let conn = open_test_conn();
         register(&conn, "a-1", "planner", "conn-x", Some("t-1"), None).unwrap();
@@ -595,123 +870,264 @@ mod tests {
         );
     }
 
-    // ---- telegram-multi-cli Slice 1: is_alive + first_alive ----
+    // ---------------------------------------------------------------
+    // Slice 2 of multi-agent-telegram-on-v0.6 — resolve_routing tests.
+    // Verifies the routing-key lookup against the Slice 1 partial-UNIQUE
+    // expression-index in 4 cases:
+    //   (a) DM hit: (chat, None) returns the bound agent_id
+    //   (b) topic hit: (chat, Some(thread)) returns the bound agent_id
+    //   (c) orphan miss: unbound routing key returns None
+    //   (d) state filter: an `orphaned` row is NOT returned even when
+    //       its routing key matches
+    // ---------------------------------------------------------------
 
-    /// TC-TMC-2.1: is_alive returns true for a registered (alive) agent.
-    #[test]
-    fn is_alive_returns_true_for_registered() {
-        let conn = open_test_conn();
-        register(&conn, "agent-id-abc", "planner", "c-x", Some("t-1"), None).unwrap();
-        assert!(is_alive(&conn, "agent-id-abc").unwrap());
+    fn slice2_seed_routing(
+        conn: &Connection,
+        agent_id: &str,
+        connection_id: &str,
+        routing_chat_id: i64,
+        routing_thread_id: Option<i64>,
+        state: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO agent_registry \
+             (agent_id, agent_name, connection_id, chat_thread_id, spawned_at, last_pinged_at, state, routing_chat_id, routing_thread_id) \
+             VALUES (?1, ?2, ?3, NULL, 1, 1, ?4, ?5, ?6)",
+            params![
+                agent_id,
+                "x",
+                connection_id,
+                state,
+                routing_chat_id,
+                routing_thread_id,
+            ],
+        )
+        .expect("seed insert");
     }
 
-    /// TC-TMC-2.2: is_alive returns false for an unknown agent_id.
     #[test]
-    fn is_alive_returns_false_for_unknown() {
+    fn slice2_resolve_routing_dm_hit() {
         let conn = open_test_conn();
-        assert!(!is_alive(&conn, "nonexistent-id").unwrap());
+        slice2_seed_routing(&conn, "a-dm", "c1", 100, None, "alive");
+        let resolved = resolve_routing(&conn, 100, None).unwrap();
+        assert_eq!(resolved, Some("a-dm".to_string()));
     }
 
-    /// TC-TMC-2.3: is_alive returns false for an orphaned agent.
     #[test]
-    fn is_alive_returns_false_for_orphaned() {
+    fn slice2_resolve_routing_topic_hit() {
         let conn = open_test_conn();
-        register(&conn, "agent-id-orphaned", "planner", "c-x", Some("t-1"), None).unwrap();
-        mark_connection_orphaned(&conn, "c-x").unwrap();
-        assert!(!is_alive(&conn, "agent-id-orphaned").unwrap());
+        slice2_seed_routing(&conn, "a-b", "c1", 500, Some(7), "alive");
+        let resolved = resolve_routing(&conn, 500, Some(7)).unwrap();
+        assert_eq!(resolved, Some("a-b".to_string()));
     }
 
-    /// TC-TMC-2.4: is_alive on an empty string and a SQL-injection payload
-    /// both return false WITHOUT modifying agent_registry (parameterised
-    /// query). UC-TMC-2-EC1.
     #[test]
-    fn is_alive_rejects_malformed_ids() {
+    fn slice2_resolve_routing_orphan_miss_returns_none() {
         let conn = open_test_conn();
-        register(&conn, "real-agent", "planner", "c-x", Some("t-1"), None).unwrap();
-        let before: i64 = conn
-            .query_row("SELECT COUNT(*) FROM agent_registry", [], |r| r.get(0))
-            .unwrap();
-        assert!(!is_alive(&conn, "").unwrap());
-        assert!(!is_alive(&conn, "'; DROP TABLE agent_registry;--").unwrap());
-        let after: i64 = conn
-            .query_row("SELECT COUNT(*) FROM agent_registry", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(before, after, "table must be untouched by malformed ids");
-        // The legitimate row is still alive — table survived.
-        assert!(is_alive(&conn, "real-agent").unwrap());
+        // Bind one CLI to chat=500/topic=7; query for chat=500/topic=8 (no binding)
+        slice2_seed_routing(&conn, "a-b", "c1", 500, Some(7), "alive");
+        let resolved = resolve_routing(&conn, 500, Some(8)).unwrap();
+        assert_eq!(resolved, None);
+        // And query for a chat that has no binding at all.
+        let resolved = resolve_routing(&conn, 999, None).unwrap();
+        assert_eq!(resolved, None);
     }
 
-    /// TC-TMC-3.1: first_alive prefers the prefer_role substring match.
     #[test]
-    fn first_alive_prefers_role() {
+    fn slice2_resolve_routing_excludes_orphaned_rows() {
         let conn = open_test_conn();
-        register(&conn, "id-orch", "orchestrator-main", "c-x", Some("t-1"), None).unwrap();
-        register(&conn, "id-work", "worker", "c-y", Some("t-2"), None).unwrap();
-        let hit = first_alive(&conn, None, Some("orchestrator")).unwrap().unwrap();
-        assert!(
-            hit.agent_name.contains("orchestrator"),
-            "expected an orchestrator row, got {}",
-            hit.agent_name
+        // The row with routing key (100, NULL) is `orphaned` — the
+        // resolve query must NOT return it. (KP1 binding can be
+        // recreated by a new `claudebase run` from another cwd.)
+        slice2_seed_routing(&conn, "a-dead", "c1", 100, None, "orphaned");
+        let resolved = resolve_routing(&conn, 100, None).unwrap();
+        assert_eq!(
+            resolved, None,
+            "orphaned row must not be returned by resolve_routing"
         );
-        assert_eq!(hit.agent_id, "id-orch");
     }
 
-    /// TC-TMC-3.2: first_alive falls back to any alive agent when no
-    /// prefer_role match exists.
     #[test]
-    fn first_alive_fallback_no_role_match() {
+    fn slice2_resolve_routing_dm_and_topic_distinct() {
+        // KP1 + KP2/KP3 simultaneously: same chat_id, one DM (None) and
+        // two topics (7 + 8). resolve_routing returns the correct CLI
+        // for each routing key.
         let conn = open_test_conn();
-        register(&conn, "id-work", "worker", "c-y", Some("t-2"), None).unwrap();
-        let hit = first_alive(&conn, None, Some("orchestrator")).unwrap().unwrap();
-        assert_eq!(hit.agent_name, "worker");
-        assert_eq!(hit.agent_id, "id-work");
+        slice2_seed_routing(&conn, "cli-a", "c1", 1000, None, "alive");
+        slice2_seed_routing(&conn, "cli-b", "c2", 1000, Some(7), "alive");
+        slice2_seed_routing(&conn, "cli-c", "c3", 1000, Some(8), "alive");
+        assert_eq!(
+            resolve_routing(&conn, 1000, None).unwrap(),
+            Some("cli-a".to_string())
+        );
+        assert_eq!(
+            resolve_routing(&conn, 1000, Some(7)).unwrap(),
+            Some("cli-b".to_string())
+        );
+        assert_eq!(
+            resolve_routing(&conn, 1000, Some(8)).unwrap(),
+            Some("cli-c".to_string())
+        );
     }
 
-    /// TC-TMC-3.3: first_alive returns None when there are zero alive rows.
-    #[test]
-    fn first_alive_returns_none_when_empty() {
-        let conn = open_test_conn();
-        assert!(first_alive(&conn, None, Some("orchestrator")).unwrap().is_none());
-        // Also None when the only rows are orphaned.
-        register(&conn, "id-x", "worker", "c-x", Some("t-1"), None).unwrap();
-        mark_connection_orphaned(&conn, "c-x").unwrap();
-        assert!(first_alive(&conn, None, Some("orchestrator")).unwrap().is_none());
+    // ---------------------------------------------------------------
+    // Slice 4a of multi-agent-telegram-on-v0.6 — bind/unbind/stamp +
+    // list_routings_for tests. Covers the binding mutators that
+    // Slice 4b/4c command handlers will call into.
+    // ---------------------------------------------------------------
+
+    fn slice4_register_alive(conn: &Connection, agent_id: &str, agent_name: &str) {
+        conn.execute(
+            "INSERT INTO agent_registry \
+             (agent_id, agent_name, connection_id, chat_thread_id, spawned_at, last_pinged_at, state) \
+             VALUES (?1, ?2, ?3, NULL, 1, 1, 'alive')",
+            params![agent_id, agent_name, format!("conn-{agent_id}")],
+        )
+        .expect("register insert");
     }
 
-    /// TC-TMC-3.4: with two equally-preferred agents, two consecutive
-    /// first_alive calls return the SAME row (deterministic agent_id sort).
-    #[test]
-    fn first_alive_deterministic_tiebreak() {
-        let conn = open_test_conn();
-        register(&conn, "id-orch-b", "orchestrator-b", "c-x", Some("t-1"), None).unwrap();
-        register(&conn, "id-orch-a", "orchestrator-a", "c-y", Some("t-2"), None).unwrap();
-        let first = first_alive(&conn, None, Some("orchestrator")).unwrap().unwrap();
-        let second = first_alive(&conn, None, Some("orchestrator")).unwrap().unwrap();
-        assert_eq!(first.agent_id, second.agent_id);
-        // ORDER BY agent_id ASC → "id-orch-a" wins over "id-orch-b".
-        assert_eq!(first.agent_id, "id-orch-a");
+    fn slice4_routing_of(conn: &Connection, agent_id: &str) -> (Option<i64>, Option<i64>) {
+        conn.query_row(
+            "SELECT routing_chat_id, routing_thread_id FROM agent_registry WHERE agent_id = ?1",
+            params![agent_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("query routing")
     }
 
-    /// first_alive with prefer_role=None returns the first alive agent by
-    /// deterministic agent_id sort.
     #[test]
-    fn first_alive_no_prefer_role_returns_first_alive() {
-        let conn = open_test_conn();
-        register(&conn, "id-b", "worker-b", "c-x", Some("t-1"), None).unwrap();
-        register(&conn, "id-a", "worker-a", "c-y", Some("t-2"), None).unwrap();
-        let hit = first_alive(&conn, None, None).unwrap().unwrap();
-        assert_eq!(hit.agent_id, "id-a");
+    fn slice4a_bind_routing_initial_succeeds() {
+        let mut conn = open_test_conn();
+        slice4_register_alive(&conn, "a1", "alice");
+        bind_routing_key(&mut conn, "a1", 500, Some(7)).expect("initial bind");
+        let (cid, tid) = slice4_routing_of(&conn, "a1");
+        assert_eq!(cid, Some(500));
+        assert_eq!(tid, Some(7));
     }
 
-    /// first_alive scopes to a thread when `thread` is Some.
     #[test]
-    fn first_alive_scopes_to_thread() {
+    fn slice4a_bind_routing_dm_with_none_thread() {
+        let mut conn = open_test_conn();
+        slice4_register_alive(&conn, "a-dm", "alice");
+        bind_routing_key(&mut conn, "a-dm", 42, None).expect("DM bind");
+        let (cid, tid) = slice4_routing_of(&conn, "a-dm");
+        assert_eq!(cid, Some(42));
+        assert_eq!(tid, None);
+    }
+
+    #[test]
+    fn slice4a_bind_routing_displaces_existing_binding() {
+        // /switch semantic: re-binding chat=500/thread=7 to a different
+        // CLI clears the old CLI's routing_* columns and sets the new
+        // CLI's columns. partial-UNIQUE index never violated.
+        let mut conn = open_test_conn();
+        slice4_register_alive(&conn, "old", "olivia");
+        slice4_register_alive(&conn, "new", "natalie");
+        bind_routing_key(&mut conn, "old", 500, Some(7)).expect("old bound");
+        bind_routing_key(&mut conn, "new", 500, Some(7)).expect("new rebound");
+        // Old must be cleared
+        assert_eq!(slice4_routing_of(&conn, "old"), (None, None));
+        // New must hold the binding
+        assert_eq!(slice4_routing_of(&conn, "new"), (Some(500), Some(7)));
+    }
+
+    #[test]
+    fn slice4a_bind_routing_idempotent_same_agent() {
+        let mut conn = open_test_conn();
+        slice4_register_alive(&conn, "a1", "alice");
+        bind_routing_key(&mut conn, "a1", 100, None).unwrap();
+        bind_routing_key(&mut conn, "a1", 100, None).expect("re-bind same agent");
+        assert_eq!(slice4_routing_of(&conn, "a1"), (Some(100), None));
+    }
+
+    #[test]
+    fn slice4a_bind_routing_preserves_orphaned_rows() {
+        // An orphaned CLI's routing_* columns are NOT cleared when a new
+        // alive CLI rebinds the same routing key — the orphaned record
+        // is excluded from the partial-UNIQUE index anyway, and we want
+        // to preserve the audit trail of "this CLI was bound here at
+        // shutdown".
+        let mut conn = open_test_conn();
+        conn.execute(
+            "INSERT INTO agent_registry \
+             (agent_id, agent_name, connection_id, chat_thread_id, spawned_at, last_pinged_at, state, routing_chat_id, routing_thread_id) \
+             VALUES ('ghost', 'g', 'cg', NULL, 1, 1, 'orphaned', 500, 7)",
+            [],
+        )
+        .unwrap();
+        slice4_register_alive(&conn, "new", "n");
+        bind_routing_key(&mut conn, "new", 500, Some(7)).unwrap();
+        // Ghost (orphaned) row's routing still populated
+        assert_eq!(slice4_routing_of(&conn, "ghost"), (Some(500), Some(7)));
+        // New (alive) row also bound
+        assert_eq!(slice4_routing_of(&conn, "new"), (Some(500), Some(7)));
+    }
+
+    #[test]
+    fn slice4a_unbind_routing_clears_columns() {
+        let mut conn = open_test_conn();
+        slice4_register_alive(&conn, "a1", "alice");
+        bind_routing_key(&mut conn, "a1", 100, Some(3)).unwrap();
+        unbind_routing_key(&conn, "a1").expect("unbind");
+        assert_eq!(slice4_routing_of(&conn, "a1"), (None, None));
+    }
+
+    #[test]
+    fn slice4a_unbind_routing_noop_on_unknown_agent() {
         let conn = open_test_conn();
-        register(&conn, "id-t1", "orchestrator-x", "c-x", Some("t-1"), None).unwrap();
-        register(&conn, "id-t2", "orchestrator-y", "c-y", Some("t-2"), None).unwrap();
-        let hit = first_alive(&conn, Some("t-2"), Some("orchestrator"))
-            .unwrap()
+        unbind_routing_key(&conn, "never-registered").expect("noop unbind");
+    }
+
+    #[test]
+    fn slice4a_stamp_last_user_id_sets_column() {
+        let mut conn = open_test_conn();
+        slice4_register_alive(&conn, "a1", "alice");
+        bind_routing_key(&mut conn, "a1", 100, None).unwrap();
+        stamp_last_user_id(&conn, "a1", 8791871989).expect("stamp");
+        let last: Option<i64> = conn
+            .query_row(
+                "SELECT last_user_id FROM agent_registry WHERE agent_id='a1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(hit.agent_id, "id-t2");
+        assert_eq!(last, Some(8791871989));
+    }
+
+    #[test]
+    fn slice4a_list_routings_empty_when_no_binding() {
+        let conn = open_test_conn();
+        let rows = list_routings_for(&conn, 999, None).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn slice4a_list_routings_returns_dm_binding() {
+        let mut conn = open_test_conn();
+        slice4_register_alive(&conn, "a-dm", "alice");
+        bind_routing_key(&mut conn, "a-dm", 42, None).unwrap();
+        let rows = list_routings_for(&conn, 42, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent_id, "a-dm");
+        assert_eq!(rows[0].agent_name, "alice");
+    }
+
+    #[test]
+    fn slice4a_list_routings_topic_aware() {
+        // KP2/KP3 scenario: same group, two topics, different CLIs.
+        // list_routings_for(chat=500, thread=Some(7)) returns ONLY the
+        // CLI bound to topic α; it must NOT return the CLI bound to
+        // topic β (8).
+        let mut conn = open_test_conn();
+        slice4_register_alive(&conn, "cli-b", "bob");
+        slice4_register_alive(&conn, "cli-c", "carol");
+        bind_routing_key(&mut conn, "cli-b", 500, Some(7)).unwrap();
+        bind_routing_key(&mut conn, "cli-c", 500, Some(8)).unwrap();
+        let rows_alpha = list_routings_for(&conn, 500, Some(7)).unwrap();
+        assert_eq!(rows_alpha.len(), 1);
+        assert_eq!(rows_alpha[0].agent_id, "cli-b");
+        let rows_beta = list_routings_for(&conn, 500, Some(8)).unwrap();
+        assert_eq!(rows_beta.len(), 1);
+        assert_eq!(rows_beta[0].agent_id, "cli-c");
     }
 }

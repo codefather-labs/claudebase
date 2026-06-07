@@ -138,6 +138,85 @@ impl Default for ChatBus {
 /// has no @-mention semantics and continues calling the original 1-arg
 /// builder. Only the Telegram inbound path in `daemon/telegram.rs`
 /// invokes the routed variant.
+/// Slice 8 of cli-to-cli-routing — build the `notifications/claude/channel`
+/// frame for an agent-to-agent message (direct path or DND drain).
+///
+/// **Meta convention (NFR-C2C-8 / red team F-8).** The frame uses the
+/// SAME `notifications/claude/channel` method as the Telegram inbound
+/// path, but with two distinguishing meta keys:
+///
+///   * `meta.source = "claudebase:agent"` (TG inbound uses
+///     `"claudebase"` / `"plugin:telegram:telegram"` depending on layer)
+///   * `meta.kind = "agent-to-agent"` (TG inbound omits this)
+///
+/// Claude Code's channel surface renders the meta into a `<channel
+/// source="..." kind="..." from_agent_id="..." thread="agent:..."
+/// target_agent_id="..." message_id="...">CONTENT</channel>` tag in
+/// the receiving model's prompt context. The `source` and `kind`
+/// attributes are the load-bearing distinguishers — downstream
+/// consumers MUST treat any frame with `meta.kind != "agent-to-agent"`
+/// (or no `meta.kind`) as TG inbound and fall through to the existing
+/// channel rendering (UC-C2C-15-EC1 fallthrough rule).
+///
+/// `drained_from_dnd` is `true` when the frame originates from
+/// Slice 5's recurring drain task (i.e., the message was queued under
+/// DND and is being re-emitted after expiry); `false` for the direct
+/// `agent_send` path.
+pub fn build_channel_notification_agent_to_agent(
+    content: &str,
+    from_agent_id: &str,
+    target_agent_id: &str,
+    message_id: &str,
+    drained_from_dnd: bool,
+) -> Value {
+    let thread = format!("agent:{target_agent_id}");
+    // Slice 8 hotfix #2 (Wave 5 live QA, doc_id #13 in insights corpus):
+    // Round 1 added the 5 TG-shape keys but kept extra distinguishers
+    // (kind / target_agent_id / from_agent_id / thread / drained_from_dnd /
+    // source) in meta — frames STILL dropped because CC's channel
+    // renderer rejects unknown meta keys. This is the SAME pattern
+    // caught in v0.9-cut Slice 8 AR-9 amendment: load agent-to-agent
+    // distinguishers into `params.content` as a parseable preamble
+    // and keep meta bit-for-bit identical to the TG inbound shape.
+    //
+    // Meta MUST contain ONLY the 5 TG-known keys (plus the optional
+    // `target_agent_id` which TG inbound also uses since Slice 6 of
+    // multi-agent-on-v0.6):
+    //   chat_id, message_id, user, user_id, ts, target_agent_id
+    //
+    // Content preamble carries the rest as a one-line JSON object
+    // followed by a blank line then the verbatim user content, so a
+    // receiver model parses the metadata then reads the message.
+    let now_iso = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    let preamble = serde_json::json!({
+        "agent_to_agent": {
+            "from_agent_id": from_agent_id,
+            "target_agent_id": target_agent_id,
+            "thread": thread,
+            "drained_from_dnd": drained_from_dnd,
+            "message_id": message_id,
+        }
+    });
+    let preamble_line = serde_json::to_string(&preamble)
+        .unwrap_or_else(|_| "{\"agent_to_agent\":{}}".to_string());
+    let body = format!("{preamble_line}\n\n{content}");
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/claude/channel",
+        "params": {
+            "meta": {
+                "chat_id": thread,
+                "message_id": message_id,
+                "user": from_agent_id,
+                "user_id": from_agent_id,
+                "ts": now_iso,
+                "target_agent_id": target_agent_id,
+            },
+            "content": body,
+        }
+    })
+}
+
 pub fn build_channel_notification_routed(
     msg: &ChatMessage,
     target_agent_id: Option<&str>,
@@ -468,6 +547,10 @@ COMMIT;
     // Slice 8 — `pending_asks` table for `chat_ask` MCP tool. Additive,
     // idempotent. Architect AR-6: chat.db single-database discipline.
     crate::daemon::pending_asks::apply_pending_asks_migration(conn)?;
+    // Slice 1 of cli-to-cli-routing — additive v5→v6 migration adding
+    // the 5 cross-agent discovery / DND columns to `agent_registry`
+    // plus a `project_id` lookup index. Idempotent via probe-before-ADD.
+    apply_agent_registry_c2c_migration(conn)?;
     Ok(())
 }
 
@@ -551,6 +634,69 @@ fn apply_routing_migration(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Slice 1 of cli-to-cli-routing — additive migration adding cross-agent
+/// discovery and DND state columns to `agent_registry`, plus a `project_id`
+/// lookup index. v5→v6 transition; idempotent via the same
+/// `pragma_table_info` probe pattern used by `apply_routing_migration`.
+///
+/// New columns:
+///   - `project_id TEXT` — normalized git remote URL (host/owner/repo) or
+///     fallback per `src/project_id.rs` (Slice 2). Populated by Slice 3's
+///     extended `agent_register` handler. Indexed for `--project current`
+///     filter in Slice 6's `claudebase agent list-alive` CLI.
+///   - `branch TEXT` — `git rev-parse --abbrev-ref HEAD` captured at
+///     register time. Populated by Slice 3.
+///   - `working_dir TEXT` — absolute cwd captured at register time.
+///     Distinguishes per-clone agents that share a `project_id`.
+///   - `feature_description TEXT` — operator-facing label set by Slice 3's
+///     new `agent_describe` MCP tool. Mandated post-ExitPlanMode by the
+///     Slice 7 hook.
+///   - `dnd_until_ts INTEGER` — UNIX millis until which the agent is in
+///     Do-Not-Disturb mode. NULL = no DND; `i64::MAX` = indefinite
+///     (architect A-3 + OQ-UC-C2C-1 resolution). The Slice 5 drain task
+///     scans for rows with `dnd_until_ts < now() AND dnd_until_ts IS NOT NULL`
+///     so the `i64::MAX` sentinel is naturally excluded without special-case
+///     code.
+///
+/// Index `agent_registry_project_id_idx ON agent_registry(project_id)`
+/// supports the `WHERE project_id = ? AND project_id IS NOT NULL` filter
+/// used by Slice 6's `list-alive --project current`. Legacy rows where the
+/// `project_id` could not be derived (cwd-less pre-Slice-3 inserts) have
+/// `project_id IS NULL` and surface only under `--project all` per
+/// UC-C2C-1-EC3 backfill semantics.
+fn apply_agent_registry_c2c_migration(conn: &Connection) -> rusqlite::Result<()> {
+    let columns: &[(&str, &str)] = &[
+        ("project_id", "TEXT DEFAULT NULL"),
+        ("branch", "TEXT DEFAULT NULL"),
+        ("working_dir", "TEXT DEFAULT NULL"),
+        ("feature_description", "TEXT DEFAULT NULL"),
+        ("dnd_until_ts", "INTEGER DEFAULT NULL"),
+    ];
+
+    conn.execute_batch("BEGIN")?;
+    for (col, decl) in columns {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('agent_registry') WHERE name = ?1)",
+            [col],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            // Column declarations are source literals (no user input),
+            // safe to format!() into the ALTER TABLE statement — SQLite
+            // parameters bind values, never identifiers.
+            conn.execute_batch(&format!(
+                "ALTER TABLE agent_registry ADD COLUMN {col} {decl}"
+            ))?;
+        }
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS agent_registry_project_id_idx \
+         ON agent_registry(project_id)",
+    )?;
+    conn.execute_batch("COMMIT")?;
+    Ok(())
+}
+
 /// Open the chat.db at `$HOME/.claude/knowledge/chat.db` (creating
 /// parent dirs and the file as needed), apply schema v5, and return the
 /// Connection. Caller is responsible for moving the Connection into a
@@ -582,7 +728,7 @@ pub fn open_chat_db() -> anyhow::Result<Connection> {
 }
 
 /// Current wall-clock milliseconds since the UNIX epoch.
-pub(crate) fn now_millis() -> i64 {
+pub fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -1031,8 +1177,11 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        // Original v6 had 9 columns + 6 new = 15.
-        assert_eq!(n, 15, "agent_registry should have exactly 15 columns post-migration");
+        // Base v5 schema: 9 columns. apply_routing_migration adds 6.
+        // Slice 1 of cli-to-cli-routing's apply_agent_registry_c2c_migration
+        // adds 5 more (project_id / branch / working_dir /
+        // feature_description / dnd_until_ts). Total = 9 + 6 + 5 = 20.
+        assert_eq!(n, 20, "agent_registry should have exactly 20 columns post-migration");
     }
 
     #[test]

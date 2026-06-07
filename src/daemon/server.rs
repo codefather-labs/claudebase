@@ -442,6 +442,14 @@ pub async fn serve(_args: &DaemonServeArgs) -> anyhow::Result<()> {
         tracing::info!("telegram long-poll spawned");
     }
 
+    // Slice 5 of cli-to-cli-routing — spawn the DND drain background
+    // task. NEW recurring tokio task (architect A-5 — NOT an extension
+    // of the startup-one-shot drain_pending_outbound_tg). Fires every
+    // 30s, panic-safe via tokio::spawn supervisor, rate-limited at 10
+    // messages per agent per tick per FR-C2C-5.5.
+    spawn_dnd_drain_task(bus.clone());
+    tracing::info!("dnd drain task spawned");
+
     // Accept loop. We never return Ok(()) from here in Slice 1a — the
     // daemon runs until killed. Slice 1d will wire a SIGTERM cancel
     // signal that breaks out of this loop.
@@ -704,6 +712,20 @@ where
                     let resp = handle_agent_register(echo_id, &args, connection_id).await;
                     let _ = outbound_tx.send(resp);
                 }
+                "agent_describe" => {
+                    let resp = handle_agent_describe(echo_id, &args, connection_id).await;
+                    let _ = outbound_tx.send(resp);
+                }
+                "agent_send" => {
+                    let resp =
+                        handle_agent_send(echo_id, &args, &bus, connection_id).await;
+                    let _ = outbound_tx.send(resp);
+                }
+                "agent_set_dnd" => {
+                    let resp =
+                        handle_agent_set_dnd(echo_id, &args, &bus, connection_id).await;
+                    let _ = outbound_tx.send(resp);
+                }
                 "agent_unregister" => {
                     let resp = handle_agent_unregister(echo_id, &args).await;
                     let _ = outbound_tx.send(resp);
@@ -819,16 +841,54 @@ fn build_tools_list_response(id: serde_json::Value) -> serde_json::Value {
                 },
                 {
                     "name": "agent_register",
-                    "description": "Register an agent with the daemon's agent_registry",
+                    "description": "Register an agent with the daemon's agent_registry. Optionally pass `cwd` (absolute path) so the daemon can resolve the project_id (git remote URL normalized) and capture the current branch at register time — populating the v6 columns project_id/branch/working_dir used by cli-to-cli routing's `agent list-alive --project current` filter.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "agent_id": {"type": "string"},
                             "name": {"type": "string"},
                             "thread": {"type": ["string", "null"]},
+                            "cwd": {"type": ["string", "null"], "description": "Absolute path to the caller's working directory. Optional — backward-compat with older bridges."},
                             "metadata": {"type": ["object", "null"]}
                         },
                         "required": ["agent_id", "name"]
+                    }
+                },
+                {
+                    "name": "agent_set_dnd",
+                    "description": "Set Do-Not-Disturb mode for the agent on THIS connection. State strings: `on` = indefinite (dnd_until_ts stored as i64::MAX sentinel; drain WHERE dnd_until_ts < now naturally excludes); `off` = clears DND to NULL; `<N>m`/`<N>h` = N minutes/hours from now; `until HH:MM` = next local HH:MM (rolls to tomorrow if past). While DND is active, peer `agent_send` calls persist to chat_messages with delivered_at=NULL; the daemon's recurring 30s drain task fires when DND expires.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "state": {"type": "string"}
+                        },
+                        "required": ["state"]
+                    }
+                },
+                {
+                    "name": "agent_send",
+                    "description": "Send a direct message to another agent registered on the same daemon. The from_agent_id is resolved server-side from the calling connection's registered identity (FR-C2C-4.6) — callers CANNOT impersonate by passing a `from` field. Target must be currently alive in agent_registry; orphaned/dead targets return an error. If the recipient is in DND (dnd_until_ts > now), the message is persisted with delivered_at=NULL and the response is { queued: true, delivered_when: <ts> } — Slice 5's background drain task delivers when DND clears.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "to_agent_id": {"type": "string", "description": "Target agent_id (must be alive in agent_registry)."},
+                            "content": {"type": "string", "description": "Message body (non-empty)."},
+                            "urgent": {"type": ["boolean", "null"], "description": "Reserved for a future DND-override mode; MVP no-op."}
+                        },
+                        "required": ["to_agent_id", "content"]
+                    }
+                },
+                {
+                    "name": "agent_describe",
+                    "description": "Publish a human-readable feature description (and optionally an updated branch) for the agent bound to THIS connection. The daemon resolves the agent_id from the connection's registered identity — callers cannot describe arbitrary other agents. Mandated post-ExitPlanMode by the Slice 7 hook so other CCs see what this agent is working on via `agent list-alive`.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "feature_id": {"type": ["string", "null"], "description": "Optional feature slug (e.g. `cli-to-cli-routing`). Logged but not persisted as a separate column in v6."},
+                            "branch": {"type": ["string", "null"], "description": "Optional updated branch name; omit to preserve existing value via COALESCE."},
+                            "description": {"type": "string", "description": "Operator-facing human label describing the current task."}
+                        },
+                        "required": ["description"]
                     }
                 },
                 {
@@ -1296,7 +1356,18 @@ async fn handle_agent_register(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     let metadata = args.get("metadata").cloned();
+    // Slice 3 of cli-to-cli-routing — optional `cwd` arg. When the
+    // bridge passes its own working directory, the daemon resolves the
+    // project_id + branch on this side (the bridge is a thin pass-
+    // through, identity discipline lives in the daemon). Backward
+    // compat: older bridges that don't pass cwd leave the v6 columns
+    // NULL — they appear under `--project all` only per UC-C2C-1-EC3.
+    let cwd_arg = args
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let cid_str = connection_id.to_string();
+    let agent_id_for_capture = agent_id.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
         let conn = crate::daemon::chat::open_chat_db()?;
         let outcome = crate::daemon::agent_registry::register(
@@ -1307,6 +1378,18 @@ async fn handle_agent_register(
             thread.as_deref(),
             metadata.as_ref(),
         )?;
+        if let Some(cwd_str) = cwd_arg {
+            let cwd_path = std::path::PathBuf::from(&cwd_str);
+            let project_id = crate::project_id::resolve_project_id(&cwd_path);
+            let branch = git_current_branch(&cwd_path);
+            let _ = crate::daemon::agent_registry::capture_identity(
+                &conn,
+                &agent_id_for_capture,
+                Some(&project_id),
+                branch.as_deref(),
+                Some(&cwd_str),
+            );
+        }
         Ok(outcome.spawned_at)
     })
     .await;
@@ -1323,6 +1406,428 @@ async fn handle_agent_register(
             tracing::error!(error = %e, "agent_register spawn_blocking panicked");
             tool_error_response(id, -32603, "internal error")
         }
+    }
+}
+
+/// Slice 3 of cli-to-cli-routing — shells out to `git -C <cwd>
+/// rev-parse --abbrev-ref HEAD`. Returns `Some("feat/foo")` on a
+/// branch, `None` if the cwd isn't a git repo OR is at detached HEAD
+/// OR git is missing. Defensive: never panics, never blocks the
+/// caller's task long enough to matter (git config-only operations
+/// complete in <10ms on a local repo).
+fn git_current_branch(cwd: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?;
+    let trimmed = s.trim();
+    if trimmed.is_empty() || trimmed == "HEAD" {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Slice 3 of cli-to-cli-routing — `agent_describe` MCP tool handler.
+/// Updates `feature_description` (required) and optionally `branch` on
+/// the agent_registry row bound to the caller's connection_id.
+///
+/// FR-C2C-4.6 sender identity binding: the agent_id whose row is
+/// updated is RESOLVED from the connection_id via
+/// `lookup_agent_id_by_connection`, NOT taken from caller args. Local
+/// processes that haven't registered (or registered as a different
+/// agent_id) cannot describe arbitrary other agents.
+async fn handle_agent_describe(
+    id: serde_json::Value,
+    args: &serde_json::Value,
+    connection_id: Uuid,
+) -> serde_json::Value {
+    let description = match args.get("description").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return tool_error_response(id, -32602, "description required (non-empty string)")
+        }
+    };
+    let branch = args
+        .get("branch")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let cid_str = connection_id.to_string();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+        let conn = crate::daemon::chat::open_chat_db()?;
+        let agent_id =
+            crate::daemon::agent_registry::lookup_agent_id_by_connection(&conn, &cid_str)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no alive agent on this connection — call agent_register first"
+                    )
+                })?;
+        let updated = crate::daemon::agent_registry::describe(
+            &conn,
+            &agent_id,
+            &description,
+            branch.as_deref(),
+        )?;
+        if updated == 0 {
+            anyhow::bail!("agent_registry row missing for resolved agent_id {agent_id}");
+        }
+        Ok(agent_id)
+    })
+    .await;
+    match result {
+        Ok(Ok(agent_id)) => {
+            let payload = serde_json::json!({"described": true, "agent_id": agent_id});
+            tool_text_response(id, &payload)
+        }
+        Ok(Err(e)) => tool_error_response(id, -32603, &e.to_string()),
+        Err(e) => {
+            tracing::error!(error = %e, "agent_describe spawn_blocking panicked");
+            tool_error_response(id, -32603, "internal error")
+        }
+    }
+}
+
+/// Slice 4 of cli-to-cli-routing — `agent_send` MCP tool handler.
+///
+/// **FR-C2C-4.6 sender identity binding (SECURITY-CRITICAL).** The
+/// `from_agent_id` recorded in `chat_messages.from_agent` is resolved
+/// from the caller's `connection_id` via the Slice 3 helper
+/// `lookup_agent_id_by_connection`. **Caller-supplied identity fields
+/// are NEVER consulted.** A local process that holds a UDS handle but
+/// never called `agent_register` on that connection gets the explicit
+/// error "no alive agent on this connection — call agent_register
+/// first" (security pre-review action SEC-1b).
+///
+/// INVARIANT: the bridge's contract is "one identity per UDS
+/// connection." The `LIMIT 1 ORDER BY last_pinged_at DESC` tie-
+/// breaker inside `lookup_agent_id_by_connection` covers the
+/// theoretical multi-id-per-connection case (permission_relayer
+/// pattern) which today's bridge does not exercise. A future
+/// multiplexing bridge MUST re-audit this binding — the tie-breaker
+/// is recency-deterministic, not authorization-strong.
+///
+/// **SEC-2 race mitigation.** The DB-side primitive
+/// `agent_registry::send_message` wraps the target-alive check and
+/// the chat_messages INSERT in a single SQLite transaction with
+/// `delivered_at = NULL`. The handler then calls `bus.publish(...)`;
+/// only if the publish returns >= 1 subscriber is
+/// `mark_delivered(now)` called. Zero-subscriber publishes leave the
+/// row drainable by Slice 5's DND drain task.
+async fn handle_agent_send(
+    id: serde_json::Value,
+    args: &serde_json::Value,
+    bus: &SharedBus,
+    connection_id: Uuid,
+) -> serde_json::Value {
+    let to_agent_id = match args.get("to_agent_id").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return tool_error_response(
+                id,
+                -32602,
+                "to_agent_id required (non-empty string)",
+            )
+        }
+    };
+    let content = match args.get("content").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_error_response(id, -32602, "content required (non-empty string)"),
+    };
+
+    let cid_str = connection_id.to_string();
+    let to_agent_id_for_send = to_agent_id.clone();
+    let content_for_send = content.clone();
+    let outcome_result = tokio::task::spawn_blocking(move || -> anyhow::Result<(String, crate::daemon::agent_registry::SendOutcome)> {
+        let conn = crate::daemon::chat::open_chat_db()?;
+        let from_agent_id =
+            crate::daemon::agent_registry::lookup_agent_id_by_connection(&conn, &cid_str)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no alive agent on this connection — call agent_register first"
+                    )
+                })?;
+        let now_ms = chat::now_millis();
+        let outcome = crate::daemon::agent_registry::send_message(
+            &conn,
+            &from_agent_id,
+            &to_agent_id_for_send,
+            &content_for_send,
+            now_ms,
+        )?;
+        Ok((from_agent_id, outcome))
+    })
+    .await;
+
+    let (from_agent_id, outcome) = match outcome_result {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => return tool_error_response(id, -32603, &e.to_string()),
+        Err(e) => {
+            tracing::error!(error = %e, "agent_send spawn_blocking panicked");
+            return tool_error_response(id, -32603, "internal error");
+        }
+    };
+
+    match outcome.decision {
+        crate::daemon::agent_registry::SendDecision::Deliver => {
+            let thread = format!("agent:{to_agent_id}");
+            let frame = chat::build_channel_notification_agent_to_agent(
+                &content,
+                &from_agent_id,
+                &to_agent_id,
+                &outcome.message_id,
+                false,
+            );
+            let subscriber_count = bus.publish(&thread, frame).await;
+            if subscriber_count >= 1 {
+                let msg_id_for_mark = outcome.message_id.clone();
+                let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+                    let conn = crate::daemon::chat::open_chat_db()?;
+                    crate::daemon::agent_registry::mark_delivered(
+                        &conn,
+                        &msg_id_for_mark,
+                        chat::now_millis(),
+                    )
+                })
+                .await;
+                let payload = serde_json::json!({
+                    "delivered": true,
+                    "message_id": outcome.message_id,
+                    "subscribers": subscriber_count,
+                });
+                tool_text_response(id, &payload)
+            } else {
+                // SEC-2 — publish found no subscribers (target's bridge
+                // raced disconnect or never subscribed). Leave
+                // delivered_at NULL so Slice 5's drain re-emits on
+                // bridge reconnect / DND-off.
+                let payload = serde_json::json!({
+                    "queued": true,
+                    "message_id": outcome.message_id,
+                    "reason": "no_subscriber",
+                });
+                tool_text_response(id, &payload)
+            }
+        }
+        crate::daemon::agent_registry::SendDecision::Queue { dnd_until_ts } => {
+            let payload = serde_json::json!({
+                "queued": true,
+                "message_id": outcome.message_id,
+                "delivered_when": dnd_until_ts,
+                "reason": "dnd",
+            });
+            tool_text_response(id, &payload)
+        }
+    }
+}
+
+/// Slice 5 of cli-to-cli-routing — `agent_set_dnd` MCP tool handler.
+///
+/// Accepts `{state}` where state ∈ {"on", "off", "<N>m", "<N>h",
+/// "until HH:MM"} per `agent_registry::parse_dnd_state`. The
+/// `agent_id` whose row is updated is resolved server-side from the
+/// caller's `connection_id` (FR-C2C-4.6 binding mirrors `agent_send`
+/// / `agent_describe`). Callers cannot DND-arbitrary-other-agents.
+///
+/// On success returns `{"dnd_until_ts": <ts or null>}` so the bridge
+/// can confirm the new state without a follow-up read.
+async fn handle_agent_set_dnd(
+    id: serde_json::Value,
+    args: &serde_json::Value,
+    bus: &SharedBus,
+    connection_id: Uuid,
+) -> serde_json::Value {
+    let state_str = match args.get("state").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_error_response(id, -32602, "state required (non-empty string)"),
+    };
+    let cid_str = connection_id.to_string();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(String, Option<i64>, Vec<crate::daemon::agent_registry::DrainableMessage>)> {
+        let conn = crate::daemon::chat::open_chat_db()?;
+        let agent_id =
+            crate::daemon::agent_registry::lookup_agent_id_by_connection(&conn, &cid_str)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no alive agent on this connection — call agent_register first"
+                    )
+                })?;
+        let now_ms = chat::now_millis();
+        let dnd_until_ts =
+            crate::daemon::agent_registry::parse_dnd_state(&state_str, now_ms)?;
+        let updated = crate::daemon::agent_registry::set_dnd(
+            &conn,
+            &agent_id,
+            dnd_until_ts,
+        )?;
+        if updated == 0 {
+            anyhow::bail!("no alive agent_registry row for {agent_id}");
+        }
+        // Slice 5 hotfix (Wave 5 live QA): when the operator transitions
+        // DND to off (dnd_until_ts becomes None), the recurring
+        // drain_dnd_tick task will NEVER pick up the queued inbox
+        // because its WHERE clause requires dnd_until_ts IS NOT NULL.
+        // Drain inline here so explicit-off has the same delivery
+        // semantics as natural expiry.
+        let drainable = if dnd_until_ts.is_none() {
+            crate::daemon::agent_registry::drain_agent_inbox(&conn, &agent_id, 10)?
+        } else {
+            Vec::new()
+        };
+        Ok((agent_id, dnd_until_ts, drainable))
+    })
+    .await;
+    match result {
+        Ok(Ok((agent_id, ts, drainable))) => {
+            // Emit notifications + mark_delivered for any inline-drained
+            // messages, mirroring the dnd_drain_tick body shape.
+            for msg in &drainable {
+                let target_agent_id = msg.thread_id.strip_prefix("agent:").unwrap_or("");
+                let frame = chat::build_channel_notification_agent_to_agent(
+                    &msg.content,
+                    &msg.from_agent,
+                    target_agent_id,
+                    &msg.id,
+                    true,
+                );
+                let subscriber_count = bus.publish(&msg.thread_id, frame).await;
+                if subscriber_count >= 1 {
+                    let id_for_mark = msg.id.clone();
+                    let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+                        let conn = crate::daemon::chat::open_chat_db()?;
+                        crate::daemon::agent_registry::mark_delivered(
+                            &conn,
+                            &id_for_mark,
+                            chat::now_millis(),
+                        )
+                    })
+                    .await;
+                }
+            }
+            let payload = serde_json::json!({
+                "ok": true,
+                "dnd_until_ts": ts,
+                "agent_id": agent_id,
+                "drained_on_off": drainable.len(),
+            });
+            tool_text_response(id, &payload)
+        }
+        Ok(Err(e)) => tool_error_response(id, -32603, &e.to_string()),
+        Err(e) => {
+            tracing::error!(error = %e, "agent_set_dnd spawn_blocking panicked");
+            tool_error_response(id, -32603, "internal error")
+        }
+    }
+}
+
+/// Slice 5 of cli-to-cli-routing — DND drain background task.
+///
+/// Spawned ONCE from the daemon main loop (see `run_uds_server`).
+/// Every 30 seconds:
+///   1. Snapshot expired DND via `drain_dnd_tick`.
+///   2. For each drainable message, emit
+///      `notifications/claude/channel` via the bus + mark_delivered.
+///
+/// **F-5 panic recovery.** Each tick body is wrapped in
+/// `std::panic::catch_unwind` (via `AssertUnwindSafe`); a panic in
+/// one tick logs `tracing::error!` and the outer loop continues
+/// at the next interval. The task NEVER exits on a tick panic —
+/// silent feature-break is the named failure mode this guard
+/// prevents.
+///
+/// **Heartbeat.** Each tick emits `tracing::info!(active_dnd=N,
+/// drained=M)` so a future operator-visible "DND drain task alive"
+/// metric has a log breadcrumb.
+///
+/// This is the **NEW** recurring tokio task per architect A-5; it
+/// is NOT an extension of `drain_pending_outbound_tg` (verified
+/// startup-one-shot at `telegram.rs:160-205`).
+fn spawn_dnd_drain_task(bus: SharedBus) {
+    tokio::spawn(async move {
+        const INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+        const RATE_LIMIT_PER_AGENT: usize = 10; // FR-C2C-5.5
+        loop {
+            tokio::time::sleep(INTERVAL).await;
+            // Spawn the tick body as its own task so a panic in the
+            // body marks the JoinHandle as `is_panic()` and the outer
+            // loop just logs + continues (F-5 panic recovery).
+            let bus_for_tick = bus.clone();
+            let join = tokio::spawn(async move {
+                dnd_drain_tick(&bus_for_tick, RATE_LIMIT_PER_AGENT).await;
+            });
+            match join.await {
+                Ok(_) => {}
+                Err(je) if je.is_panic() => {
+                    tracing::error!(
+                        "dnd drain tick panicked — outer loop continues at next interval"
+                    );
+                }
+                Err(je) => {
+                    tracing::error!(error = %je, "dnd drain tick join error");
+                }
+            }
+        }
+    });
+}
+
+async fn dnd_drain_tick(bus: &SharedBus, rate_limit: usize) {
+    let now_ms = chat::now_millis();
+    let stats = match tokio::task::spawn_blocking(
+        move || -> anyhow::Result<crate::daemon::agent_registry::DrainStats> {
+            let conn = crate::daemon::chat::open_chat_db()?;
+            crate::daemon::agent_registry::drain_dnd_tick(&conn, now_ms, rate_limit)
+        },
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "dnd drain tick: chat.db error — skipping tick");
+            return;
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "dnd drain tick: spawn_blocking join error");
+            return;
+        }
+    };
+    if stats.cleared_dnd == 0 && stats.drainable.is_empty() {
+        // Quiet heartbeat — only log when something happened.
+        return;
+    }
+    tracing::info!(
+        active_dnd = stats.cleared_dnd,
+        drained = stats.drainable.len(),
+        "dnd drain tick"
+    );
+    for msg in &stats.drainable {
+        let target_agent_id = msg.thread_id.strip_prefix("agent:").unwrap_or("");
+        let frame = chat::build_channel_notification_agent_to_agent(
+            &msg.content,
+            &msg.from_agent,
+            target_agent_id,
+            &msg.id,
+            true,
+        );
+        let subscriber_count = bus.publish(&msg.thread_id, frame).await;
+        if subscriber_count >= 1 {
+            let id_for_mark = msg.id.clone();
+            let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+                let conn = crate::daemon::chat::open_chat_db()?;
+                crate::daemon::agent_registry::mark_delivered(
+                    &conn,
+                    &id_for_mark,
+                    chat::now_millis(),
+                )
+            })
+            .await;
+        }
+        // If subscriber_count == 0, leave delivered_at NULL — message
+        // will be picked up on the next drain tick when the bridge
+        // reconnects and subscribes to its agent inbox.
     }
 }
 

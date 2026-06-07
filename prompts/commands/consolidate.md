@@ -1,4 +1,13 @@
-# Command: Consolidate
+# Command: Consolidate — sleep-replay drift detection across the feature's accumulated stack
+
+**INVOKE THIS BETWEEN WAVES AND BEFORE MERGE-READY.** This is the SDLC pipeline's memory-consolidation pass — the hippocampal sleep-replay analogue. Every slice agent looks at its own scope only; NOBODY looks across the whole stack for "the PRD says X but the QA cases say Y" / "we acknowledged a hack in Slice 3 but never tracked the followup" / "the verifier marked Slice 5 PASS but Slice 6 is silently broken because Slice 5 didn't actually wire what the PRD asked for." `/consolidate` catches that.
+
+**Use `/consolidate` proactively when:**
+- You just finished a wave in a long feature — BEFORE starting the next wave (this is the auto-chain trigger inside `/develop-feature`)
+- You're returning to a long-running feature after time away — drift accumulates silently while you're gone
+- BEFORE `/qa-cycle` — surface drift NOW so strict QA execution doesn't amplify it into FAIL verdicts
+- BEFORE `/merge-ready` — informational pre-flight to see if any hack or drift will fail Gate 1
+- When 3+ slices have committed without a consolidation pass
 
 Invoke the `consolidator` agent to surface cross-artifact drift, decision divergence, hack accumulation, verdict-vs-reality mismatches, and pattern observations across the current feature's accumulated work.
 

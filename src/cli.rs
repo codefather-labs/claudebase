@@ -414,6 +414,12 @@ pub enum Command {
     /// The SDLC SessionStart onboarding hook (if installed) auto-fires on
     /// session boot — nothing extra wired here. Exec replaces this process.
     Run(RunArgs),
+    /// `claudebase agent ...` — cli-to-cli routing discovery surface
+    /// (Slice 6 of cli-to-cli-routing). Reads chat.db directly so this
+    /// works whether or not the daemon is running:
+    ///   `agent list-alive --project current|all|<slug>` — peer discovery
+    ///   `agent inspect <agent_id>` — registry snapshot + queue depth
+    Agent(AgentArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -480,6 +486,54 @@ pub struct ChatListArgs {
 #[derive(Args, Debug)]
 pub struct ChatThreadsArgs {
     /// Emit JSON `{threads: [...]}` instead of human-readable text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `claudebase agent ...` — cli-to-cli routing discovery surface
+/// (Slice 6 of cli-to-cli-routing).
+#[derive(Args, Debug)]
+pub struct AgentArgs {
+    #[command(subcommand)]
+    pub sub: AgentSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AgentSubcommand {
+    /// List currently-alive agents, scoped by project. Reads chat.db
+    /// directly — daemon is NOT required. Default scope is `current`
+    /// (resolves `git remote origin URL` of cwd to a `project_id` and
+    /// filters by it). Pass `--project all` for cross-project listing
+    /// or `--project <slug>` for an explicit project_id.
+    ///
+    /// **last_seen_at semantics:** `last_pinged_at` is set at register
+    /// time and is NOT refreshed by subsequent calls — it reflects the
+    /// timestamp of the most recent connect-or-re-register, not last
+    /// activity. CLI output labels the field accordingly.
+    ListAlive(AgentListAliveArgs),
+    /// Inspect a single agent_registry row: identity + DND state +
+    /// queue depth of undelivered messages. Read-only. Exit 1 if the
+    /// agent_id is not present in the registry.
+    Inspect(AgentInspectArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct AgentListAliveArgs {
+    /// Project scope filter. One of `current` (default — resolves
+    /// project_id from cwd's git remote URL), `all` (no filter),
+    /// or a literal project_id slug to match exactly.
+    #[arg(long, default_value = "current")]
+    pub project: String,
+    /// Emit JSON `[{...}]` instead of a human-readable table.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct AgentInspectArgs {
+    /// Target agent_id to inspect.
+    pub agent_id: String,
+    /// Emit JSON `{...}` instead of human-readable text.
     #[arg(long)]
     pub json: bool,
 }

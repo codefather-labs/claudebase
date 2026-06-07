@@ -68,6 +68,22 @@ pub const TOOL_WHITELIST: &[&str] = &[
     "agent_unregister",
     "agent_list_alive",
     "agent_reap",
+    // Slice 3 of cli-to-cli-routing — publishes feature_description for
+    // cross-agent discovery surface. Daemon binds caller identity from
+    // connection_id (FR-C2C-4.6), so impersonation via args is blocked
+    // at the dispatch layer; the whitelist entry only opens the route.
+    "agent_describe",
+    // Slice 4 of cli-to-cli-routing — DM between agents on this daemon.
+    // Sender identity is bound server-side via connection_id lookup
+    // (FR-C2C-4.6 + security pre-review SEC-1); recipient state='alive'
+    // check rejects orphaned/dead targets (architect F-3); DND-respecting
+    // queue path persists delivered_at=NULL for Slice 5's drain.
+    "agent_send",
+    // Slice 5 of cli-to-cli-routing — toggle DND state on the calling
+    // agent. Connection-bound identity per FR-C2C-4.6; indefinite DND
+    // encoded as i64::MAX sentinel (architect A-3 / OQ-UC-C2C-1) so
+    // the drain WHERE clause naturally excludes.
+    "agent_set_dnd",
     // Slice 8 — chat_ask + chat_list_pending_asks (SEC-7 whitelist parity
     // with daemon dispatch). chat_ask renders a Telegram inline keyboard
     // and returns {ask_id, status: "pending"}; chat_list_pending_asks is

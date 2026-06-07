@@ -353,6 +353,37 @@ launches a session connected to the channel. A Telegram message routed to your C
 
 ---
 
+## 👥 Multi-agent coordination — cli-to-cli routing
+
+`claudebase` ships a third surface beyond the two corpora: a **daemon-mediated agent-to-agent channel** that lets multiple Claude Code sessions on the same operator's machine discover each other, publish what they're working on, and DM each other directly. The pain it solves: when you have 3 CC windows open across 3 clones / git worktrees of the same repo, plans drafted in isolation collide on the same files. Now they can talk.
+
+The plumbing reuses the same daemon (`claudebase daemon serve`) that powers the Telegram channel. Every Claude Code session launched through `claudebase run` registers in `chat.db`'s `agent_registry` table with its `project_id` (normalized git-remote URL), `branch`, `working_dir`, and `feature_description`. Peers find each other via:
+
+```text
+# Discovery — who else is alive on this project (same git remote)?
+claudebase agent list-alive --project current --json
+
+# Per-agent snapshot — branch, feature_description, DND state, queue depth
+claudebase agent inspect <agent_id> --json
+```
+
+Once you see a peer, three MCP tools drive the conversation:
+
+| MCP tool | Purpose |
+|---|---|
+| `agent_describe(description, feature_id?, branch?)` | Publish what THIS session is working on. The daemon binds your `from_agent_id` to the connection (sender-identity binding) so local processes that never called `agent_register` cannot impersonate. |
+| `agent_send(to_agent_id, content)` | Direct message to a peer. Target must be alive in the registry; orphaned / dead targets reject. The recipient gets a `<channel ...>` notification in their CC system context. |
+| `agent_set_dnd(state)` | `on` / `off` / `Nm` / `Nh` / `until HH:MM` — toggle Do-Not-Disturb. Under DND, peer `agent_send` calls persist with `delivered_at=NULL` and a background task drains the queue on DND-off. |
+
+Two hooks wire this into every claudebase-aware CC session:
+
+- **`PreToolUse:EnterPlanMode`** — fires before plan-mode entry; surfaces that peers exist and nudges `agent list-alive` before drafting, to catch overlapping work.
+- **`PostToolUse:ExitPlanMode`** — fires after plan-mode exit; mandates `agent_describe(...)` so peers immediately see what was just decided.
+
+Together they form the read-write boundary: discover peers before planning, publish your plan after exiting. Trust model is single-box, single-user — no prompt-injection guard between agents in the MVP.
+
+---
+
 ## 🗺 Roadmap
 
 The next big design milestone for the **multi-CLI agent fleet** is cross-machine routing — a claudebase server with HTTP/WSS + mandatory Bearer-token auth. The UDS-based single-machine multi-CLI routing with Telegram is now shipped (see above). Remaining plans:

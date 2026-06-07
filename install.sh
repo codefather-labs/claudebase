@@ -23,7 +23,7 @@ set -u
 # ============================================================================
 # Constants
 # ============================================================================
-CLAUDEBASE_VERSION="0.7.0"
+CLAUDEBASE_VERSION="0.8.0"
 CLAUDEBASE_PDFIUM_VERSION="chromium/7802"
 REPO_URL="https://github.com/codefather-labs/claudebase.git"
 RELEASE_BASE="https://github.com/codefather-labs/claudebase/releases/download"
@@ -68,9 +68,6 @@ WHAT GETS INSTALLED:
   ~/.claude/tools/claudebase/pdfium/        PDFium dynamic library for PDF extraction
   ~/.claude/tools/claudebase/models/        e5-multilingual-small encoder (pre-cached)
   ~/.claude/rules/cognitive-self-check.md   3-protocol discipline (Facts / Decisions / Inbound)
-  ~/.claude/rules/knowledge-base.md         CLI contract + citation discipline
-  ~/.claude/rules/knowledge-base-tool.md    Usage mandate + insights protocol
-  ~/.claude/rules/tool-limitations.md       Read/grep/bash truncation gotchas
   ~/.claude/hooks/claudebase-insight-capture.sh   Stop hook — insight-capture reflection
   ~/.claude/hooks/claudebase-selfcheck-reminder.sh UserPromptSubmit hook — self-check reminder
   ~/.claude/commands/knowledge-ingest.md    /knowledge-ingest skill
@@ -369,7 +366,7 @@ install_claudebase_hooks() {
   # UserPromptSubmit reminder).
   rm -f "$hooks_dir/claudebase-insight-capture.sh" "$hooks_dir/claudebase-insight-capture.ps1"
 
-  local hook_files=(claudebase-selfcheck-reminder.sh claudebase-selfcheck-reminder.ps1 claudebase-read-insights-reminder.sh claudebase-read-insights-reminder.ps1)
+  local hook_files=(claudebase-selfcheck-reminder.sh claudebase-selfcheck-reminder.ps1 claudebase-read-insights-reminder.sh claudebase-read-insights-reminder.ps1 claudebase-agent-routing-reminder.sh claudebase-agent-routing-reminder.ps1 claudebase-feature-describe.sh claudebase-feature-describe.ps1)
   for hook in "${hook_files[@]}"; do
     local src="$SCRIPT_DIR/hooks/$hook"
     local dst="$hooks_dir/$hook"
@@ -400,6 +397,8 @@ install_claudebase_hooks() {
   local stop_cmd="$HOME/.claude/hooks/claudebase-insight-capture.sh"
   local selfcheck_cmd="$HOME/.claude/hooks/claudebase-selfcheck-reminder.sh"
   local readins_cmd="$HOME/.claude/hooks/claudebase-read-insights-reminder.sh"
+  local routing_cmd="$HOME/.claude/hooks/claudebase-agent-routing-reminder.sh"
+  local describe_cmd="$HOME/.claude/hooks/claudebase-feature-describe.sh"
   local tmp; tmp="$(mktemp)"
 
   # (1) Ensure .hooks.UserPromptSubmit has exactly one matcher block with our
@@ -414,6 +413,8 @@ install_claudebase_hooks() {
       --arg stop_cmd "$stop_cmd" \
       --arg selfcheck_cmd "$selfcheck_cmd" \
       --arg readins_cmd "$readins_cmd" \
+      --arg routing_cmd "$routing_cmd" \
+      --arg describe_cmd "$describe_cmd" \
       '
       .hooks //= {}
       | .hooks.Stop //= []
@@ -433,6 +434,18 @@ install_claudebase_hooks() {
           (if any(.[]?; (.hooks // []) | any(.command == $readins_cmd))
            then .
            else . + [{"matcher": "startup|resume|compact", "hooks": [{"type": "command", "command": $readins_cmd}]}]
+           end)
+      | .hooks.PreToolUse //= []
+      | .hooks.PreToolUse |=
+          (if any(.[]?; (.hooks // []) | any(.command == $routing_cmd))
+           then .
+           else . + [{"matcher": "EnterPlanMode", "hooks": [{"type": "command", "command": $routing_cmd}]}]
+           end)
+      | .hooks.PostToolUse //= []
+      | .hooks.PostToolUse |=
+          (if any(.[]?; (.hooks // []) | any(.command == $describe_cmd))
+           then .
+           else . + [{"matcher": "ExitPlanMode", "hooks": [{"type": "command", "command": $describe_cmd}]}]
            end)
       | (if (.hooks.Stop // []) | length > 0 then
            .hooks.Stop |= (
@@ -848,7 +861,7 @@ echo -e "${BOLD}============================================${NC}"
 echo ""
 echo "  This will install to $CLAUDE_DIR:"
 echo "    tools/claudebase/   (binary + pdfium + e5 model)"
-echo "    rules/              (4 files — cognitive-self-check, knowledge-base, knowledge-base-tool, tool-limitations)"
+echo "    rules/              (1 file - cognitive-self-check)"
 echo "    commands/           (4 files — knowledge-ingest, reflect, consolidate, update-claudebase)"
 echo "    agents/             (2 files — reflection, consolidator)"
 echo "    hooks/              (2 hooks — Stop[insight-capture] + UserPromptSubmit[self-check])"

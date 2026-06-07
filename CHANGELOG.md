@@ -4,6 +4,12 @@ All notable changes to claudebase will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-06-07
+
+### Added
+
+- **Agent-to-agent (CLI-to-CLI) communication.** Multiple Claude Code CLIs now discover each other by a stable cross-clone `project_id` (resolved from the git remote-origin URL, a `.claudebase/config.json` override, or a path hash) and message one another directly through new MCP tools — `agent_send` (deliver a message to another live agent), `agent_describe` (publish/read what a peer is working on), and `agent_set_dnd` (do-not-disturb). `claudebase agent list-alive --project current` lists peers on the same repo. Two Claude Code hooks form the read/write boundary: `agent-routing-reminder` (PreToolUse:EnterPlanMode) surfaces who else is working on what before you plan, and `feature-describe` (PostToolUse:ExitPlanMode) publishes your decided plan via `agent_describe` and mirrors it to the scratchpad.
+
 ## [Unreleased]
 
 ### Added

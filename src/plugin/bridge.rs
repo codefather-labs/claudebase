@@ -509,14 +509,28 @@ pub async fn run() -> anyhow::Result<()> {
                                 if response.get("error").is_none() {
                                     if let Some((new_id, new_name)) = rename_target {
                                         persist_rename_if_changed(&new_id, new_name.as_deref());
-                                        // Keep the bridge's in-memory
-                                        // self-identity in lock-step with
-                                        // the on-disk file so subsequent
-                                        // channel-notification filters
-                                        // recognize the renamed id as
-                                        // "this CLI" without waiting for
-                                        // the next bridge restart.
-                                        if !new_id.trim().is_empty() {
+                                        // Slice 4 of cli-to-cli-routing (architect F-1
+                                        // + security pre-review SEC-5): re-route the
+                                        // bridge's `agent:<id>` inbox subscription
+                                        // when the id changes. Order matters —
+                                        // SEC-5 mandates subscribe(new) BEFORE
+                                        // unsubscribe(old) so there is never a
+                                        // zero-subscription window during which
+                                        // another agent's `agent_send(to=new_id)`
+                                        // would publish to no subscribers. Worst
+                                        // case is a transient double-subscription
+                                        // (harmless — old_id's row was just
+                                        // renamed in agent_registry, so peer
+                                        // senders targeting old_id fail the
+                                        // alive-check anyway).
+                                        let old_id = self_agent_id.clone();
+                                        if !new_id.trim().is_empty() && new_id != old_id {
+                                            if let Some(d) = daemon.as_ref() {
+                                                rename_resubscribe_agent_inbox(
+                                                    d, &old_id, &new_id,
+                                                )
+                                                .await;
+                                            }
                                             self_agent_id = new_id;
                                         }
                                     }
@@ -762,6 +776,104 @@ fn derive_identity() -> AgentIdentity {
 async fn bootstrap_after_connect(daemon: &DaemonChannel) {
     autoregister_self(daemon).await;
     autosubscribe_from_access(daemon).await;
+    // Slice 4 of cli-to-cli-routing (architect F-1) — subscribe this
+    // bridge to its own `agent:<my-id>` inbox so notifications from
+    // peer `agent_send(to=<my-id>)` calls reach this CC's channel
+    // surface. Same identity source as `autoregister_self` above
+    // (`derive_identity()`), same fire-and-forget pattern as
+    // `autosubscribe_from_access`. Daemon's `chat_subscribe` handler
+    // is open-subscription (see security pre-review SEC-4 — accepted
+    // under single-box single-user trust); authorization for the
+    // inbound traffic still lives in the bridge filter at
+    // `should_relay_channel_notification` via target_agent_id match.
+    autosubscribe_agent_inbox(daemon).await;
+}
+
+/// Slice 4 of cli-to-cli-routing (security pre-review SEC-5) —
+/// re-route the bridge's `agent:<id>` inbox subscription when the
+/// `self_agent_id` changes via `agent_register` rename. Order is
+/// load-bearing: subscribe(new) MUST land at the daemon BEFORE
+/// unsubscribe(old) so no zero-subscription window opens for an
+/// inbound `agent_send` targeting `new_id`. Daemon processes frames
+/// from one connection in send-order, so writing them in this order
+/// guarantees the daemon-side dispatch order too.
+async fn rename_resubscribe_agent_inbox(daemon: &DaemonChannel, old_id: &str, new_id: &str) {
+    let new_thread = format!("agent:{new_id}");
+    let old_thread = format!("agent:{old_id}");
+    let sub_frame = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "bridge-rename-subscribe",
+        "method": "tools/call",
+        "params": {
+            "name": "chat_subscribe",
+            "arguments": { "thread": new_thread }
+        }
+    });
+    let unsub_frame = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "bridge-rename-unsubscribe",
+        "method": "tools/call",
+        "params": {
+            "name": "chat_unsubscribe",
+            "arguments": { "thread": old_thread }
+        }
+    });
+    let sub_body = match serde_json::to_vec(&sub_frame) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "rename-resubscribe: subscribe serialize failed");
+            return;
+        }
+    };
+    let unsub_body = match serde_json::to_vec(&unsub_frame) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "rename-resubscribe: unsubscribe serialize failed");
+            return;
+        }
+    };
+    let mut wh = daemon.write_half.lock().await;
+    if let Err(e) = write_frame(&mut *wh, &sub_body).await {
+        tracing::warn!(error = %e, %new_id, "rename-resubscribe: subscribe(new) failed");
+        return;
+    }
+    if let Err(e) = write_frame(&mut *wh, &unsub_body).await {
+        tracing::warn!(error = %e, %old_id, "rename-resubscribe: unsubscribe(old) failed");
+        return;
+    }
+    tracing::info!(%old_id, %new_id, "rename-resubscribe: subscribe(new) then unsubscribe(old)");
+}
+
+async fn autosubscribe_agent_inbox(daemon: &DaemonChannel) {
+    let id = derive_identity();
+    if id.agent_id.trim().is_empty() {
+        // Degraded mode — bridge filter falls back to "relay all" so
+        // there's no inbox to subscribe to either. Caller logs.
+        return;
+    }
+    let thread = format!("agent:{}", id.agent_id);
+    let frame = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "bridge-autosubscribe-agent",
+        "method": "tools/call",
+        "params": {
+            "name": "chat_subscribe",
+            "arguments": { "thread": thread }
+        }
+    });
+    let body = match serde_json::to_vec(&frame) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "autosubscribe_agent_inbox: serialize failed");
+            return;
+        }
+    };
+    let mut wh = daemon.write_half.lock().await;
+    if let Err(e) = write_frame(&mut *wh, &body).await {
+        tracing::warn!(error = %e, agent_id = %id.agent_id, "autosubscribe_agent_inbox: write_frame failed");
+        return;
+    }
+    tracing::info!(agent_id = %id.agent_id, thread = %thread, "subscribed to agent inbox");
 }
 
 /// Fire-and-forget auto-register: announce this CLI as alive in the
@@ -774,6 +886,16 @@ async fn bootstrap_after_connect(daemon: &DaemonChannel) {
 /// discipline).
 async fn autoregister_self(daemon: &DaemonChannel) {
     let id = derive_identity();
+    // Slice 3 of cli-to-cli-routing — pass the bridge's cwd to the
+    // daemon so register-time identity capture (project_id / branch /
+    // working_dir) can resolve git context on the daemon side. When
+    // the bridge's cwd is unavailable (rare; e.g. process spawned
+    // without a cwd), the arg is omitted and the daemon leaves the v6
+    // columns NULL (backward compat).
+    let cwd_arg = std::env::current_dir()
+        .ok()
+        .map(|p| serde_json::Value::String(p.to_string_lossy().into_owned()))
+        .unwrap_or(serde_json::Value::Null);
     let frame = serde_json::json!({
         "jsonrpc": "2.0",
         "id": "bridge-autoregister",
@@ -783,6 +905,7 @@ async fn autoregister_self(daemon: &DaemonChannel) {
             "arguments": {
                 "agent_id": id.agent_id,
                 "name": id.name,
+                "cwd": cwd_arg,
             }
         }
     });

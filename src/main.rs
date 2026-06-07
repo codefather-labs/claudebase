@@ -90,6 +90,9 @@ fn main() -> std::process::ExitCode {
         // `run` is an exec wrapper around the `claude` CLI — no filesystem
         // ops on a project root. The path gate still runs uniformly.
         Command::Run(_) => None,
+        // `agent` reads chat.db (user-level) like `chat`. No per-project
+        // root used; gate still runs uniformly.
+        Command::Agent(_) => None,
     };
 
     let root = match cli::resolve_project_root(project_root_arg) {
@@ -146,7 +149,268 @@ fn main() -> std::process::ExitCode {
             cli::ChatSubcommand::Threads(a) => run_chat_threads(a),
         },
         Command::Run(args) => run_claude_with_preset(&args),
+        Command::Agent(args) => match args.sub {
+            cli::AgentSubcommand::ListAlive(a) => run_agent_list_alive(&a),
+            cli::AgentSubcommand::Inspect(a) => run_agent_inspect(&a),
+        },
     }
+}
+
+/// `claudebase agent list-alive --project current|all|<slug>` — Slice 6
+/// of cli-to-cli-routing. Reads chat.db directly (daemon NOT required).
+///
+/// Project scope semantics:
+///   * `current` (default) — resolves `git remote origin URL` of the
+///     current working directory via `project_id::resolve_project_id`,
+///     filters `WHERE project_id = ? AND project_id IS NOT NULL` so
+///     legacy NULL-project_id rows are excluded.
+///   * `all` — no filter; everything alive across all known projects.
+///   * `<literal slug>` — exact match against the column.
+fn run_agent_list_alive(args: &cli::AgentListAliveArgs) -> std::process::ExitCode {
+    use claudebase::daemon::chat::open_chat_db;
+    let conn = match open_chat_db() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: open chat.db: {e}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    let (where_clause, project_value): (&str, Option<String>) = match args.project.as_str() {
+        "all" => ("state = 'alive'", None),
+        "current" => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let pid = claudebase::project_id::resolve_project_id(&cwd);
+            (
+                "state = 'alive' AND project_id IS NOT NULL AND project_id = ?1",
+                Some(pid),
+            )
+        }
+        slug => (
+            "state = 'alive' AND project_id IS NOT NULL AND project_id = ?1",
+            Some(slug.to_string()),
+        ),
+    };
+    let sql = format!(
+        "SELECT agent_id, agent_name, project_id, branch, working_dir, \
+         feature_description, last_pinged_at, dnd_until_ts \
+         FROM agent_registry \
+         WHERE {where_clause} \
+         ORDER BY last_pinged_at DESC \
+         LIMIT 1000"
+    );
+    let rows: Vec<AgentListRow> = {
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: prepare query: {e}");
+                return std::process::ExitCode::from(1);
+            }
+        };
+        let mapper = |row: &rusqlite::Row<'_>| -> rusqlite::Result<AgentListRow> {
+            Ok(AgentListRow {
+                agent_id: row.get(0)?,
+                agent_name: row.get(1)?,
+                project_id: row.get(2)?,
+                branch: row.get(3)?,
+                working_dir: row.get(4)?,
+                feature_description: row.get(5)?,
+                last_seen_at: row.get(6)?,
+                dnd_until_ts: row.get(7)?,
+            })
+        };
+        let result: rusqlite::Result<Vec<AgentListRow>> = match project_value.as_ref() {
+            Some(p) => stmt
+                .query_map(rusqlite::params![p], mapper)
+                .and_then(|it| it.collect()),
+            None => stmt.query_map([], mapper).and_then(|it| it.collect()),
+        };
+        match result {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("error: query: {e}");
+                return std::process::ExitCode::from(1);
+            }
+        }
+    };
+    if args.json {
+        let json: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "agent_id": r.agent_id,
+                    "agent_name": r.agent_name,
+                    "project_id": r.project_id,
+                    "branch": r.branch,
+                    "working_dir": r.working_dir,
+                    "feature_description": r.feature_description,
+                    "last_seen_at": r.last_seen_at,
+                    "dnd_until_ts": r.dnd_until_ts,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&json).unwrap_or_default());
+    } else if rows.is_empty() {
+        println!("no agents alive for scope {:?}", args.project);
+    } else {
+        println!(
+            "{:<22} {:<12} {:<32} {:<28} {:<24} {:<10}",
+            "AGENT_ID", "NAME", "PROJECT_ID", "BRANCH", "FEATURE", "DND_UNTIL"
+        );
+        for r in &rows {
+            let dnd_label = match r.dnd_until_ts {
+                None => "-".to_string(),
+                Some(ts) if ts == i64::MAX => "indefinite".to_string(),
+                Some(ts) => format!("{ts}"),
+            };
+            println!(
+                "{:<22} {:<12} {:<32} {:<28} {:<24} {:<10}",
+                truncate(&r.agent_id, 22),
+                truncate(&r.agent_name, 12),
+                truncate(r.project_id.as_deref().unwrap_or("-"), 32),
+                truncate(r.branch.as_deref().unwrap_or("-"), 28),
+                truncate(r.feature_description.as_deref().unwrap_or("-"), 24),
+                dnd_label,
+            );
+        }
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+/// `claudebase agent inspect <agent_id>` — Slice 6 + red team F-4
+/// observability surface. Reads chat.db, returns a snapshot of the
+/// registry row + undelivered_count from chat_messages. Exit 1 when
+/// the agent_id is absent.
+fn run_agent_inspect(args: &cli::AgentInspectArgs) -> std::process::ExitCode {
+    use claudebase::daemon::chat::open_chat_db;
+    let conn = match open_chat_db() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: open chat.db: {e}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    let row: Option<AgentInspectRow> = conn
+        .query_row(
+            "SELECT agent_id, agent_name, state, connection_id, project_id, \
+             branch, working_dir, feature_description, spawned_at, \
+             last_pinged_at, dnd_until_ts \
+             FROM agent_registry WHERE agent_id = ?1",
+            rusqlite::params![&args.agent_id],
+            |r| {
+                Ok(AgentInspectRow {
+                    agent_id: r.get(0)?,
+                    agent_name: r.get(1)?,
+                    state: r.get(2)?,
+                    connection_id: r.get(3)?,
+                    project_id: r.get(4)?,
+                    branch: r.get(5)?,
+                    working_dir: r.get(6)?,
+                    feature_description: r.get(7)?,
+                    spawned_at: r.get(8)?,
+                    last_pinged_at: r.get(9)?,
+                    dnd_until_ts: r.get(10)?,
+                })
+            },
+        )
+        .ok();
+    let row = match row {
+        Some(r) => r,
+        None => {
+            eprintln!("error: agent_id not found: {}", args.agent_id);
+            return std::process::ExitCode::from(1);
+        }
+    };
+    let thread = format!("agent:{}", args.agent_id);
+    let undelivered_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM chat_messages \
+             WHERE thread_id = ?1 AND delivered_at IS NULL",
+            rusqlite::params![&thread],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let now_ms = claudebase::daemon::chat::now_millis();
+    let dnd_state = match row.dnd_until_ts {
+        None => "off".to_string(),
+        Some(ts) if ts == i64::MAX => "indefinite".to_string(),
+        Some(ts) if ts > now_ms => format!("until_ms={ts}"),
+        Some(_) => "expired".to_string(),
+    };
+    if args.json {
+        let json = serde_json::json!({
+            "agent_id": row.agent_id,
+            "agent_name": row.agent_name,
+            "state": row.state,
+            "connection_id": row.connection_id,
+            "project_id": row.project_id,
+            "branch": row.branch,
+            "working_dir": row.working_dir,
+            "feature_description": row.feature_description,
+            "spawned_at": row.spawned_at,
+            "last_pinged_at": row.last_pinged_at,
+            "dnd_until_ts": row.dnd_until_ts,
+            "dnd_state": dnd_state,
+            "undelivered_count": undelivered_count,
+        });
+        println!("{}", serde_json::to_string_pretty(&json).unwrap_or_default());
+    } else {
+        println!("agent_id:            {}", row.agent_id);
+        println!("agent_name:          {}", row.agent_name);
+        println!("state:               {}", row.state);
+        println!(
+            "project_id:          {}",
+            row.project_id.as_deref().unwrap_or("-")
+        );
+        println!("branch:              {}", row.branch.as_deref().unwrap_or("-"));
+        println!(
+            "working_dir:         {}",
+            row.working_dir.as_deref().unwrap_or("-")
+        );
+        println!(
+            "feature_description: {}",
+            row.feature_description.as_deref().unwrap_or("-")
+        );
+        println!("spawned_at:          {}", row.spawned_at);
+        println!("last_pinged_at:      {}", row.last_pinged_at);
+        println!("dnd_state:           {}", dnd_state);
+        println!("undelivered_count:   {}", undelivered_count);
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max.saturating_sub(3)])
+    }
+}
+
+#[derive(Debug)]
+struct AgentListRow {
+    agent_id: String,
+    agent_name: String,
+    project_id: Option<String>,
+    branch: Option<String>,
+    working_dir: Option<String>,
+    feature_description: Option<String>,
+    last_seen_at: i64,
+    dnd_until_ts: Option<i64>,
+}
+
+#[derive(Debug)]
+struct AgentInspectRow {
+    agent_id: String,
+    agent_name: String,
+    state: String,
+    connection_id: String,
+    project_id: Option<String>,
+    branch: Option<String>,
+    working_dir: Option<String>,
+    feature_description: Option<String>,
+    spawned_at: i64,
+    last_pinged_at: i64,
+    dnd_until_ts: Option<i64>,
 }
 
 /// `claudebase run [-- args...]` — exec `claude` with the telegram channel

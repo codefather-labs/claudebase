@@ -28,7 +28,7 @@ $ErrorActionPreference = 'Stop'
 # ============================================================================
 # Constants
 # ============================================================================
-$Script:ClaudebaseVersion       = '0.7.0'
+$Script:ClaudebaseVersion       = '0.8.0'
 $Script:ClaudebasePdfiumVersion = 'chromium/7802'
 $Script:RepoUrl                 = 'https://github.com/codefather-labs/claudebase.git'
 $Script:ReleaseBase             = 'https://github.com/codefather-labs/claudebase/releases/download'
@@ -63,7 +63,7 @@ WHAT GETS INSTALLED:
   %USERPROFILE%\.claude\tools\claudebase\claudebase.exe   CLI binary
   %USERPROFILE%\.claude\tools\claudebase\pdfium\bin\pdfium.dll
   %USERPROFILE%\.claude\tools\claudebase\models\          e5 encoder cache
-  %USERPROFILE%\.claude\rules\        knowledge-base, knowledge-base-tool, tool-limitations
+  %USERPROFILE%\.claude\rules\        cognitive-self-check
   %USERPROFILE%\.claude\commands\     knowledge-ingest, reflect, consolidate, update-claudebase
   %USERPROFILE%\.claude\agents\       reflection (Drift), consolidator (Mnem)
   %USERPROFILE%\.claude\bin\claudebase.cmd  Global wrapper (User PATH)
@@ -288,7 +288,7 @@ function Install-ClaudebaseHooks {
 
     # Deploy both variants of the self-check reminder + read-insights reminder;
     # Windows wires the .ps1 variants.
-    foreach ($hook in 'claudebase-selfcheck-reminder.sh', 'claudebase-selfcheck-reminder.ps1', 'claudebase-read-insights-reminder.sh', 'claudebase-read-insights-reminder.ps1') {
+    foreach ($hook in 'claudebase-selfcheck-reminder.sh', 'claudebase-selfcheck-reminder.ps1', 'claudebase-read-insights-reminder.sh', 'claudebase-read-insights-reminder.ps1', 'claudebase-agent-routing-reminder.sh', 'claudebase-agent-routing-reminder.ps1', 'claudebase-feature-describe.sh', 'claudebase-feature-describe.ps1') {
         $src = Join-Path $Script:ScriptDir "hooks\$hook"
         $dst = Join-Path $hooksDir $hook
         if (-not (Test-Path $src)) { Write-Warn "hooks/$hook missing in source — skipping"; continue }
@@ -299,6 +299,8 @@ function Install-ClaudebaseHooks {
     $stopCmd = "powershell -NoProfile -File `"$(Join-Path $hooksDir 'claudebase-insight-capture.ps1')`""
     $selfcheckCmd = "powershell -NoProfile -File `"$(Join-Path $hooksDir 'claudebase-selfcheck-reminder.ps1')`""
     $readinsCmd = "powershell -NoProfile -File `"$(Join-Path $hooksDir 'claudebase-read-insights-reminder.ps1')`""
+    $routingCmd = "powershell -NoProfile -File `"$(Join-Path $hooksDir 'claudebase-agent-routing-reminder.ps1')`""
+    $describeCmd = "powershell -NoProfile -File `"$(Join-Path $hooksDir 'claudebase-feature-describe.ps1')`""
 
     if (-not (Test-Path $settings)) {
         $obj = [ordered]@{ permissions = [ordered]@{ allow = @() } }
@@ -347,6 +349,36 @@ function Install-ClaudebaseHooks {
         if (-not $ssAlready) {
             $ssNewEntry = [pscustomobject]@{ matcher = 'startup|resume|compact'; hooks = @([pscustomobject]@{ type = 'command'; command = $readinsCmd }) }
             $json.hooks.SessionStart = @($ssExisting) + $ssNewEntry
+        }
+
+        # PreToolUse:EnterPlanMode -> agent-routing-reminder (cli-to-cli read side).
+        if (-not ($json.hooks.PSObject.Properties.Name -contains 'PreToolUse')) {
+            $json.hooks | Add-Member -NotePropertyName 'PreToolUse' -NotePropertyValue @() -Force
+        }
+        $preExisting = @($json.hooks.PreToolUse)
+        $preAlready = $false
+        foreach ($entry in $preExisting) {
+            if ($entry.hooks) { foreach ($h in $entry.hooks) { if ($h.command -eq $routingCmd) { $preAlready = $true; break } } }
+            if ($preAlready) { break }
+        }
+        if (-not $preAlready) {
+            $preNewEntry = [pscustomobject]@{ matcher = 'EnterPlanMode'; hooks = @([pscustomobject]@{ type = 'command'; command = $routingCmd }) }
+            $json.hooks.PreToolUse = @($preExisting) + $preNewEntry
+        }
+
+        # PostToolUse:ExitPlanMode -> feature-describe (cli-to-cli write side).
+        if (-not ($json.hooks.PSObject.Properties.Name -contains 'PostToolUse')) {
+            $json.hooks | Add-Member -NotePropertyName 'PostToolUse' -NotePropertyValue @() -Force
+        }
+        $postExisting = @($json.hooks.PostToolUse)
+        $postAlready = $false
+        foreach ($entry in $postExisting) {
+            if ($entry.hooks) { foreach ($h in $entry.hooks) { if ($h.command -eq $describeCmd) { $postAlready = $true; break } } }
+            if ($postAlready) { break }
+        }
+        if (-not $postAlready) {
+            $postNewEntry = [pscustomobject]@{ matcher = 'ExitPlanMode'; hooks = @([pscustomobject]@{ type = 'command'; command = $describeCmd }) }
+            $json.hooks.PostToolUse = @($postExisting) + $postNewEntry
         }
 
         # Unwire the retired Stop insight-capture hook: strip its command from

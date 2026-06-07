@@ -1598,3 +1598,308 @@ This schema change applies to `insights.db` files only (both local `<project>/.c
 ### Symptom-only patches (with root-cause links)
 
 - The v0.7/v0.8 root cause of brokenness was not isolated (operator's `docs/plans/claudebase-v0.9-product-plan.md` §1). v0.9 ships from the rebuild branch with v0.7's insights surface ported on top. Symptom: operator's box returns `error: index database invalid; re-ingest required` on every `insight create`. Root cause that remains: unknown (possibly a migration interaction between v0.6 schema and a v0.7 partial-apply, or a pre-existing DB corruption). Tracked at: `.claude/plan.md` §Symptom-only patches + `docs/plans/claudebase-v0.9-product-plan.md` §2 open bug #7. The Slice 1 done-condition (test against operator's actual DB snapshot) is the only verification that the migration correctly handles this specific real-world state. Salience: high.
+
+---
+
+## §20. CLI-to-CLI Routing — Agent-to-Agent Communication via Daemon
+
+**Status:** [PLANNED]
+**Date:** 2026-06-06
+**Priority:** High
+**Related:** §18 (Multi-Agent Telegram Routing — `agent_registry` table schema v4/v5 originated there; this section adds v5→v6 additive columns and reuses the existing `chat_messages` + `notifications/claude/channel` transport unchanged). §19 (claudebase v0.9 cut — `chat_messages.delivered_at` outbound spool from commit `ccdf538` is reused bit-for-bit; `agent_registry` table is the same table extended here). Plan source: `.claude/plan.md` (233 lines, read in full this session; HEAD `ccdf538` on branch `feat/multi-agent-on-v0.6`).
+
+Changelog: Claude Code instances running in different terminals or clones of the same repo can now discover each other, share what they are working on, and send direct messages — without leaving the editor.
+
+### 20.1 Feature Description
+
+The operator runs multiple Claude Code windows simultaneously across different folders, branches, or git worktrees of the same logical project. Today these instances are completely siloed: they do not know about each other, cannot share findings, and produce overlapping or conflicting work without warning.
+
+Existing infrastructure in the claudebase daemon already handles 80% of the problem. The `agent_registry` table (added in §18) tracks live agents by `agent_id` and `routing_key`. The `chat_messages` table with the guaranteed-delivery outbound spool (commit `ccdf538`) already provides at-least-once delivery semantics. The `notifications/claude/channel` MCP notification path already routes messages to the right Claude Code session. This feature is primarily wiring: extend the `agent_registry` schema (v5→v6), add three thin MCP tools (`agent_describe`, `agent_send`, `agent_set_dnd`), wire a `PostToolUse:ExitPlanMode` hook to mandate feature-description updates, add bridge auto-subscribe to an agent-specific inbox thread, and implement a DND (Do Not Disturb) state machine with background drain.
+
+The trust model is single-box single-user. No prompt-injection guards between agents in MVP — the operator has confirmed that the use case is a local single-machine context. Inbound agent messages are wrapped in an `<agent-message>` XML tag to provide provenance context to the receiving model, but no escape-sequence sanitization or rate-limit guards are applied.
+
+### 20.2 User Story
+
+As the SDLC pipeline operator running multiple Claude Code windows on the same machine, I want each CC instance to register itself with the daemon and publish what feature it is working on, so that other CC instances can discover it, see its current task, send it a direct message, and avoid working on overlapping files — all without leaving the terminal.
+
+### 20.3 Functional Requirements
+
+#### FR-C2C-1: Schema Migration v5→v6 (Slice 1)
+
+1. **FR-C2C-1.1:** The migration function `apply_agent_registry_c2c_migration` in `src/daemon/chat.rs` — invoked from `ensure_chat_db_schema` after `apply_routing_migration` and `apply_pending_asks_migration` — MUST apply an additive v5→v6 migration to `agent_registry` that adds the following columns when they are absent: `project_id TEXT`, `branch TEXT`, `working_dir TEXT`, `feature_description TEXT NULL`, `dnd_until_ts INTEGER NULL`. The migration MUST be idempotent: re-running against an already-migrated v6 schema MUST exit cleanly without error. This follows the same probe-before-ADD pattern as `apply_routing_migration` (see `src/daemon/chat.rs:508-540`).
+2. **FR-C2C-1.2:** An index `agent_registry_project_id_idx ON agent_registry(project_id)` MUST be created as part of the migration to support efficient `list-alive --project` scope filtering.
+3. **FR-C2C-1.3:** All existing `agent_registry` rows MUST survive the migration with their original column values unchanged. New columns MUST be backfilled with `NULL` (for `feature_description` and `dnd_until_ts`) and with `NULL` for `project_id`, `branch`, `working_dir` (values cannot be derived retroactively). Legacy `agent_registry` rows where `cwd IS NULL` (those predating the `apply_routing_migration` `cwd` column added 2026-06-04) will have `project_id = NULL` after backfill. The `--project current` filter MUST use `WHERE project_id = ? AND project_id IS NOT NULL` to exclude these unscopable rows. Rows with `project_id IS NULL` appear ONLY when the user passes `--project all`.
+4. **FR-C2C-1.4:** The schema version sentinel in `src/daemon/chat.rs` MUST be bumped after the migration completes. `claudebase status --json` MUST reflect the new schema version.
+5. **FR-C2C-1.5:** The existing columns on `agent_registry` (per `src/daemon/chat.rs:443-459` and the `apply_routing_migration` additions at lines 508-518) MUST remain structurally unchanged — no renames, no type changes, no constraint additions. Preserved columns are:
+   - `agent_id TEXT PRIMARY KEY`
+   - `agent_name TEXT NOT NULL`
+   - `connection_id TEXT NOT NULL`
+   - `chat_thread_id TEXT`
+   - `permission_relayer TEXT`
+   - `spawned_at INTEGER NOT NULL`
+   - `last_pinged_at INTEGER NOT NULL`
+   - `state TEXT NOT NULL CHECK (state IN ('alive','orphaned','dead'))`
+   - `metadata TEXT`
+   - `routing_chat_id INTEGER` (added by `apply_routing_migration`)
+   - `routing_thread_id INTEGER CHECK (routing_thread_id IS NULL OR routing_thread_id > 0)` (added by `apply_routing_migration`)
+   - `last_user_id INTEGER` (added by `apply_routing_migration`)
+   - `host TEXT` (added by `apply_routing_migration`)
+   - `cwd TEXT` (added by `apply_routing_migration`)
+   - `pid INTEGER` (added by `apply_routing_migration`)
+
+#### FR-C2C-2: `project_id` Resolver (Slice 2)
+
+1. **FR-C2C-2.1:** A new module `src/project_id.rs` MUST be added to the crate (declared via `pub mod project_id;` in `src/lib.rs`). It MUST export one public function: `resolve_project_id(cwd: &Path) -> String`.
+2. **FR-C2C-2.2:** `resolve_project_id` MUST implement a three-step fallback chain in order:
+   - Step 1: Run `git -C <cwd> config --get remote.origin.url`. On success, normalize the URL to a `host/owner/repo` string: strip the protocol prefix (`https://`, `git@`, `ssh://`), strip the trailing `.git` suffix if present, replace `:` host-path separators (SSH format) with `/`, and lowercase the entire result.
+   - Step 2: If Step 1 fails (non-zero exit or no `origin` remote), read `<cwd>/.claudebase/config.json` and return the `project_id` field if present and non-empty.
+   - Step 3: If both Steps 1 and 2 fail, return `sha256(canonical_absolute_path(cwd))[..16]` as a hex string prefixed with `local:`.
+3. **FR-C2C-2.3:** The resolver MUST be covered by at least 8 unit tests covering: HTTPS URL normalization, SSH URL normalization (colon-separator form), `.git` suffix stripping, case normalization, no-git-repo fallback (Step 3), `.claudebase/config.json` override (Step 2 priority over Step 3), git worktree with different origin, and fork-with-different-origin (two different repos in same directory structure).
+4. **FR-C2C-2.4:** An integration test MUST create a real git repository in a temp directory, run `resolve_project_id` against it, and assert the result matches the expected normalized form of the temp repo's origin URL.
+
+#### FR-C2C-3: `agent_describe` MCP Tool + Register-Time Identity Capture (Slice 3)
+
+1. **FR-C2C-3.1:** The existing `agent_register` MCP handler MUST be extended to call `resolve_project_id(cwd)` and `git rev-parse --abbrev-ref HEAD` at register time and persist the resulting `project_id`, `branch`, and `working_dir` values into the `agent_registry` row.
+2. **FR-C2C-3.2:** A new MCP tool `agent_describe` MUST be added to `src/daemon/server.rs` with the following input schema: `{ feature_id: string, branch: string, description: string }`. The handler MUST UPDATE the existing `agent_registry` row for the calling `agent_id`, writing `feature_description = description` and `branch = branch`.
+3. **FR-C2C-3.3:** `agent_describe` MUST be registered in `src/plugin/mcp.rs`'s TOOL_WHITELIST with a JSON schema matching the input shape in FR-C2C-3.2.
+4. **FR-C2C-3.4:** A round-trip test MUST verify: agent registers → row contains non-NULL `project_id` + `branch` + `working_dir` → `agent_describe` is called → row's `feature_description` is updated → `agent_list_alive` returns the updated description.
+
+#### FR-C2C-4: `agent_send` MCP Tool + Bridge Auto-Subscribe (Slice 4)
+
+1. **FR-C2C-4.1:** A new MCP tool `agent_send` MUST be added with input schema: `{ to_agent_id: string, content: string, urgent?: boolean }`. The handler MUST:
+   a. Verify `to_agent_id` exists in `agent_registry` (fail with a structured error if not found — see FR-C2C-4.2).
+   b. Post the message to thread `agent:<to_agent_id>` using the existing `chat_post` machinery (the same `chat_messages` table used by Telegram, inserting with `thread_id = 'agent:<to_agent_id>'`, reusing `delivered_at` tracking from commit `ccdf538`).
+   c. If the receiver's `dnd_until_ts` is NULL or in the past: emit a `notifications/claude/channel` notification with `target_agent_id=<to_agent_id>` and return `{ delivered: true }`.
+   d. If the receiver IS in DND (`dnd_until_ts > now`): persist the message with `delivered_at = NULL` and return `{ queued: true, delivered_when: dnd_until_ts }`. No notification is emitted.
+2. **FR-C2C-4.2:** When `to_agent_id` is not found in `agent_registry`, `agent_send` MUST return a structured error (exit 1 / error response body) with a message indicating the agent does not exist. It MUST NOT silently enqueue for an unknown agent.
+3. **FR-C2C-4.3:** The outbound `notifications/claude/channel` notification for agent-to-agent messages MUST use the same wire format as Telegram inbound (shape frozen in §18 §Frozen — bit-for-bit existing surface): `source="claudebase"`, `chat_id="<from_agent_id>"`, `thread="agent:<to_agent_id>"`, `target_agent_id=<to_agent_id>`, with an additional optional `meta.kind="agent-to-agent"` field.
+4. **FR-C2C-4.4:** On initial bridge connection, `src/plugin/bridge.rs` MUST auto-subscribe to the thread `agent:<my-agent-id>` so that inbound agent-to-agent messages are delivered as channel notifications without requiring an explicit `chat_subscribe` call from the agent.
+5. **FR-C2C-4.5:** The bridge's existing `should_relay_channel_notification(target_agent_id)` filter MUST remain unchanged. It already routes notifications to the correct CC session; agent-to-agent notifications reuse it without modification.
+6. **FR-C2C-4.6 (Sender Identity Binding — SECURITY):** `handle_agent_send` MUST resolve `from_agent_id` from the connection's registered identity by querying `agent_registry WHERE connection_id = <current_connection_id>`, NOT from caller-supplied arguments. This prevents any local process with UDS access from impersonating arbitrary agents. The implementation MUST mirror the existing `handle_agent_register` pattern at `src/daemon/server.rs` which binds the caller identity to the connection's `connection_id: Uuid` from connection state — the UDS connection state already carries this. Slice 4 REQUIRES a **security pre-review** from `security-auditor` before implementation begins.
+
+#### FR-C2C-5: `agent_set_dnd` MCP Tool + DND Drain Background Task (Slice 5)
+
+1. **FR-C2C-5.1:** A new MCP tool `agent_set_dnd` MUST be added with input schema: `{ state: string }` where `state` accepts the following values: `"on"` (DND active indefinitely), `"off"` (clear DND), `"<N>m"` (DND for N minutes), `"<N>h"` (DND for N hours), `"until HH:MM"` (DND until a wall-clock time in the local timezone). The handler MUST write the computed `dnd_until_ts` (Unix epoch integer, or NULL for "off") to `agent_registry` for the calling agent_id. **Indefinite DND encoding:** `agent_set_dnd("on")` without a duration MUST write `dnd_until_ts = i64::MAX (9223372036854775807)`. `NULL` means no DND is active. The drain task's `WHERE dnd_until_ts < now()` predicate naturally excludes `i64::MAX` rows without special-casing. An explicit test in `tests/agent_dnd_test.rs` MUST cover the indefinite path.
+2. **FR-C2C-5.2:** The daemon MUST run a **new recurring `tokio::spawn` background task** in the daemon main loop (NOT an extension of `drain_pending_outbound_tg`, which is a startup-one-shot). This task polls `agent_registry` every 30 seconds for rows where `dnd_until_ts IS NOT NULL AND dnd_until_ts < now()`. For each expired DND row, the task MUST: (a) clear `dnd_until_ts` to NULL, (b) query `chat_messages WHERE thread_id = 'agent:<id>' AND delivered_at IS NULL`, (c) emit `notifications/claude/channel` for each queued message using the existing notification path, and (d) set `delivered_at = now()` on each drained message row. The SQL drain pattern reuses the approach from `src/daemon/telegram.rs:160-205` applied to `thread_id LIKE 'agent:%'` rows for agents whose `dnd_until_ts < now()` was just cleared.
+3. **FR-C2C-5.3:** When DND is active and `agent_send` is called, the caller MUST receive the response `{ queued: true, delivered_when: <dnd_until_ts as ISO-8601 string> }` within 2 seconds of the call.
+4. **FR-C2C-5.4:** DND drain latency MUST be at most 30 seconds from DND expiry (enforced by the polling interval). This is an explicit operator-acknowledged trade-off: event-driven drain is deferred as an optimization (see §20.8 R-C2C-4).
+5. **FR-C2C-5.5 (DND Drain Rate Limit):** The drain task MUST emit at most 10 `notifications/claude/channel` notifications per agent per 30-second tick. If an agent has more than 10 queued messages, the task processes the oldest 10 (ordered by `created_at ASC`) and leaves the remainder with `delivered_at = NULL` — they surface on the next tick. This protects the CC channel surface from bombardment when many messages drain simultaneously on DND-off. The `delivered_at` timestamp on drained rows MUST be set to the actual emission time, not the original `created_at`, so drain order is preserved across ticks.
+
+#### FR-C2C-6: `claudebase agent list-alive` CLI Subcommand (Slice 6)
+
+1. **FR-C2C-6.1:** A new CLI subcommand `claudebase agent list-alive` MUST be added. It MUST accept a `--project` flag with values: `current` (filter by the `project_id` resolved from the invoking process's cwd), `all` (return all alive agents across all projects), or `<slug>` (a literal normalized project_id string). Default is `current`.
+2. **FR-C2C-6.2:** The output MUST include the following fields for each alive agent: `agent_id`, `branch`, `working_dir`, `feature_description` (NULL displayed as `null`), `last_seen_at`, `dnd_until_ts` (NULL displayed as `null`).
+3. **FR-C2C-6.3:** With `--json`, output MUST be a JSON array of objects with the fields listed in FR-C2C-6.2. Without `--json`, a human-readable table format MUST be used.
+4. **FR-C2C-6.4:** The `--project current` filter MUST call `resolve_project_id(cwd())` to determine the current project's normalized identifier, then SELECT only rows from `agent_registry` where `project_id = <resolved> AND project_id IS NOT NULL` (the `IS NOT NULL` guard excludes legacy rows that predate the `cwd` column and received `project_id = NULL` during the v5→v6 backfill; see FR-C2C-1.3).
+5. **FR-C2C-6.5:** Agents from other projects MUST NOT appear in `--project current` output. This is the load-bearing isolation property (AC-C2C-1).
+
+#### FR-C2C-7: `PostToolUse:ExitPlanMode` Hook for Feature-Description Discipline (Slice 7)
+
+1. **FR-C2C-7.1:** Two new hook scripts MUST be created: `hooks/claudebase-feature-describe.sh` and `hooks/claudebase-feature-describe.ps1`. Both MUST contain only ASCII bytes (codepoint ≤ 127); the same ASCII-only constraint applies as in §19 FR-V9-6.2 — Windows PowerShell 5.1 parses no-BOM scripts in the local ANSI code page. Hook scripts MUST read `.claude/plan.md` first heading via **literal-text extraction only** (e.g., `grep` / `awk` text extraction). Scripts MUST NOT execute heading content in any form (`bash -c "<heading>"` or equivalent shell-expansion patterns are forbidden). Low risk given single-box trust model but defense-in-depth applies.
+2. **FR-C2C-7.2:** The hook MUST fire on the Claude Code `PostToolUse` event when the tool name matches `ExitPlanMode`. It MUST read the first heading from `.claude/plan.md` to extract the feature title, then inject `additionalContext` that mandates the receiving agent to: (a) call `agent_describe(feature_id, branch, description)` via MCP, and (b) update the `.claude/scratchpad.md` `## Feature:` line to match. Both writes MUST happen in the same turn. **Pre-flight hook event verification (Slice 7 requirement):** The implementer MUST verify the hook event name and matcher field against the actual `~/.claude/settings.json` schema BEFORE writing the scripts. Primary target: `PostToolUse` event + `matchers: ["ExitPlanMode"]`. Fallback A (if primary is not supported): `UserPromptSubmit` event + detect-previous-turn-ExitPlanMode heuristic. Fallback B: `Stop` hook + content-marker detection. Fallback C (operator-driven): Mira calls `agent_describe` manually post-bootstrap. The implementer MUST document which strategy was verified and used in the slice commit message.
+3. **FR-C2C-7.3:** The installer (`install.sh` and `install.ps1`) MUST wire both hook scripts into `~/.claude/settings.json` under `hooks.PostToolUse` using dedup-by-command-string equality (the same idempotent wiring pattern as §19 FR-V9-6.3). Re-running the installer MUST produce zero new entries.
+4. **FR-C2C-7.4:** The hook MUST be idempotent: if `.claude/plan.md` does not exist or has no heading on the first non-blank line, the hook MUST emit an empty `additionalContext` (or a minimal note) rather than failing.
+
+#### FR-C2C-7b: `PreToolUse:EnterPlanMode` Peer-Awareness Hook (Slice 7b — operator-requested 2026-06-06)
+
+Complementary read-side hook to FR-C2C-7 — fires BEFORE the agent enters plan mode so plans drafted in isolation can be coordinated against parallel work in other CC sessions. Together with FR-C2C-7 (the write-side, post-exit) they form the read-write boundary of cli-to-cli routing: read peers before planning, publish your plan after exiting.
+
+1. **FR-C2C-7b.1:** Two new hook scripts MUST be created: `hooks/claudebase-agent-routing-reminder.sh` and `hooks/claudebase-agent-routing-reminder.ps1`. Same ASCII-only constraint as FR-C2C-7.1 (`.ps1` codepoints ≤ 127). Scripts MUST gracefully skip emit (empty `additionalContext`) when the `claudebase` binary is absent on the operator's box so non-claudebase sessions are not noisy.
+
+2. **FR-C2C-7b.2:** The hook MUST fire on the Claude Code `PreToolUse` event when the tool name matches `EnterPlanMode`. It MUST inject `additionalContext` teaching the receiving agent (a) the WHY of cli-to-cli routing — that parallel CC sessions often collide on overlapping work and the channel exists to detect-and-coordinate BEFORE the plan commits; (b) the DISCOVER primitives `claudebase agent list-alive --project current` and `claudebase agent inspect <agent_id>`; (c) the MCP communication tool surface `agent_send` / `agent_describe` / `agent_set_dnd` with explicit FR-C2C-4.6 daemon-side identity-binding callout; (d) the INBOUND peer-message wire format (TG-shape `<channel>` meta + JSON `agent_to_agent` preamble at the start of the content body per FR-C2C-8 hotfix #2 + blank line + verbatim sender text); (e) the single-box single-user trust model breadcrumb.
+
+3. **FR-C2C-7b.3:** Installer wiring MUST add this hook to `~/.claude/settings.json` under `hooks.PreToolUse` with matcher `EnterPlanMode` using the SAME idempotent dedup-by-command-string pattern as FR-C2C-7.3. Re-running the installer MUST produce zero new entries.
+
+4. **FR-C2C-7b.4:** The hook script SHOULD NOT spawn a subprocess that runs `claudebase agent list-alive` for the agent — the script's job is to TEACH the agent what to do, not to do it. The agent invokes the discovery primitives itself when the planning context calls for it. Keeps the hook fast (single file existence check + JSON envelope emit) and avoids consuming agent-context budget with output the agent might not need.
+
+#### FR-C2C-8: Bridge Inbound `<agent-message>` Rendering Convention (Slice 8)
+
+1. **FR-C2C-8.1:** `src/plugin/bridge.rs` MUST branch on the `meta.kind` field of an inbound `notifications/claude/channel` event. When `meta.kind = "agent-to-agent"`, the notification content MUST be rendered as `<agent-message from="<chat_id>" thread="<thread>" ts="<timestamp>">CONTENT</agent-message>` rather than the Telegram `<channel>` shape.
+2. **FR-C2C-8.2:** The Telegram inbound rendering (`<channel>` shape) MUST remain unchanged for all notifications where `meta.kind` is absent or is not `"agent-to-agent"`. This is a non-negotiable regression-safety requirement.
+3. **FR-C2C-8.3:** The `from`, `thread`, and `ts` attributes on the `<agent-message>` tag MUST be populated from the corresponding fields of the notification's meta object (`chat_id`, `thread`, and the message timestamp).
+4. **FR-C2C-8.4:** At least 4 unit tests MUST cover: (a) Telegram inbound still renders `<channel>` (regression), (b) agent-to-agent inbound renders `<agent-message>`, (c) `<agent-message>` contains the correct `from` attribute, (d) missing `meta.kind` defaults to `<channel>` rendering. **Discriminator fallthrough rule:** ANY value of `meta.kind` other than the literal string `"agent-to-agent"` falls through to the existing `<channel>` rendering path. Implementers MUST NOT treat unknown `meta.kind` values as a discriminated union to error on — they are future-extension values that must render as `<channel>` for backward compatibility.
+
+### 20.4 Non-Functional Requirements
+
+1. **NFR-C2C-1 (end-to-end delivery latency):** `agent_send` MUST return within 2 seconds on a local box (daemon and both CC instances on the same machine, LAN-isolated). The round-trip includes the daemon handler + SQLite write + channel notification emit. — salience: high.
+2. **NFR-C2C-2 (DND drain latency):** After DND expiry, queued messages MUST be drained and delivered as channel notifications within 30 seconds. This is determined by the background task polling interval (FR-C2C-5.2). — salience: medium.
+3. **NFR-C2C-3 (schema migration backward compatibility):** The v5→v6 migration MUST be idempotent and additive. No existing column may be dropped or renamed. No data in existing rows may be lost. — salience: high.
+4. **NFR-C2C-4 (single-box single-user trust model):** No network surface is exposed beyond the existing UDS/named-pipe socket. Agent-to-agent messages never leave the local machine. No authentication layer is added between agents in MVP. This trade-off is operator-confirmed (plan.md §Trust model, 2026-06-05). — salience: high.
+5. **NFR-C2C-5 (regression safety for Telegram surface):** All existing Telegram functionality (`<channel>` rendering, `should_relay_channel_notification` filter, `chat_post` / `chat_subscribe` / `chat_ask` / `chat_reply` tools) MUST remain fully functional after this feature lands. The existing 178+ tests MUST continue to pass. — salience: high.
+6. **NFR-C2C-6 (ASCII-only hook scripts):** Both `.ps1` hook files MUST contain only ASCII bytes (codepoint ≤ 127). — salience: high.
+7. **NFR-C2C-7 (test coverage target):** The feature MUST add approximately 45 new unit and integration tests across 8 new test files (breakdown: ~6 v6 schema, ~8 project_id resolver, ~6 agent_describe, ~8 agent_send, ~7 agent_set_dnd, ~6 CLI list-alive, ~4 bridge render). — salience: medium.
+
+8. **NFR-C2C-8 (agent-to-agent rendering convention):** Daemon-emitted agent-to-agent notifications MUST use the SAME `notifications/claude/channel` JSON-RPC method as the Telegram inbound path, with two distinguishing meta fields: `meta.source = "claudebase:agent"` (distinct from `"claudebase"` / `"plugin:telegram:telegram"` used for TG) AND `meta.kind = "agent-to-agent"`. Claude Code's channel surface renders the meta into a `<channel source="claudebase:agent" kind="agent-to-agent" from_agent_id="<sender>" thread="agent:<receiver>" target_agent_id="<receiver>" message_id="<uuid>" drained_from_dnd="<bool>">CONTENT</channel>` tag in the receiving model's prompt context. Downstream consumers (future bridge versions, CC versions, alternative MCP clients) MUST treat any frame where `meta.kind != "agent-to-agent"` (or `meta.kind` is absent) as TG inbound and fall through to the existing channel rendering (UC-C2C-15-EC1 fallthrough rule — implementers MUST NOT treat unknown `meta.kind` values as a discriminated-union error). The frame builder `crate::daemon::chat::build_channel_notification_agent_to_agent` is the single source of truth for the wire shape; both the direct `agent_send` path AND the Slice 5 DND drain path MUST call it (no inline JSON literals duplicating the shape). — salience: high.
+
+### 20.5 Acceptance Criteria
+
+All five criteria must pass before `/merge-ready` is invoked for this feature.
+
+| ID | Criterion | Evidence Required |
+|---|---|---|
+| **AC-C2C-1** | Operator runs `claudebase agent list-alive --project current` from one CC. Output is a JSON array listing all currently-alive agents in the same `project_id` (normalized from `git remote origin URL`), excluding agents from other projects. Each entry includes `agent_id`, `branch`, `working_dir`, `feature_description`, `last_seen_at`, `dnd_until_ts`. | Shell stdout JSON array; at least 2 agents present (operator opens 2 CC windows in 2 different clones of the same repo); both appear in the list; cwd hashes for unrelated projects do NOT appear; `feature_description` field is non-NULL for at least one entry. Captured in `docs/qa/evidence/cli-to-cli-routing/AC-C2C-1-list-alive-stdout.json`. |
+| **AC-C2C-2** | Operator publishes a feature description from one CC via MCP tool `agent_describe(feature_id, branch, description)`. Within 5 seconds, the other CC running `agent list-alive` sees the updated description in the daemon. | Daemon-side SQL `SELECT feature_description FROM agent_registry WHERE agent_id=?` returns the published string; second CC's `agent list-alive --project current` shows the updated field. Captured in `docs/qa/evidence/cli-to-cli-routing/AC-C2C-2-describe-roundtrip.txt`. |
+| **AC-C2C-3** | Agent A in CC #1 calls MCP tool `agent_send(to_agent_id, content)`. Within 2 seconds, CC #2 receives the message as a `notifications/claude/channel` notification with `target_agent_id=B`. CC #2's bridge filter passes it through. | CC #2 transcript shows the inbound `<agent-message from="A" thread="agent:B">...</agent-message>` block; `chat_messages` row exists with `from_agent='A'`, `thread='agent:B'`, `delivered_at` non-NULL. Captured in `docs/qa/evidence/cli-to-cli-routing/AC-C2C-3-send-receive-transcript.md`. |
+| **AC-C2C-4** | Agent B sets DND via `agent_set_dnd("30m")`. Agent A's subsequent `agent_send` to B is enqueued but produces no `notifications/claude/channel` emit during the DND window. On `agent_set_dnd("off")`, the daemon drains and delivers the queued messages to CC #2. | CC #2 transcript shows NO notification during DND window; `agent_send` returns `{queued: true, delivered_when: <ts>}`; after DND off, CC #2 transcript shows queued messages drained as channel notifications within `30s × ceil(count/10)` seconds (rate limit: 10 per 30s tick per FR-C2C-5.5); `chat_messages.delivered_at` is set on all drained rows. Captured in `docs/qa/evidence/cli-to-cli-routing/AC-C2C-4-dnd-queued-then-drained.md`. |
+| **AC-C2C-5** | The `PostToolUse` hook matching `ExitPlanMode` fires after an operator exits plan mode. The injected context mandates calling `agent_describe` AND updating `.claude/scratchpad.md` `## Feature:`. Both writes succeed in the same agent turn. | Hook output captured in session transcript; daemon-side row updated with non-NULL `feature_description`; scratchpad's `## Feature:` line matches the daemon's `feature_description`. Captured in `docs/qa/evidence/cli-to-cli-routing/AC-C2C-5-hook-fired-stdout.txt`. |
+
+### 20.6 Affected Components
+
+**New files:**
+- `src/project_id.rs` — `resolve_project_id` function and fallback chain
+- `hooks/claudebase-feature-describe.sh`
+- `hooks/claudebase-feature-describe.ps1`
+- `tests/store_v6_test.rs` — schema migration tests
+- `tests/agent_registry_v6_test.rs` — extended struct and query tests
+- `tests/project_id_test.rs` — resolver unit tests (≥8)
+- `tests/agent_describe_test.rs` — round-trip tests (≥6)
+- `tests/agent_send_test.rs` — send/DND/queue path tests (≥8)
+- `tests/agent_dnd_test.rs` — DND state machine tests (≥7)
+- `tests/cli_agent_list_alive_test.rs` — CLI output and scope filter tests (≥6)
+- `tests/bridge_agent_message_render_test.rs` — rendering regression tests (≥4)
+- `docs/use-cases/cli-to-cli-routing_use_cases.md` — (produced by ba-analyst, Step 2)
+- `docs/qa/cli-to-cli-routing_test_cases.md` — (produced by qa-planner, Step 4)
+- `docs/qa/evidence/cli-to-cli-routing/` — (populated by qa-engineer in Slice 9)
+
+**Modified files:**
+- `src/daemon/chat.rs` — `apply_agent_registry_c2c_migration` function (new, invoked from `ensure_chat_db_schema` after `apply_routing_migration` and `apply_pending_asks_migration`) — v5→v6 migration logic
+- `src/daemon/agent_registry.rs` — struct extension (`project_id`, `branch`, `working_dir`, `feature_description`, `dnd_until_ts`) + query functions for list-alive with project filter
+- `src/daemon/server.rs` — `agent_register` extension + `agent_describe` handler + `agent_send` handler (with sender identity binding per FR-C2C-4.6) + `agent_set_dnd` handler + DND-expiry background task (new `tokio::spawn` recurring task)
+- `src/plugin/bridge.rs` — auto-subscribe to `agent:<my-id>` on connect + `<agent-message>` rendering branch
+- `src/plugin/mcp.rs` — TOOL_WHITELIST additions for `agent_describe`, `agent_send`, `agent_set_dnd` + tool specs
+- `src/cli.rs` — `AgentSubcommand::ListAlive` with `--project` flag
+- `src/main.rs` — `run_agent_list_alive` handler
+- `src/lib.rs` — `pub mod project_id;`
+- `install.sh` — PostToolUse hook wiring (additive, idempotent)
+- `install.ps1` — PostToolUse hook wiring (additive, idempotent)
+
+**Preserved bit-for-bit (frozen):**
+- `chat_messages` schema — including `delivered_at` column from `ccdf538`; agent-to-agent messages reuse the same table with `thread = 'agent:<id>'` convention
+- `notifications/claude/channel` wire format meta shape — `chat_id` as string, `target_agent_id`, etc. (§18 contract)
+- `should_relay_channel_notification(target_agent_id)` bridge filter — UNCHANGED; reused for agent-to-agent routing
+- Telegram `<channel>` inbound rendering — UNCHANGED; agent-to-agent uses the new `<agent-message>` shape only when `meta.kind = "agent-to-agent"`
+
+### 20.7 Schema Changes
+
+The following additive SQL DDL constitutes the complete v5→v6 migration applied to `agent_registry`. The migration is implemented as `apply_agent_registry_c2c_migration(conn)` in `src/daemon/chat.rs`, following the same probe-before-ADD pattern as `apply_routing_migration` (lines 508-540 of the same file):
+
+```sql
+-- Additive columns on agent_registry (guarded by PRAGMA table_info probe before each ALTER)
+-- Follows the same probe-before-ADD pattern as apply_routing_migration in src/daemon/chat.rs:508-540
+ALTER TABLE agent_registry ADD COLUMN project_id TEXT;
+ALTER TABLE agent_registry ADD COLUMN branch TEXT;
+ALTER TABLE agent_registry ADD COLUMN working_dir TEXT;
+ALTER TABLE agent_registry ADD COLUMN feature_description TEXT;
+ALTER TABLE agent_registry ADD COLUMN dnd_until_ts INTEGER;
+
+-- Index for efficient project-scoped list-alive queries
+CREATE INDEX IF NOT EXISTS agent_registry_project_id_idx ON agent_registry(project_id);
+```
+
+Backfill: existing rows receive `NULL` for all five new columns. Legacy rows where `cwd IS NULL` (predating `apply_routing_migration`) receive `project_id = NULL` and are excluded from `--project current` queries (see FR-C2C-1.3, FR-C2C-6.4). `project_id` is populated at next `agent_register` call for each agent (no retroactive derivation).
+
+The `chat_messages` table is unchanged by this migration. The column name is `thread_id` (verified at `src/daemon/chat.rs:431` — `thread_id TEXT NOT NULL`); agent-to-agent messages insert with `thread_id = 'agent:<to_agent_id>'`.
+
+This schema change applies to `chat.db` (the daemon's operational database). `index.db` (books corpus), `insights.db` (agent insights), and `claudebase.db` are unaffected.
+
+### 20.8 Out of Scope (this feature)
+
+- **Prompt-injection guard between agents** — operator-confirmed deferred; single-box single-user trust is sufficient for MVP.
+- **Broadcast/topic-style threads** (e.g., a `project:claudebase` shared channel all agents subscribe to) — MVP is DM-style only.
+- **Cross-host communication** (agent on machine A talks to agent on machine B) — daemon is local-only.
+- **Urgent-override of DND** (`agent_send --urgent`) — proposed, deferred; MVP DND is a hard block.
+- **Event-driven DND drain** (tokio one-shot timer per DND expiry instead of 30s polling) — deferred optimization; 30s latency is acceptable per operator acknowledgment.
+
+### 20.9 Risks and Dependencies
+
+**R-C2C-1 (`project_id` ambiguity for forks and monorepo splits):** Two clones of forks with different `origin` URLs produce different `project_id` values and will NOT discover each other. Mitigation: the `.claudebase/config.json::project_id` manual override path provides an escape hatch. Acceptable for MVP. Salience: medium.
+
+**R-C2C-2 (Hook fires only on plan-mode exit; mid-session feature switches are undetected):** If the operator says "now work on slice 9" without entering plan mode, no ExitPlanMode fires → no hook → `feature_description` in the daemon is stale. Mitigation: extending the existing `UserPromptSubmit` hook to detect scratchpad-vs-daemon drift is documented in §20.3 FR-C2C-7.2 as a low-priority deferred follow-up. Salience: medium.
+
+**R-C2C-3 (Race condition on concurrent `agent_describe` for the same `agent_id`):** Two CC windows in the same cwd both register as the same agent_id and both call `agent_describe` concurrently. Last-write-wins; no merge. Acceptable for MVP; documented. Salience: low.
+
+**R-C2C-4 (DND drain background task adds ~30s polling cost):** Could be replaced with an event-driven one-shot timer on DND change. MVP ships with polling. Deferred optimization. Salience: low.
+
+**R-C2C-5 (`<agent-message>` tag is a new model-facing convention):** Claude Code's channel surface may not render it specially. Mitigation: the receiving model treats the tag as quoted provenance context. Integration test with a real CC verifies the tag is visible to the model. Salience: medium.
+
+**R-C2C-6 (Single-branch interleave with v0.9-cut Wave 3):** cli-to-cli-routing commits share the `feat/multi-agent-on-v0.6` branch with parked v0.9-cut Wave 3 (Slices 9-11). Mitigation: distinct commit-message prefixes per feature; merge-prep Slice 10 triages commits. Operator-accepted. Salience: medium.
+
+**R-C2C-7 (Bridge auto-subscribe may require additive logic for `agent:*` threads):** The existing self-bootstrap at bridge init is hardcoded for `telegram:*` threads. Adding `agent:<my-id>` subscribe may require reading the `agent_id` at connect time. Mitigation: implementer reads `src/plugin/bridge.rs` before Slice 4 to confirm the bootstrap pattern. Salience: high.
+
+**R-C2C-8 (`chat_messages.thread_id` column constraints):** The `chat_messages.thread_id` column (verified at `src/daemon/chat.rs:431`) has no CHECK constraint restricting values to `telegram:%` prefixes — it is declared as `TEXT NOT NULL` with no enum guard. Agent-to-agent messages using `thread_id = 'agent:<id>'` are therefore structurally valid. This risk is RESOLVED by verification: no constraint conflict exists. Salience: low (downgraded from high; constraint verified this session).
+
+## Facts
+
+### Verified facts
+
+- `.claude/plan.md` lines 1–233 read in full this session — source: Read tool call, offset 0 limit 233 — salience: high.
+- Current branch `feat/multi-agent-on-v0.6` HEAD `ccdf538` — source: `.claude/plan.md` line 5 (plan.md §Verified facts: "verified `git branch --show-current` + `git log -1 --oneline` this session") — salience: high.
+- **CORRECTED (architect amendment 2026-06-06):** `agent_registry` actual columns verified at `src/daemon/chat.rs:443-459` (base schema) and `src/daemon/chat.rs:508-518` (routing migration additions): `agent_id PRIMARY KEY`, `agent_name NOT NULL`, `connection_id NOT NULL`, `chat_thread_id`, `permission_relayer`, `spawned_at NOT NULL`, `last_pinged_at NOT NULL`, `state CHECK('alive'|'orphaned'|'dead')`, `metadata`; plus routing migration columns `routing_chat_id`, `routing_thread_id CHECK(>0)`, `last_user_id`, `host`, `cwd`, `pid`. The original PRD §20 stated `agent_id, routing_key, last_seen_at, registered_at` — this was factually incorrect and has been corrected in FR-C2C-1.5 and §20.7 — source: Read tool call `src/daemon/chat.rs:443-552` this session — salience: high.
+- **CORRECTED (architect amendment 2026-06-06):** Migration function is `apply_routing_migration` (and the new `apply_agent_registry_c2c_migration` to be created) in `src/daemon/chat.rs`, invoked from `ensure_chat_db_schema` (line 418) — NOT in `src/store.rs` as originally stated — source: Read tool call `src/daemon/chat.rs:418-472` this session — salience: high.
+- **CORRECTED (architect amendment 2026-06-06):** `chat_messages` column is `thread_id` (not `thread`) — verified at `src/daemon/chat.rs:431` — salience: high.
+- **CORRECTED (architect amendment 2026-06-06):** `chat_messages.thread_id` has no CHECK constraint restricting values to `telegram:%` — verified at `src/daemon/chat.rs:426-434` (base schema declaration) — R-C2C-8 risk resolved — source: Read tool call this session — salience: high.
+- `ensure_chat_db_schema` calls `apply_routing_migration(conn)` then `apply_pending_asks_migration(conn)` before returning — source: `src/daemon/chat.rs:467-471` Read this session — salience: high.
+- `chat_messages.delivered_at` column exists and is populated by the outbound spool (commit `ccdf538`) — source: `src/daemon/chat.rs:433` Read this session — salience: high.
+- Existing MCP tools `agent_register`, `agent_list_alive`, `agent_unregister`, `chat_post`, `chat_subscribe`, `chat_ask`, `chat_list_pending_asks`, `chat_list_threads`, `chat_reply`, `chat_list` verified as live — source: `.claude/plan.md` line 179 — salience: high.
+- `should_relay_channel_notification(target_agent_id)` bridge filter exists (Slice 6 multi-agent-tg) — source: `.claude/plan.md` line 180 — salience: high.
+- `.claudebase/config.json` per-project persistence exists (commit `25189bc`) — source: `.claude/plan.md` line 182 — salience: medium.
+- Acceptance criteria AC-C2C-1 through AC-C2C-5 copied verbatim from `.claude/plan.md` lines 38–42 (§Success Criteria table) — source: plan.md Read this session — salience: high.
+- PRD §19 is the prior section (claudebase v0.9 cut); §20 is the correct next section — source: Grep on `^## §\d+` against `docs/PRD.md` this session returning `§19` as last match at line 1303 — salience: high.
+- `docs/PRD.md` line count is 1600 (verified via PowerShell `Get-Content | Count` this session at original authoring) — source: Bash tool call this session — salience: medium.
+- Insights corpus hit: doc_id=5 (`agent:mira:-:-:080737317032621b`) contains "Operator correction on cli-to-cli routing design: feature_description for cross-agent discovery MUST be agent-published via MCP (PostToolUse:ExitPlanMode hook mandates the call) and mirrored in both scratchpad and daemon" — source: `claudebase insight search` call this session — salience: high.
+- `notifications/claude/channel` wire format — meta MUST match TG inbound contract shape (§18 contract, frozen) — source: `.claude/plan.md` lines 48–52 §Frozen section — salience: high.
+- Corpus scope relevance check: `claudebase list --json` returned 0 documents for this project workspace; corpus is absent. No topical queries executed — salience: low.
+
+### External contracts
+
+- **`git config --get remote.origin.url`** — symbol: returns remote URL string or exits non-zero if remote `origin` is not configured — source: git documentation (not opened this session) — verified: no — assumption (well-established git CLI contract; risk: non-standard remote name or bare repo setup may not have `origin`; mitigated by fallback chain) — salience: medium.
+- **`git rev-parse --abbrev-ref HEAD`** — symbol: returns current branch name or `HEAD` if in detached HEAD state — source: git documentation (not opened this session) — verified: no — assumption — salience: low.
+- **`PostToolUse` hook event with `ExitPlanMode` matcher** — symbol: Claude Code hook system fires `PostToolUse` after every tool call; `matchers: ["ExitPlanMode"]` in settings.json scopes to that one tool. Fallback strategy documented in FR-C2C-7.2: Primary → PostToolUse+matchers:[ExitPlanMode]; Fallback A → UserPromptSubmit+detect-prev-turn-ExitPlanMode; Fallback B → Stop hook+content-marker; Fallback C → operator-driven. Implementer MUST verify before scripting — source: Claude Code hook documentation (not opened this session) — verified: no — assumption. Risk: hook event semantics, field name, or `matchers` key may differ; Slice 7 pre-flight verification is mandatory (FR-C2C-7.2) — salience: high.
+- **`notifications/claude/channel` wire format** — symbol: meta object fields `chat_id` (string), `target_agent_id` (string), `thread` (string), optional `meta.kind` (string) — source: §18 PRD contract (read this session at docs/PRD.md line 783+) + commit `ccdf538` live-tested in plan.md §Verified facts — verified: yes — salience: high.
+- **`chat_messages` table columns** — symbol: `thread_id TEXT NOT NULL` (CORRECTED from earlier `thread TEXT`), `delivered_at INTEGER` (nullable) — source: `src/daemon/chat.rs:431,433` Read this session — verified: yes — salience: high.
+- **`src/daemon/server.rs` `handle_agent_register` pattern** — symbol: uses `connection_id: Uuid` from connection state to bind caller identity (per FR-C2C-4.6 sender identity binding) — source: architect finding citing `src/daemon/server.rs:1284`; file NOT read this session — verified: no — assumption. Risk: if the pattern differs, FR-C2C-4.6 implementer must adapt the identity-binding approach. Verify by reading `src/daemon/server.rs:1280-1290` before Slice 4 — salience: high.
+
+### Assumptions
+
+- Bridge auto-subscribe to `agent:<my-id>` can reuse the existing self-bootstrap pattern at bridge init; the current pattern is hardcoded for `telegram:*` threads and may require additive logic. Risk: if `agent_id` is not available at bridge init time (e.g., because registration happens after init), the auto-subscribe cannot fire. How to verify: implementer reads `src/plugin/bridge.rs` before Slice 4. Tracked in R-C2C-7. Salience: high.
+- `chat_messages.thread_id` has no CHECK constraint restricting values to `telegram:%` prefixes — RESOLVED by architect verification (`src/daemon/chat.rs:431` confirms `thread_id TEXT NOT NULL` with no enum guard); R-C2C-8 risk downgraded to low. Salience: low.
+- The `<agent-message>` rendering convention will be visible to the receiving model as provenance context even if Claude Code's channel surface has no special treatment for it. Risk: CC may strip unknown XML-tag shapes. Mitigation: integration test in Slice 8 live-verifies with real CC. Salience: medium.
+- Approximately 45 new tests will be added across 8 new test files. Risk: actual count may differ during implementation; this is a planning estimate. How to verify: `cargo test --workspace` count before and after each slice. Salience: low.
+- **PRD §20 pre-amendment factual errors acknowledged (2026-06-06):** The original PRD §20 (authored 2026-06-05) contained factual errors about the codebase: (1) wrong agent_registry column names (`routing_key, last_seen_at, registered_at` vs actual `agent_name, connection_id, spawned_at, last_pinged_at, state, metadata, routing_chat_id, ...`); (2) migration in `src/store.rs` (actual: `src/daemon/chat.rs`); (3) phantom path `src/agent_registry.rs` (actual: `src/daemon/agent_registry.rs`); (4) wrong chat_messages column `thread` (actual: `thread_id`). All four corrected based on architect-grounded reading of `src/daemon/chat.rs:418-552`. Risk: any plan or test files authored from the pre-amendment PRD may carry the same errors; ba-analyst and qa-planner running in parallel MUST be notified. Salience: high.
+
+### Open questions
+
+- **OQ-C2C-1:** Does bridge auto-subscribe to `agent:<my-id>` need to be project-scoped (subscribe only when in matching `project_id`)? MVP proposal: NO — subscribe always; rely on `target_agent_id` filter. Confirm at Slice 4 implementation — needs: architect call at Slice 4 start. Salience: low.
+- **OQ-C2C-2:** Should `agent_send` to a non-existent `agent_id` fail loudly (error response) or enqueue with `delivered_when: null` and wait for the agent to register? MVP proposal: fail loudly (FR-C2C-4.2). Confirm at bootstrap — needs: operator decision or architect call. Salience: low.
+- **OQ-C2C-3:** Should the `PostToolUse:ExitPlanMode` hook ALSO fire on `UserPromptSubmit` to catch mid-session feature drift (R-C2C-2)? MVP proposal: defer. Confirm at bootstrap — needs: operator decision. Salience: medium.
+
+## Decisions
+
+### Inbound validation
+
+- Task received: write PRD §20 (cli-to-cli-routing) from `.claude/plan.md` as source of truth. Challenged: yes — §19 already existed (v0.9-cut) and had been listed in the task prompt as "§18 multi-agent-telegram"; the correct section number is §20, not §19 as naively stated. Protocol 3 Q1: task is coherent. Q2: no upstream error — the plan is approved. Q4: no amplification. Outcome: proceeded with §20 as correct section number, sourcing all FRs from plan.md lines 72–103. Salience: high.
+- Insights corpus hit (doc_id=5) confirmed that the design choice of MCP-mandated `feature_description` via PostToolUse hook was an operator correction already applied in this session. Inbound task is consistent with that correction. No contradiction. Salience: high.
+- **Amendment task received 2026-06-06:** Architect PASS-WITH-CONDITIONS verdict identified 4 CRITICAL and 7 MAJOR factual errors in PRD §20. Protocol 3 Q1: amendment task is coherent — the errors are concrete and evidence-grounded. Q2: the original PRD §20 contained upstream errors (wrong column names, wrong file paths, wrong column name) that would propagate to every downstream agent (planner, test-writer, implementer). Q4: executing amendment is correct; NOT executing would amplify the upstream errors. Outcome: applied all 11 amendments (CRITICAL-1 through MAJOR-11 + OQ-UC-C2C-1 resolved). Salience: high.
+
+### Decisions made
+
+- Section number §20 chosen (§19 was already taken by the v0.9-cut PRD section). Q1 hack? no | Q2 sane? yes — sequential numbering is the only coherent choice | Q3 alternatives? n/a | Q4 cause | Q5 n/a. Salience: low.
+- AC-C2C-1 through AC-C2C-5 copied verbatim from `.claude/plan.md` §Success Criteria table (lines 38–42). Decision: no paraphrase — exact copy ensures qa-engineer's `/qa-cycle` targets the same criterion the planner designed. Q1 hack? no | Q2 sane? yes | Q3 alternatives? paraphrase rejected (drift risk) | Q4 cause | Q5 n/a. Salience: high.
+- FR numbering scheme: FR-C2C-1 through FR-C2C-8 (mirroring slice 1–8 structure from plan.md). Q1 hack? no | Q2 sane? yes — 1:1 with implementation slices aids traceability | Q3 alternatives? topic-based numbering rejected (harder to trace to plan) | Q4 cause | Q5 n/a. Salience: medium.
+- Schema DDL for v5→v6 migration presented as a SQL block. Decision: exact DDL is more useful than prose for the implementer and less ambiguous for reviewers. Q1 hack? no | Q2 sane? yes | Q3 alternatives? prose only rejected | Q4 cause | Q5 n/a. Salience: medium.
+- Trust model (single-box single-user, no prompt-injection guard) documented in §20.1 and NFR-C2C-4, not hidden. Decision: explicit scope decision, not a shortcut. Q1 hack? no (operator-confirmed 2026-06-05) | Q2 sane? yes | Q3 alternatives? sanitize-and-escape considered, rejected for MVP per operator | Q4 cause | Q5 future hardening tracked in §20.8 Out of Scope. Salience: high.
+- **Architect action A-1 (migration file location):** All FR references to `src/store.rs` replaced with `src/daemon/chat.rs::apply_agent_registry_c2c_migration`. Decision basis: verified at `src/daemon/chat.rs:418-472` this session; no `store.rs` migration function exists. Q1 hack? no | Q2 sane? yes | Q3 alternatives? creating it in `store.rs` rejected (breaks existing pattern; `store.rs` does not handle `chat.db` schema) | Q4 cause (fixing wrong file reference) | Q5 n/a. Salience: high.
+- **Architect action A-2 (column names):** FR-C2C-1.5 rewritten with actual columns from `src/daemon/chat.rs:443-459` and `508-518`. Decision: verbatim from source; no interpretation. Q1 hack? no | Q2 sane? yes | Q3 n/a | Q4 cause | Q5 n/a. Salience: high.
+- **Architect action A-3 (phantom path):** `src/agent_registry.rs` → `src/daemon/agent_registry.rs` across Modified files list. Decision: correct path to match project structure (`src/daemon/` submodule pattern). Q1 hack? no | Q2 sane? yes | Q3 n/a | Q4 cause | Q5 n/a. Salience: medium.
+- **Architect action A-4 (chat_messages column):** `chat_messages.thread` → `chat_messages.thread_id` in all FR references, drain SQL, and Schema Changes section. Decision: verbatim from `src/daemon/chat.rs:431`. Q1 hack? no | Q2 sane? yes | Q3 n/a | Q4 cause | Q5 n/a. Salience: high.
+- **Architect action A-5 (sender identity binding FR-C2C-4.6):** Added as new security requirement rather than guidance. Decision: binding `from_agent_id` to connection state is the load-bearing security property that prevents impersonation over UDS. Q1 hack? no | Q2 sane? yes — mirrors an existing pattern | Q3 alternatives? caller-supplied identity rejected (trivially bypassable) | Q4 cause (prevents impersonation) | Q5 n/a. Salience: high.
+- **FR-C2C-5.5 (DND drain rate limit):** 10 messages per agent per 30s tick. Decision: protects CC channel surface from N-message bombardment on DND-off. Q1 hack? no | Q2 sane? yes — 10/30s is an operationally reasonable limit | Q3 alternatives? unlimited drain (rejected: bombardment risk), 1/tick (too slow for typical case), configurable (premature complexity) | Q4 cause | Q5 n/a. Salience: medium.
+- **Indefinite DND as i64::MAX:** Encoding `"on"` without duration as `i64::MAX` rather than a sentinel NULL. Decision: NULL is already "no DND"; using MAX avoids a three-state (on/off/indefinite) enum in the drain WHERE clause. Q1 hack? no | Q2 sane? yes — `WHERE dnd_until_ts < now()` naturally excludes MAX | Q3 alternatives? separate `dnd_indefinite BOOLEAN` column (rejected: adds schema complexity for no benefit) | Q4 cause | Q5 n/a. Salience: medium.
+
+### Hacks / workarounds acknowledged
+
+(none — this feature is principled wiring of existing infrastructure; no shortcuts taken)
+
+### Symptom-only patches (with root-cause links)
+
+- Mid-session feature switch (operator switches task without entering plan mode) leaves `feature_description` stale in the daemon. Symptom treated: hook mandates update only on ExitPlanMode. Root cause that remains: no reliable CC lifecycle event fires on task change outside plan mode. Tracked at: R-C2C-2 in §20.9 + OQ-C2C-3. Salience: medium.

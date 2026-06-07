@@ -1,4 +1,12 @@
-# Command: Reflect
+# Command: Reflect — Default Mode Network wandering pass to catch focus-induced blindness
+
+**INVOKE THIS OFTEN.** This is the SDLC pipeline's "fresh-eyes" pass, the analogue of you-taking-a-shower-and-suddenly-remembering. Most agents (planner, architect, qa-planner, implementer, qa-engineer) stay laser-focused on their slice and never lift their head. `/reflect` lifts the head and looks around. If you have not run it in this project this week — RUN IT NOW. The cost is one agent invocation; the upside is catching duplicated code paths, abandoned PRD requirements, dead exports, slow-test cancer, and architectural drift BEFORE they cement.
+
+**Use `/reflect` proactively when:**
+- You're returning to a project after time away (1+ day) — fresh DMN pass before resuming
+- A feature just merged — see what wandering observations the new state surfaces
+- You feel "something is off" but can't name it — that's exactly the signal `/reflect` is built for
+- Once a week as background hygiene if you do nothing else with it
 
 Invoke the `reflection` agent — the Default Mode Network analogue. No specific task. The agent reads project state, wanders, and surfaces non-obvious observations: unused exports, duplicated implementations, dead code paths, architectural inconsistencies, PRD requirements that lost their slice, the test suite that grew to 800 cases of which 600 take 30+ seconds.
 

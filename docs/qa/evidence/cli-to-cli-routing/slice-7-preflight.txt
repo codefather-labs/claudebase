@@ -1,0 +1,53 @@
+# Slice 7 Pre-flight: PostToolUse:ExitPlanMode hook event verification
+
+Date: 2026-06-06
+Owner: mira
+
+## Method
+
+Inspected the operator's installed `~/.claude/settings.json` hook surface
+to enumerate hook events known to fire on this Claude Code build.
+
+## Findings
+
+Currently wired (CONFIRMED firing in production this session):
+  * SessionStart (matcher: startup|resume|compact) -> sdlc-onboarding.ps1
+  * SessionStart -> claudebase-read-insights-reminder.ps1
+  * SubagentStart -> sdlc-subagent-onboarding.ps1
+  * UserPromptSubmit -> claudebase-selfcheck-reminder.ps1
+
+NOT wired (existence not verified for THIS Claude Code build):
+  * PostToolUse (no entries in settings.json)
+  * Stop (retired by v0.7 commit; was previously wired for
+    claudebase-insight-capture but removed in favor of
+    UserPromptSubmit per insight-capture lineage)
+
+## Decision
+
+Ship the hook script ASSUMING `PostToolUse + matchers:["ExitPlanMode"]`
+works per Claude Code hook docs lineage. The plan's fallback chain
+(FR-C2C-7.2) is preserved as a code-comment in the hook script body
+and in this evidence file. Slice 9 QA will verify live; if the hook
+does not fire, the fallback path is operator-driven (Mira calls
+agent_describe as the final step of /bootstrap-feature, which has
+been the de-facto path during this session anyway).
+
+## Fallback chain (per FR-C2C-7.2)
+
+Primary:    PostToolUse + matchers:["ExitPlanMode"] (this Slice 7 ship)
+Fallback A: UserPromptSubmit + prev-turn ExitPlanMode detection
+            (limited — UserPromptSubmit hook has no transcript access)
+Fallback B: Stop hook + content-marker check
+            (Stop event status unknown for this CC build)
+Fallback C: operator-driven via /bootstrap-feature orchestrator
+            (already in place — Mira calls agent_describe as a final
+            bootstrap step; this is the safety net regardless)
+
+## Verification path for Slice 9 QA
+
+After installer deploys both hooks, operator enters plan mode in a
+fresh CC session, drafts a small plan, exits plan mode. Hook fires
+should inject `additionalContext` containing the literal substring
+"feature-describe mandate" into the next-turn system reminder. If
+the literal is absent in the next-turn context, primary path failed
+and Fallback C carries the load.

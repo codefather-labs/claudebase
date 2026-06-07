@@ -29,10 +29,18 @@
 //! `to_string()` render so the WHERE clause matches.
 
 use anyhow::Context;
+use chrono::{Local, NaiveTime, TimeZone, Timelike};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 
 use crate::daemon::chat::now_millis;
+
+/// Slice 5 of cli-to-cli-routing — sentinel value for indefinite DND.
+/// Architect A-3 + OQ-UC-C2C-1 resolution: store `i64::MAX` in the
+/// `dnd_until_ts` column so the drain query `dnd_until_ts < now()`
+/// naturally excludes the indefinite-DND row without a special-case
+/// branch.
+pub const INDEFINITE_DND: i64 = i64::MAX;
 
 /// The three states an agent can occupy. The DB CHECK constraint on
 /// `state` enforces the same vocabulary; the Rust enum is the authority
@@ -77,6 +85,15 @@ pub struct UnregisterOutcome {
 }
 
 /// One row of the agent_registry table returned by `list_alive`.
+///
+/// Slice 1 of cli-to-cli-routing — schema v6 introduces 5 new optional
+/// columns (project_id / branch / working_dir / feature_description /
+/// dnd_until_ts). They are carried through the struct here so Slice 3's
+/// `agent_describe` handler and Slice 5's `agent_set_dnd` handler can
+/// construct/inspect rows without a second struct. `list_alive`'s SELECT
+/// does NOT yet populate these — Slice 6 (the `claudebase agent list-alive`
+/// CLI surface) extends the SELECT. Until then `list_alive` returns rows
+/// with `None` in the 5 new fields.
 #[derive(Debug, Clone)]
 pub struct AgentRow {
     pub agent_id: String,
@@ -84,6 +101,20 @@ pub struct AgentRow {
     pub chat_thread_id: Option<String>,
     pub spawned_at: i64,
     pub last_pinged_at: i64,
+    /// Normalized project identity (e.g. `github.com/owner/repo`).
+    /// Populated by Slice 3 via `src/project_id.rs` resolver.
+    pub project_id: Option<String>,
+    /// Branch name captured at register time (`git rev-parse --abbrev-ref HEAD`).
+    pub branch: Option<String>,
+    /// Absolute cwd captured at register time — distinguishes per-clone
+    /// agents that share a `project_id`.
+    pub working_dir: Option<String>,
+    /// Operator-facing label set by `agent_describe`. Mandated post-
+    /// ExitPlanMode by the Slice 7 hook.
+    pub feature_description: Option<String>,
+    /// Do-Not-Disturb expiry in UNIX millis. `None` = no DND;
+    /// `Some(i64::MAX)` = indefinite (architect A-3 / OQ-UC-C2C-1).
+    pub dnd_until_ts: Option<i64>,
 }
 
 /// Outcome of a successful `agent_reap` call. The wire shape exposed
@@ -256,6 +287,437 @@ pub fn unregister(conn: &Connection, agent_id: &str) -> anyhow::Result<Unregiste
     }
 }
 
+/// Slice 3 of cli-to-cli-routing — capture project identity columns
+/// (project_id / branch / working_dir) on an alive `agent_registry`
+/// row. Called from `handle_agent_register` after the canonical UPSERT
+/// once the caller's `cwd` has been resolved.
+///
+/// COALESCE semantics: passing `None` for a field leaves the existing
+/// value untouched, so partial re-captures on rename or mid-session
+/// agent_describe don't accidentally clobber identity that's already
+/// good. Passing `Some("")` IS still a write — caller is expected to
+/// filter empties before calling (the resolver in `src/project_id.rs`
+/// never returns an empty string).
+///
+/// Returns the number of rows updated (0 if `agent_id` is not alive
+/// in the registry, 1 otherwise).
+pub fn capture_identity(
+    conn: &Connection,
+    agent_id: &str,
+    project_id: Option<&str>,
+    branch: Option<&str>,
+    working_dir: Option<&str>,
+) -> anyhow::Result<usize> {
+    let n = conn.execute(
+        "UPDATE agent_registry SET \
+           project_id  = COALESCE(?1, project_id), \
+           branch      = COALESCE(?2, branch), \
+           working_dir = COALESCE(?3, working_dir) \
+         WHERE agent_id = ?4 AND state = 'alive'",
+        params![project_id, branch, working_dir, agent_id],
+    )?;
+    Ok(n)
+}
+
+/// Slice 3 of cli-to-cli-routing — set `feature_description` (and
+/// optionally `branch`) on an existing `agent_registry` row. The
+/// `agent_describe` MCP tool surface calls this after resolving the
+/// caller's `agent_id` from the connection_id (the FR-C2C-4.6 sender
+/// identity binding primitive — see `lookup_agent_id_by_connection`).
+///
+/// Returns the number of rows updated. Caller maps `0` to a JSON-RPC
+/// error response surface ("no agent registered on this connection").
+pub fn describe(
+    conn: &Connection,
+    agent_id: &str,
+    feature_description: &str,
+    branch: Option<&str>,
+) -> anyhow::Result<usize> {
+    let n = conn.execute(
+        "UPDATE agent_registry SET \
+           feature_description = ?1, \
+           branch              = COALESCE(?2, branch) \
+         WHERE agent_id = ?3",
+        params![feature_description, branch, agent_id],
+    )?;
+    Ok(n)
+}
+
+/// Slice 3 of cli-to-cli-routing — resolve the `agent_id` of the alive
+/// row bound to a specific `connection_id`. This is the security
+/// primitive Slice 4 FR-C2C-4.6 builds on: instead of trusting a
+/// caller-supplied `from_agent_id`, the daemon looks up the identity
+/// the connection ALREADY registered. Local processes that can write
+/// to the UDS but never called `agent_register` (or registered as a
+/// different id) cannot impersonate.
+///
+/// Returns `None` when no alive row matches the connection. Multiple
+/// alive rows on one connection_id is technically possible if the
+/// caller registered several agents in different threads; we return
+/// the most-recently-pinged to break the tie.
+pub fn lookup_agent_id_by_connection(
+    conn: &Connection,
+    connection_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let result = conn
+        .query_row(
+            "SELECT agent_id FROM agent_registry \
+             WHERE connection_id = ?1 AND state = 'alive' \
+             ORDER BY last_pinged_at DESC \
+             LIMIT 1",
+            params![connection_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(result)
+}
+
+/// Decision returned by [`send_message`] — whether the handler should
+/// proceed with bus publication or skip it because the recipient is
+/// in DND. The `message_id` is the row id of the persisted
+/// `chat_messages` entry — useful for the [`mark_delivered`] follow-
+/// up call on the deliver path.
+#[derive(Debug, Clone)]
+pub enum SendDecision {
+    /// Recipient is not in DND. Handler should call `bus.publish(...)`
+    /// and, if subscriber count >= 1, follow up with `mark_delivered`.
+    Deliver,
+    /// Recipient is in DND until the given UNIX-millis timestamp.
+    /// `i64::MAX` denotes indefinite DND (architect A-3 /
+    /// OQ-UC-C2C-1). Handler returns `{queued, delivered_when}` to
+    /// the caller and lets Slice 5's drain task fire when DND clears.
+    Queue { dnd_until_ts: i64 },
+}
+
+/// Outcome of [`send_message`] — the inserted row id plus the decision
+/// the handler should act on.
+#[derive(Debug, Clone)]
+pub struct SendOutcome {
+    pub message_id: String,
+    pub decision: SendDecision,
+}
+
+/// Slice 4 of cli-to-cli-routing — DB-side primitive backing the
+/// `agent_send` MCP tool handler.
+///
+/// Wraps target-alive verification + chat_messages INSERT in a single
+/// SQLite transaction. The handler does the bus.publish + delivered_at
+/// UPDATE async-side because `ChatBus` is tokio-backed.
+///
+/// **Security pre-review SEC-2 (PASS-WITH-CONDITIONS).** The row is
+/// inserted with `delivered_at = NULL`; the handler bumps it to
+/// `now_ms` via [`mark_delivered`] only after `bus.publish` returns a
+/// non-zero subscriber count. If the publish reports zero subscribers
+/// (target's bridge raced disconnect, no subscription on this thread,
+/// etc.) the row stays drainable for Slice 5's DND-expiry drain task.
+///
+/// **FR-C2C-4.6 sender identity binding.** `from_agent_id` MUST be
+/// the value the handler resolved from `connection_id` via
+/// [`lookup_agent_id_by_connection`]. Callers passing in their own
+/// claimed identity here defeat the binding; the handler layer is
+/// the trust boundary, this DB primitive trusts its inputs.
+///
+/// Returns `Err` when the target row is absent, dead, or orphaned —
+/// closes architect finding F-3 (no silent drop to orphaned targets).
+pub fn send_message(
+    conn: &Connection,
+    from_agent_id: &str,
+    to_agent_id: &str,
+    content: &str,
+    now_ms: i64,
+) -> anyhow::Result<SendOutcome> {
+    let tx = conn
+        .unchecked_transaction()
+        .context("send_message: begin tx")?;
+    let (state, dnd_until_ts): (String, Option<i64>) = tx
+        .query_row(
+            "SELECT state, dnd_until_ts FROM agent_registry WHERE agent_id = ?1",
+            params![to_agent_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .context("send_message: query target")?
+        .ok_or_else(|| anyhow::anyhow!("agent not found or not alive: {to_agent_id}"))?;
+    if state != "alive" {
+        anyhow::bail!("agent not found or not alive: {to_agent_id}");
+    }
+    let decision = match dnd_until_ts {
+        Some(ts) if ts > now_ms => SendDecision::Queue { dnd_until_ts: ts },
+        _ => SendDecision::Deliver,
+    };
+    let message_id = uuid::Uuid::new_v4().to_string();
+    let thread = format!("agent:{to_agent_id}");
+    tx.execute(
+        "INSERT INTO chat_messages \
+         (id, thread_id, from_agent, content, reply_to, created_at, delivered_at) \
+         VALUES (?1, ?2, ?3, ?4, NULL, ?5, NULL)",
+        params![&message_id, &thread, from_agent_id, content, now_ms],
+    )
+    .context("send_message: insert chat_messages")?;
+    tx.commit().context("send_message: commit tx")?;
+    Ok(SendOutcome {
+        message_id,
+        decision,
+    })
+}
+
+/// Slice 4 of cli-to-cli-routing — stamp `delivered_at` on the row id
+/// returned by [`send_message`]. Called by the handler ONLY after
+/// `bus.publish` confirmed >= 1 subscriber on the deliver path.
+/// Returns the number of rows updated (0 if the id was already
+/// stamped or removed — both treated as no-ops by the caller).
+pub fn mark_delivered(
+    conn: &Connection,
+    message_id: &str,
+    now_ms: i64,
+) -> anyhow::Result<usize> {
+    let n = conn.execute(
+        "UPDATE chat_messages SET delivered_at = ?1 \
+         WHERE id = ?2 AND delivered_at IS NULL",
+        params![now_ms, message_id],
+    )?;
+    Ok(n)
+}
+
+/// Slice 5 of cli-to-cli-routing — parse a DND state string into a
+/// `dnd_until_ts` value the daemon stores in `agent_registry`.
+///
+/// Grammar:
+///   * `"on"`          → `Some(INDEFINITE_DND)` (i64::MAX sentinel)
+///   * `"off"`         → `None`
+///   * `"<N>m"`        → `Some(now_ms + N*60_000)` — minutes
+///   * `"<N>h"`        → `Some(now_ms + N*3_600_000)` — hours
+///   * `"until HH:MM"` → `Some(<next local HH:MM in millis>)`
+///
+/// Whitespace is trimmed; matching is case-insensitive on the keyword
+/// stems (`On`, `OFF`, etc. all work) but the numeric-unit suffixes
+/// `m`/`h` are kept lowercase per common DND-UI convention.
+///
+/// HH:MM is parsed in the operator's local timezone via `chrono::Local`.
+/// If today's HH:MM has already passed (e.g., now is 19:00 and the
+/// caller asks `until 18:00`), the timestamp rolls over to tomorrow.
+/// DST transitions are handled by chrono — the parser never panics on
+/// well-formed HH:MM where 0..=23 and 0..=59.
+pub fn parse_dnd_state(s: &str, now_ms: i64) -> anyhow::Result<Option<i64>> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("empty DND state");
+    }
+    let lower = trimmed.to_lowercase();
+
+    if lower == "on" {
+        return Ok(Some(INDEFINITE_DND));
+    }
+    if lower == "off" {
+        return Ok(None);
+    }
+    if let Some(stripped) = lower.strip_prefix("until ") {
+        let t = NaiveTime::parse_from_str(stripped.trim(), "%H:%M")
+            .context("parse `until HH:MM`")?;
+        // Anchor against the operator's local timezone today; if
+        // today's target is in the past, roll to tomorrow.
+        let now = Local
+            .timestamp_millis_opt(now_ms)
+            .single()
+            .ok_or_else(|| anyhow::anyhow!("now_ms out of chrono range"))?;
+        let today_target = now
+            .date_naive()
+            .and_hms_opt(t.hour(), t.minute(), 0)
+            .ok_or_else(|| anyhow::anyhow!("invalid HH:MM"))?;
+        let today_target_local = Local
+            .from_local_datetime(&today_target)
+            .single()
+            .or_else(|| Local.from_local_datetime(&today_target).earliest())
+            .ok_or_else(|| anyhow::anyhow!("ambiguous local time"))?;
+        let mut target = today_target_local.timestamp_millis();
+        if target <= now_ms {
+            // Roll forward one day. chrono is happy with naive +
+            // Days; we use a simple millis-add (no DST drift for a
+            // 24h step since we re-anchor in the local zone).
+            target += 24 * 3_600_000;
+        }
+        return Ok(Some(target));
+    }
+    // Number + unit suffix path.
+    let (num_part, unit) = if let Some(p) = lower.strip_suffix('m') {
+        (p, "m")
+    } else if let Some(p) = lower.strip_suffix('h') {
+        (p, "h")
+    } else {
+        anyhow::bail!("DND state must end with `m`, `h`, or be `on`/`off`/`until HH:MM`");
+    };
+    let n: u64 = num_part
+        .trim()
+        .parse()
+        .context("DND numeric prefix must parse as u64")?;
+    let delta_ms: i64 = match unit {
+        "m" => (n as i64) * 60_000,
+        "h" => (n as i64) * 3_600_000,
+        _ => anyhow::bail!("unreachable: unit was already matched"),
+    };
+    Ok(Some(now_ms + delta_ms))
+}
+
+/// Slice 5 of cli-to-cli-routing — UPDATE `dnd_until_ts` on an alive
+/// row. Passing `None` clears DND (sets the column to NULL); passing
+/// `Some(i64::MAX)` (`INDEFINITE_DND`) sets indefinite DND; any other
+/// `Some(ts)` is a future expiry.
+///
+/// Returns the rows updated (0 if `agent_id` isn't alive in the
+/// registry, 1 otherwise). Caller surfaces 0 as a "no agent on this
+/// connection" JSON-RPC error.
+pub fn set_dnd(
+    conn: &Connection,
+    agent_id: &str,
+    dnd_until_ts: Option<i64>,
+) -> anyhow::Result<usize> {
+    let n = conn.execute(
+        "UPDATE agent_registry SET dnd_until_ts = ?1 \
+         WHERE agent_id = ?2 AND state = 'alive'",
+        params![dnd_until_ts, agent_id],
+    )?;
+    Ok(n)
+}
+
+/// A single drainable message returned by [`drain_dnd_tick`]. The
+/// daemon-side handler turns each into a `notifications/claude/channel`
+/// frame + a follow-up `mark_delivered` UPDATE.
+#[derive(Debug, Clone)]
+pub struct DrainableMessage {
+    pub id: String,
+    pub thread_id: String,
+    pub from_agent: String,
+    pub content: String,
+    pub created_at: i64,
+}
+
+/// Stats returned by [`drain_dnd_tick`] for the tracing heartbeat.
+#[derive(Debug, Clone, Default)]
+pub struct DrainStats {
+    /// Number of `agent_registry` rows whose expired DND was cleared
+    /// this tick.
+    pub cleared_dnd: usize,
+    /// Messages the caller should emit on the bus + mark_delivered.
+    pub drainable: Vec<DrainableMessage>,
+}
+
+/// Slice 5 of cli-to-cli-routing — single-tick worker for the DND
+/// drain background task.
+///
+/// Steps (all inside one SQLite transaction):
+///   1. SELECT agent_id FROM agent_registry WHERE dnd_until_ts IS NOT
+///      NULL AND dnd_until_ts < now_ms — these are the agents whose
+///      DND just expired this tick.
+///   2. For each, clear `dnd_until_ts = NULL`.
+///   3. SELECT chat_messages WHERE thread_id = 'agent:<id>' AND
+///      delivered_at IS NULL ORDER BY created_at ASC LIMIT rate_limit
+///      (FR-C2C-5.5: rate_limit defaults to 10 per agent per tick).
+///   4. Return the batch to the caller; caller emits notifications +
+///      marks delivered.
+///
+/// `i64::MAX` (`INDEFINITE_DND`) is naturally excluded by the
+/// `dnd_until_ts < now_ms` predicate since no plausible `now_ms`
+/// reaches `i64::MAX`. Architect A-3 confirmed.
+///
+/// F-2 phantom-sender semantics: rows are drained with their
+/// ORIGINAL `from_agent` regardless of whether that agent is still
+/// alive. Operator-accepted symptom — receiver can detect
+/// dead-sender via `agent list-alive`.
+pub fn drain_dnd_tick(
+    conn: &Connection,
+    now_ms: i64,
+    rate_limit: usize,
+) -> anyhow::Result<DrainStats> {
+    let tx = conn
+        .unchecked_transaction()
+        .context("drain_dnd_tick: begin tx")?;
+    // Step 1 — collect expired-DND agents.
+    let expired: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT agent_id FROM agent_registry \
+             WHERE dnd_until_ts IS NOT NULL AND dnd_until_ts < ?1",
+        )?;
+        let rows: rusqlite::Result<Vec<String>> = stmt
+            .query_map(params![now_ms], |r| r.get(0))?
+            .collect();
+        rows?
+    };
+
+    let mut stats = DrainStats::default();
+    for agent_id in &expired {
+        // Step 2 — clear DND.
+        tx.execute(
+            "UPDATE agent_registry SET dnd_until_ts = NULL WHERE agent_id = ?1",
+            params![agent_id],
+        )?;
+        stats.cleared_dnd += 1;
+
+        // Step 3 — batch up to rate_limit drainable messages.
+        let thread = format!("agent:{agent_id}");
+        let mut q = tx.prepare(
+            "SELECT id, thread_id, from_agent, content, created_at \
+             FROM chat_messages \
+             WHERE thread_id = ?1 AND delivered_at IS NULL \
+             ORDER BY created_at ASC \
+             LIMIT ?2",
+        )?;
+        let rows: rusqlite::Result<Vec<DrainableMessage>> = q
+            .query_map(params![&thread, rate_limit as i64], |r| {
+                Ok(DrainableMessage {
+                    id: r.get(0)?,
+                    thread_id: r.get(1)?,
+                    from_agent: r.get(2)?,
+                    content: r.get(3)?,
+                    created_at: r.get(4)?,
+                })
+            })?
+            .collect();
+        stats.drainable.extend(rows?);
+    }
+    tx.commit().context("drain_dnd_tick: commit")?;
+    Ok(stats)
+}
+
+/// Slice 5 hotfix of cli-to-cli-routing — drain the queued inbox of a
+/// SPECIFIC agent, regardless of DND state. Called from the
+/// `agent_set_dnd("off")` handler when the operator explicitly clears
+/// DND, because the recurring `drain_dnd_tick` task only picks up
+/// rows whose `dnd_until_ts < now()` AND IS NOT NULL — clearing DND
+/// to NULL would otherwise leave queued messages permanently
+/// undelivered (regression caught by live Wave 5 QA, doc_id #10 in
+/// the insights corpus).
+///
+/// Returns the same `DrainableMessage` shape as `drain_dnd_tick` so
+/// the handler can reuse the bus.publish + mark_delivered loop. The
+/// caller is responsible for emitting and marking; this primitive
+/// only SELECTs.
+pub fn drain_agent_inbox(
+    conn: &Connection,
+    agent_id: &str,
+    rate_limit: usize,
+) -> anyhow::Result<Vec<DrainableMessage>> {
+    let thread = format!("agent:{agent_id}");
+    let mut stmt = conn.prepare(
+        "SELECT id, thread_id, from_agent, content, created_at \
+         FROM chat_messages \
+         WHERE thread_id = ?1 AND delivered_at IS NULL \
+         ORDER BY created_at ASC \
+         LIMIT ?2",
+    )?;
+    let rows: rusqlite::Result<Vec<DrainableMessage>> = stmt
+        .query_map(params![&thread, rate_limit as i64], |r| {
+            Ok(DrainableMessage {
+                id: r.get(0)?,
+                thread_id: r.get(1)?,
+                from_agent: r.get(2)?,
+                content: r.get(3)?,
+                created_at: r.get(4)?,
+            })
+        })?
+        .collect();
+    Ok(rows?)
+}
+
 /// List all rows where state='alive', optionally filtered by thread.
 /// Ordered newest-pinged first so Slice 7's routing can prefer
 /// recently-active agents on race.
@@ -276,6 +738,14 @@ pub fn list_alive(conn: &Connection, thread: Option<&str>) -> anyhow::Result<Vec
                 chat_thread_id: row.get(2)?,
                 spawned_at: row.get(3)?,
                 last_pinged_at: row.get(4)?,
+                // Slice 1 of cli-to-cli-routing — v6 columns not yet in
+                // this SELECT. Slice 6 extends the projection list when
+                // the `claudebase agent list-alive` CLI surface lands.
+                project_id: None,
+                branch: None,
+                working_dir: None,
+                feature_description: None,
+                dnd_until_ts: None,
             })
         })?
         .collect();
@@ -480,6 +950,12 @@ pub fn list_routings_for(
                 chat_thread_id: row.get(2)?,
                 spawned_at: row.get(3)?,
                 last_pinged_at: row.get(4)?,
+                // v6 columns not in this SELECT — Slice 6 extends.
+                project_id: None,
+                branch: None,
+                working_dir: None,
+                feature_description: None,
+                dnd_until_ts: None,
             })
         })?
         .collect();

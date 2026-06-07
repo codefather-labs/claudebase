@@ -264,6 +264,13 @@ fn transcribe_blocking(model_path: &std::path::Path, pcm: &[f32]) -> Result<Stri
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
     params.set_n_threads(num_cpus_safe() as i32);
     params.set_translate(false);
+    // Auto-detect the spoken language and transcribe IN that language.
+    // whisper.cpp defaults `language` to "en", which forces English output
+    // and effectively TRANSLATES non-English speech (Russian voice notes
+    // came back as English). "auto" restores source-language transcription.
+    // Verified against whisper-rs 0.16 set_language docs (whisper_params.rs:285:
+    // "For auto-detection, set this to either 'auto' or None").
+    params.set_language(Some("auto"));
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_timestamps(false);

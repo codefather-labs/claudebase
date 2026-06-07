@@ -1,6 +1,14 @@
 # Issue 006 — Telegram voice/message transcribes correctly but never reaches the live Claude Code session
 
-**Status:** OPEN (root cause confirmed; fix is a design change — needs a planned pipeline pass, not a live patch)
+**Status:** OPEN — **CORRECTED 2026-06-07: the "Option B" eviction fix below is MIS-SCOPED.** Tracing
+the full delivery path showed inbound telegram delivery is `bus.publish(&thread)` = BROADCAST to ALL
+thread subscribers (`telegram.rs:2007`), and `should_relay` (`bridge.rs`) relays when `target_agent_id`
+is None or equals self. So a stale same-`agent_id` subscriber does NOT block the live bridge from
+receiving — evicting stale connections does not gate the actual failure. The real cause is the live
+bridge not SUBSCRIBING/relaying (autosubscribe reliability, doc#54) AND/OR the known Claude Code
+channel-surface intermittency (issue 002, harness-level — the surface DID fire once this session then
+went flaky). Eviction (Option B) and the implementation plan below are retained as a record but are
+NOT the fix.
 **Date:** 2026-06-07
 **Severity:** High (cli-to-cli routing / TG channel delivery)
 **Area:** `src/plugin/bridge.rs`, `src/daemon/server.rs`, `src/daemon/telegram.rs`, `.claudebase/config.json`

@@ -89,6 +89,36 @@ Clean environment: kill stale `claudebase plugin serve` processes, keep exactly 
 restart the daemon once cleanly, then one CC restart so a single bridge subscribes. This sidesteps
 roots 1–3 for a single-session operator until the code fix lands.
 
+## Implementation plan (Option B — ready to execute, operator chose "one session at a time")
+
+Confirmed scoping fact: the daemon has **no** global `connection_id → outbound_tx` registry — each
+`outbound_tx` is local to its `handle_connection` task (`server.rs:520`). Eviction therefore needs a
+new shared cancel-registry. Steps:
+
+1. **Add a shared connection-cancel registry** `Arc<Mutex<HashMap<Uuid, oneshot::Sender<()>>>>`,
+   created in `serve()` and passed into `handle_connection` (alongside `bus`).
+2. **`handle_connection`**: create `(close_tx, close_rx)`; insert `close_tx` under `connection_id`;
+   pass `close_rx` into `run_request_loop`; remove the entry on task exit.
+3. **`run_request_loop`**: `tokio::select!` between `read_frame(...)` and `close_rx` → on close fire,
+   return cleanly (Evicted). Clean return drops `outbound_tx` → writer + per-thread forwarder tasks
+   exit → the connection's `chat_subscribe` broadcast subscriptions are torn down.
+4. **`handle_agent_register`**: BEFORE `register()` updates the row, read the prior `connection_id`
+   bound to `agent_id`; if it differs from the current connection AND is present in the registry,
+   remove it and fire its `close_tx` (evict the stale bridge).
+5. **`agent_registry`**: add `prior_connection_id(conn, agent_id) -> Option<String>`.
+6. **Regression test** (extend `tests/chat_tools_e2e_test.rs`): conn1 registers agent X + subscribes
+   thread T → conn2 registers agent X → assert conn1 is evicted (socket closed / stops receiving) AND
+   a publish to T reaches conn2 only.
+
+Concurrency invariants the `tokio-async-specialist` MUST verify before ship:
+- No `.await` while holding the registry `Mutex` (lock → take handle → drop guard → then fire).
+- `oneshot::Sender::send` is non-blocking; the select arm must not drop a partially-read frame.
+- Evicting a connection that is concurrently exiting is a safe no-op (`remove` returns `None`).
+
+This is concurrency-sensitive daemon surgery; per "сделай как положено" it ships only after the
+implementation passes the tokio-async-specialist audit + the regression test + a clean build — NOT
+as a rushed end-of-session patch.
+
 ## Facts
 
 ### Verified facts

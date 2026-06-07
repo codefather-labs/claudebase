@@ -4,6 +4,12 @@ All notable changes to claudebase will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] - 2026-06-07
+
+### Fixed
+
+- **Telegram voice-note transcription now works.** Whisper speech-to-text was shipped but never functional on any platform — the `asr-whisper` backend is an opt-in build feature and none of the release/installer build commands enabled it, so every binary contained a stub that reported the feature as not compiled in. Release builds and `install.sh --local` / `install.ps1 -Local` now build with `--features asr-whisper`, and a daemon with no `[asr]` config block defaults to the whisper backend. Send the bot a voice note → it transcribes (model auto-downloads on first use, or pre-fetch with `claudebase daemon warmup --asr`).
+
 ## [0.8.0] - 2026-06-07
 
 ### Added

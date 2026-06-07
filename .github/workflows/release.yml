@@ -149,6 +149,7 @@ jobs:
         run: |
           cargo build --release \
             -p claudebase \
+            --features asr-whisper \
             --manifest-path Cargo.toml \
             --target ${{ matrix.target }}
 

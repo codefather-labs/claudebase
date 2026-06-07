@@ -28,7 +28,7 @@ $ErrorActionPreference = 'Stop'
 # ============================================================================
 # Constants
 # ============================================================================
-$Script:ClaudebaseVersion       = '0.8.0'
+$Script:ClaudebaseVersion       = '0.8.1'
 $Script:ClaudebasePdfiumVersion = 'chromium/7802'
 $Script:RepoUrl                 = 'https://github.com/codefather-labs/claudebase.git'
 $Script:ReleaseBase             = 'https://github.com/codefather-labs/claudebase/releases/download'
@@ -145,7 +145,7 @@ function Install-Binary {
         }
         Write-Info "Building claudebase from local checkout ($($Script:ScriptDir)) - cargo build --release"
         Push-Location $Script:ScriptDir
-        & cargo build --release
+        & cargo build --release --features asr-whisper
         $buildExit = $LASTEXITCODE
         Pop-Location
         if ($buildExit -ne 0) {

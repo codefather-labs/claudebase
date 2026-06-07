@@ -23,7 +23,7 @@ set -u
 # ============================================================================
 # Constants
 # ============================================================================
-CLAUDEBASE_VERSION="0.8.0"
+CLAUDEBASE_VERSION="0.8.1"
 CLAUDEBASE_PDFIUM_VERSION="chromium/7802"
 REPO_URL="https://github.com/codefather-labs/claudebase.git"
 RELEASE_BASE="https://github.com/codefather-labs/claudebase/releases/download"
@@ -187,7 +187,7 @@ install_binary() {
       return 1
     fi
     log_info "building claudebase from local checkout ($SCRIPT_DIR) via cargo build --release"
-    if ! ( cd "$SCRIPT_DIR" && cargo build --release ); then
+    if ! ( cd "$SCRIPT_DIR" && cargo build --release --features asr-whisper ); then
       log_error "local 'cargo build --release' failed; binary not installed"
       return 1
     fi

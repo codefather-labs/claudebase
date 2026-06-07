@@ -154,12 +154,27 @@ impl Default for DmPolicy {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AsrConfig {
-    /// Slice 6-MVP populates this with `"whisper"`. v1 default empty so the
-    /// daemon doesn't crash if ASR config is absent.
-    #[serde(default)]
+    /// Defaults to `"whisper"` now that the asr-whisper backend ships in
+    /// release + installer builds — so a daemon.toml with no `[asr]` block
+    /// (or no `backend` key) still selects whisper. When the binary was
+    /// built WITHOUT `--features asr-whisper`, `make_asr` bails gracefully
+    /// (logged warn, voice notes fall back to a placeholder) — no crash.
+    #[serde(default = "default_asr_backend")]
     pub backend: Option<String>,
+}
+
+impl Default for AsrConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_asr_backend(),
+        }
+    }
+}
+
+fn default_asr_backend() -> Option<String> {
+    Some("whisper".to_string())
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

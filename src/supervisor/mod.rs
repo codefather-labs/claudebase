@@ -58,6 +58,129 @@ const ENV_SESSION: &str = "CLAUDEBASE_SESSION";
 /// prove which agent they belong to without the daemon trusting a bare id.
 const ENV_SESSION_TOKEN: &str = "CLAUDEBASE_SESSION_TOKEN";
 
+/// Turning "the operator's session is over" into "the child must exit".
+///
+/// The supervisor used to have no such path at all. It blocked on
+/// `child.wait()` with no signal handlers, and the stdin pump swallowed EOF
+/// silently -- so nothing connected the outer terminal going away to the
+/// `claude` running on the INNER pty, which by construction cannot see the
+/// outer terminal. A session left in that state keeps its transcript open, and
+/// Claude Code will not offer a still-running conversation to `/resume`: the
+/// operator loses access to their own history until the process is found and
+/// killed by hand.
+mod shutdown {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    static REQUESTED: AtomicBool = AtomicBool::new(false);
+
+    /// Signal handler. The ONLY thing it does is a store -- everything else
+    /// (allocating, logging, killing) is unsafe from a handler context.
+    #[cfg(unix)]
+    extern "C" fn on_signal(_sig: libc::c_int) {
+        REQUESTED.store(true, Ordering::SeqCst);
+    }
+
+    /// SIGHUP is the terminal going away, SIGTERM is a service stop, SIGINT is
+    /// an explicit `kill -INT`. Ctrl+C is NOT affected: the terminal is in raw
+    /// mode, so it arrives as a byte on stdin and is forwarded to the child
+    /// like any other keystroke.
+    #[cfg(unix)]
+    pub fn install_handlers() {
+        unsafe {
+            libc::signal(libc::SIGHUP, on_signal as libc::sighandler_t);
+            libc::signal(libc::SIGTERM, on_signal as libc::sighandler_t);
+            libc::signal(libc::SIGINT, on_signal as libc::sighandler_t);
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub fn install_handlers() {}
+
+    pub fn request() {
+        REQUESTED.store(true, Ordering::SeqCst);
+    }
+
+    pub fn requested() -> bool {
+        REQUESTED.load(Ordering::SeqCst)
+    }
+
+    /// Give the child a chance to save, then insist.
+    ///
+    /// SIGHUP first because that is exactly what it would have received had it
+    /// been on the operator's real terminal rather than ours. SIGTERM next.
+    /// SIGKILL last and bounded: a wedged child must not be able to hold the
+    /// operator's transcript hostage indefinitely, which is the whole failure
+    /// being fixed.
+    #[cfg(unix)]
+    fn escalate(pid: i32, done: &Arc<AtomicBool>) {
+        const LADDER: [(libc::c_int, Duration); 2] = [
+            (libc::SIGHUP, Duration::from_secs(3)),
+            (libc::SIGTERM, Duration::from_secs(5)),
+        ];
+
+        for (sig, grace) in LADDER {
+            signal_child(pid, sig);
+            let deadline = Instant::now() + grace;
+            while Instant::now() < deadline {
+                if done.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        tracing::warn!(pid, "child ignored SIGHUP and SIGTERM; sending SIGKILL");
+        signal_child(pid, libc::SIGKILL);
+    }
+
+    /// Signal the child, and only the child.
+    ///
+    /// `claude` is the session leader of the inner pty, so its process group is
+    /// its own and signalling the group reaches the helpers it spawned -- the
+    /// same reach a real hangup would have. The group is used ONLY after
+    /// confirming `getpgid(pid) == pid`; without that check a wrong pgid would
+    /// signal our own group, and the supervisor would kill the operator's
+    /// shell along with itself.
+    #[cfg(unix)]
+    fn signal_child(pid: i32, sig: libc::c_int) {
+        unsafe {
+            if libc::getpgid(pid) == pid {
+                libc::killpg(pid, sig);
+            } else {
+                libc::kill(pid, sig);
+            }
+        }
+    }
+
+    /// Watch for a shutdown request for as long as the child is alive.
+    #[cfg(unix)]
+    pub fn spawn_watcher(child_pid: Option<u32>, done: Arc<AtomicBool>) {
+        let Some(pid) = child_pid else {
+            tracing::warn!("no child pid — cannot propagate session shutdown to `claude`");
+            return;
+        };
+        let pid = pid as i32;
+        std::thread::spawn(move || {
+            loop {
+                if done.load(Ordering::SeqCst) {
+                    return;
+                }
+                if requested() {
+                    tracing::info!(pid, "session ending — asking `claude` to exit");
+                    escalate(pid, &done);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+    }
+
+    #[cfg(not(unix))]
+    pub fn spawn_watcher(_child_pid: Option<u32>, _done: Arc<AtomicBool>) {}
+}
+
 /// Entry point for `claudebase run`.
 pub fn run(args: &RunArgs) -> Result<std::process::ExitCode> {
     let identity = identity::derive(args.nick.as_deref());
@@ -96,11 +219,19 @@ pub fn run(args: &RunArgs) -> Result<std::process::ExitCode> {
         .context("spawn `claude` — is the Claude Code CLI on PATH?")?;
     drop(pair.slave);
 
+    // Captured at spawn, from the child handle itself. Every later signal is
+    // aimed at THIS pid and nothing else -- no matching by process name, which
+    // reliably finds the operator's other sessions instead.
+    let child_pid = child.process_id();
+
     let mut reader = pair.master.try_clone_reader().context("clone pty reader")?;
     let writer = Arc::new(Mutex::new(pair.master.take_writer().context("pty writer")?));
     let master = Arc::new(Mutex::new(pair.master));
 
     let done = Arc::new(AtomicBool::new(false));
+    shutdown::install_handlers();
+    shutdown::spawn_watcher(child_pid, done.clone());
+
     let draft = Arc::new(DraftTracker::new());
     let modal = Arc::new(ModalDetector::new());
 
@@ -150,15 +281,25 @@ pub fn run(args: &RunArgs) -> Result<std::process::ExitCode> {
                     break;
                 }
                 match stdin.read(&mut buf) {
-                    Ok(0) => break,
+                    // stdin is a TTY here (this thread only runs when it is),
+                    // so EOF means the operator's terminal went away. The child
+                    // is on a different pty and will never notice on its own.
+                    Ok(0) => {
+                        shutdown::request();
+                        break;
+                    }
                     Ok(n) => {
                         draft_in.observe_operator_input(&buf[..n]);
                         let Ok(mut w) = writer_in.lock() else { break };
                         if w.write_all(&buf[..n]).is_err() || w.flush().is_err() {
+                            shutdown::request();
                             break;
                         }
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        shutdown::request();
+                        break;
+                    }
                 }
             }
         });

@@ -184,12 +184,16 @@ jobs:
           # would also hit unrelated processes.
           trap 'kill "$daemon_pid" 2>/dev/null || true' EXIT
 
+          # Wait for the SOCKET, not for `daemon status`: that command answers
+          # exit 0 with `state: not-installed` before the daemon is up, so
+          # polling it raced the schema creation and the next command hit a
+          # locked database.
+          sock="${XDG_RUNTIME_DIR:-$HOME/.claude/run}/claudebase/daemon.sock"
           for _ in $(seq 1 60); do
-            if "$HOME/.claude/tools/claudebase/claudebase" daemon status >/dev/null 2>&1; then
-              break
-            fi
+            [ -S "$sock" ] && break
             sleep 1
           done
+          test -S "$sock" || { echo "daemon never created $sock"; exit 1; }
           "$HOME/.claude/tools/claudebase/claudebase" daemon status
           "$HOME/.claude/tools/claudebase/claudebase" daemon callback status
 

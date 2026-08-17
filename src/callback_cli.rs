@@ -55,8 +55,22 @@ pub fn disable() -> Result<String> {
 }
 
 /// `daemon callback status`
+///
+/// Read-only: this command only reads, and `open_chat_db` runs the schema
+/// ensure — a WRITE transaction — on every open. Opening read-write to read
+/// made `status` fail with `database is locked` whenever the daemon happened to
+/// be writing, which is exactly when an operator runs it. Same reasoning that
+/// moved the nick lookup off the write path.
 pub fn status() -> Result<String> {
-    let conn = chat::open_chat_db().context("open chat.db")?;
+    // A read-only handle does not create the file, so on a machine where the
+    // daemon has never run there is nothing to open. That is a normal state
+    // right after installing, not an error worth a database message.
+    let Ok(conn) = chat::open_chat_db_readonly() else {
+        return Ok("bind: (disabled — enable with `claudebase daemon callback enable`)\n\n\
+                   no tokens yet — they are minted when a session registers, and the daemon \
+                   has not run here yet\n"
+            .to_string());
+    };
     let bind = callback::configured_bind(&conn)?;
 
     let mut out = String::new();
@@ -89,8 +103,15 @@ pub fn status() -> Result<String> {
 }
 
 /// `daemon callback token <nick> [--reveal]`
+///
+/// Read-only, for the same reason as `status`.
 pub fn token(nick: &str, reveal: bool) -> Result<String> {
-    let conn = chat::open_chat_db().context("open chat.db")?;
+    let conn = chat::open_chat_db_readonly().map_err(|_| {
+        anyhow::anyhow!(
+            "no callback tokens yet — the daemon has not run on this machine.\n\
+             Start a session with `claudebase run`, which registers and mints one."
+        )
+    })?;
     let Some(tok) = callback::token_for(&conn, nick)? else {
         bail!(
             "no callback token for `{nick}` — tokens are minted when a session registers.\n\

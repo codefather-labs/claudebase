@@ -442,7 +442,26 @@ pub fn xml_escape(s: &str) -> String {
 // SEC-2-1 — systemd unit generator (Linux)
 // ---------------------------------------------------------------------------
 
-/// Build the literal text of the systemd USER service unit. Every
+/// Build the literal text of the systemd USER service unit.
+///
+/// Deliberately WITHOUT `CapabilityBoundingSet=`, `AmbientCapabilities=` and
+/// `ProtectKernelModules=`.
+/// They were here, and on systemd 255 (Ubuntu 24.04 LTS) they make the unit
+/// fail to start at all: the user manager is itself unprivileged and cannot
+/// drop capabilities, so every start exits `218/CAPABILITIES` and the service
+/// crash-loops. systemd 259 tolerates them, which is why this survived until it
+/// was installed on a 24.04 machine on 2026-08-17.
+///
+/// `ProtectKernelModules=` fails the same way and for the same reason: it works
+/// by dropping CAP_SYS_MODULE, so it is capability manipulation wearing a
+/// different name. Bisected on the failing machine — removing it alone was what
+/// turned `activating` into `active`.
+///
+/// Nothing is lost by their absence: a service run by the user manager has no
+/// capabilities to bound in the first place, and could never have loaded a
+/// kernel module. The rest of the hardening applies to user units and stays.
+///
+/// Every
 /// hardening directive in SEC-2-1 is present; no `User=` directive
 /// exists.
 pub fn generate_systemd_unit(binary_path: &Path) -> String {
@@ -465,15 +484,12 @@ ProtectSystem=strict\n\
 ProtectHome=read-only\n\
 ReadWritePaths=%h/.claude %h/.config/claudebase\n\
 ProtectKernelTunables=true\n\
-ProtectKernelModules=true\n\
 ProtectControlGroups=true\n\
 RestrictNamespaces=true\n\
 RestrictRealtime=true\n\
 LockPersonality=true\n\
 MemoryDenyWriteExecute=true\n\
 SystemCallArchitectures=native\n\
-CapabilityBoundingSet=\n\
-AmbientCapabilities=\n\
 \n\
 [Install]\n\
 WantedBy=default.target\n",
@@ -1383,6 +1399,28 @@ mod tests {
         }
     }
 
+    /// systemd 255 (Ubuntu 24.04 LTS, the current LTS) refuses a USER unit that
+    /// tries to drop capabilities: the user manager is unprivileged, so every
+    /// start exits `218/CAPABILITIES` and the daemon crash-loops. Observed live
+    /// on a clean 24.04 install on 2026-08-17; systemd 259 accepts the same
+    /// unit, which is how it went unnoticed.
+    #[test]
+    fn systemd_user_unit_does_not_try_to_drop_capabilities() {
+        let s = generate_systemd_unit(Path::new("/usr/local/bin/claudebase"));
+        assert!(
+            !s.contains("CapabilityBoundingSet"),
+            "a user unit cannot drop capabilities; systemd 255 refuses to start it"
+        );
+        assert!(!s.contains("AmbientCapabilities"), "same reason");
+        // Capability manipulation under another name: it works by dropping
+        // CAP_SYS_MODULE. Bisection on systemd 255 showed this single directive
+        // was what kept the daemon crash-looping.
+        assert!(
+            !s.contains("ProtectKernelModules"),
+            "ProtectKernelModules drops CAP_SYS_MODULE, which a user manager cannot do"
+        );
+    }
+
     #[test]
     fn systemd_unit_contains_hardening_directives() {
         let s = generate_systemd_unit(Path::new("/usr/local/bin/claudebase"));
@@ -1393,14 +1431,14 @@ mod tests {
             "ProtectHome=read-only",
             "ReadWritePaths=%h/.claude %h/.config/claudebase",
             "ProtectKernelTunables=true",
-            "ProtectKernelModules=true",
             "ProtectControlGroups=true",
             "RestrictNamespaces=true",
             "RestrictRealtime=true",
             "LockPersonality=true",
             "MemoryDenyWriteExecute=true",
             "SystemCallArchitectures=native",
-            "CapabilityBoundingSet=",
+            // No CapabilityBoundingSet / AmbientCapabilities here on purpose —
+            // see `systemd_user_unit_does_not_try_to_drop_capabilities`.
         ] {
             assert!(
                 s.contains(token),

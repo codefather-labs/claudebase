@@ -8,7 +8,19 @@
 use claudebase::daemon::service::{generate_launchd_plist, generate_systemd_unit};
 use std::path::Path;
 
-/// TC-2.6 — systemd unit must contain ALL hardening directives.
+/// TC-2.6 — systemd unit must contain the hardening directives a USER manager
+/// can actually apply.
+///
+/// `CapabilityBoundingSet=`, `AmbientCapabilities=` and `ProtectKernelModules=`
+/// are deliberately NOT in this list, and their absence is asserted by
+/// `test_systemd_user_unit_never_touches_capabilities` below. They were
+/// required here until 2026-08-17, when a clean Ubuntu 24.04 install showed the
+/// daemon crash-looping on `218/CAPABILITIES`: a user manager is unprivileged
+/// and cannot drop capabilities, and `ProtectKernelModules` is capability
+/// manipulation under another name (it drops CAP_SYS_MODULE). systemd 259
+/// tolerates them, so this test passed on the maintainer's machine while
+/// enforcing a directive set that made the service unstartable on the current
+/// LTS — the suite was pinning the defect in place.
 #[test]
 fn test_systemd_unit_contains_all_hardening_directives() {
     let unit = generate_systemd_unit(Path::new("/usr/local/bin/claudebase"));
@@ -19,19 +31,37 @@ fn test_systemd_unit_contains_all_hardening_directives() {
         "ProtectHome=read-only",
         "ReadWritePaths=%h/.claude %h/.config/claudebase",
         "ProtectKernelTunables=true",
-        "ProtectKernelModules=true",
         "ProtectControlGroups=true",
         "RestrictNamespaces=true",
         "RestrictRealtime=true",
         "LockPersonality=true",
         "MemoryDenyWriteExecute=true",
         "SystemCallArchitectures=native",
-        "CapabilityBoundingSet=",
     ];
     for directive in required {
         assert!(
             unit.contains(directive),
             "systemd unit is missing required directive `{directive}`\nfull unit:\n{unit}"
+        );
+    }
+}
+
+/// The other half of TC-2.6: what the unit must NOT contain.
+///
+/// Bisected on the failing machine — removing `ProtectKernelModules` alone was
+/// what turned `activating` into `active`.
+#[test]
+fn test_systemd_user_unit_never_touches_capabilities() {
+    let unit = generate_systemd_unit(Path::new("/usr/local/bin/claudebase"));
+    for forbidden in [
+        "CapabilityBoundingSet",
+        "AmbientCapabilities",
+        "ProtectKernelModules",
+    ] {
+        assert!(
+            !unit.contains(forbidden),
+            "user unit contains `{forbidden}`; systemd 255 refuses to start it \
+             (exit 218/CAPABILITIES)\nfull unit:\n{unit}"
         );
     }
 }

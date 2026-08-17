@@ -1,5 +1,15 @@
 # Plan: Multi-Agent Telegram Routing on v0.6 Foundation
 
+> [!IMPORTANT]
+> **Historical record — the interface described below was replaced in v0.10.**
+> Telegram and peer messaging no longer go through a Claude Code plugin, an MCP channel,
+> or `<channel …>` turns. Inbound messages arrive in the session's input as
+> `[telegram_message]: …` / `[agent-to-agent:<nick>]: …`, and replies go out via
+> `claudebase telegram send` / `claudebase agent send`.
+> Current contract: [`README.md`](../README.md#-telegram--setup-and-the-message-contract)
+> and [`docs/plans/claudebase-v0.10-pty-transport.md`](claudebase-v0.10-pty-transport.md).
+> This file is kept as the record of what was built at the time.
+
 **Feature slug:** `multi-agent-telegram-on-v0.6`
 **Owner:** Mira (orchestrator)
 **Branch strategy:** new branch `feat/multi-agent-on-v0.6` from tag `claudebase-v0.6.0`

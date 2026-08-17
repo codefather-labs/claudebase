@@ -1,0 +1,10 @@
+claudebase run: project config ready (session_id=b6d7f64d-bc10-41fe-a4a0-90e03219ca19, name=claudebase)
+{"timestamp":"2026-08-16T12:30:15.821036Z","level":"INFO","fields":{"message":"supervisor identity","agent_id":"4465c7b6-31e2-4d66-9901-904f91c7651b","name":"claudebase"},"target":"claudebase::supervisor"}
+{"timestamp":"2026-08-16T12:30:15.821735Z","level":"WARN","fields":{"message":"stdin is not a TTY — operator proxying disabled, injection still active"},"target":"claudebase::supervisor"}
+{"timestamp":"2026-08-16T12:30:15.832339Z","level":"INFO","fields":{"message":"subscribed","thread":"agent:4465c7b6-31e2-4d66-9901-904f91c7651b"},"target":"claudebase::supervisor"}
+{"timestamp":"2026-08-16T12:30:15.838801Z","level":"INFO","fields":{"message":"subscribed","thread":"telegram:999001"},"target":"claudebase::supervisor"}
+{"timestamp":"2026-08-16T12:30:36.240927Z","level":"INFO","fields":{"message":"injected inbound block","count":1,"bytes":615},"target":"claudebase::supervisor::inject"}
+{"timestamp":"2026-08-16T12:30:54.434273Z","level":"WARN","fields":{"message":"daemon connection ended; will reconnect","error":"daemon connection closed"},"target":"claudebase::supervisor"}
+{"timestamp":"2026-08-16T12:30:56.464935Z","level":"INFO","fields":{"message":"subscribed","thread":"agent:4465c7b6-31e2-4d66-9901-904f91c7651b"},"target":"claudebase::supervisor"}
+{"timestamp":"2026-08-16T12:30:56.473225Z","level":"INFO","fields":{"message":"subscribed","thread":"telegram:999001"},"target":"claudebase::supervisor"}
+{"timestamp":"2026-08-16T12:31:09.488068Z","level":"INFO","fields":{"message":"injected inbound block","count":1,"bytes":657},"target":"claudebase::supervisor::inject"}

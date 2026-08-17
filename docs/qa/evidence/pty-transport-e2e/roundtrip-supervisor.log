@@ -1,0 +1,6 @@
+claudebase run: project config ready (session_id=b6d7f64d-bc10-41fe-a4a0-90e03219ca19, name=claudebase)
+{"timestamp":"2026-08-16T12:26:09.934525Z","level":"INFO","fields":{"message":"supervisor identity","agent_id":"b3e387e2-e25d-4861-821a-60c61ca89cf8","name":"claudebase"},"target":"claudebase::supervisor"}
+{"timestamp":"2026-08-16T12:26:09.935119Z","level":"WARN","fields":{"message":"stdin is not a TTY — operator proxying disabled, injection still active"},"target":"claudebase::supervisor"}
+{"timestamp":"2026-08-16T12:26:09.943096Z","level":"INFO","fields":{"message":"subscribed","thread":"agent:b3e387e2-e25d-4861-821a-60c61ca89cf8"},"target":"claudebase::supervisor"}
+{"timestamp":"2026-08-16T12:26:09.943498Z","level":"INFO","fields":{"message":"subscribed","thread":"telegram:999001"},"target":"claudebase::supervisor"}
+{"timestamp":"2026-08-16T12:26:35.454456Z","level":"INFO","fields":{"message":"injected inbound block","count":1,"bytes":655},"target":"claudebase::supervisor::inject"}

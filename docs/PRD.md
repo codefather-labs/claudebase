@@ -406,6 +406,14 @@ As an SDLC pipeline operator, I want each Claude Code session to start with the 
 
 ## §17. Agent Chat Daemon + Telegram Bridge + ASR Pipeline + Claude Code Plugin
 
+> [!IMPORTANT]
+> **Superseded in part by v0.10 (pty-transport).** The daemon, Telegram bridge and ASR pipeline
+> described here still ship. What changed is the LAST HOP into Claude Code: the MCP plugin bridge
+> (`claudebase plugin serve`), the `--channels` registration and the `notifications/claude/channel`
+> frames are gone. Messages now arrive in a session's input as `[telegram_message]: …` and replies
+> go out via `claudebase telegram send`. See `docs/plans/claudebase-v0.10-pty-transport.md`.
+
+
 **Status:** [PLANNED]
 **Date:** 2026-05-17
 **Priority:** High
@@ -782,7 +790,12 @@ All new subcommands follow the existing `claudebase` CLI conventions: `--json` f
 
 ## §18. Multi-Agent Telegram Routing on v0.6 Foundation
 
-**Status:** [PLANNED]
+> **Superseded by §21 (2026-08-17).** The plugin/MCP-channel transport this section is built on was
+> removed in v0.10; the Telegram poller, access gate and routing survive inside the daemon, but the
+> `plugins/telegram-rs/` requirements below (FR-MAT-4.1, FR-MAT-4.3, NFR-MAT-1) describe a component
+> that no longer exists. Kept unedited as the record of what was decided on 2026-06-02.
+
+**Status:** [SUPERSEDED]
 **Date:** 2026-06-02
 **Priority:** High
 **Related:** §17 (Agent Chat Daemon + Telegram Bridge — this feature is the additive, topic-aware routing layer on top of the v0.6 baseline shipped under §17; the daemon UDS framing, `chat.db` location, `agent_registry` table and the `notifications/claude/channel` wire shape from §17 are all preserved here). §16 (Insights Base — the `chat.db` sibling-file pattern continues). Plan source: `.claude/plan.md` (v2, 321 lines, read in full this session) — same body persisted at `docs/plans/multi-agent-telegram-on-v0.6.md` (untracked, 320 lines).
@@ -1603,7 +1616,14 @@ This schema change applies to `insights.db` files only (both local `<project>/.c
 
 ## §20. CLI-to-CLI Routing — Agent-to-Agent Communication via Daemon
 
-**Status:** [PLANNED]
+> **Interface superseded by §21 (2026-08-17).** The feature shipped, but its surface moved: the
+> `agent_send` / `agent_describe` MCP tools specified below are now CLI commands
+> (`claudebase agent send|describe|list|rename|whoami`), and delivery no longer goes through
+> `notifications/claude/channel` — it is written into the session's input by the PTY supervisor. The
+> registry schema, identity enforcement and DND semantics are unchanged. Kept unedited as the record
+> of what was decided on 2026-06-06.
+
+**Status:** [SHIPPED — interface superseded by §21]
 **Date:** 2026-06-06
 **Priority:** High
 **Related:** §18 (Multi-Agent Telegram Routing — `agent_registry` table schema v4/v5 originated there; this section adds v5→v6 additive columns and reuses the existing `chat_messages` + `notifications/claude/channel` transport unchanged). §19 (claudebase v0.9 cut — `chat_messages.delivered_at` outbound spool from commit `ccdf538` is reused bit-for-bit; `agent_registry` table is the same table extended here). Plan source: `.claude/plan.md` (233 lines, read in full this session; HEAD `ccdf538` on branch `feat/multi-agent-on-v0.6`).
@@ -1903,3 +1923,115 @@ This schema change applies to `chat.db` (the daemon's operational database). `in
 ### Symptom-only patches (with root-cause links)
 
 - Mid-session feature switch (operator switches task without entering plan mode) leaves `feature_description` stale in the daemon. Symptom treated: hook mandates update only on ExitPlanMode. Root cause that remains: no reliable CC lifecycle event fires on task change outside plan mode. Tracked at: R-C2C-2 in §20.9 + OQ-C2C-3. Salience: medium.
+
+---
+
+## §21. PTY Transport — Telegram and Agent-to-Agent without a Claude Code plugin
+
+**Status:** [SHIPPED]
+**Date:** 2026-08-17
+**Priority:** High
+**Related:** §17 (daemon UDS framing, `chat.db`, `agent_registry` — reused unchanged), §18 (Telegram
+routing — the poller and access gate move into the daemon; the plugin half is deleted), §20
+(session-to-session routing — semantics preserved, surface moved from MCP tools to CLI commands).
+Plan source: `docs/plans/claudebase-v0.10-pty-transport.md`.
+
+Changelog: Telegram and peer messages reach a Claude Code session by being written into its terminal
+input, and replies leave through CLI commands. No plugin, no marketplace, no MCP channel.
+
+### 21.1 Feature Description
+
+§18 and §20 both delivered messages through `notifications/claude/channel`, a Claude Code plugin
+surface. That surface broke on Claude Code updates repeatedly (issue 002), and it is gated by a
+feature flag third parties cannot set. The transport was therefore rebuilt on the one interface
+Claude Code cannot take away: the terminal.
+
+`claudebase run` owns the pty in which `claude` runs. Inbound messages are pasted into the session's
+input as a prefixed line; outbound replies are ordinary CLI calls the agent makes itself.
+
+### 21.2 Functional Requirements
+
+**FR-PTY-1 (Inbound shape).** A message delivered into a session's input MUST be a single prefixed
+line: `[telegram_message]: <text>` for operator traffic, `[agent-to-agent:<nick>]: <text>` for peer
+traffic. Nothing else is injected — the reply protocol is taught once by the SessionStart hook, not
+prepended to messages.
+
+**FR-PTY-2 (Injection gating).** A message MUST NOT be written while a modal is up or while the
+operator has an unsubmitted draft on the input line. Ungated messages are queued and retried, never
+dropped. The submit key MUST be a separate, later write than the paste.
+
+**FR-PTY-3 (Outbound).** Replies MUST leave through `claudebase telegram send` /
+`claudebase agent send`. The sender cannot see the terminal, so a normal answer is not a reply.
+
+**FR-PTY-4 (Source classification).** The channel a message came from MUST be derived from the
+notification the daemon actually emits, not assumed. A Telegram notification carries a bare numeric
+`meta.chat_id`; peer notifications carry `agent:<id>`; posts and replies carry a prefixed
+`meta.thread`. An unclassifiable frame MUST NOT be labelled as operator traffic.
+
+**FR-PTY-5 (Nicks are addresses).** Every session has a nick, resolved by `/switch` and
+`--agent_nick`. A nick deliberately chosen for a working directory MUST survive restart, and a
+rename MUST carry that session's Telegram bindings with it. A nick MUST NOT be reserved by a session
+whose process is dead.
+
+**FR-PTY-6 (Sender labels stay addressable).** When a sender's nick cannot be resolved, the label
+MUST fall back to the full `agent_id` — a value `--agent_nick` accepts — never a truncation.
+
+**FR-PTY-7 (Access control is operator-only).** Pairing, allowlisting and policy changes MUST be
+CLI commands run in the operator's own terminal. They MUST NOT be exposed as skills or as anything
+reachable from channel content.
+
+**FR-PTY-8 (Reverse migration).** The installer MUST unpatch the official Anthropic Telegram plugin
+it previously hijacked, restoring the upstream `.mcp.json` from the backup taken at patch time, and
+MUST remove the retired `claudebase@claudebase-dev` marketplace.
+
+### 21.3 Non-Functional Requirements
+
+**NFR-PTY-1.** `chat.db` is opened concurrently by the daemon, every supervisor and every short-lived
+CLI command. It MUST be configured for that: `busy_timeout` set, WAL enabled, and read-only callers
+MUST NOT open a write transaction to perform a read.
+
+**NFR-PTY-2.** Supervisor logs MUST NOT go to the terminal that hosts the TUI.
+
+### 21.4 Out of Scope
+
+- Remote daemon over TCP (`claudebase daemon baseurl`) — designed in the plan's Slice 9, deferred.
+- Forking Claude Code, or depending on `--input-format stream-json` / the Claude Agent SDK. Both are
+  recorded as fallbacks if the PTY approach fails; it did not.
+
+## Facts
+
+### Verified facts
+- Telegram notifications put a bare numeric chat id in `meta.chat_id` and set no `meta.thread`, while posts/replies set a prefixed `meta.thread` — source: `src/daemon/chat.rs` `build_channel_notification_telegram` / `build_channel_notification`, pinned by tests in `src/daemon/subscribe_client.rs::classify_tests` which build frames with the real builders — salience: high.
+- `agent_registry::resolve_target` accepts a full `agent_id` or a nick, never an id prefix — source: `src/daemon/agent_registry.rs:660-695` read this session — salience: high.
+- `open_chat_db` set neither `busy_timeout` nor WAL, and ran `ensure_chat_db_schema` (a write transaction) on every open — source: `src/daemon/chat.rs:757-781` read this session; the knowledge DB sets both at `src/store.rs:122` — salience: high.
+- Chat bindings are keyed by nick, not by `agent_id`, so they outlive a process — source: `apply_chat_bindings_migration` in `src/daemon/chat.rs` — salience: high.
+- The full release suite passes: 30 test binaries, 459 tests, exit 0 — source: `cargo test --release` run this session — salience: medium.
+
+### External contracts
+- **Telegram Bot API** — symbol: `getMe`, `getUpdates`, `sendMessage`, bot-token shape `<bot_id>:<secret>` — source: responses observed live this session via `claudebase telegram get_me` and the daemon's long-poll — verified: yes — salience: high.
+- **Claude Code TUI input** — symbol: bracketed paste `ESC[200~ … ESC[201~`, DEC private modes 1004 / 1000 / 1002 / 1003 / 1006 / 2004 — source: measured against the running binary, evidence in `docs/qa/evidence/pty-inject/` — verified: yes — salience: high.
+- **Claude Code hooks** — symbol: `SessionStart` with `hookSpecificOutput.additionalContext`; skill source `~/.claude/skills/<name>/SKILL.md` — source: observed working this session (the contract hook fires and its text appears in context) — verified: yes — salience: high.
+
+### Assumptions
+- The 400 ms gap between paste and submit is above the real floor, which was not measured — risk: a machine slow enough to submit before the paste lands would lose a message — how to verify: bisect the delay under load in `spikes/pty_inject` — salience: medium.
+
+### Open questions
+- Messages held behind a closed injection gate are invisible to the sender; whether to notify over Telegram after ~60 s is undecided — needs: user decision — salience: medium.
+
+## Decisions
+
+### Inbound validation
+- Operator asked for a session to invent its own nick at startup. Challenged: yes — a nick re-invented on every start would break `chat_bindings`, which are keyed by nick, reintroducing the delivery loss fixed the day before. Outcome: pushed back with the concrete conflict and implemented "invent once, remember per directory" instead — salience: high.
+- Operator asked to update "all docs" on Telegram / a2a. Challenged: yes — dated PRD sections and issue/QA artifacts are the audit record the project's own cognitive-self-check rule depends on. Outcome: added this section plus non-destructive supersede notices rather than rewriting §18 / §20 — salience: medium.
+
+### Decisions made
+- Transport is the pty rather than a plugin, `--input-format stream-json`, or a Claude Code fork. Alternatives considered and rejected: stream-json and the Agent SDK (kept as recorded fallbacks, not needed); forking leaked sources (rejected outright). Q1-Q5: hack? no — it targets the cause, that the channel surface is not available to third parties | sane? yes | alternatives? listed | cause | n/a — salience: high.
+- Source classification reads the notification the daemon actually emits, and its tests build frames with the real builders rather than fixtures. Q1-Q5: hack? no | sane? yes | alternatives? a fixture-based test was rejected because a fixture would have encoded the same wrong assumption that caused the bug | cause | n/a — salience: high.
+- A rename carries its Telegram bindings to the new nick. Alternatives considered and rejected: leaving the binding and requiring a fresh `/switch` — rejected as silent failure. Q1-Q5: hack? no | sane? yes | alternatives? listed | cause | n/a — salience: medium.
+- Unresolvable sender labels fall back to the full `agent_id`. Alternatives considered and rejected: the previous 8-character truncation, which produced a label that could neither be resolved nor replied to. Q1-Q5: hack? no | sane? yes | alternatives? listed | cause | n/a — salience: high.
+
+### Hacks / workarounds acknowledged
+- `--dangerously-skip-permissions` remains default-on at operator instruction, so a prefixed line is the only marker separating external text from instructions. Why it's a hack: it relies on the model honouring the contract rather than on enforcement. Removal path: risk R-6 in the plan; revisit if a permission surface becomes available that does not break on Claude Code updates — salience: high.
+
+### Symptom-only patches (with root-cause links)
+- (none)

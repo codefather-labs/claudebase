@@ -1,5 +1,15 @@
 # Use Cases: Agent Chat Daemon + Telegram Bridge + ASR Pipeline + Claude Code Plugin
 
+> [!IMPORTANT]
+> **Historical record — the interface described below was replaced in v0.10.**
+> Telegram and peer messaging no longer go through a Claude Code plugin, an MCP channel,
+> or `<channel …>` turns. Inbound messages arrive in the session's input as
+> `[telegram_message]: …` / `[agent-to-agent:<nick>]: …`, and replies go out via
+> `claudebase telegram send` / `claudebase agent send`.
+> Current contract: [`README.md`](../../README.md#-telegram--setup-and-the-message-contract)
+> and [`docs/plans/claudebase-v0.10-pty-transport.md`](../plans/claudebase-v0.10-pty-transport.md).
+> This file is kept as the record of what was built at the time.
+
 > Based on [PRD §17](../PRD.md#17-agent-chat-daemon--telegram-bridge--asr-pipeline--claude-code-plugin) and [.claude/plan.md](../../.claude/plan.md)
 
 ---

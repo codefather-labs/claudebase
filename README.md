@@ -27,7 +27,7 @@ Single Rust binary · no Python · no external APIs.
 
 ```
 Layer 4 · Multi-channel orchestration   ← planned (server foundation + transports)
-Layer 3 · Plugin runtime                 ← shipping (telegram-rs, future Discord/Slack/Matrix)
+Layer 3 · Channel transport              ← shipping (Telegram in-daemon; Discord/Slack/Matrix next)
 Layer 2 · Cross-session agent memory     ← shipping (insights corpus)
 Layer 1 · Hybrid retrieval over docs     ← shipping (books corpus)
 Layer 0 · Single static Rust binary, local-first
@@ -41,9 +41,9 @@ Stop at Layer 1 if all you want is RAG. Go to Layer 4 when you want an orchestra
 - 🌐 **Multilingual + cross-lingual** — query in English, recall chunks in Russian / Chinese / etc
 - 📄 **Per-page PDF navigation** — every hit carries `path:page:chunk_id` so the agent cites verifiable evidence
 - 🧠 **Cross-session agent memory** (insights corpus) — hippocampal-replay analogue; agents persist load-bearing observations across sessions
-- 💬 **Telegram channel bridge** — Rust port of the official Anthropic plugin, ships from this repo
-- 🚀 **`claudebase run`** — one-shot launcher: `claude` with the Telegram channel preset preloaded
-- 🔌 **Claude Code MCP plugin** + agent toolkit out of the box (rules, commands, agents)
+- 💬 **Telegram built into the daemon** — no Claude Code plugin, no MCP channel, nothing a CLI update can break
+- 🚀 **`claudebase run`** — PTY supervisor: runs `claude` unmodified and injects inbound messages into its input
+- 🔌 **Agent toolkit out of the box** (rules, commands, agents, hooks)
 - ⚡ **Pure local** — single static Rust binary, no Python, no external API calls
 
 ## 🚀 Quick install
@@ -68,7 +68,7 @@ cd claudebase
 bash install.sh --local --yes      # or .\install.ps1 -Yes -Local on Windows
 ```
 
-> The installer downloads the pre-built `claudebase` binary + the `telegram-plugin-rs` binary from the latest GitHub release, drops the agent toolkit (rules / commands / agents) into `~/.claude/`, installs PDFium + the e5 encoder cache, best-effort installs `ffmpeg` + `whisper-cli` for voice transcription, and patches the official Anthropic Telegram plugin's cache with our Rust binary. No Rust toolchain required on the install machine.
+> The installer downloads the pre-built `claudebase` binary from the latest GitHub release, drops the agent toolkit (rules / commands / agents / hooks) into `~/.claude/`, installs PDFium + the e5 encoder cache, best-effort installs `ffmpeg` + `whisper-cli` for voice transcription, and registers the daemon as a user service. It does NOT touch Claude Code's plugins. No Rust toolchain required on the install machine.
 
 **Supported binary platforms** (release matrix):
 - **macOS**: arm64 only (M1/M2/M3/M4+). **Intel Mac (`x86_64-apple-darwin`) deprecated as of v0.7.1** — `ort 2.0.0-rc.12` stopped shipping prebuilt binaries for that target. If you're on Intel Mac, either run the Linux binary under Rosetta-via-VM, or build from source: `cargo install --path .` (requires Rust toolchain).
@@ -78,7 +78,6 @@ bash install.sh --local --yes      # or .\install.ps1 -Yes -Local on Windows
 **Opt-outs** (env vars before running the installer):
 - `CLAUDEBASE_VERSION=x.y.z` — pin a specific version (downgrade, repeatable CI installs). Default: latest `claudebase-v*` tag on origin (via `git ls-remote`, no API quota). Falls back to a baked-in constant if the remote lookup fails (air-gapped / GitHub unreachable).
 - `CLAUDEBASE_SKIP_WHISPER=1` — skip ffmpeg + whisper-cli install (no voice transcription)
-- `CLAUDEBASE_SKIP_TELEGRAM=1` — skip Telegram plugin install + patch
 
 ## 🎬 Demo
 
@@ -103,8 +102,8 @@ $ claudebase insight search "RRF parameters" --salience high --top-k 5
 1. doc#42 sha=a1b2c3d4 agent=retrieval-tuning type=agent-learned
    RRF k=60 outperforms k=40 on 17-PDF corpus
 
-$ claudebase run                          # = claude --channels plugin:telegram@claude-plugins-official
-$ claudebase run --no-telegram            # = claude (without channel preset)
+$ claudebase run                          # `claude` under a PTY supervisor; Telegram + peer messages arrive in its input
+$ claudebase run --no-telegram            # plain `claude`, no supervisor, no inbound messages
 $ claudebase run -- --debug -c            # forwards extra args verbatim to claude
 ```
 
@@ -123,7 +122,7 @@ graph LR
     G --> H[Claude Code agent]
     I[Agent observations] -->|claudebase insight create| J[(insights.db<br/>same FTS5+vec)]
     J -.cross-session recall.-> H
-    K[Telegram messages] -->|telegram-rs plugin| L[claudebase MCP server]
+    K[Telegram messages] -->|daemon long-poll + ASR| L[claudebase daemon]
     L -.channel callbacks.-> H
 ```
 
@@ -137,8 +136,8 @@ graph LR
 | OCR (image chunks) | `ocr-rs` v2 / PaddleOCR PP-OCRv4 via MNN runtime |
 | Books-corpus storage | Single `index.db` SQLite file per project — no co-located figure files; image bytes as BLOB |
 | Insights-corpus storage | Separate `insights.db` per project — same engine + an `insights` metadata table (type / agent / salience / feature / session / source-artifact); cascade-deletes through chunks and chunks_vec |
-| Telegram bridge | `plugins/telegram-rs/` — Rust port of the official Anthropic plugin (Apache-2.0, single bun-process → single Rust process) |
-| Inter-process IPC | UDS today; HTTP/WSS + Bearer-token auth planned (see [`docs/plans/claudebase-server-foundation.md`](docs/plans/claudebase-server-foundation.md)) |
+| Telegram bridge | `src/daemon/telegram.rs` — long-poll, ASR and outbound queue inside the daemon; no external plugin |
+| Inter-process IPC | UDS (named pipe on Windows), length-prefixed JSON frames; TCP + pre-shared-key auth designed in Slice 9 of [`the v0.10 plan`](docs/plans/claudebase-v0.10-pty-transport.md) |
 
 Deep-dive (L2/cosine equivalence math, RRF derivation, e5 prefix asymmetry contract): [`docs/architecture/technical-decisions.md`](docs/architecture/technical-decisions.md). Benchmarks (+75% Recall@5 vs lexical baseline on the 12-query golden set): [`docs/benchmarks/2026-05-10-baseline.md`](docs/benchmarks/2026-05-10-baseline.md).
 
@@ -148,7 +147,7 @@ Deep-dive (L2/cosine equivalence math, RRF derivation, e5 prefix asymmetry contr
 |---|---|
 | LLM agents that remember what they learned across sessions | Insights corpus + `claudebase insight create / search` |
 | Claude Code to cite the actual page of the book it's quoting from | Books corpus + per-page navigation via PDFium |
-| To chat with your long-running Claude Code session from your phone | Telegram channel plugin + `claudebase run` |
+| To chat with your long-running Claude Code session from your phone | `claudebase telegram addbot` + `claudebase run` |
 | A fleet of specialised agents on different machines coordinating | Planned: server foundation + agent registry — see [`docs/plans/`](docs/plans/) |
 | Local-first RAG without Python, Pinecone, or any external service | Layer 1 alone — `claudebase ingest` + `claudebase search` |
 
@@ -257,7 +256,7 @@ claudebase search <query> --corpus all   RRF-fuse hits from books and insights
 **Launcher:**
 
 ```text
-claudebase run [--no-telegram] [-- args...]    exec `claude` with the Telegram channel
+claudebase run [--no-telegram] [-- args...]    run `claude` under the PTY supervisor
                                                preset preloaded; forwards extra args
 ```
 
@@ -306,94 +305,166 @@ Be honest with the tag — marking everything `high` defeats the purge and turns
 | "Did a prior planner flag this scope as oversized?" | insights |
 | Genuinely spans both | `claudebase search --corpus all` (RRF-fused; each hit tagged with `source_corpus`) |
 
-## 💬 Telegram Multi-CLI Setup
+## 💬 Telegram — setup and the message contract
 
-One bot, many Claude Code CLIs. The daemon acts as the single Telegram poller and routes each chat to a bound CLI instance.
+One bot, many Claude Code sessions. The daemon is the single Telegram poller; each chat is routed to
+one session. **No Claude Code plugin is involved** — inbound messages are written straight into the
+session's input, and replies go out through the CLI. That is deliberate: the plugin/channel path
+broke on every Claude Code update, and the terminal does not.
 
-### How it works
+### Setup
 
-The daemon owns the bot token's `getUpdates` polling slot. Each Telegram chat (DM or group) is bound to exactly one CLI instance — the **chat-as-id** model. Sending a message in a chat delivers it to that chat's bound CLI. Multiple CLIs can connect to the daemon simultaneously; each operator or team chat can be switched to whichever CLI is relevant at the moment.
+```bash
+claudebase telegram addbot "<token from @BotFather>"   # verified via getMe, stored in chat.db
+claudebase daemon restart                              # the daemon reads the registry at boot
+claudebase telegram get_me                             # raw Telegram API response, to confirm
+```
 
-**Group chats:** all members of a group share one binding. `/switch` in a group chat rebinds the entire chat for everyone — this is intentional and documented in `/help`.
+Then message the bot. Under the default `pairing` policy the first message from an unknown sender is
+held and the bot replies with a code:
+
+```bash
+claudebase telegram access            # policy, allowlist, pending codes
+claudebase telegram pair <code>       # approve
+claudebase telegram policy allowlist  # close the door once everyone is in
+```
+
+`pairing` is a bootstrap mode, not a resting state — it lets any stranger trigger a code. Switch to
+`allowlist` when the list is complete (the command refuses if that would lock you out of an empty
+list).
+
+### The message contract
+
+Inbound messages appear in the session's input as a prefixed line:
+
+```text
+[telegram_message]: what the operator sent
+[agent-to-agent:mira]: what a peer session sent
+```
+
+The prefix says two things: this is a MESSAGE rather than something the operator typed at the
+prompt, and — for peer traffic — who sent it. **The sender cannot see the terminal**, so a reply
+only reaches them through a command:
+
+```bash
+claudebase telegram send --text "reply to the operator"
+claudebase telegram send --stdin                        # multi-line body
+claudebase agent send "reply" --agent_nick <nick>       # reply to a peer session
+```
+
+No destination argument is needed for Telegram: it resolves from the session's binding, then from
+the only known chat, and refuses with a candidate list if that is ambiguous. Every claudebase-aware
+session gets this contract injected at SessionStart by the `claudebase-channel-contract` hook, so
+the agent knows it before the first message arrives.
 
 ### Bot command reference
 
 | Command | Effect |
 |---|---|
-| `/agents` | List all CLI instances currently online and registered with the daemon. |
-| `/switch <name>` | Rebind this chat to the named CLI. The name must match a live agent (use `/agents` to see available names). Rejected with a helpful error if the target is unknown or offline. |
-| `/whoami` | Show which CLI this chat is currently bound to, and its agent ID. |
-| `/here` | Show the bound CLI's hostname and working directory (best-effort; reports "unavailable" in v1 if the CLI has not registered location metadata). |
+| `/agents` | List sessions currently online and registered with the daemon. |
+| `/switch <name>` | Rebind this chat to the named session. |
+| `/whoami` | Show which session this chat is bound to. |
+| `/here` | Show the bound session's host and working directory. |
+
+**Group chats:** all members share one binding; `/switch` in a group rebinds it for everyone.
 
 ### `chat_ask` — multiple-choice questions as Telegram buttons
 
-Agents can surface a multiple-choice question as native Telegram inline keyboard buttons:
+Agents can surface a multiple-choice question as native inline keyboard buttons. The daemon sends one
+button per option, the operator taps, and the answer is routed back to the asking session.
 
-```
-chat_ask(thread, question, options=[{label, description}, ...])
-```
+**Scope:** single-select, DM chats only. Free-text and multi-select are not supported.
 
-The daemon sends a Telegram message with one button per option. The operator taps a button; the daemon dismisses the spinner and routes the answer back to the requesting agent on the chat-bound CLI.
+### Voice messages
 
-**v1 scope:** single-select only; DM chats only (group-chat `chat_ask` is deferred — see `docs/PRD.md` §19 Out of Scope). Free-text answers and multi-select are not supported in v1.
-
-### Connecting a CLI session (real-time channel push)
-
-For a routed Telegram message to arrive **in your live Claude Code session** (not just be polled on demand), the session must be launched with the Telegram plugin registered as a **channel** — Claude Code injects `notifications/claude/channel` as `<channel ...>` turns only from a `--channels`-registered plugin, never from a plain `mcpServers` entry.
-
-The installer (`install.sh` / `install.ps1`) wires this for you: it patches the official Telegram plugin's `.mcp.json` so the channel's MCP server is the claudebase **daemon bridge** (`claudebase plugin serve`). The bridge relays the single daemon (it does not poll), so there is no dual-poll. Then:
-
-```
-claudebase run        # = claude --channels plugin:telegram@claude-plugins-official
-```
-
-launches a session connected to the channel. A Telegram message routed to your CLI arrives automatically as `<channel source="plugin:telegram:telegram" chat_id="..." user="...">...</channel>`, and you reply with the `chat_reply` tool. (The agent calls `agent_register` + `chat_subscribe` once per session to receive its bound thread; auto-register by `CLAUDE_CODE_SESSION_ID` is planned for a follow-up.)
-
-**To revert** the channel wiring: restore the plugin's `.mcp.json.upstream-backup`, or `claude plugin install telegram@claude-plugins-official`. To stop the daemon polling entirely: set `[telegram] enabled = false` in `daemon.toml` and restart the daemon.
+Voice notes are transcribed locally by whisper (`ffmpeg` + `whisper-cli`, installed best-effort) and
+arrive as ordinary `[telegram_message]:` text. Nothing leaves the machine.
 
 ---
 
-## 👥 Multi-agent coordination — cli-to-cli routing
+## 👥 Multi-agent coordination — session-to-session routing
 
-`claudebase` ships a third surface beyond the two corpora: a **daemon-mediated agent-to-agent channel** that lets multiple Claude Code sessions on the same operator's machine discover each other, publish what they're working on, and DM each other directly. The pain it solves: when you have 3 CC windows open across 3 clones / git worktrees of the same repo, plans drafted in isolation collide on the same files. Now they can talk.
+Multiple Claude Code sessions on one machine discover each other, publish what they are working on,
+and message each other directly. The pain it solves: three CC windows across three worktrees of the
+same repo, drafting plans that collide on the same files.
 
-The plumbing reuses the same daemon (`claudebase daemon serve`) that powers the Telegram channel. Every Claude Code session launched through `claudebase run` registers in `chat.db`'s `agent_registry` table with its `project_id` (normalized git-remote URL), `branch`, `working_dir`, and `feature_description`. Peers find each other via:
+Every session started with `claudebase run` registers in `chat.db`'s `agent_registry` with its nick,
+`project_id` (normalized git remote), `branch`, `working_dir` and description.
 
-```text
-# Discovery — who else is alive on this project (same git remote)?
-claudebase agent list-alive --project current --json
-
-# Per-agent snapshot — branch, feature_description, DND state, queue depth
-claudebase agent inspect <agent_id> --json
+```bash
+claudebase agent list                              # nick, id, online/offline, what each is on
+claudebase agent list --all --json                 # include offline sessions, machine-readable
+claudebase agent send "text" --agent_nick <nick>   # DM a peer
+claudebase agent send "text" --agent_id <id>       # when two sessions share a nick
+claudebase agent describe "what I am working on"   # publish into your own row
 ```
 
-Once you see a peer, three MCP tools drive the conversation:
+Inbound peer messages arrive as `[agent-to-agent:<nick>]: text`.
 
-| MCP tool | Purpose |
-|---|---|
-| `agent_describe(description, feature_id?, branch?)` | Publish what THIS session is working on. The daemon binds your `from_agent_id` to the connection (sender-identity binding) so local processes that never called `agent_register` cannot impersonate. |
-| `agent_send(to_agent_id, content)` | Direct message to a peer. Target must be alive in the registry; orphaned / dead targets reject. The recipient gets a `<channel ...>` notification in their CC system context. |
-| `agent_set_dnd(state)` | `on` / `off` / `Nm` / `Nh` / `until HH:MM` — toggle Do-Not-Disturb. Under DND, peer `agent_send` calls persist with `delivered_at=NULL` and a background task drains the queue on DND-off. |
+### Nicks
 
-Two hooks wire this into every claudebase-aware CC session:
+The nick is the address: `/switch` from Telegram and `--agent_nick` both resolve it. It defaults to
+the project name, so every window opened in one repository answers to the same one — which is why a
+session is asked at startup to give itself a distinctive one:
 
-- **`PreToolUse:EnterPlanMode`** — fires before plan-mode entry; surfaces that peers exist and nudges `agent list-alive` before drafting, to catch overlapping work.
-- **`PostToolUse:ExitPlanMode`** — fires after plan-mode exit; mandates `agent_describe(...)` so peers immediately see what was just decided.
+```bash
+claudebase agent whoami                # nick, id, and whether it was chosen or derived
+claudebase agent rename "<nick>"       # rename this session (also /claudebase-daemon-change-nick)
+claudebase run --nick "<nick>"         # set it at startup instead
+```
 
-Together they form the read-write boundary: discover peers before planning, publish your plan after exiting. Trust model is single-box, single-user — no prompt-injection guard between agents in the MVP.
+A **chosen** nick is remembered for that working directory and comes back on restart. That is not a
+convenience: Telegram chat bindings are keyed by nick precisely so they outlive a process, so a
+session returning under a different name would silently stop receiving. For the same reason a rename
+carries its bindings with it — the chat follows the session rather than being stranded on the old
+name.
+
+A nick is held only by a session whose process is actually alive, so a crashed window does not keep
+its name reserved.
+
+**Identity is enforced, not declared.** The daemon resolves the sender from the connection, or from a
+`(agent_id, session_token)` pair it minted itself at registration and handed to the session through
+its environment. A bare `--from` is refused, so one session cannot speak as another. Only sessions
+started with `claudebase run` can send.
+
+Ambiguity is always an error: two live sessions sharing a nick makes `--agent_nick` refuse and list
+the candidate ids rather than pick one. Delivering to the wrong peer is not recoverable.
+
+Two hooks wire this into every claudebase-aware session:
+
+- **`PreToolUse:EnterPlanMode`** — surfaces that peers exist and nudges `claudebase agent list`
+  before drafting, to catch overlapping work.
+- **`PostToolUse:ExitPlanMode`** — mandates `claudebase agent describe` so peers immediately see what
+  was decided.
+
+Trust model is single-box, single-user: peer messages are untrusted-but-friendly, read as data rather
+than orders.
 
 ---
 
 ## 🗺 Roadmap
 
-The next big design milestone for the **multi-CLI agent fleet** is cross-machine routing — a claudebase server with HTTP/WSS + mandatory Bearer-token auth. The UDS-based single-machine multi-CLI routing with Telegram is now shipped (see above). Remaining plans:
+Single-machine routing is shipped: one daemon owns the Telegram connection, and every session
+started with `claudebase run` receives messages in its input and answers through the CLI.
+
+The next milestone is **cross-machine**: a daemon on one box in the LAN, sessions on several others
+(`claudebase daemon baseurl "http://192.168.31.170:<port>"`). It is designed, not built — see
+Slice 9 of [`claudebase-v0.10-pty-transport.md`](docs/plans/claudebase-v0.10-pty-transport.md).
+Two things gate it, and both are load-bearing:
+
+- **Authentication.** Today the only guard is filesystem permissions on the UDS — "reach the socket"
+  and "be the user" are the same thing. Over TCP they are not, and the daemon's surface can send
+  Telegram messages as you and read the whole chat history. A pre-shared key, a localhost-by-default
+  bind, and TLS (or a documented SSH tunnel) come before the transport itself.
+- **Client-side DB reads.** Destination resolution, peer lookup and thread listing currently read
+  `chat.db` directly, and a remote machine has no such file. Those reads move behind daemon tools
+  first; otherwise `baseurl` would half-work — sends succeed, addressing fails.
 
 | Plan | Status |
 |---|---|
-| [`claudebase-server-foundation.md`](docs/plans/claudebase-server-foundation.md) | foundation — HTTP/WSS + auth + OS service install (launchd / systemd / Windows SCM) |
-| [`agent-registry-multi-cli.md`](docs/plans/agent-registry-multi-cli.md) | registry + cli↔cli message bus + permission-gated spawn + monitoring |
-| [`telegram-multi-cli-orchestration.md`](docs/plans/telegram-multi-cli-orchestration.md) | UDS-based single-machine multi-CLI Telegram routing — **shipped** |
-| [`claudebase-project-dir.md`](docs/plans/claudebase-project-dir.md) | per-project `.claudebase/` dir (config.toml + identity.local + state) |
+| [`claudebase-v0.10-pty-transport.md`](docs/plans/claudebase-v0.10-pty-transport.md) | PTY transport, bot registry, CLI access control — **shipped**; Slice 9 (remote daemon) designed |
+| [`claudebase-v0.9-product-plan.md`](docs/plans/claudebase-v0.9-product-plan.md) | v0.9 product scope — historical |
+| [`multi-agent-telegram-on-v0.6.md`](docs/plans/multi-agent-telegram-on-v0.6.md) | the plugin-slot era — historical, superseded by v0.10 |
 
 Discuss in [GH Discussions](https://github.com/codefather-labs/claudebase/discussions) or open an issue.
 
@@ -406,8 +477,8 @@ Discuss in [GH Discussions](https://github.com/codefather-labs/claudebase/discus
 | Hybrid retrieval (BM25 + dense + RRF) | ✅ | partial | partial | partial | ✅ |
 | Per-page PDF citations | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Cross-session agent memory | ✅ (insights corpus) | ❌ | ❌ | ❌ | ❌ |
-| Claude Code MCP plugin | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Telegram channel bridge | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Claude Code MCP server | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Telegram bridge (no plugin required) | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Multilingual / cross-lingual recall | ✅ (e5) | depends on chosen embedder | depends on chosen embedder | depends on chosen embedder | ✅ |
 | Engine | SQLite + FTS5 + sqlite-vec | columnar (LanceDB) | DuckDB / SQLite | custom vector engine | hosted |
 
@@ -419,11 +490,11 @@ Different tools, different sweet spots. claudebase aims at the **agent-infrastru
 claudebase/
 ├── src/                    Rust source (cli, store, search, ingest, encoder, ocr, pdf, ...)
 ├── tests/                  Integration tests + fixtures
-├── plugins/
-│   └── telegram-rs/        Rust port of the official Anthropic Telegram channel plugin
+├── hooks/                  SessionStart / UserPromptSubmit hooks installed into ~/.claude/hooks/
 ├── prompts/                Claude Code agent toolkit installed into ~/.claude/
 │   ├── rules/              knowledge-base, knowledge-base-tool, tool-limitations
 │   ├── commands/           /knowledge-ingest, /reflect, /consolidate, /update-claudebase
+│   ├── skills/             /claudebase-daemon-change-nick, access, configure
 │   └── agents/             reflection (Drift), consolidator (Mnem)
 ├── bench/                  Benchmark harness + golden query set
 ├── docs/                   Self-contained product documentation
@@ -433,7 +504,7 @@ claudebase/
 │   ├── benchmarks/         Golden-set numbers
 │   └── plans/              Forward-looking design docs (roadmap items)
 ├── .github/                Issue templates, PR template, workflows
-├── Cargo.toml              Workspace root: claudebase + plugins/telegram-rs members
+├── Cargo.toml              Workspace root (single member since v0.10)
 ├── install.sh / install.ps1   Cross-platform installer
 ├── CONTRIBUTING.md / SECURITY.md / CODE_OF_CONDUCT.md / CHANGELOG.md
 ├── RELEASING.md            Release procedure (tag claudebase-vX.Y.Z → workflow → GH release)
@@ -457,4 +528,4 @@ MIT — see [LICENSE](LICENSE).
 
 ## 🙏 Acknowledgments
 
-Built on [`sqlite-vec`](https://github.com/asg017/sqlite-vec), [`fastembed-rs`](https://github.com/Anush008/fastembed-rs), [`pdfium-render`](https://github.com/ajrcarey/pdfium-render), [`ocr-rs`](https://github.com/ChunelFeng/ocr-rs) / [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR), [`tracing`](https://github.com/tokio-rs/tracing), [`tokio`](https://github.com/tokio-rs/tokio), and the [official Anthropic Telegram plugin](https://github.com/anthropics/claude-plugins-official) (Apache-2.0 — see `plugins/telegram-rs/NOTICE` for attribution).
+Built on [`sqlite-vec`](https://github.com/asg017/sqlite-vec), [`fastembed-rs`](https://github.com/Anush008/fastembed-rs), [`pdfium-render`](https://github.com/ajrcarey/pdfium-render), [`ocr-rs`](https://github.com/ChunelFeng/ocr-rs) / [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR), [`tracing`](https://github.com/tokio-rs/tracing), [`tokio`](https://github.com/tokio-rs/tokio), and the [official Anthropic Telegram plugin](https://github.com/anthropics/claude-plugins-official) (Apache-2.0 — the pairing and access-gate logic in `src/daemon/` is derived from it; see [`NOTICE`](NOTICE)).

@@ -1,0 +1,9 @@
+[1786880287.870] run: cmd=claude args=[] mode=Paste submit=Cr delay_ms=16000 repeat=1 size=24x80
+[1786880287.871] run: stdin is NOT a tty — proxying anyway, injection still exercised (spike question 5)
+[1786880303.872] scenario Typing: begin
+[1786880303.872] note: typing: operator types a partial line, no submit
+[1786880303.872] type: 62 bytes
+[1786880305.372] note: typing: inject on top of it
+[1786880305.372] paste: mode=Paste 76 bytes
+[1786880305.773] submit: written
+[1786880305.773] scenario Typing: round 1 done

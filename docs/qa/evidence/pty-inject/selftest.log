@@ -1,0 +1,3 @@
+[1786879575.163] selftest: start (child=cat)
+[1786879575.164] selftest: wrote marker (31 bytes)
+[1786879575.265] selftest: marker_found=true bytes_seen=32 sample="claudebase-pty-selftest-marker\r\n"

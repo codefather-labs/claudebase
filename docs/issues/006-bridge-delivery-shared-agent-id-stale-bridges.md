@@ -1,5 +1,30 @@
 # Issue 006 — Telegram voice/message transcribes correctly but never reaches the live Claude Code session
 
+> [!NOTE]
+> **RESOLVED 2026-08-16 by the v0.10 PTY transport.** Root causes 1 and 3 are gone by construction,
+> and the correction above (that the real cause was subscribe-reliability plus the harness-level
+> channel-surface intermittency of issue 002) is what the new design addresses:
+>
+> * **Root cause 1 — shared `agent_id`.** `claudebase run` now derives a UNIQUE id per process while
+>   keeping a stable nick, so concurrent sessions in one project are distinguishable
+>   (`src/supervisor/mod.rs`, module `identity`).
+> * **Root cause 3 — stale bridges accumulating.** There is no bridge process any more. The
+>   supervisor owns the daemon connection for exactly the lifetime of its `claude` child; when the
+>   session ends, the connection closes and the daemon marks the row orphaned.
+> * **Subscribe reliability.** The supervisor re-registers and re-subscribes on every reconnect.
+>   Verified live: `claudebase daemon restart` mid-session, re-subscribed 2.0 s later, delivery
+>   continued (`docs/qa/evidence/pty-transport-e2e/daemon-restart-resilience.log`).
+> * **Option B (connection-cancel registry) was NOT implemented** — correctly, per the correction
+>   note below. Evicting stale connections would have treated a symptom of a design that no longer
+>   exists.
+>
+> One failure mode found while proving this, absent from the analysis below: the daemon broadcasts an
+> outbound `chat_reply` to the same thread the agent just answered on, so a subscriber injected its
+> own reply back into itself — a self-sustaining loop. Fixed by filtering on sender identity
+> (`src/daemon/subscribe_client.rs`).
+>
+> Kept as the record of the diagnosis.
+
 **Status:** OPEN — **CORRECTED 2026-06-07: the "Option B" eviction fix below is MIS-SCOPED.** Tracing
 the full delivery path showed inbound telegram delivery is `bus.publish(&thread)` = BROADCAST to ALL
 thread subscribers (`telegram.rs:2007`), and `should_relay` (`bridge.rs`) relays when `target_agent_id`

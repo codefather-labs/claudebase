@@ -1,0 +1,3 @@
+[1786879678.904] run: cmd=claude args=[] mode=Paste submit=Cr delay_ms=20000 repeat=1 size=24x80
+[1786879678.905] run: stdin is NOT a tty — proxying anyway, injection still exercised (spike question 5)
+[1786879698.906] inject: mode=Paste submit=Cr bytes=83 shot=1/1

@@ -1,5 +1,15 @@
 # Test Cases: CLI-to-CLI Routing — Agent-to-Agent Communication via Daemon
 
+> [!IMPORTANT]
+> **Historical record — the interface described below was replaced in v0.10.**
+> Telegram and peer messaging no longer go through a Claude Code plugin, an MCP channel,
+> or `<channel …>` turns. Inbound messages arrive in the session's input as
+> `[telegram_message]: …` / `[agent-to-agent:<nick>]: …`, and replies go out via
+> `claudebase telegram send` / `claudebase agent send`.
+> Current contract: [`README.md`](../../README.md#-telegram--setup-and-the-message-contract)
+> and [`docs/plans/claudebase-v0.10-pty-transport.md`](../plans/claudebase-v0.10-pty-transport.md).
+> This file is kept as the record of what was built at the time.
+
 > Based on [PRD §20](../PRD.md#20-cli-to-cli-routing--agent-to-agent-communication-via-daemon) and [Use Cases](../use-cases/cli-to-cli-routing_use_cases.md).
 >
 > Feature slug: `cli-to-cli-routing`. Branch: `feat/multi-agent-on-v0.6`.

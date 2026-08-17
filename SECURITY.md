@@ -30,14 +30,17 @@ You'll get an acknowledgement within 7 days, an initial triage within 14 days, a
 ## Scope
 
 In scope:
-- The `claudebase` Rust binary + everything in `src/`, `plugins/`, `bench/`, `tests/`
+- The `claudebase` Rust binary + everything in `src/`, `bench/`, `tests/`
 - The `install.sh` / `install.ps1` installers (path traversal, code injection via env, etc)
 - The cross-platform release pipeline (`.github/workflows/release.yml`)
-- The `plugins/telegram-rs/` Telegram channel plugin
+- The Telegram bridge and the session-to-session transport inside the daemon (`src/daemon/`),
+  including the pairing / access gate and the PTY supervisor that writes inbound messages into a
+  session's input (`src/supervisor/`)
 
 Out of scope (file separately upstream):
 - Vulnerabilities in dependencies — file with the dep author, then ping us so we bump
-- Vulnerabilities in Claude Code itself or the official Anthropic Telegram plugin — file at [anthropics/claude-plugins-official](https://github.com/anthropics/claude-plugins-official) or via Anthropic's security channel
+- Vulnerabilities in Claude Code itself — file with Anthropic
+- Vulnerabilities in the official Anthropic Telegram plugin — file at [anthropics/claude-plugins-official](https://github.com/anthropics/claude-plugins-official). claudebase no longer ships or patches that plugin; the installer actively unpatches it.
 - Vulnerabilities in the user's local Telegram bot token (operator's BotFather token security is the operator's responsibility)
 
 ## What we consider a vulnerability

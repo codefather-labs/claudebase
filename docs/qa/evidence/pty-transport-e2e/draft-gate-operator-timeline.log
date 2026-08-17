@@ -1,0 +1,8 @@
+[1786883545.316] run: cmd=./target/release/claudebase args=["run", "--subscribe", "telegram:999002"] mode=Paste submit=Cr delay_ms=20000 repeat=1 size=24x80
+[1786883545.316] run: stdin is NOT a tty — proxying anyway, injection still exercised (spike question 5)
+[1786883565.317] scenario Hold: begin
+[1786883565.317] note: hold: operator starts a line and does not submit
+[1786883565.317] type: 44 bytes
+[1786883590.317] note: hold: operator submits, draft gate should open
+[1786883590.317] submit: written
+[1786883590.317] scenario Hold: round 1 done

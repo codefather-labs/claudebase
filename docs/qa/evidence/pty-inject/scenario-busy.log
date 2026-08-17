@@ -1,0 +1,10 @@
+[1786880377.164] run: cmd=claude args=[] mode=Paste submit=Cr delay_ms=16000 repeat=1 size=24x80
+[1786880377.165] run: stdin is NOT a tty — proxying anyway, injection still exercised (spike question 5)
+[1786880393.166] scenario Busy: begin
+[1786880393.166] note: busy: start a long generation
+[1786880393.166] paste: mode=Paste 129 bytes
+[1786880393.566] submit: written
+[1786880396.067] note: busy: inject WHILE generating
+[1786880396.067] paste: mode=Paste 76 bytes
+[1786880396.467] submit: written
+[1786880396.467] scenario Busy: round 1 done

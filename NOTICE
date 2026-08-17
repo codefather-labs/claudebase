@@ -1,0 +1,49 @@
+claudebase — third-party attribution
+====================================
+
+Portions of the Telegram channel implementation in this repository are derived
+from the official Telegram channel plugin for Claude Code, originally authored
+by Anthropic in TypeScript:
+
+    https://github.com/anthropics/claude-plugins-official
+    Path:          external_plugins/telegram
+    Source commit: 3449c10cd1f254c2529a4a7e96a094ef118a00a5
+
+Licensed under the Apache License, Version 2.0. You may obtain a copy of the
+License at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Where the derived code lives
+----------------------------
+
+Until v0.10 the port lived in `plugins/telegram-rs/`, a standalone crate that
+replaced the upstream plugin's TypeScript server process. That crate was removed
+when claudebase stopped integrating with Claude Code through a plugin at all.
+
+The derived logic did NOT go away with it — it moved into the daemon, and this
+NOTICE therefore stays with the repository root:
+
+  - `src/daemon/channel_state.rs` — access gate, DM policy and the pairing-code
+    flow, ported 1:1 from upstream's `server.ts` (`gate`, `checkApprovals`,
+    pairing-code generation, `access.json` state shape).
+  - `src/daemon/telegram.rs` — long-poll loop, approved-directory watcher and
+    the outbound send path, following upstream's structure and message strings.
+  - `~/.claude/channels/<channel>/` state layout, mirroring upstream's
+    convention so operators moving between the two find the same files.
+
+Modifications relative to the upstream TypeScript implementation
+----------------------------------------------------------------
+
+  - Reimplemented in Rust against tokio (replaces bun + grammy +
+    @modelcontextprotocol/sdk).
+  - Voice transcription via a local whisper subprocess, backported from
+    codefather-labs/claude-plugins-official.
+  - Delivery into Claude Code happens through a PTY supervisor writing into the
+    session's input, not through an MCP channel plugin.
+  - Bot credentials are stored in the daemon's SQLite database rather than a
+    `.env` file.
+
+Unless required by applicable law or agreed to in writing, software distributed
+under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+CONDITIONS OF ANY KIND, either express or implied.

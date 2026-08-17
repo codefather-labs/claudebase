@@ -1,0 +1,7 @@
+[1786880596.092] run: cmd=claude args=["--dangerously-skip-permissions"] mode=Paste submit=Cr delay_ms=16000 repeat=1 size=24x80
+[1786880596.093] run: stdin is NOT a tty — proxying anyway, injection still exercised (spike question 5)
+[1786880612.093] scenario Multiline: begin
+[1786880612.093] note: multiline: 3-line block, one paste
+[1786880612.093] paste: mode=Paste 131 bytes
+[1786880612.494] submit: written
+[1786880612.494] scenario Multiline: round 1 done

@@ -1,5 +1,25 @@
 # Plan: Fix Claude Code 2.1.144 channel-surface — claudebase plugin
 
+> [!NOTE]
+> **RESOLVED 2026-08-16 by removing the dependency, not by fixing the channel surface.**
+>
+> None of the three hypotheses below turned out to be worth pursuing, because the premise was:
+> "our plugin must make Claude Code's channel surface fire." v0.10 dropped that premise. Inbound
+> messages no longer arrive as `notifications/claude/channel` at all — `claudebase run` owns the PTY
+> that `claude` runs in and writes the message into its input, so the surface is not in the path.
+>
+> Reading the CC 2.1.233 binary this session also showed the original goal was unreachable by
+> design: channel plugins are gated against an allowlist that comes from a server-side feature flag
+> (`tengu_harbor_ledger`) when managed settings do not override it. A third-party marketplace can
+> never be on that list — only `--dangerously-load-development-channels` or a machine-wide
+> managed-settings file would have worked, permanently.
+>
+> Current transport: `docs/plans/claudebase-v0.10-pty-transport.md`.
+> Evidence that it works end to end: `docs/qa/evidence/pty-transport-e2e/`.
+>
+> Kept as the record of the investigation.
+
+
 ## Context
 
 claudebase plugin's daemon + bridge stack is **fully functional** end-to-end:

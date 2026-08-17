@@ -68,16 +68,27 @@ WHAT GETS INSTALLED:
   ~/.claude/tools/claudebase/pdfium/        PDFium dynamic library for PDF extraction
   ~/.claude/tools/claudebase/models/        e5-multilingual-small encoder (pre-cached)
   ~/.claude/rules/cognitive-self-check.md   3-protocol discipline (Facts / Decisions / Inbound)
-  ~/.claude/hooks/claudebase-insight-capture.sh   Stop hook — insight-capture reflection
-  ~/.claude/hooks/claudebase-selfcheck-reminder.sh UserPromptSubmit hook — self-check reminder
-  ~/.claude/commands/knowledge-ingest.md    /knowledge-ingest skill
-  ~/.claude/commands/reflect.md             /reflect skill (DMN observation)
-  ~/.claude/commands/consolidate.md         /consolidate skill (drift detection)
-  ~/.claude/agents/reflection.md            reflection agent (Drift persona)
-  ~/.claude/agents/consolidator.md          consolidator agent (Mnem persona)
-  ~/.claude/hooks/claudebase-channel-contract.sh  SessionStart hook - message contract
+  ~/.claude/commands/                       /knowledge-ingest, /reflect, /consolidate, /update-claudebase
+  ~/.claude/agents/                         reflection (Drift), consolidator (Mnem)
+  ~/.claude/skills/                         /claudebase-daemon-change-nick,
+                                            /claudebase-daemon-setup-auth-token,
+                                            /claudebase-daemon-callback-info
+  ~/.claude/hooks/claudebase-channel-contract.sh   SessionStart - how outside messages arrive
+  ~/.claude/hooks/claudebase-read-insights-reminder.sh  SessionStart - load prior insights
+  ~/.claude/hooks/claudebase-selfcheck-reminder.sh UserPromptSubmit - self-check reminder
+  ~/.claude/hooks/claudebase-agent-routing-reminder.sh  PreToolUse:EnterPlanMode - peers exist
+  ~/.claude/hooks/claudebase-feature-describe.sh   PostToolUse:ExitPlanMode - publish the plan
   /usr/local/bin/claudebase                 Global alias (symlink)
-  ~/.claude/settings.json                   Bash allowlist entry merged
+  ~/.claude/settings.json                   Bash allowlist + the hooks above, merged
+
+WHAT IS *REMOVED* (reverse migration, idempotent):
+  the old Stop[insight-capture] hook, the claudebase patch inside the official
+  Anthropic Telegram plugin, and the retired claudebase@claudebase-dev marketplace.
+
+AFTER INSTALLING:
+  claudebase run                            start a session the daemon can reach
+  claudebase telegram addbot "<token>"      wire up Telegram
+  claudebase daemon callback enable         open the HTTP callback endpoint (off by default)
 HELPEOF
 }
 
@@ -208,6 +219,7 @@ install_binary() {
       log_error "--local binary build needs cargo (install the rust toolchain via rustup)"
       return 1
     fi
+    ensure_build_deps || return 1
     log_info "building claudebase from local checkout ($SCRIPT_DIR) via cargo build --release"
     if ! ( cd "$SCRIPT_DIR" && cargo build --release --features asr-whisper ); then
       log_error "local 'cargo build --release' failed; binary not installed"
@@ -369,12 +381,20 @@ EOF
 
 # ============================================================================
 # Install claudebase hooks into ~/.claude/hooks/ and wire them into
-# ~/.claude/settings.json. Two hooks, both part of the cognitive-infra layer:
+# ~/.claude/settings.json. Five hooks across two layers — the cognitive-infra
+# layer and the transport layer:
 #
-#   - Stop -> claudebase-insight-capture.sh — fires after every agent turn,
-#     prompts a reflection; if the agent learned something axis-worthy it
-#     persists an insight via `claudebase insight create`, else stops silently.
-#     Loop-safe via stop_hook_active.
+#   - SessionStart -> claudebase-channel-contract.sh — teaches the session how
+#     messages from outside the terminal arrive ([telegram_message]:,
+#     [agent-to-agent:<nick>]:, [callback]:) and that a reply only leaves
+#     through a CLI call. It has to be in context BEFORE the first such line
+#     appears, which is why it is a hook and not a skill.
+#   - SessionStart -> claudebase-read-insights-reminder.sh — load prior-session
+#     insights by tag rather than re-reading everything.
+#   - PreToolUse:EnterPlanMode -> claudebase-agent-routing-reminder.sh — surface
+#     that peers exist before drafting a plan that collides with theirs.
+#   - PostToolUse:ExitPlanMode -> claudebase-feature-describe.sh — publish what
+#     was decided so peers can see it.
 #   - UserPromptSubmit -> claudebase-selfcheck-reminder.sh — fires before the
 #     agent responds, injects a SHORT agent-only reminder of the three
 #     cognitive-self-check protocols (the rule it reminds about,
@@ -414,7 +434,6 @@ install_claudebase_hooks() {
 
   if ! command -v jq >/dev/null 2>&1; then
     log_warn "jq required for settings.json hook merge — add manually:"
-    log_warn '  hooks.Stop[*].hooks[*].command = ~/.claude/hooks/claudebase-insight-capture.sh'
     log_warn '  hooks.UserPromptSubmit[*].hooks[*].command = ~/.claude/hooks/claudebase-selfcheck-reminder.sh'
     log_warn '  hooks.SessionStart[*].hooks[*].command = ~/.claude/hooks/claudebase-read-insights-reminder.sh'
     log_warn '  hooks.SessionStart[*].hooks[*].command = ~/.claude/hooks/claudebase-channel-contract.sh'
@@ -502,6 +521,78 @@ install_claudebase_hooks() {
     rm -f "$tmp"
     log_warn "settings.json hook merge failed; please add manually"
   fi
+}
+
+# ============================================================================
+# Build dependencies — ONLY for --local
+# ============================================================================
+# The default install path downloads a pre-built binary and compiles nothing,
+# so it needs none of this. Only `--local` compiles the crate.
+#
+# OpenSSL is deliberately absent from this list. It used to be required —
+# `fastembed -> hf-hub -> native-tls` and `teloxide-core -> reqwest ->
+# native-tls` pulled `openssl-sys`, which needs the development headers, and the
+# resulting binary linked `libssl.so.3` at RUNTIME so a release build refused to
+# start on any distribution carrying a different OpenSSL major. Both crates were
+# moved to rustls, `openssl-sys` left the dependency tree entirely, and a clean
+# Ubuntu 24.04 container built and installed successfully with no `libssl-dev`
+# present. If a future dependency reintroduces it, the install-smoke workflow
+# fails on the `ldd` assertion before anyone has to debug it.
+#
+# Deliberately does NOT install anything without consent: this is the only
+# place the installer would touch system packages, and a script that silently
+# runs `sudo apt-get install` is a script nobody should pipe from the internet.
+# Missing pieces are named, the exact command is printed, and it runs only if
+# the operator agreed (--yes, or the confirmation prompt).
+ensure_build_deps() {
+  [ "$LOCAL_MODE" = true ] || return 0
+
+  local missing_desc=()
+  command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1 || missing_desc+=("a C compiler")
+  command -v pkg-config >/dev/null 2>&1 || missing_desc+=("pkg-config")
+
+  # The local build runs with --features asr-whisper, which compiles
+  # whisper.cpp through whisper-rs-sys: cmake drives the build and bindgen
+  # needs clang's own resource headers. Observed on a clean Ubuntu 24.04 on
+  # 2026-08-17: without them the build dies far from its cause, with
+  # `fatal error: 'stdbool.h' file not found` inside ggml.h -- which names
+  # neither cmake, nor clang, nor the feature that pulled either in.
+  command -v cmake >/dev/null 2>&1 || missing_desc+=("cmake (whisper build)")
+  command -v clang >/dev/null 2>&1 || missing_desc+=("clang + libclang (bindgen)")
+
+  [ ${#missing_desc[@]} -eq 0 ] && return 0
+
+  local pm="" cmd=""
+  if   command -v apt-get >/dev/null 2>&1; then pm=apt-get; cmd="sudo apt-get install -y build-essential pkg-config cmake clang libclang-dev"
+  elif command -v dnf     >/dev/null 2>&1; then pm=dnf;     cmd="sudo dnf install -y gcc pkgconf-pkg-config cmake clang clang-devel"
+  elif command -v yum     >/dev/null 2>&1; then pm=yum;     cmd="sudo yum install -y gcc pkgconfig cmake clang clang-devel"
+  elif command -v pacman  >/dev/null 2>&1; then pm=pacman;  cmd="sudo pacman -S --needed --noconfirm base-devel pkgconf cmake clang"
+  elif command -v zypper  >/dev/null 2>&1; then pm=zypper;  cmd="sudo zypper install -y gcc pkg-config cmake clang llvm-clang-devel"
+  elif command -v apk     >/dev/null 2>&1; then pm=apk;     cmd="sudo apk add build-base pkgconfig cmake clang clang-dev"
+  elif command -v brew    >/dev/null 2>&1; then pm=brew;    cmd="brew install pkg-config cmake llvm"
+  fi
+
+  log_warn "the local build needs: ${missing_desc[*]}"
+
+  if [ -z "$pm" ]; then
+    log_error "no supported package manager found — install the above, then re-run with --local"
+    return 1
+  fi
+
+  log_info "install command for this system:"
+  log_info "  $cmd"
+
+  if [ "$ASSUME_YES" != true ] && ! confirm "Run it now?"; then
+    log_error "build dependencies not installed; run the command above and retry"
+    return 1
+  fi
+
+  if ! eval "$cmd"; then
+    log_error "installing build dependencies failed; run the command manually and retry"
+    return 1
+  fi
+
+  log_ok "build dependencies present"
 }
 
 # ============================================================================
@@ -773,7 +864,8 @@ echo "    tools/claudebase/   (binary + pdfium + e5 model)"
 echo "    rules/              (1 file - cognitive-self-check)"
 echo "    commands/           (4 files — knowledge-ingest, reflect, consolidate, update-claudebase)"
 echo "    agents/             (2 files — reflection, consolidator)"
-echo "    hooks/              (2 hooks — Stop[insight-capture] + UserPromptSubmit[self-check])"
+echo "    skills/             (3 skills — change-nick, setup-auth-token, callback-info)"
+echo "    hooks/              (5 hooks — 2x SessionStart, UserPromptSubmit, Pre/PostToolUse)"
 echo ""
 
 if ! confirm "Proceed with installation?"; then
@@ -783,6 +875,12 @@ fi
 
 get_source_dir
 install_prompts
+# Defined since the hooks landed, but never invoked until 2026-08-17 — found by
+# installing onto a clean machine, where ~/.claude/hooks simply did not exist.
+# Without it a session receives `[telegram_message]:` / `[callback]:` lines it
+# was never told about, which is the one thing the transport cannot recover from
+# on its own.
+install_claudebase_hooks
 install_binary
 register_alias
 register_bash_allowlist

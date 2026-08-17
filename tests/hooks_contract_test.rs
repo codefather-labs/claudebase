@@ -103,7 +103,7 @@ fn routing_hook_documents_the_cli_peer_contract() {
 }
 
 #[test]
-fn channel_contract_hook_teaches_both_prefixes_and_both_reply_commands() {
+fn channel_contract_hook_teaches_every_prefix_and_every_reply_command() {
     for name in [
         "claudebase-channel-contract.sh",
         "claudebase-channel-contract.ps1",
@@ -114,6 +114,12 @@ fn channel_contract_hook_teaches_both_prefixes_and_both_reply_commands() {
                 "[claudebase channel contract]",
                 "[telegram_message]: <text>",
                 "[agent-to-agent:<nick>]: <text>",
+                // A session that meets an unexplained `[callback]:` line has no
+                // way to know it is external data rather than the operator
+                // typing. Every prefix the transport can produce has to be here,
+                // so this list grows whenever a new source is added.
+                "[callback]: <text>",
+                "[callback:<label>]: <text>",
                 "claudebase telegram send",
                 "claudebase agent send",
                 "claudebase agent list",
@@ -122,6 +128,11 @@ fn channel_contract_hook_teaches_both_prefixes_and_both_reply_commands() {
                 // only thing marking channel content as data (plan risk R-6).
                 "untrusted data",
                 "claudebase telegram pair",
+                // The two callback skills are how an operator gets a token and
+                // debugs a callback that never arrived; unreferenced, they are
+                // invisible.
+                "claudebase-daemon-callback-info",
+                "claudebase-daemon-setup-auth-token",
             ],
         );
         assert_absent(name, REMOVED_SURFACES);

@@ -1,0 +1,253 @@
+name: install-smoke
+
+# Installs claudebase onto a CLEAN machine and asserts the result, because that
+# is the one thing the rest of the test suite structurally cannot do.
+#
+# On 2026-08-17 a first install onto a fresh Ubuntu 24.04 box surfaced four
+# defects at once, every one of them invisible to the unit and integration
+# suites:
+#
+#   1. `libssl-dev` was an undeclared build dependency. Since fixed at the root
+#      by moving the TLS stack to rustls, so it is no longer needed at all —
+#      the `ldd` assertion below is what keeps it from creeping back.
+#   2. `cmake` + `clang` are needed by `--features asr-whisper` via bindgen, and
+#      nothing said so.
+#   3. `install_claudebase_hooks()` existed in both installers and was called by
+#      NEITHER — so no hook had ever been installed by the installer. The hook
+#      tests pass happily: they check the CONTENT of the hook files, not that
+#      anything puts them in place.
+#   4. The generated systemd USER unit carried `ProtectKernelModules=`, which
+#      drops CAP_SYS_MODULE. systemd 259 tolerates it in a user unit; systemd
+#      255 (Ubuntu 24.04 LTS) refuses, and the daemon crash-looped with
+#      `218/CAPABILITIES`. A unit test asserted the directive must be PRESENT —
+#      the suite was pinning the defect in place.
+#
+# The common thread: every prior install ran on a machine that already carried
+# the state, often put there by hand. A container has no such history.
+#
+# Ubuntu 24.04 is not an arbitrary choice — it is the current LTS, and it is the
+# systemd generation on which defect 4 is fatal. The newest runner is tested too,
+# so a divergence between them fails here rather than at a user.
+
+on:
+  pull_request:
+    paths:
+      - 'install.sh'
+      - 'install.ps1'
+      - 'hooks/**'
+      - 'prompts/**'
+      - 'src/daemon/service.rs'
+      - 'Cargo.toml'
+      - '.github/workflows/install-smoke.yml'
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  install-from-source:
+    name: install.sh --local on ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 24.04 is the current LTS and the systemd generation where a user unit
+        # that touches capabilities refuses to start. 26.04 is what the
+        # maintainer's machine runs, i.e. where such a bug hides.
+        image: ['ubuntu:24.04', 'ubuntu:26.04']
+    container:
+      image: ${{ matrix.image }}
+      # The installer's own dependency preflight must be exercised, so the
+      # container is deliberately bare: no toolchain, no OpenSSL, no cmake.
+      options: --user root
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Minimal bootstrap (curl, git, jq only)
+        run: |
+          set -eux
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          # Everything the installer itself is supposed to arrange is NOT
+          # installed here. If this list has to grow to make the job pass, the
+          # installer is missing a dependency and that is the finding.
+          apt-get install -y --no-install-recommends curl ca-certificates git jq sudo
+
+      - name: Install Rust
+        run: |
+          set -eux
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --no-modify-path --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: The dependency preflight must REFUSE before consent
+        shell: bash
+        run: |
+          set -eu
+          # Exercised in isolation: the point is that it names what is missing
+          # and the exact command, rather than letting cargo fail somewhere deep
+          # inside a -sys crate's build script.
+          out=$(
+            LOCAL_MODE=true ASSUME_YES=false \
+            bash -c '
+              log_warn(){ echo "WARN: $*"; }; log_info(){ echo "INFO: $*"; }
+              log_error(){ echo "ERR: $*"; }; log_ok(){ echo "OK: $*"; }
+              confirm(){ return 1; }
+              eval "$(sed -n "/^ensure_build_deps() {/,/^}/p" install.sh)"
+              ensure_build_deps
+            ' || true
+          )
+          echo "$out"
+          echo "$out" | grep -q "install command for this system" \
+            || { echo "preflight did not print an install command"; exit 1; }
+          echo "$out" | grep -q "apt-get install" \
+            || { echo "preflight did not detect apt"; exit 1; }
+
+      - name: Run the installer
+        shell: bash
+        run: bash install.sh --local --yes
+
+      - name: The binary is installed and runs
+        shell: bash
+        run: |
+          set -eux
+          test -x "$HOME/.claude/tools/claudebase/claudebase"
+          "$HOME/.claude/tools/claudebase/claudebase" --version
+
+      - name: The binary links nothing exotic
+        shell: bash
+        run: |
+          set -eu
+          libs=$(ldd "$HOME/.claude/tools/claudebase/claudebase" \
+                 | awk '{print $1}' | grep -vE 'linux-vdso|ld-linux' | sort -u)
+          echo "$libs"
+          # OpenSSL is the one that made release binaries refuse to start on a
+          # distribution carrying a different major version. The TLS stack is
+          # rustls now; if this ever reappears, portability regressed.
+          if echo "$libs" | grep -qE 'libssl|libcrypto'; then
+            echo "the binary linked OpenSSL again — a release build will not start"
+            echo "on distributions with a different OpenSSL major"
+            exit 1
+          fi
+
+      - name: Hooks are installed AND wired
+        shell: bash
+        run: |
+          set -eu
+          # Defect 3: the installer defined a hook installer it never called.
+          # Assert the files AND the settings.json wiring, since either half
+          # alone was true at some point while the feature did not work.
+          for h in claudebase-channel-contract.sh \
+                   claudebase-read-insights-reminder.sh \
+                   claudebase-selfcheck-reminder.sh \
+                   claudebase-agent-routing-reminder.sh \
+                   claudebase-feature-describe.sh; do
+            test -f "$HOME/.claude/hooks/$h" || { echo "missing hook: $h"; exit 1; }
+          done
+
+          for ev in SessionStart UserPromptSubmit PreToolUse PostToolUse; do
+            jq -e ".hooks.\"$ev\" | length > 0" "$HOME/.claude/settings.json" >/dev/null \
+              || { echo "settings.json has no $ev hook wired"; exit 1; }
+          done
+
+          # The contract has to teach every prefix the transport can produce; a
+          # session meeting an unexplained one cannot recover on its own.
+          ctx=$(bash "$HOME/.claude/hooks/claudebase-channel-contract.sh" \
+                | jq -r '.hookSpecificOutput.additionalContext')
+          for token in '[telegram_message]' '[agent-to-agent:' '[callback]'; do
+            echo "$ctx" | grep -qF "$token" \
+              || { echo "channel contract does not teach $token"; exit 1; }
+          done
+
+      - name: Skills, rules and agents are installed
+        shell: bash
+        run: |
+          set -eu
+          for s in claudebase-daemon-change-nick \
+                   claudebase-daemon-setup-auth-token \
+                   claudebase-daemon-callback-info; do
+            test -f "$HOME/.claude/skills/$s/SKILL.md" || { echo "missing skill: $s"; exit 1; }
+          done
+          test -f "$HOME/.claude/rules/cognitive-self-check.md"
+          test -d "$HOME/.claude/agents"
+
+      - name: The daemon starts and answers
+        shell: bash
+        run: |
+          set -eu
+          # systemd does not run in this container, so the unit is validated
+          # separately (below) and the daemon is exercised directly — what
+          # matters here is that the built binary can actually serve.
+          export HOME="$HOME"
+          "$HOME/.claude/tools/claudebase/claudebase" daemon serve &
+          daemon_pid=$!
+          # Kill by the pid captured at spawn, never by name: a pattern match
+          # would also hit unrelated processes.
+          trap 'kill "$daemon_pid" 2>/dev/null || true' EXIT
+
+          for _ in $(seq 1 60); do
+            if "$HOME/.claude/tools/claudebase/claudebase" daemon status >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          "$HOME/.claude/tools/claudebase/claudebase" daemon status
+          "$HOME/.claude/tools/claudebase/claudebase" daemon callback status
+
+      - name: The generated systemd unit is valid for a USER manager
+        shell: bash
+        run: |
+          set -eu
+          apt-get install -y --no-install-recommends systemd >/dev/null 2>&1 || true
+          "$HOME/.claude/tools/claudebase/claudebase" daemon install >/dev/null 2>&1 || true
+          unit="$HOME/.config/systemd/user/claudebase.service"
+          if [ ! -f "$unit" ]; then
+            echo "no unit generated; skipping (daemon install needs a systemd session)"
+            exit 0
+          fi
+          cat "$unit"
+          # Defect 4: a user manager is itself unprivileged and cannot drop
+          # capabilities. Anything that tries makes every start exit
+          # 218/CAPABILITIES. ProtectKernelModules counts — it works by dropping
+          # CAP_SYS_MODULE.
+          for bad in CapabilityBoundingSet AmbientCapabilities ProtectKernelModules; do
+            if grep -q "$bad" "$unit"; then
+              echo "user unit contains $bad — systemd 255 refuses to start it"
+              exit 1
+            fi
+          done
+          if command -v systemd-analyze >/dev/null 2>&1; then
+            systemd-analyze verify --user-unit "$unit" || true
+          fi
+
+  install-idempotent:
+    name: installing twice changes nothing
+    runs-on: ubuntu-latest
+    container:
+      image: 'ubuntu:24.04'
+      options: --user root
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bootstrap
+        run: |
+          set -eux
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends curl ca-certificates git jq sudo
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --no-modify-path --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install, then install again
+        shell: bash
+        run: |
+          set -eu
+          bash install.sh --local --yes
+          cp "$HOME/.claude/settings.json" /tmp/settings-first.json
+          bash install.sh --local --yes
+          # An installer that duplicates hook entries on every run quietly
+          # multiplies the work a session does at startup, and the growth is
+          # invisible until someone reads settings.json.
+          if ! diff -u /tmp/settings-first.json "$HOME/.claude/settings.json"; then
+            echo "settings.json changed on a second identical install"
+            exit 1
+          fi

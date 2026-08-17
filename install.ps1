@@ -66,7 +66,21 @@ WHAT GETS INSTALLED:
   %USERPROFILE%\.claude\rules\        cognitive-self-check
   %USERPROFILE%\.claude\commands\     knowledge-ingest, reflect, consolidate, update-claudebase
   %USERPROFILE%\.claude\agents\       reflection (Drift), consolidator (Mnem)
+  %USERPROFILE%\.claude\skills\       daemon-change-nick, daemon-setup-auth-token,
+                                      daemon-callback-info
+  %USERPROFILE%\.claude\hooks\        SessionStart x2 (channel contract, read-insights),
+                                      UserPromptSubmit (self-check),
+                                      Pre/PostToolUse (peer routing, feature describe)
   %USERPROFILE%\.claude\bin\claudebase.cmd  Global wrapper (User PATH)
+
+WHAT IS *REMOVED* (reverse migration, idempotent):
+  the old Stop[insight-capture] hook, the claudebase patch inside the official
+  Anthropic Telegram plugin, and the retired claudebase@claudebase-dev marketplace.
+
+AFTER INSTALLING:
+  claudebase run                        start a session the daemon can reach
+  claudebase telegram addbot "<token>"  wire up Telegram
+  claudebase daemon callback enable     open the HTTP callback endpoint (off by default)
 "@ | Write-Host
 }
 
@@ -161,6 +175,17 @@ function Install-Binary {
         if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
             Write-Err "-Local binary build needs cargo (install the rust toolchain via rustup)"
             return
+        }
+        # No OpenSSL preflight here, unlike install.sh. `native-tls` declares
+        # openssl-sys only under cfg(not(any(windows, apple))) -- on Windows it
+        # uses SChannel, so this build needs no OpenSSL headers at all. What it
+        # DOES need is the MSVC toolchain, and cargo's own error names it
+        # clearly ("linker `link.exe` not found"), so there is nothing to add.
+        if (-not (Get-Command link.exe -ErrorAction SilentlyContinue) -and
+            -not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
+            Write-Warn "MSVC build tools not detected on PATH; if the build fails with"
+            Write-Warn "  'linker `link.exe` not found', install the Visual Studio Build Tools"
+            Write-Warn "  (Desktop development with C++) and re-run from a Developer prompt."
         }
         Write-Info "Building claudebase from local checkout ($($Script:ScriptDir)) - cargo build --release"
         Push-Location $Script:ScriptDir
@@ -295,8 +320,14 @@ function Register-BashAllowlist {
 
 # ============================================================================
 # Install claudebase hooks into ~/.claude/hooks/ and wire into settings.json:
-#   - Stop -> claudebase-insight-capture.ps1 (insight-capture reflection)
+#   - SessionStart -> claudebase-channel-contract.ps1 (how messages from outside
+#     the terminal arrive, and that a reply only leaves through a CLI call)
+#   - SessionStart -> claudebase-read-insights-reminder.ps1 (prior insights)
 #   - UserPromptSubmit -> claudebase-selfcheck-reminder.ps1 (self-check nudge)
+#   - PreToolUse:EnterPlanMode -> claudebase-agent-routing-reminder.ps1
+#   - PostToolUse:ExitPlanMode -> claudebase-feature-describe.ps1
+# The retired Stop[insight-capture] hook is actively UNWIRED and its files
+# deleted -- see below.
 # Idempotent — dedup by command-string equality so re-running never duplicates.
 # ============================================================================
 function Install-ClaudebaseHooks {
@@ -708,6 +739,8 @@ if (-not (Confirm-Action "Proceed with installation?")) {
 
 Get-SourceDir
 Install-Prompts
+# See install.sh: defined and never called until 2026-08-17.
+Install-ClaudebaseHooks
 Install-Binary
 Register-Alias
 Register-BashAllowlist

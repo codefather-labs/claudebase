@@ -57,7 +57,18 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # is loaded transitively via `ort` — per architect AI-3 we use load-dynamic
 # (the runtime dylib is downloaded by install.sh, mirroring pdfium pattern)
 # to keep the binary <10 MB.
-fastembed = "5"
+# rustls, NOT native-tls. fastembed's defaults reach OpenSSL through
+# hf-hub -> native-tls, which made the binary link `libssl.so.3` at RUNTIME —
+# so a release build would refuse to start on any distribution carrying a
+# different OpenSSL major, and building from source needed the OpenSSL headers.
+# These three features mirror the crate's own defaults exactly
+# (`ort-download-binaries-native-tls`, `hf-hub-native-tls`, `image-models`),
+# swapping only the TLS backend.
+fastembed = { version = "5", default-features = false, features = [
+    "ort-download-binaries-rustls-tls",
+    "hf-hub-rustls-tls",
+    "image-models",
+] }
 
 # Error plumbing
 anyhow = "1"
@@ -91,7 +102,13 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 # verified via `cargo search teloxide`). default-features=false to avoid
 # pulling sqlx + dialogue + macros we don't need; we only consume the bare
 # Bot client + getUpdates long-poll surface.
-teloxide = { version = "0.17", default-features = false, features = ["ctrlc_handler"] }
+# `rustls` is load-bearing beyond preference: without it teloxide-core enables
+# `reqwest/native-tls`, and cargo's feature unification then drags OpenSSL back
+# into the binary even though every other dependency here is already on rustls.
+teloxide = { version = "0.17", default-features = false, features = [
+    "ctrlc_handler",
+    "rustls",
+] }
 
 # Slice 4 — daemon.toml + secrets.toml loaders.
 toml = "0.8"

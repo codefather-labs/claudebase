@@ -55,19 +55,27 @@ fn test_install_refuses_symlinked_parent_dir() {
 }
 
 #[test]
-fn test_ensure_install_parent_refuses_world_writable_existing_dir() {
+fn test_ensure_install_parent_tightens_a_loose_existing_dir() {
+    // Behaviour changed deliberately (see the rationale in
+    // `ensure_install_parent`): refusing a loose directory broke
+    // `claudebase daemon install` on every upgrade, forcing operators to chmod
+    // by hand. These are claudebase-owned dirs under $HOME, so normalising
+    // 0o777 -> 0o700 is a tightening. The security property that still MUST
+    // hold is the symlink refusal above — that is the actual attack.
+    //
+    // This test asserted the old refuse-behaviour and had been failing since
+    // the change; it now pins what the code is meant to do.
     let dir = tempdir().unwrap();
     let target = dir.path().join("loose_dir");
     fs::create_dir(&target).unwrap();
-    // 0o777 has bits outside the required 0o700 — must refuse.
     fs::set_permissions(&target, fs::Permissions::from_mode(0o777)).unwrap();
 
-    let err = ensure_install_parent(&target, 0o700)
-        .expect_err("loose-permission existing dir must be refused");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("refuse to install into"),
-        "wrong error text: {msg}"
+    ensure_install_parent(&target, 0o700).expect("a loose dir should be tightened, not refused");
+
+    let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o700,
+        "install parent must end up exactly 0o700, got {mode:o}"
     );
 }
 

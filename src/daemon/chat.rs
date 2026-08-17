@@ -544,6 +544,31 @@ COMMIT;
     // probe + `IF NOT EXISTS` on the index. Tolerates pre-existing
     // v0.7/v0.8 leftover columns (additive-only, never drops).
     apply_routing_migration(conn)?;
+    // pty-transport Slice 1 — `session_token` column. A short-lived CLI
+    // process (`claudebase agent chat`) arrives on its OWN connection and so
+    // has no registered identity, but `agent_send` resolves the sender from
+    // the connection (FR-C2C-4.6, anti-impersonation). The supervisor
+    // therefore registers with a per-session token and exports it into the
+    // `claude` child's environment; the CLI presents it and the daemon maps
+    // token -> agent_id. Persisted rather than kept in memory because a
+    // child's environment is fixed at spawn: a daemon restart must not
+    // invalidate a token the running session can no longer be told about.
+    apply_session_token_migration(conn)?;
+    // pty-transport Slice 8 — Telegram bot registry. Replaces the two-file
+    // token split (.env + secrets.toml) documented in docs/issues/004 with a
+    // single owner; the files stay readable as fallbacks.
+    crate::daemon::bots::apply_migration(conn)?;
+    // pty-transport Slice 13 — chat bindings keyed by NICK.
+    //
+    // `/switch` used to write `routing_chat_id` onto the agent's registry row,
+    // and every restart creates a new row (unique agent_id per process, issue
+    // 006 root cause 1). So the binding died with the session and the operator
+    // had to `/switch` again after every restart — messages sent in between
+    // reached nobody. Binding to the nick outlives the process.
+    apply_chat_bindings_migration(conn)?;
+    // pty-transport Slice 14 — remember the nick a session was DELIBERATELY
+    // given, so the next session in the same directory starts under it again.
+    apply_nick_memory_migration(conn)?;
     // Slice 8 — `pending_asks` table for `chat_ask` MCP tool. Additive,
     // idempotent. Architect AR-6: chat.db single-database discipline.
     crate::daemon::pending_asks::apply_pending_asks_migration(conn)?;
@@ -573,6 +598,61 @@ COMMIT;
 /// than a new `migrations.rs` module — disproportionate to introduce a
 /// module pattern the project does not have for ~30 LOC of additive
 /// ALTERs.
+/// Additive `session_token` column on `agent_registry`. Same probe-before-ADD
+/// idempotency pattern as `apply_routing_migration`.
+/// `chat_bindings` — which NICK a Telegram chat is routed to.
+///
+/// One row per (chat, topic). The nick is resolved to a live `agent_id` at
+/// delivery time, so a session that restarts under the same nick keeps
+/// receiving without the operator touching `/switch`.
+fn apply_chat_bindings_migration(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS chat_bindings (
+           chat_id    INTEGER NOT NULL,
+           thread_id  INTEGER NOT NULL DEFAULT -1,
+           agent_name TEXT NOT NULL,
+           bound_at   INTEGER NOT NULL,
+           PRIMARY KEY (chat_id, thread_id)
+         );",
+    )
+}
+
+/// `nick_memory` — the nick an operator (or the session itself) CHOSE for a
+/// working directory, as opposed to the project-name default.
+///
+/// Keyed by (host, cwd) rather than by agent_id: every restart mints a fresh
+/// agent_id, so anything keyed by it dies with the process. This is the same
+/// reasoning that moved chat bindings off the registry row.
+///
+/// It exists because the nick is load-bearing twice over: `chat_bindings` maps
+/// a Telegram chat to a NAME, and `--agent_nick` addresses a NAME. A session
+/// that came back under a different name would silently lose the operator's
+/// `/switch` binding — so a chosen name has to survive the process that chose
+/// it.
+fn apply_nick_memory_migration(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS nick_memory (
+           host       TEXT NOT NULL,
+           cwd        TEXT NOT NULL,
+           nick       TEXT NOT NULL,
+           updated_at INTEGER NOT NULL,
+           PRIMARY KEY (host, cwd)
+         );",
+    )
+}
+
+fn apply_session_token_migration(conn: &Connection) -> rusqlite::Result<()> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('agent_registry') WHERE name = 'session_token')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        conn.execute_batch("ALTER TABLE agent_registry ADD COLUMN session_token TEXT DEFAULT NULL")?;
+    }
+    Ok(())
+}
+
 fn apply_routing_migration(conn: &Connection) -> rusqlite::Result<()> {
     // Each (column, type+constraints) pair. `DEFAULT NULL` explicit per
     // architect MINOR for clarity-of-intent even though it's the SQLite
@@ -723,7 +803,48 @@ pub fn open_chat_db() -> anyhow::Result<Connection> {
         let perms = std::fs::Permissions::from_mode(0o600);
         std::fs::set_permissions(&path, perms)?;
     }
+    apply_concurrency_pragmas(&conn)?;
     ensure_chat_db_schema(&conn)?;
+    Ok(conn)
+}
+
+/// chat.db is opened by SEVERAL processes at once — the daemon writing inbound
+/// messages, every supervisor reading the registry, every short-lived CLI
+/// command. Without these two pragmas SQLite's default is to fail a contended
+/// statement IMMEDIATELY with `SQLITE_BUSY` rather than wait for the lock.
+///
+/// That default cost us a real bug on 2026-08-17: a peer message arrived
+/// labelled `[agent-to-agent:d1eb9528]` — the sender's agent_id, not its nick —
+/// because the name lookup ran while the daemon held a write lock, returned
+/// `SQLITE_BUSY`, and the caller could not tell "no such agent" from "could not
+/// read right now". The knowledge database has had both pragmas since
+/// `store.rs`; chat.db was simply missed.
+///
+/// `busy_timeout` is the load-bearing half: contended readers and writers wait
+/// instead of erroring. WAL additionally lets readers proceed DURING a write,
+/// which is the common case here (many readers, one daemon writing).
+fn apply_concurrency_pragmas(conn: &Connection) -> rusqlite::Result<()> {
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    // Persistent property of the file; re-applying on an already-WAL database
+    // is a no-op. Tolerated rather than fatal: a database on a filesystem that
+    // cannot do WAL (some network mounts) still works with busy_timeout alone.
+    if let Err(e) = conn.pragma_update(None, "journal_mode", "WAL") {
+        tracing::debug!(error = %e, "chat.db could not switch to WAL; busy_timeout still applies");
+    }
+    Ok(())
+}
+
+/// A read-only handle for hot lookups.
+///
+/// `open_chat_db` runs `ensure_chat_db_schema` — a `BEGIN; CREATE TABLE …`
+/// write transaction — on EVERY open. That turns a plain "what is this agent
+/// called" read into a writer competing with the daemon, which is what made the
+/// nick lookup contend in the first place. Callers that only read use this and
+/// contend with nobody.
+pub fn open_chat_db_readonly() -> anyhow::Result<Connection> {
+    let path = crate::store::user_level_chat_db_path();
+    let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     Ok(conn)
 }
 
@@ -1180,8 +1301,10 @@ mod tests {
         // Base v5 schema: 9 columns. apply_routing_migration adds 6.
         // Slice 1 of cli-to-cli-routing's apply_agent_registry_c2c_migration
         // adds 5 more (project_id / branch / working_dir /
-        // feature_description / dnd_until_ts). Total = 9 + 6 + 5 = 20.
-        assert_eq!(n, 20, "agent_registry should have exactly 20 columns post-migration");
+        // feature_description / dnd_until_ts). pty-transport Slice 1 adds
+        // `session_token` (capability for short-lived CLI senders).
+        // Total = 9 + 6 + 5 + 1 = 21.
+        assert_eq!(n, 21, "agent_registry should have exactly 21 columns post-migration");
     }
 
     #[test]

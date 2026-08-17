@@ -1,0 +1,44 @@
+[package]
+name = "pty-inject-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone spike crate (NOT in the claudebase workspace) — the empty
+# [workspace] table below declares this directory its own workspace root so
+# `cargo build` inside it does not trip the "package believes it's in a
+# workspace" error from the repo-root Cargo.toml.
+#
+# Slice 0 of the pty-transport feature (docs/plans/claudebase-v0.10-pty-transport.md).
+# BLOCKING gate: the whole plan assumes we can inject text into a live
+# `claude` TUI by owning the PTY it runs in. This spike answers, empirically:
+#
+#   1. does the TUI accept bracketed paste (ESC[200~ ... ESC[201~)?
+#   2. does submission need CR, LF, or does bracketed-paste self-submit?
+#   3. what happens when we inject WHILE the model is generating?
+#   4. what happens when we inject WHILE the operator is mid-keystroke?
+#   5. what happens when the supervisor itself has no controlling TTY?
+#
+# Isolation from the main crate keeps the cold-build cost at ~3 deps instead
+# of the full claudebase tree (pdfium, fastembed, ocr-rs, ...) — same reason
+# the ipc_concurrent_accept spike lives outside the workspace.
+[workspace]
+
+[dependencies]
+# Cross-platform PTY: Unix openpty + Windows ConPTY behind one API. Version
+# confirmed present on crates.io 2026-08-16 (`cargo search portable-pty`).
+# The ConPTY half is NOT exercised by this spike — Windows is a separate
+# gate (risk R-3 in the plan).
+portable-pty = "0.9"
+anyhow = "1"
+
+# Raw-mode + window-size ioctls on the REAL terminal. Deliberately raw libc
+# instead of crossterm: the spike needs exactly tcgetattr/tcsetattr/TIOCGWINSZ
+# and nothing else, and the production supervisor will want the same minimal
+# surface.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "pty-inject-spike"
+path = "src/main.rs"

@@ -18,6 +18,12 @@ fn spawn_daemon_capturing_stderr(tempdir: &Path) -> Result<std::process::Child> 
     let bin = env!("CARGO_BIN_EXE_claudebase");
     let mut cmd = Command::new(bin);
     cmd.args(["daemon", "serve"]);
+    // HOME isolation is as load-bearing as the socket: without it the spawned
+    // daemon opens the OPERATOR's chat.db, finds their registered bot and
+    // starts polling Telegram — stealing the getUpdates slot from the real
+    // daemon for the length of the test run (observed live 2026-08-16 as
+    // "Conflict: terminated by other getUpdates request").
+    cmd.env("HOME", tempdir);
     // Force info-level minimum so accept-loop bind line shows up regardless
     // of the user's local RUST_LOG. The subscriber init MUST honour RUST_LOG
     // when set and default to info when unset.

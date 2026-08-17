@@ -1,7 +1,8 @@
-# Cargo workspace. The root crate is the `claudebase` CLI; plugins/ holds
-# auxiliary binaries shipped alongside (telegram-rs etc.).
+# Cargo workspace. Single member since v0.10 — `plugins/telegram-rs` (the Rust
+# port of the official Anthropic Telegram plugin) was removed along with the
+# plugin transport it existed to serve.
 [workspace]
-members = [".", "plugins/telegram-rs"]
+members = ["."]
 resolver = "2"
 
 [package]
@@ -71,6 +72,9 @@ ocr-rs = "2.2.2"
 # dispatch arms per src/main.rs INVARIANT comment).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "net", "time", "sync"] }
 interprocess = { version = "2", features = ["tokio"] }
+# pty-transport Slice 2 — `claudebase run` owns the PTY that `claude` runs in.
+# portable-pty gives Unix openpty + Windows ConPTY behind one API.
+portable-pty = "0.9"
 fslock = "0.2"
 uuid = { version = "1", features = ["v4"] }
 
@@ -197,6 +201,10 @@ anyhow = "1"
 httpmock = "0.7"
 
 # Unix-specific signal handling (SIGTERM in daemon_single_instance tests)
+# Terminal raw-mode + TIOCGWINSZ for the PTY supervisor (src/supervisor/mod.rs).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(unix)'.dev-dependencies]
 nix = { version = "0.27", features = ["signal"] }
 

@@ -82,7 +82,6 @@ fn main() -> std::process::ExitCode {
         // resolve to the current cwd) but the resolved root is unused
         // by the daemon/plugin dispatch.
         Command::Daemon(_) => None,
-        Command::Plugin(_) => None,
         // Chat reads `~/.claude/knowledge/chat.db` directly — user-level,
         // not per-project — so the project root is unused. The gate still
         // runs to keep the security backbone uniform.
@@ -93,6 +92,9 @@ fn main() -> std::process::ExitCode {
         // `agent` reads chat.db (user-level) like `chat`. No per-project
         // root used; gate still runs uniformly.
         Command::Agent(_) => None,
+        // `telegram` talks to the daemon over UDS and reads the user-level
+        // chat.db; no project-scoped filesystem access.
+        Command::Telegram(_) => None,
     };
 
     let root = match cli::resolve_project_root(project_root_arg) {
@@ -141,17 +143,55 @@ fn main() -> std::process::ExitCode {
             cli::DaemonSubcommand::Status(a) => run_daemon_status(&a),
             cli::DaemonSubcommand::Logs(a) => run_daemon_logs(&a),
         },
-        Command::Plugin(args) => match &args.sub {
-            cli::PluginSubcommand::Serve(serve_args) => run_plugin_serve(serve_args),
-        },
         Command::Chat(args) => match &args.sub {
             cli::ChatSubcommand::List(a) => run_chat_list(a),
             cli::ChatSubcommand::Threads(a) => run_chat_threads(a),
         },
         Command::Run(args) => run_claude_with_preset(&args),
+        Command::Telegram(args) => match &args.sub {
+            cli::TelegramSubcommand::Send(a) => run_telegram_send(a),
+            cli::TelegramSubcommand::Status => run_telegram_status(),
+            cli::TelegramSubcommand::Addbot(a) => run_telegram_addbot(a),
+            cli::TelegramSubcommand::Bots => run_telegram_bots(),
+            cli::TelegramSubcommand::GetMe(a) => simple_async(
+                claudebase::telegram_cli::get_me_command(a.token.as_deref()),
+                "telegram get_me",
+            ),
+            cli::TelegramSubcommand::Pair(a) => {
+                simple(claudebase::access_cli::pair(&a.code), "telegram pair")
+            }
+            cli::TelegramSubcommand::Access => {
+                simple(claudebase::access_cli::show(), "telegram access")
+            }
+            cli::TelegramSubcommand::Policy(a) => {
+                simple(claudebase::access_cli::set_policy(&a.value), "telegram policy")
+            }
+            cli::TelegramSubcommand::Allow(a) => {
+                simple(claudebase::access_cli::allow(&a.sender_id), "telegram allow")
+            }
+            cli::TelegramSubcommand::Revoke(a) => {
+                simple(claudebase::access_cli::revoke(&a.sender_id), "telegram revoke")
+            }
+        },
         Command::Agent(args) => match args.sub {
             cli::AgentSubcommand::ListAlive(a) => run_agent_list_alive(&a),
             cli::AgentSubcommand::Inspect(a) => run_agent_inspect(&a),
+            cli::AgentSubcommand::Send(a) => run_agent_send(&a),
+            cli::AgentSubcommand::Whoami => {
+                simple(claudebase::agent_cli::whoami(), "agent whoami")
+            }
+            cli::AgentSubcommand::Rename(a) => simple_async(
+                claudebase::agent_cli::rename(&a.nick),
+                "agent rename",
+            ),
+            cli::AgentSubcommand::Describe(a) => simple_async(
+                claudebase::agent_cli::describe(&a.description, a.branch.as_deref()),
+                "agent describe",
+            ),
+            cli::AgentSubcommand::List(a) => simple(
+                claudebase::agent_cli::list(a.all, a.json),
+                "agent list",
+            ),
         },
     }
 }
@@ -467,60 +507,61 @@ fn run_claude_with_preset(args: &cli::RunArgs) -> std::process::ExitCode {
         ensure_project_config();
     }
 
-    let mut argv: Vec<OsString> = vec![claude_path.clone().into()];
-    if !args.no_telegram {
-        argv.push("--channels".into());
-        argv.push("plugin:telegram@claude-plugins-official".into());
-    }
-    // Operator-requested default-on bypass of Claude Code permission prompts
-    // (multi-agent-telegram-on-v0.6 side-quest, scope-creep on plan v4 R3a
-    // from the v0.9 fleet plan — operator wants this now for ergonomics).
-    // Verified flag name against `claude --help` this session:
-    // `--dangerously-skip-permissions  Bypass all permission checks.`
-    // SECURITY TRADE-OFF: a prompt-injected channel notification reaching a
-    // skip-permissions CLI has higher blast radius than a normal session.
-    // Acceptable for the operator's single-user setup but worth re-evaluating
-    // before multi-user rollout (mirror of the v0.9 plan's red-team flag).
-    if !args.no_skip_permissions {
-        argv.push("--dangerously-skip-permissions".into());
-    }
-    for a in &args.args {
-        argv.push(OsString::from(a));
+    // pty-transport Slice 2 — the supervisor OWNS the terminal `claude` runs
+    // in, so inbound Telegram / agent messages can be written into its input
+    // exactly as if the operator typed them. This replaced the old
+    // `exec claude --channels plugin:telegram@claude-plugins-official` path:
+    // no plugin slot, no MCP channel, nothing that a Claude Code update or a
+    // marketplace change can take away.
+    //
+    // `--no-telegram` keeps the legacy behaviour (plain exec, no daemon leg)
+    // as an escape hatch when the supervisor itself is suspect.
+    if args.no_telegram {
+        let mut argv: Vec<OsString> = vec![claude_path.clone().into()];
+        if !args.no_skip_permissions {
+            argv.push("--dangerously-skip-permissions".into());
+        }
+        for a in &args.args {
+            argv.push(OsString::from(a));
+        }
+        eprintln!("claudebase run → exec (no-telegram) {}", claude_path.display());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let err = std::process::Command::new(&claude_path).args(&argv[1..]).exec();
+            eprintln!("claudebase run: exec failed: {err}");
+            return std::process::ExitCode::from(126);
+        }
+        #[cfg(not(unix))]
+        {
+            return match std::process::Command::new(&claude_path).args(&argv[1..]).status() {
+                Ok(status) => match status.code() {
+                    Some(c) if (0..=255).contains(&c) => std::process::ExitCode::from(c as u8),
+                    _ => std::process::ExitCode::SUCCESS,
+                },
+                Err(e) => {
+                    eprintln!("claudebase run: spawn failed: {e}");
+                    std::process::ExitCode::from(126)
+                }
+            };
+        }
     }
 
-    // Best-effort log so the operator sees what was launched (stderr to
-    // keep stdout clean for any piped use).
-    eprintln!(
-        "claudebase run → exec {} {}",
-        claude_path.display(),
-        argv.iter()
-            .skip(1)
-            .map(|s| s.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let err = std::process::Command::new(&claude_path)
-            .args(&argv[1..])
-            .exec();
-        eprintln!("claudebase run: exec failed: {}", err);
-        std::process::ExitCode::from(126)
-    }
-    #[cfg(not(unix))]
-    {
-        // Windows has no exec — spawn and wait, forwarding exit code.
-        match std::process::Command::new(&claude_path).args(&argv[1..]).status() {
-            Ok(status) => match status.code() {
-                Some(c) if (0..=255).contains(&c) => std::process::ExitCode::from(c as u8),
-                _ => std::process::ExitCode::SUCCESS,
-            },
-            Err(e) => {
-                eprintln!("claudebase run: spawn failed: {}", e);
-                std::process::ExitCode::from(126)
-            }
+    // Supervisor logs go to a FILE, never to the terminal.
+    //
+    // The supervisor shares the operator's terminal with Claude Code's TUI: a
+    // log line printed there lands inside the rendered input box, which is what
+    // it looked like when this shipped writing JSON to stderr. Diagnostics are
+    // still needed — they are how the gate stalls and subscription problems get
+    // found — so they are written to `~/.claude/logs/claudebase-run-<pid>.log`
+    // and `CLAUDEBASE_LOG_STDERR=1` restores the old behaviour for anyone
+    // debugging the supervisor itself outside a TUI.
+    init_supervisor_tracing();
+    match claudebase::supervisor::run(args) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("claudebase run: {e:#}");
+            std::process::ExitCode::FAILURE
         }
     }
 }
@@ -575,6 +616,8 @@ fn ensure_daemon_running() {
     for _ in 0..30 {
         std::thread::sleep(std::time::Duration::from_millis(100));
         if is_daemon_alive() {
+            // Only interesting when we had to start it — the "not reachable"
+            // line above already told the operator something was happening.
             eprintln!("claudebase run: daemon up");
             return;
         }
@@ -604,10 +647,10 @@ fn ensure_project_config() {
         }
     };
     match claudebase::project_config::load_or_create(&cwd) {
-        Ok(cfg) => eprintln!(
-            "claudebase run: project config ready (session_id={}, name={})",
-            cfg.session_id, cfg.name
-        ),
+        // Success is the normal case and says nothing the operator needs — the
+        // terminal belongs to Claude Code's TUI, not to our bookkeeping. Only
+        // failures, which change behaviour, are worth a line.
+        Ok(_) => {}
         Err(e) => eprintln!(
             "claudebase run: failed to create .claudebase/config.json ({}) - bridge will fall back to cwd-basename / UUID",
             e
@@ -741,6 +784,71 @@ fn run_chat_threads(args: &cli::ChatThreadsArgs) -> std::process::ExitCode {
 /// `try_init()` is idempotent and is the supported entry point — a
 /// double-install (e.g. plugin spawning a daemon in-process during
 /// tests) becomes a silent no-op rather than a panic.
+/// Where a supervisor session writes its log.
+///
+/// Per-pid so concurrent sessions do not interleave, and under `~/.claude/logs`
+/// next to the daemon's own logs rather than in the project directory.
+fn supervisor_log_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    let dir = std::path::PathBuf::from(home).join(".claude").join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join(format!("claudebase-run-{}.log", std::process::id())))
+}
+
+/// Shared file handle usable as a `tracing` writer.
+#[derive(Clone)]
+struct SharedFile(std::sync::Arc<std::sync::Mutex<std::fs::File>>);
+
+impl std::io::Write for SharedFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.0.lock() {
+            Ok(mut f) => f.write(buf),
+            // A poisoned mutex must not take the session down over a log line.
+            Err(_) => Ok(buf.len()),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.0.lock() {
+            Ok(mut f) => f.flush(),
+            Err(_) => Ok(()),
+        }
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedFile {
+    type Writer = SharedFile;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Tracing for `claudebase run`: file by default, stderr only on request.
+fn init_supervisor_tracing() {
+    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+    let filter = || {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("claudebase=info"))
+    };
+
+    if std::env::var_os("CLAUDEBASE_LOG_STDERR").is_some() {
+        let _ = tracing_subscriber::registry()
+            .with(filter())
+            .with(fmt::layer().json().with_writer(std::io::stderr))
+            .try_init();
+        return;
+    }
+
+    let Some(path) = supervisor_log_path() else { return };
+    let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+        return;
+    };
+    let writer = SharedFile(std::sync::Arc::new(std::sync::Mutex::new(file)));
+    let _ = tracing_subscriber::registry()
+        .with(filter())
+        .with(fmt::layer().json().with_writer(writer))
+        .try_init();
+}
+
 fn init_tracing() {
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -805,12 +913,159 @@ fn run_daemon_serve(args: &cli::DaemonServeArgs) -> std::process::ExitCode {
 }
 
 /// `claudebase plugin serve` — entry point. Slice 1a stub.
-fn run_plugin_serve(args: &cli::PluginServeArgs) -> std::process::ExitCode {
-    init_tracing();
-    match claudebase::daemon::run_tokio(claudebase::plugin::serve(args)) {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+/// `claudebase agent send` — agent-to-agent messaging over the CLI.
+fn run_agent_send(args: &cli::AgentSendArgs) -> std::process::ExitCode {
+    use std::io::Read;
+
+    let text = if args.stdin {
+        let mut buf = String::new();
+        if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+            eprintln!("claudebase agent chat: reading stdin failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+        buf
+    } else {
+        match args.text.as_deref() {
+            Some(t) => t.to_string(),
+            None => {
+                eprintln!("claudebase agent send: pass the text as an argument or use --stdin");
+                return std::process::ExitCode::from(2);
+            }
+        }
+    };
+
+    let (target, is_id) = match (args.agent_id.as_deref(), args.agent_nick.as_deref()) {
+        (Some(id), _) => (id.to_string(), true),
+        (None, Some(name)) => (name.to_string(), false),
+        (None, None) => {
+            eprintln!("claudebase agent send: pass --agent_nick <nick> or --agent_id <id>");
+            return std::process::ExitCode::from(2);
+        }
+    };
+
+    match claudebase::daemon::run_tokio(claudebase::agent_cli::send(
+        text.trim_end_matches('\n'),
+        &target,
+        is_id,
+    )) {
+        Ok(msg) => {
+            println!("{msg}");
+            std::process::ExitCode::SUCCESS
+        }
         Err(e) => {
-            tracing::error!(error = %format!("{e:#}"), "claudebase plugin fatal");
+            eprintln!("claudebase agent send: {e:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// `claudebase telegram send` — pty-transport Slice 1.
+///
+/// Runs on the sync dispatch path like every other short CLI subcommand;
+/// the tokio runtime is built only for the duration of the daemon round-trip
+/// (invariant 1 in the module header: no `#[tokio::main]`).
+fn run_telegram_send(args: &cli::TelegramSendArgs) -> std::process::ExitCode {
+    use std::io::Read;
+
+    let text = if args.stdin {
+        let mut buf = String::new();
+        if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+            eprintln!("claudebase telegram send: reading stdin failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+        buf
+    } else {
+        match args.text.as_deref() {
+            Some(t) => t.to_string(),
+            None => {
+                eprintln!("claudebase telegram send: pass --text \"…\" or --stdin");
+                return std::process::ExitCode::from(2);
+            }
+        }
+    };
+
+    let result = claudebase::daemon::run_tokio(claudebase::telegram_cli::send(
+        text.trim_end_matches('\n'),
+        args.thread.as_deref(),
+    ));
+    match result {
+        Ok(msg) => {
+            println!("{msg}");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("claudebase telegram send: {e:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// Print a command's `Result<String>` and map it to an exit code.
+///
+/// Every access command has the same shape — succeed with a human-readable
+/// report or fail with a message — so the plumbing lives in one place instead
+/// of six near-identical runners.
+fn simple(result: anyhow::Result<String>, what: &str) -> std::process::ExitCode {
+    match result {
+        Ok(msg) => {
+            println!("{}", msg.trim_end());
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("claudebase {what}: {e:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// Same, for commands that need the tokio runtime (network calls).
+fn simple_async<F: std::future::Future<Output = anyhow::Result<String>>>(
+    fut: F,
+    what: &str,
+) -> std::process::ExitCode {
+    simple(claudebase::daemon::run_tokio(fut), what)
+}
+
+/// `claudebase telegram status` — explain the resolved default target.
+fn run_telegram_status() -> std::process::ExitCode {
+    match claudebase::telegram_cli::status() {
+        Ok(report) => {
+            print!("{report}");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("claudebase telegram status: {e:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// `claudebase telegram addbot <token>` — Slice 8.
+fn run_telegram_addbot(args: &cli::TelegramAddbotArgs) -> std::process::ExitCode {
+    match claudebase::daemon::run_tokio(claudebase::telegram_cli::addbot(
+        &args.token,
+        args.label.as_deref(),
+    )) {
+        Ok(msg) => {
+            println!("{msg}");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("claudebase telegram addbot: {e:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// `claudebase telegram bots` — list registered bots.
+fn run_telegram_bots() -> std::process::ExitCode {
+    match claudebase::telegram_cli::list_bots() {
+        Ok(report) => {
+            print!("{report}");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("claudebase telegram bots: {e:#}");
             std::process::ExitCode::FAILURE
         }
     }

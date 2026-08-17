@@ -343,18 +343,451 @@ pub fn describe(
     Ok(n)
 }
 
-/// Slice 3 of cli-to-cli-routing — resolve the `agent_id` of the alive
-/// row bound to a specific `connection_id`. This is the security
-/// primitive Slice 4 FR-C2C-4.6 builds on: instead of trusting a
-/// caller-supplied `from_agent_id`, the daemon looks up the identity
-/// the connection ALREADY registered. Local processes that can write
-/// to the UDS but never called `agent_register` (or registered as a
-/// different id) cannot impersonate.
+
+/// Bind a Telegram chat to a NICK.
 ///
-/// Returns `None` when no alive row matches the connection. Multiple
-/// alive rows on one connection_id is technically possible if the
-/// caller registered several agents in different threads; we return
-/// the most-recently-pinged to break the tie.
+/// The nick, not the `agent_id`: ids are per-process and die with the session,
+/// which is why a restart used to silently unbind the chat.
+pub fn bind_chat_to_name(
+    conn: &Connection,
+    chat_id: i64,
+    thread_id: Option<i64>,
+    agent_name: &str,
+    now_ms: i64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "INSERT INTO chat_bindings (chat_id, thread_id, agent_name, bound_at) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(chat_id, thread_id) DO UPDATE SET \
+           agent_name = excluded.agent_name, bound_at = excluded.bound_at",
+        params![chat_id, thread_id.unwrap_or(-1), agent_name, now_ms],
+    )
+}
+
+/// Chats bound to `agent_name`, as `(chat_id, thread_id)`.
+pub fn chats_bound_to_name(
+    conn: &Connection,
+    agent_name: &str,
+) -> rusqlite::Result<Vec<(i64, Option<i64>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT chat_id, thread_id FROM chat_bindings WHERE agent_name = ?1",
+    )?;
+    let rows = stmt.query_map([agent_name], |row| {
+        let chat: i64 = row.get(0)?;
+        let thread: i64 = row.get(1)?;
+        Ok((chat, if thread < 0 { None } else { Some(thread) }))
+    })?;
+    rows.collect()
+}
+
+/// Restore this session's routing keys from the nick bindings.
+///
+/// Called at register: a session coming back under the same nick re-acquires
+/// the chats it was bound to, so the operator does not `/switch` after every
+/// restart. The previous holder's stale routing key is cleared first — two rows
+/// claiming one chat would make delivery ambiguous.
+pub fn restore_bindings_for(
+    conn: &Connection,
+    agent_id: &str,
+    agent_name: &str,
+    now_ms: i64,
+) -> anyhow::Result<usize> {
+    let bindings = chats_bound_to_name(conn, agent_name)?;
+    let mut restored = 0usize;
+    for (chat_id, thread_id) in bindings {
+        conn.execute(
+            "UPDATE agent_registry SET routing_chat_id = NULL, routing_thread_id = NULL \
+             WHERE routing_chat_id = ?1 \
+               AND COALESCE(routing_thread_id, -1) = COALESCE(?2, -1) \
+               AND agent_id != ?3",
+            params![chat_id, thread_id, agent_id],
+        )?;
+        // `bind_routing_key` wants `&mut Connection` for its own transaction;
+        // here the caller already owns the connection, so write the columns
+        // directly. Uniqueness is preserved by the clear above.
+        conn.execute(
+            "UPDATE agent_registry SET routing_chat_id = ?1, routing_thread_id = ?2 \
+             WHERE agent_id = ?3",
+            params![chat_id, thread_id, agent_id],
+        )?;
+        let _ = now_ms;
+        restored += 1;
+    }
+    Ok(restored)
+}
+
+/// Rename a session.
+///
+/// The nick is the address `/switch` and `--agent_nick` use, so it has to be
+/// something the operator chose and recognises — the derived one is the project
+/// name, identical for every session opened in a repo.
+///
+/// Only the registry row changes. The project's `.claudebase/config.json` keeps
+/// its own name on purpose: that file is shared by every session in the
+/// directory, so persisting a rename there would silently rename the next
+/// window started in the same place.
+pub fn rename(conn: &Connection, agent_id: &str, new_name: &str) -> anyhow::Result<usize> {
+    validate_agent_name(new_name).context("agent rename: validate name")?;
+    let taken: Option<String> = conn
+        .query_row(
+            "SELECT agent_id FROM agent_registry \
+             WHERE agent_name = ?1 AND agent_id != ?2 AND state = 'alive'",
+            params![new_name, agent_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if taken.is_some() {
+        anyhow::bail!(
+            "`{new_name}` is already taken by another live session — nicks are how \
+             /switch addresses a window, so two windows may not share one"
+        );
+    }
+    let n = conn.execute(
+        "UPDATE agent_registry SET agent_name = ?1 WHERE agent_id = ?2",
+        params![new_name, agent_id],
+    )?;
+    Ok(n)
+}
+
+/// Record where a session actually runs: host, pid, cwd.
+///
+/// These columns have existed since the routing migration but nothing ever
+/// wrote them, so `state` was the only liveness signal — and `state` lies: it
+/// only changes when the daemon notices a connection EOF or reboots. A session
+/// killed with the daemon down stays `alive` forever, which is how `/switch`
+/// ended up offering four identical buttons for sessions that were gone.
+pub fn capture_process(
+    conn: &Connection,
+    agent_id: &str,
+    host: Option<&str>,
+    pid: Option<i64>,
+    cwd: Option<&str>,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE agent_registry SET \
+           host = COALESCE(?1, host), \
+           pid  = COALESCE(?2, pid), \
+           cwd  = COALESCE(?3, cwd) \
+         WHERE agent_id = ?4",
+        params![host, pid, cwd, agent_id],
+    )
+}
+
+/// Is the process behind this row still running?
+///
+/// Only answerable for rows recorded on THIS host: a pid from another machine
+/// says nothing about a local process table, and checking it anyway would
+/// happily "verify" an unrelated local process that happens to share the
+/// number. Unknown → `true`, because refusing to route to a session we cannot
+/// disprove is worse than routing to one that may be gone (the message queues;
+/// a wrong "offline" hides a working session).
+pub fn process_is_live(row_host: Option<&str>, row_pid: Option<i64>, this_host: &str) -> bool {
+    let (Some(host), Some(pid)) = (row_host, row_pid) else {
+        return true;
+    };
+    if host != this_host {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        // Signal 0 performs the existence and permission checks without
+        // delivering anything. EPERM means the process EXISTS but belongs to
+        // someone we may not signal — treating that as dead would report a
+        // running session owned by another user as offline.
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+/// Sessions that are both registered `alive` AND whose process is still
+/// running on this host.
+///
+/// This is what `/agents`, `/switch` and `claudebase agent list` must use.
+/// `list_alive` alone answers "who registered and never got cleaned up", which
+/// is not the question anyone is asking.
+pub fn list_online(conn: &Connection, this_host: &str) -> anyhow::Result<Vec<AgentRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT agent_id, agent_name, chat_thread_id, spawned_at, last_pinged_at, host, pid \
+         FROM agent_registry WHERE state = 'alive' \
+         ORDER BY last_pinged_at DESC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let host: Option<String> = row.get(5)?;
+        let pid: Option<i64> = row.get(6)?;
+        Ok((
+            AgentRow {
+                agent_id: row.get(0)?,
+                agent_name: row.get(1)?,
+                chat_thread_id: row.get(2)?,
+                spawned_at: row.get(3)?,
+                last_pinged_at: row.get(4)?,
+                project_id: None,
+                branch: None,
+                working_dir: None,
+                feature_description: None,
+                dnd_until_ts: None,
+            },
+            host,
+            pid,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        let (agent, host, pid) = r?;
+        if process_is_live(host.as_deref(), pid, this_host) {
+            out.push(agent);
+        }
+    }
+    Ok(out)
+}
+
+/// Bury rows left behind by a previous session in the same identity slot.
+///
+/// A slot is (agent_name, cwd, host): the same nick, in the same directory, on
+/// the same machine. Restarting a session leaves the old row behind — each
+/// process gets a fresh `agent_id` by design (issue 006 root cause 1) — so
+/// without this the registry accumulates one entry per restart.
+///
+/// Only rows whose process is provably gone are buried. Two sessions genuinely
+/// running side by side in one directory are a legitimate state and both stay.
+pub fn supersede_stale_slots(
+    conn: &Connection,
+    keep_agent_id: &str,
+    agent_name: &str,
+    cwd: Option<&str>,
+    this_host: &str,
+) -> anyhow::Result<usize> {
+    let Some(cwd) = cwd else { return Ok(0) };
+    let mut stmt = conn.prepare(
+        "SELECT agent_id, host, pid FROM agent_registry \
+         WHERE agent_name = ?1 AND cwd = ?2 AND agent_id != ?3 AND state != 'dead'",
+    )?;
+    let candidates: Vec<(String, Option<String>, Option<i64>)> = stmt
+        .query_map(params![agent_name, cwd, keep_agent_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut buried = 0usize;
+    for (agent_id, host, pid) in candidates {
+        if process_is_live(host.as_deref(), pid, this_host) {
+            continue;
+        }
+        buried += conn.execute(
+            "UPDATE agent_registry SET state = 'dead' WHERE agent_id = ?1",
+            params![agent_id],
+        )?;
+    }
+    Ok(buried)
+}
+
+/// Hostname of the machine this process runs on, for the columns above.
+/// Move every Telegram chat binding from `old_nick` to `new_nick`.
+///
+/// Bindings are keyed by NAME so they can outlive a process (Slice 13). The
+/// cost of that choice is that a rename would otherwise orphan them: the
+/// operator's `/switch` would still point at a name nobody answers to. Since a
+/// name identifies at most one live session, every binding on the old name
+/// belonged to the session doing the renaming, so following it is the only
+/// answer that keeps the conversation where the operator left it.
+///
+/// `INSERT OR REPLACE` semantics are deliberate: if the chat was already bound
+/// to the new name, that binding already points here and the duplicate is
+/// dropped rather than raising a primary-key conflict.
+pub fn migrate_bindings(
+    conn: &Connection,
+    old_nick: &str,
+    new_nick: &str,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE OR REPLACE chat_bindings SET agent_name = ?2 WHERE agent_name = ?1",
+        params![old_nick, new_nick],
+    )
+}
+
+/// Record that this working directory's session goes by `nick`.
+///
+/// Called on an explicit rename only. A nick the supervisor derived from the
+/// project name is NOT remembered — otherwise the memory would just echo the
+/// default back and there would be no way to tell "chosen" from "fell out of
+/// the directory name", which is exactly the distinction the SessionStart hook
+/// needs in order to ask for a name once and then stay quiet.
+pub fn remember_nick(
+    conn: &Connection,
+    host: &str,
+    cwd: &str,
+    nick: &str,
+    now_ms: i64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "INSERT INTO nick_memory (host, cwd, nick, updated_at) VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(host, cwd) DO UPDATE SET nick = excluded.nick, updated_at = excluded.updated_at",
+        params![host, cwd, nick, now_ms],
+    )
+}
+
+/// The nick previously chosen for this working directory, if any.
+pub fn recall_nick(conn: &Connection, host: &str, cwd: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT nick FROM nick_memory WHERE host = ?1 AND cwd = ?2",
+        params![host, cwd],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+}
+
+/// Is `nick` currently held by a live session other than `except_agent_id`?
+///
+/// A remembered nick is reused only when it is free: two windows in one
+/// directory cannot share a name, since the name is what `/switch` and
+/// `--agent_nick` resolve.
+pub fn nick_is_taken(
+    conn: &Connection,
+    nick: &str,
+    except_agent_id: Option<&str>,
+) -> rusqlite::Result<bool> {
+    let holder: Option<String> = conn
+        .query_row(
+            "SELECT agent_id FROM agent_registry \
+             WHERE agent_name = ?1 AND state = 'alive' AND agent_id != ?2",
+            params![nick, except_agent_id.unwrap_or("")],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match holder {
+        None => Ok(false),
+        // A row can claim `alive` while its process is gone (the state column
+        // lied before F-12); verify rather than trust it, or a crashed session
+        // would hold its name hostage forever.
+        Some(id) => {
+            let row: Option<(Option<String>, Option<i64>)> = conn
+                .query_row(
+                    "SELECT host, pid FROM agent_registry WHERE agent_id = ?1",
+                    params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let host_now = this_host();
+            Ok(match row {
+                Some((h, pid)) => process_is_live(h.as_deref(), pid, &host_now),
+                None => false,
+            })
+        }
+    }
+}
+
+pub fn this_host() -> String {
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+        if rc == 0 {
+            let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+            return String::from_utf8_lossy(&buf[..end]).into_owned();
+        }
+    }
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "unknown-host".to_string())
+}
+
+/// Store the per-session token for an agent (pty-transport Slice 1).
+///
+/// Called from `agent_register` when the supervisor supplies one. Overwrites
+/// on re-register, so a reconnecting supervisor keeps the token its child was
+/// spawned with.
+pub fn set_session_token(
+    conn: &Connection,
+    agent_id: &str,
+    token: &str,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE agent_registry SET session_token = ?2 WHERE agent_id = ?1",
+        params![agent_id, token],
+    )
+}
+
+/// Resolve a sender identity from a `(agent_id, session_token)` pair.
+///
+/// This is the ONLY way a process that is not the registered connection may
+/// claim an identity, and it is what keeps FR-C2C-4.6 intact for the CLI: the
+/// token is minted by the daemon at register time and handed only to the
+/// supervisor, which passes it to its own child through the environment.
+/// A wrong or missing token resolves to `None` and the caller must refuse.
+///
+/// Constant-time comparison is deliberately NOT used: the token never crosses
+/// a network, both sides are local processes owned by the same user, and a
+/// timing oracle on a UDS is not a meaningful threat next to simply reading
+/// the environment of a process you already own.
+pub fn resolve_session_token(
+    conn: &Connection,
+    agent_id: &str,
+    token: &str,
+) -> rusqlite::Result<bool> {
+    if token.is_empty() {
+        return Ok(false);
+    }
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT session_token FROM agent_registry WHERE agent_id = ?1 AND state = 'alive'",
+            params![agent_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(stored.as_deref() == Some(token))
+}
+
+/// Resolve `--agent <name|id>` to a single alive `agent_id`.
+///
+/// Exact id wins. Otherwise match on name among ALIVE agents and take the most
+/// recently seen one — but only if the name is unambiguous: sending a message
+/// to the wrong peer is not recoverable, so ambiguity is an error carrying the
+/// candidate list rather than a silent pick.
+pub fn resolve_target(conn: &Connection, needle: &str) -> anyhow::Result<String> {
+    let by_id: Option<String> = conn
+        .query_row(
+            "SELECT agent_id FROM agent_registry WHERE agent_id = ?1 AND state = 'alive'",
+            params![needle],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(id) = by_id {
+        return Ok(id);
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT agent_id, last_pinged_at FROM agent_registry \
+         WHERE agent_name = ?1 AND state = 'alive' \
+         ORDER BY last_pinged_at DESC",
+    )?;
+    let rows: Vec<(String, i64)> = stmt
+        .query_map(params![needle], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    match rows.len() {
+        0 => anyhow::bail!(
+            "no alive agent matches `{needle}` — check `claudebase agent list-alive`"
+        ),
+        1 => Ok(rows[0].0.clone()),
+        _ => anyhow::bail!(
+            "`{needle}` matches {} alive agents; pass --agent-id with one of:\n  {}",
+            rows.len(),
+            rows.iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        ),
+    }
+}
+
 pub fn lookup_agent_id_by_connection(
     conn: &Connection,
     connection_id: &str,
@@ -998,6 +1431,120 @@ mod tests {
         conn
     }
 
+    fn seed_alive(conn: &Connection, agent_id: &str, nick: &str, pid: Option<i64>) {
+        conn.execute(
+            "INSERT INTO agent_registry \
+               (agent_id, agent_name, connection_id, state, spawned_at, last_pinged_at, host, pid) \
+             VALUES (?1, ?2, ?1, 'alive', 0, 0, ?3, ?4)",
+            params![agent_id, nick, this_host(), pid],
+        )
+        .expect("seed");
+    }
+
+    /// A rename must take the operator's conversation with it. Bindings are
+    /// keyed by name so they survive a restart; the price is that a rename
+    /// would strand them on a name nobody answers to.
+    #[test]
+    fn renaming_carries_the_telegram_binding_across() {
+        let conn = open_test_conn();
+        bind_chat_to_name(&conn, 434566766, None, "planner", 1).expect("bind");
+
+        let moved = migrate_bindings(&conn, "planner", "mira").expect("migrate");
+        assert_eq!(moved, 1);
+
+        assert_eq!(
+            chats_bound_to_name(&conn, "mira").expect("new"),
+            vec![(434566766, None)],
+            "the chat follows the session that renamed itself"
+        );
+        assert!(
+            chats_bound_to_name(&conn, "planner").expect("old").is_empty(),
+            "nothing is left pointing at the abandoned name"
+        );
+    }
+
+    /// The chat was already bound to the new name -- migrating must not blow up
+    /// on the (chat_id, thread_id) primary key.
+    #[test]
+    fn migrating_onto_an_existing_binding_collapses_rather_than_conflicts() {
+        let conn = open_test_conn();
+        bind_chat_to_name(&conn, 42, None, "planner", 1).expect("old");
+        bind_chat_to_name(&conn, 42, None, "mira", 2).expect("new");
+
+        migrate_bindings(&conn, "planner", "mira").expect("must not conflict");
+
+        assert_eq!(
+            chats_bound_to_name(&conn, "mira").expect("bound"),
+            vec![(42, None)]
+        );
+    }
+
+    /// The point of the memory: a name chosen in a directory outlives the
+    /// process that chose it, so the next session comes back addressable under
+    /// it and the Telegram binding keyed by that name still resolves.
+    #[test]
+    fn a_chosen_nick_survives_the_session_that_chose_it() {
+        let conn = open_test_conn();
+        remember_nick(&conn, "hostA", "/work/api", "mira", 1).expect("remember");
+
+        assert_eq!(
+            recall_nick(&conn, "hostA", "/work/api").expect("recall"),
+            Some("mira".to_string())
+        );
+        // Scoped to the directory, not global: a different project must not
+        // inherit someone else's name.
+        assert_eq!(recall_nick(&conn, "hostA", "/work/ui").expect("recall"), None);
+        // And not to a different machine, since pids and bindings are per-host.
+        assert_eq!(recall_nick(&conn, "hostB", "/work/api").expect("recall"), None);
+    }
+
+    #[test]
+    fn renaming_again_replaces_the_memory_rather_than_accumulating() {
+        let conn = open_test_conn();
+        remember_nick(&conn, "hostA", "/work/api", "mira", 1).expect("first");
+        remember_nick(&conn, "hostA", "/work/api", "atlas", 2).expect("second");
+
+        assert_eq!(
+            recall_nick(&conn, "hostA", "/work/api").expect("recall"),
+            Some("atlas".to_string()),
+            "the latest choice wins"
+        );
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nick_memory", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(rows, 1, "one row per directory, not one per rename");
+    }
+
+    /// Two windows in one directory cannot share a name -- the name is what
+    /// `/switch` and `--agent_nick` resolve to a single session.
+    #[test]
+    fn a_nick_held_by_a_live_session_reads_as_taken() {
+        let conn = open_test_conn();
+        seed_alive(&conn, "agent-1", "mira", Some(std::process::id() as i64));
+
+        assert!(nick_is_taken(&conn, "mira", None).expect("taken"));
+        assert!(
+            !nick_is_taken(&conn, "mira", Some("agent-1")).expect("self"),
+            "a session does not block itself from keeping its own name"
+        );
+        assert!(!nick_is_taken(&conn, "atlas", None).expect("free"));
+    }
+
+    /// The registry `state` column has lied before (F-12): a crashed session
+    /// leaves an `alive` row behind. If that row could reserve a nick, the name
+    /// would be lost forever and every restart would land on `<project>-2`.
+    #[test]
+    fn a_dead_session_does_not_hold_its_nick_hostage() {
+        let conn = open_test_conn();
+        // pid 0 is not a process we can signal as existing on Linux.
+        seed_alive(&conn, "agent-ghost", "mira", Some(2_147_483_646));
+
+        assert!(
+            !nick_is_taken(&conn, "mira", None).expect("ghost"),
+            "an `alive` row whose process is gone must release the name"
+        );
+    }
+
     #[test]
     fn agent_state_round_trip() {
         for s in [AgentState::Alive, AgentState::Orphaned, AgentState::Dead] {
@@ -1605,5 +2152,190 @@ mod tests {
         let rows_beta = list_routings_for(&conn, 500, Some(8)).unwrap();
         assert_eq!(rows_beta.len(), 1);
         assert_eq!(rows_beta[0].agent_id, "cli-c");
+    }
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+
+    fn db() -> Connection {
+        let c = Connection::open_in_memory().expect("memory db");
+        crate::daemon::chat::ensure_chat_db_schema(&c).expect("schema");
+        c
+    }
+
+    fn insert(c: &Connection, id: &str, name: &str, state: &str, host: Option<&str>, pid: Option<i64>, cwd: Option<&str>) {
+        c.execute(
+            "INSERT INTO agent_registry \
+             (agent_id, agent_name, connection_id, spawned_at, last_pinged_at, state, host, pid, cwd) \
+             VALUES (?1, ?2, 'conn', 0, 0, ?3, ?4, ?5, ?6)",
+            params![id, name, state, host, pid, cwd],
+        )
+        .expect("insert");
+    }
+
+    /// pid 1 always exists but is owned by root — `kill(1, 0)` from a normal
+    /// user returns EPERM, which is exactly the case that must still count as
+    /// alive. The current process covers the ordinary rc == 0 path.
+    const LIVE_PID: i64 = 1;
+    const DEAD_PID: i64 = 4_194_300;
+
+    #[test]
+    fn a_row_without_host_or_pid_is_trusted() {
+        // Legacy rows predate these columns; calling them dead would hide
+        // working sessions.
+        assert!(process_is_live(None, None, "h1"));
+        assert!(process_is_live(Some("h1"), None, "h1"));
+        assert!(process_is_live(None, Some(DEAD_PID), "h1"));
+    }
+
+    #[test]
+    fn a_pid_from_another_host_is_not_probed_locally() {
+        // Checking it here would "verify" an unrelated local process that
+        // happens to share the number.
+        assert!(process_is_live(Some("other-box"), Some(DEAD_PID), "this-box"));
+    }
+
+    #[test]
+    fn local_pids_are_probed() {
+        let me = std::process::id() as i64;
+        assert!(process_is_live(Some("h1"), Some(me), "h1"), "our own pid is alive");
+        assert!(
+            process_is_live(Some("h1"), Some(LIVE_PID), "h1"),
+            "a process we may not signal (EPERM) still exists"
+        );
+        assert!(!process_is_live(Some("h1"), Some(DEAD_PID), "h1"));
+    }
+
+    #[test]
+    fn list_online_drops_rows_whose_process_is_gone() {
+        let c = db();
+        let me = std::process::id() as i64;
+        insert(&c, "live", "planner", "alive", Some("h1"), Some(me), None);
+        insert(&c, "gone", "planner", "alive", Some("h1"), Some(DEAD_PID), None);
+        insert(&c, "orph", "planner", "orphaned", Some("h1"), Some(me), None);
+
+        let online = list_online(&c, "h1").expect("list");
+        let ids: Vec<&str> = online.iter().map(|a| a.agent_id.as_str()).collect();
+        assert_eq!(ids, vec!["live"], "only a registered AND running session is online");
+    }
+
+    #[test]
+    fn supersede_buries_only_the_dead_row_in_the_same_slot() {
+        let c = db();
+        let me = std::process::id() as i64;
+        insert(&c, "new", "planner", "alive", Some("h1"), Some(me), Some("/repo"));
+        insert(&c, "old", "planner", "alive", Some("h1"), Some(DEAD_PID), Some("/repo"));
+        insert(&c, "sibling", "planner", "alive", Some("h1"), Some(me), Some("/repo"));
+        insert(&c, "elsewhere", "planner", "alive", Some("h1"), Some(DEAD_PID), Some("/other"));
+
+        let buried = supersede_stale_slots(&c, "new", "planner", Some("/repo"), "h1").expect("sweep");
+        assert_eq!(buried, 1, "exactly the dead row in this slot");
+
+        let state = |id: &str| -> String {
+            c.query_row("SELECT state FROM agent_registry WHERE agent_id = ?1", [id], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(state("old"), "dead");
+        assert_eq!(state("new"), "alive");
+        assert_eq!(state("sibling"), "alive", "a second live session in the same dir is legitimate");
+        assert_eq!(state("elsewhere"), "alive", "a different directory is a different slot");
+    }
+
+    #[test]
+    fn supersede_without_a_cwd_does_nothing() {
+        let c = db();
+        insert(&c, "a", "planner", "alive", Some("h1"), Some(DEAD_PID), None);
+        // Without a cwd there is no slot to compare, and burying by nick alone
+        // would kill unrelated sessions that share a project name.
+        assert_eq!(supersede_stale_slots(&c, "b", "planner", None, "h1").unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+
+    fn db() -> Connection {
+        let c = Connection::open_in_memory().expect("memory db");
+        crate::daemon::chat::ensure_chat_db_schema(&c).expect("schema");
+        c
+    }
+
+    fn add(c: &Connection, id: &str, name: &str, state: &str) {
+        c.execute(
+            "INSERT INTO agent_registry \
+             (agent_id, agent_name, connection_id, spawned_at, last_pinged_at, state) \
+             VALUES (?1, ?2, 'conn', 0, 0, ?3)",
+            params![id, name, state],
+        )
+        .expect("insert");
+    }
+
+    fn routing_of(c: &Connection, id: &str) -> Option<i64> {
+        c.query_row(
+            "SELECT routing_chat_id FROM agent_registry WHERE agent_id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten()
+    }
+
+    #[test]
+    fn a_restarted_session_reacquires_its_chat() {
+        // The scenario that made the operator `/switch` after every restart:
+        // the binding lived on the old row, the new process got a new id.
+        let c = db();
+        add(&c, "old-id", "john_snow", "orphaned");
+        bind_chat_to_name(&c, 434566766, None, "john_snow", 1).unwrap();
+        c.execute(
+            "UPDATE agent_registry SET routing_chat_id = 434566766 WHERE agent_id = 'old-id'",
+            [],
+        )
+        .unwrap();
+
+        add(&c, "new-id", "john_snow", "alive");
+        let restored = restore_bindings_for(&c, "new-id", "john_snow", 2).unwrap();
+
+        assert_eq!(restored, 1);
+        assert_eq!(routing_of(&c, "new-id"), Some(434566766));
+        assert_eq!(
+            routing_of(&c, "old-id"),
+            None,
+            "the dead row must release the chat — two claimants make delivery ambiguous"
+        );
+    }
+
+    #[test]
+    fn a_session_with_no_binding_gets_nothing() {
+        let c = db();
+        add(&c, "id", "planner", "alive");
+        assert_eq!(restore_bindings_for(&c, "id", "planner", 1).unwrap(), 0);
+        assert_eq!(routing_of(&c, "id"), None);
+    }
+
+    #[test]
+    fn rebinding_a_chat_moves_it_to_the_new_nick() {
+        let c = db();
+        bind_chat_to_name(&c, 42, None, "planner", 1).unwrap();
+        bind_chat_to_name(&c, 42, None, "backend", 2).unwrap();
+
+        assert_eq!(chats_bound_to_name(&c, "backend").unwrap(), vec![(42, None)]);
+        assert!(
+            chats_bound_to_name(&c, "planner").unwrap().is_empty(),
+            "one chat routes to one session"
+        );
+    }
+
+    #[test]
+    fn topics_bind_independently_of_the_main_chat() {
+        let c = db();
+        bind_chat_to_name(&c, 42, None, "main-window", 1).unwrap();
+        bind_chat_to_name(&c, 42, Some(7), "topic-window", 1).unwrap();
+
+        assert_eq!(chats_bound_to_name(&c, "main-window").unwrap(), vec![(42, None)]);
+        assert_eq!(chats_bound_to_name(&c, "topic-window").unwrap(), vec![(42, Some(7))]);
     }
 }

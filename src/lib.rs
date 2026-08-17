@@ -5,6 +5,8 @@
 //! target without any Cargo.toml edits (architect-approved invariant for
 //! Slice 2).
 
+pub mod access_cli;
+pub mod agent_cli;
 pub mod chunker;
 pub mod cli;
 pub mod daemon;
@@ -15,10 +17,11 @@ pub mod ocr;
 pub mod output;
 pub mod parser;
 pub mod pdf;
-pub mod plugin;
 pub mod project_config;
 pub mod project_id;
 pub mod registry;
 pub mod search;
 pub mod store;
+pub mod supervisor;
+pub mod telegram_cli;
 pub mod text;

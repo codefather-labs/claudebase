@@ -340,8 +340,9 @@ pub fn gate_dm(access: &mut Access, sender_id: &str, chat_id: &str, now: i64) ->
     }
 }
 
-/// Format the pairing reply text matching server.ts:911-914 verbatim
-/// (skill name swapped to `/claudebase:access pair` per port).
+/// Format the pairing reply text. Shape matches server.ts:911-914; the
+/// instruction points at the CLI because access management is a deterministic
+/// command now, not a skill an LLM interprets (pty-transport Slice 10).
 pub fn format_pair_reply(code: &str, is_resend: bool) -> String {
     let lead = if is_resend {
         "Still pending"
@@ -349,7 +350,7 @@ pub fn format_pair_reply(code: &str, is_resend: bool) -> String {
         "Pairing required"
     };
     format!(
-        "{lead} — run in Claude Code:\n\n/claudebase:access pair {code}"
+        "{lead} — run in your terminal:\n\nclaudebase telegram pair {code}"
     )
 }
 
@@ -514,12 +515,12 @@ mod tests {
         let s = format_pair_reply("abc123", false);
         assert_eq!(
             s,
-            "Pairing required — run in Claude Code:\n\n/claudebase:access pair abc123"
+            "Pairing required — run in your terminal:\n\nclaudebase telegram pair abc123"
         );
         let s = format_pair_reply("abc123", true);
         assert_eq!(
             s,
-            "Still pending — run in Claude Code:\n\n/claudebase:access pair abc123"
+            "Still pending — run in your terminal:\n\nclaudebase telegram pair abc123"
         );
     }
 

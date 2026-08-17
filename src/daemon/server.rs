@@ -250,9 +250,26 @@ pub async fn serve(_args: &DaemonServeArgs) -> anyhow::Result<()> {
             }
         };
 
-    // .env takes precedence over secrets.toml — `/claudebase:configure`
-    // skill is the canonical setup path going forward.
-    let telegram_token_opt: Option<config::RedactedToken> = env_token.or(secrets_token_opt);
+    // Slice 8 — the bot registry in chat.db is now the canonical source
+    // (`claudebase telegram addbot <token>`), because a single owner is what
+    // docs/issues/004 was missing. The two file sources remain fallbacks in
+    // their previous relative order so existing installs keep working with no
+    // reconfiguration: registry -> .env -> secrets.toml.
+    let db_token: Option<config::RedactedToken> = match crate::daemon::chat::open_chat_db() {
+        Ok(conn) => match crate::daemon::bots::default_token(&conn) {
+            Ok(t) => t.map(config::RedactedToken::new),
+            Err(e) => {
+                eprintln!("warning: bot registry unreadable, falling back to files: {e}");
+                None
+            }
+        },
+        Err(e) => {
+            eprintln!("warning: chat.db unavailable for bot registry: {e}");
+            None
+        }
+    };
+    let telegram_token_opt: Option<config::RedactedToken> =
+        db_token.or(env_token).or(secrets_token_opt);
 
     // SEC-15: also validate daemon.toml if present (symlink + no
     // bot_token field). Skip silently if absent.
@@ -710,6 +727,10 @@ where
                 }
                 "agent_register" => {
                     let resp = handle_agent_register(echo_id, &args, connection_id).await;
+                    let _ = outbound_tx.send(resp);
+                }
+                "agent_rename" => {
+                    let resp = handle_agent_rename(echo_id, &args).await;
                     let _ = outbound_tx.send(resp);
                 }
                 "agent_describe" => {
@@ -1366,8 +1387,25 @@ async fn handle_agent_register(
         .get("cwd")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    // pty-transport Slice 1 — optional per-session token. Minted by the PTY
+    // supervisor and exported into its `claude` child, so short-lived CLI
+    // processes spawned inside that session can prove which agent they are
+    // without the daemon trusting a bare `from` field.
+    let session_token = args
+        .get("session_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    // Where the session actually runs. Without these the registry cannot tell a
+    // live session from one that died while the daemon was down, which is what
+    // made `/switch` list four identical buttons.
+    let client_host = args
+        .get("host")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let client_pid = args.get("pid").and_then(|v| v.as_i64());
     let cid_str = connection_id.to_string();
     let agent_id_for_capture = agent_id.clone();
+    let name_for_capture = name.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
         let conn = crate::daemon::chat::open_chat_db()?;
         let outcome = crate::daemon::agent_registry::register(
@@ -1378,6 +1416,45 @@ async fn handle_agent_register(
             thread.as_deref(),
             metadata.as_ref(),
         )?;
+        if let Some(token) = session_token.as_deref() {
+            crate::daemon::agent_registry::set_session_token(&conn, &agent_id_for_capture, token)?;
+        }
+        let host_now = crate::daemon::agent_registry::this_host();
+        let _ = crate::daemon::agent_registry::capture_process(
+            &conn,
+            &agent_id_for_capture,
+            client_host.as_deref(),
+            client_pid,
+            cwd_arg.as_deref(),
+        );
+        // Dedup: bury rows from previous sessions in the same (nick, cwd, host)
+        // slot whose process is gone. Sessions genuinely running side by side
+        // are untouched.
+        // A session returning under the same nick re-acquires the chats bound to
+        // it. Without this the operator had to `/switch` after every restart,
+        // and anything sent in between reached nobody — the binding pointed at
+        // the previous process's row.
+        match crate::daemon::agent_registry::restore_bindings_for(
+            &conn,
+            &agent_id_for_capture,
+            &name_for_capture,
+            crate::daemon::chat::now_millis(),
+        ) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(restored = n, nick = %name_for_capture, "restored chat bindings for this nick"),
+            Err(e) => tracing::warn!(error = %e, "restoring chat bindings failed (non-fatal)"),
+        }
+        match crate::daemon::agent_registry::supersede_stale_slots(
+            &conn,
+            &agent_id_for_capture,
+            &name_for_capture,
+            cwd_arg.as_deref(),
+            &host_now,
+        ) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(buried = n, "superseded stale registry rows for this slot"),
+            Err(e) => tracing::warn!(error = %e, "supersede sweep failed (non-fatal)"),
+        }
         if let Some(cwd_str) = cwd_arg {
             let cwd_path = std::path::PathBuf::from(&cwd_str);
             let project_id = crate::project_id::resolve_project_id(&cwd_path);
@@ -1434,15 +1511,99 @@ fn git_current_branch(cwd: &std::path::Path) -> Option<String> {
     }
 }
 
-/// Slice 3 of cli-to-cli-routing — `agent_describe` MCP tool handler.
-/// Updates `feature_description` (required) and optionally `branch` on
-/// the agent_registry row bound to the caller's connection_id.
+
+/// Handle `agent_rename` — change the nick a session is addressed by.
 ///
-/// FR-C2C-4.6 sender identity binding: the agent_id whose row is
-/// updated is RESOLVED from the connection_id via
-/// `lookup_agent_id_by_connection`, NOT taken from caller args. Local
-/// processes that haven't registered (or registered as a different
-/// agent_id) cannot describe arbitrary other agents.
+/// Token-authenticated like `agent_send`: the caller proves which session it
+/// speaks for, so one session cannot rename another out from under the
+/// operator.
+async fn handle_agent_rename(
+    id: serde_json::Value,
+    args: &serde_json::Value,
+) -> serde_json::Value {
+    let new_name = match args.get("name").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => return tool_error_response(id, -32602, "name required (non-empty string)"),
+    };
+    let claimed = match args.get("from_agent_id").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_error_response(id, -32602, "from_agent_id required"),
+    };
+    let token = args
+        .get("session_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+        let conn = crate::daemon::chat::open_chat_db()?;
+        if !crate::daemon::agent_registry::resolve_session_token(&conn, &claimed, &token)? {
+            anyhow::bail!("session_token does not match an alive agent");
+        }
+        use rusqlite::OptionalExtension as _;
+        // Captured BEFORE the rename: any Telegram chat `/switch`-bound to the
+        // old name was bound to THIS session, since names are unique among live
+        // sessions. Leaving those bindings behind would silently stop delivery
+        // the moment a session renamed itself -- and the SessionStart hook now
+        // asks fresh sessions to do exactly that.
+        let old_name: Option<String> = conn
+            .query_row(
+                "SELECT agent_name FROM agent_registry WHERE agent_id = ?1",
+                rusqlite::params![claimed],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        let n = crate::daemon::agent_registry::rename(&conn, &claimed, &new_name)?;
+        if n == 0 {
+            anyhow::bail!("no registry row for this session");
+        }
+
+        if let Some(old) = old_name.filter(|o| o != &new_name) {
+            match crate::daemon::agent_registry::migrate_bindings(&conn, &old, &new_name) {
+                Ok(moved) if moved > 0 => {
+                    tracing::info!(%old, new = %new_name, moved, "moved chat bindings to the new nick")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "could not move chat bindings to the new nick"),
+            }
+        }
+        // Remember the choice against this working directory, so the next
+        // session started here comes back under the same name and keeps the
+        // Telegram binding that `/switch` made against it. A rename that is
+        // forgotten on exit is the bug this closes, not a feature.
+        use rusqlite::OptionalExtension as _;
+        let row: Option<(Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT host, cwd FROM agent_registry WHERE agent_id = ?1",
+                rusqlite::params![claimed],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((Some(host), Some(cwd))) = row {
+            let now = chrono::Utc::now().timestamp_millis();
+            if let Err(e) =
+                crate::daemon::agent_registry::remember_nick(&conn, &host, &cwd, &new_name, now)
+            {
+                // The rename itself succeeded; failing to memorise it costs the
+                // next restart its name, not this session its identity.
+                tracing::warn!(error = %e, "could not remember nick for this directory");
+            }
+        }
+        Ok(new_name)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(name)) => tool_text_response(id, &serde_json::json!({"renamed": true, "name": name})),
+        Ok(Err(e)) => tool_error_response(id, -32603, &e.to_string()),
+        Err(e) => {
+            tracing::error!(error = %e, "agent_rename spawn_blocking panicked");
+            tool_error_response(id, -32603, "internal error")
+        }
+    }
+}
+
 async fn handle_agent_describe(
     id: serde_json::Value,
     args: &serde_json::Value,
@@ -1459,15 +1620,37 @@ async fn handle_agent_describe(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     let cid_str = connection_id.to_string();
+    // Same sender-resolution ladder as agent_send: connection identity first,
+    // then a daemon-minted (agent_id, session_token) pair so a short-lived
+    // `claudebase agent describe` can publish for its session.
+    let claimed_from = args
+        .get("from_agent_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let claimed_token = args
+        .get("session_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
         let conn = crate::daemon::chat::open_chat_db()?;
-        let agent_id =
-            crate::daemon::agent_registry::lookup_agent_id_by_connection(&conn, &cid_str)?
-                .ok_or_else(|| {
+        let agent_id = match crate::daemon::agent_registry::lookup_agent_id_by_connection(
+            &conn, &cid_str,
+        )? {
+            Some(id) => id,
+            None => {
+                let claimed = claimed_from.ok_or_else(|| {
                     anyhow::anyhow!(
-                        "no alive agent on this connection — call agent_register first"
+                        "no alive agent on this connection — call agent_register first, \
+                         or pass from_agent_id + session_token"
                     )
                 })?;
+                let token = claimed_token.unwrap_or_default();
+                if !crate::daemon::agent_registry::resolve_session_token(&conn, &claimed, &token)? {
+                    anyhow::bail!("session_token does not match an alive agent");
+                }
+                claimed
+            }
+        };
         let updated = crate::daemon::agent_registry::describe(
             &conn,
             &agent_id,
@@ -1543,15 +1726,45 @@ async fn handle_agent_send(
     let cid_str = connection_id.to_string();
     let to_agent_id_for_send = to_agent_id.clone();
     let content_for_send = content.clone();
+    let claimed_from = args
+        .get("from_agent_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let claimed_token = args
+        .get("session_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let outcome_result = tokio::task::spawn_blocking(move || -> anyhow::Result<(String, crate::daemon::agent_registry::SendOutcome)> {
         let conn = crate::daemon::chat::open_chat_db()?;
-        let from_agent_id =
-            crate::daemon::agent_registry::lookup_agent_id_by_connection(&conn, &cid_str)?
-                .ok_or_else(|| {
+        // Sender resolution, in order of trust:
+        //   1. the identity registered on THIS connection (unchanged path —
+        //      long-lived bridges / supervisors);
+        //   2. an (agent_id, session_token) pair minted by the daemon at
+        //      register time (pty-transport Slice 1) — this is how a
+        //      short-lived `claudebase agent chat` process, which owns no
+        //      registered connection, proves who it is.
+        // A bare `from_agent_id` without a valid token is REFUSED: that would
+        // reduce FR-C2C-4.6 to an honour system.
+        let from_agent_id = match crate::daemon::agent_registry::lookup_agent_id_by_connection(
+            &conn, &cid_str,
+        )? {
+            Some(id) => id,
+            None => {
+                let claimed = claimed_from.ok_or_else(|| {
                     anyhow::anyhow!(
-                        "no alive agent on this connection — call agent_register first"
+                        "no alive agent on this connection — call agent_register first, \
+                         or pass from_agent_id + session_token"
                     )
                 })?;
+                let token = claimed_token.unwrap_or_default();
+                if !crate::daemon::agent_registry::resolve_session_token(
+                    &conn, &claimed, &token,
+                )? {
+                    anyhow::bail!("session_token does not match an alive agent");
+                }
+                claimed
+            }
+        };
         let now_ms = chat::now_millis();
         let outcome = crate::daemon::agent_registry::send_message(
             &conn,

@@ -65,33 +65,6 @@ fn spawn_daemon_with_home_and_telegram(
     Ok(child)
 }
 
-/// Spawn plugin with HOME and XDG_RUNTIME_DIR isolation (copied from chat_tools_e2e_test)
-#[allow(dead_code)]
-fn spawn_plugin_with_home(tempdir: &Path) -> Result<Child> {
-    let bin = env!("CARGO_BIN_EXE_claudebase");
-    let mut cmd = Command::new(bin);
-    cmd.args(["plugin", "serve"]);
-    cmd.stdin(Stdio::piped());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::null());
-    cmd.env("HOME", tempdir);
-
-    #[cfg(unix)]
-    {
-        let runtime_dir = tempdir.join("run");
-        cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
-    }
-
-    #[cfg(windows)]
-    {
-        cmd.env("USERPROFILE", tempdir);
-        let localappdata = tempdir.join("AppData\\Local");
-        cmd.env("LOCALAPPDATA", &localappdata);
-    }
-
-    let child = cmd.spawn()?;
-    Ok(child)
-}
 
 /// Helper to create secrets.toml with bot token
 fn create_secrets_toml(tempdir: &Path) -> Result<()> {

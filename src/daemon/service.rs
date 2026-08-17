@@ -23,10 +23,12 @@
 //!    `~/Library/LaunchAgents`; never `/Library/LaunchDaemons`. No
 //!    `UserName` key in the plist.
 //! 7. SEC-2-7  — `.mcp.json` content is built by `serde_json` over a
-//!    `McpDescriptor` struct; `args` is hard-coded `["plugin","serve"]`.
+//!    (v0.10: the `.mcp.json` descriptor is no longer written — installs now
+//!    REMOVE the stale one left by older versions.)
 //! 8. SEC-2-8  — `.mcp.json` idempotency mirrors SEC-2-4.
-//! 9. SEC-2-9  — `ensure_install_parent` refuses loose-permission parent
-//!    directories.
+//! 9. SEC-2-9  — `ensure_install_parent` refuses SYMLINKED parent directories
+//!    and normalises loose-permission ones to exactly the required mode
+//!    (refusing them broke every upgrade; see the fn body for the rationale).
 //! 10. SEC-2-10 — every external invocation uses arg-vector form via
 //!    `std::process::Command::new(<literal>)`; never `sh -c`.
 //! 11. SEC-2-11 — Windows account is forced to NT AUTHORITY\\LocalService
@@ -100,29 +102,6 @@ pub struct StatusOutput {
 /// verbatim — `args` is hard-coded to `["plugin","serve"]` and the only
 /// dynamic field is `command`, which is set to the canonicalised binary
 /// path.
-#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct McpDescriptor {
-    pub command: String,
-    pub args: Vec<String>,
-}
-
-impl McpDescriptor {
-    /// Build a descriptor for the given canonical binary path. The
-    /// `args` vector is hard-coded so a future arg-injection regression
-    /// cannot smuggle a malicious flag through `daemon install`.
-    pub fn new(binary: &Path) -> Self {
-        McpDescriptor {
-            command: binary.to_string_lossy().into_owned(),
-            args: vec!["plugin".to_string(), "serve".to_string()],
-        }
-    }
-
-    /// Render the descriptor to pretty-printed JSON (UTF-8).
-    pub fn to_json(&self) -> Result<String> {
-        serde_json::to_string_pretty(self).context("serialise .mcp.json descriptor")
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Path helpers (HOME / config / install directories)
 // ---------------------------------------------------------------------------
@@ -583,25 +562,34 @@ pub fn check_idempotency(path: &Path, new_content: &[u8]) -> IdempotencyDecision
 }
 
 // ---------------------------------------------------------------------------
-// `.mcp.json` writer (SEC-2-7 + SEC-2-8)
+// `.mcp.json` cleanup (v0.10 — the descriptor it used to write is obsolete)
 // ---------------------------------------------------------------------------
 
-/// Write `~/.claude/plugins/claudebase/.mcp.json` atomically with
-/// content-equality short-circuit. Returns the textual content that
-/// was (or would be) on disk so callers can log it.
-pub fn write_mcp_descriptor(binary: &Path) -> Result<(PathBuf, IdempotencyDecision)> {
-    let desc = McpDescriptor::new(binary);
-    let body = desc.to_json()?;
-    let path = mcp_json_path()?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!(".mcp.json target has no parent"))?;
-    ensure_install_parent(parent, 0o700)?;
-    match check_idempotency(&path, body.as_bytes()) {
-        IdempotencyDecision::AlreadyInstalled => Ok((path, IdempotencyDecision::AlreadyInstalled)),
-        IdempotencyDecision::Fresh | IdempotencyDecision::Differs => {
-            write_refusing_symlink(&path, body.as_bytes(), 0o644)?;
-            Ok((path, IdempotencyDecision::Fresh))
+/// Delete the stale `~/.claude/plugins/claudebase/.mcp.json` left by installs
+/// before v0.10.
+///
+/// That file registered `claudebase plugin serve` as a Claude Code MCP server —
+/// the transport this release removed. `daemon install` used to WRITE it; it
+/// now removes it instead, so upgrading is self-healing rather than leaving a
+/// descriptor pointing at a subcommand that no longer exists.
+///
+/// Best-effort by design: a failure here must never block a daemon install.
+/// Returns the path when something was actually removed.
+pub fn remove_stale_mcp_descriptor() -> Option<PathBuf> {
+    let path = mcp_json_path().ok()?;
+    if !path.exists() {
+        return None;
+    }
+    match fs::remove_file(&path) {
+        Ok(()) => {
+            // Drop the directory too when it becomes empty — it existed only to
+            // hold this descriptor.
+            let _ = path.parent().map(fs::remove_dir);
+            Some(path)
+        }
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "could not remove stale .mcp.json");
+            None
         }
     }
 }
@@ -650,7 +638,8 @@ mod platform {
         }
 
         // .mcp.json descriptor
-        write_mcp_descriptor(binary)?;
+        // v0.10: installs no longer register an MCP descriptor; clean the old one.
+        let _ = remove_stale_mcp_descriptor();
 
         // systemctl daemon-reload + enable
         let _ = Command::new("systemctl")
@@ -824,7 +813,8 @@ mod platform {
             }
         }
 
-        write_mcp_descriptor(binary)?;
+        // v0.10: installs no longer register an MCP descriptor; clean the old one.
+        let _ = remove_stale_mcp_descriptor();
 
         // `launchctl load` is NOT idempotent — re-loading an already
         // bootstrapped agent exits non-zero with "Load failed: 5: Input/
@@ -1022,7 +1012,8 @@ mod platform {
                 .context("create Windows Service")?;
         }
         let _ = args; // no_start handled below
-        write_mcp_descriptor(binary)?;
+        // v0.10: installs no longer register an MCP descriptor; clean the old one.
+        let _ = remove_stale_mcp_descriptor();
         if !args.no_start {
             start()?;
         } else {
@@ -1373,17 +1364,12 @@ mod tests {
     }
 
     #[test]
-    fn mcp_descriptor_args_are_hardcoded() {
-        let d = McpDescriptor::new(Path::new("/tmp/claudebase"));
-        assert_eq!(d.args, vec!["plugin".to_string(), "serve".to_string()]);
-    }
-
-    #[test]
-    fn mcp_descriptor_json_round_trip() {
-        let d = McpDescriptor::new(Path::new("/usr/local/bin/claudebase"));
-        let s = d.to_json().unwrap();
-        let back: McpDescriptor = serde_json::from_str(&s).unwrap();
-        assert_eq!(d, back);
+    fn removing_a_missing_mcp_descriptor_is_a_no_op() {
+        // The file is gone on any post-v0.10 machine; install must not fail
+        // (or report a removal) when there is nothing to clean.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("HOME", tmp.path());
+        assert!(remove_stale_mcp_descriptor().is_none());
     }
 
     #[test]

@@ -1,0 +1,548 @@
+//! `claudebase run` — PTY supervisor. Slice 2 + 3 of the pty-transport feature.
+//!
+//! Replaces the old `exec claude --channels plugin:telegram@…` wrapper. Instead
+//! of handing the process image to `claude` and disappearing, the supervisor
+//! stays alive as its parent:
+//!
+//! ```text
+//!   operator's terminal ⇄ [supervisor] ⇄ PTY ⇄ claude
+//!                              ↑
+//!                    daemon (UDS): inbound Telegram / agent messages
+//! ```
+//!
+//! Inbound messages are written into the PTY master, which is byte-for-byte
+//! indistinguishable from the operator typing them. Nothing here depends on
+//! Claude Code's plugin machinery, MCP protocol version, or channel allowlist —
+//! the interface is a terminal, which is the most stable interface there is.
+//!
+//! ## The three findings this module is built around
+//!
+//! Measured in `spikes/pty_inject/`, evidence in `docs/qa/evidence/pty-inject/`:
+//!
+//! * **F-2** — a submit key written in the same buffer as the paste does
+//!   nothing. Paste and Enter must be two writes separated by a pause.
+//! * **F-3** — a modal dialog swallows the message entirely AND the submit key
+//!   answers it (a stray CR once confirmed "Yes, use my browser"). So injection
+//!   is gated on a modal detector, and a queued message is never dropped.
+//! * **F-6** — injecting over a half-typed line silently concatenates: the
+//!   operator's draft is merged into the inbound message and submitted. Since
+//!   the supervisor proxies every keystroke, it tracks draft state exactly
+//!   instead of guessing with a timer.
+
+mod draft;
+pub mod inject;
+mod screen;
+
+use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use serde_json::json;
+
+use crate::cli::RunArgs;
+
+pub use draft::DraftTracker;
+pub use inject::{InboundMessage, Injector};
+pub use identity::AgentIdentity;
+pub use screen::ModalDetector;
+
+/// Env vars exported into the `claude` child so any Bash call made from inside
+/// that session can attribute itself without arguments (`telegram send`).
+const ENV_AGENT_ID: &str = "CLAUDEBASE_AGENT_ID";
+const ENV_SESSION: &str = "CLAUDEBASE_SESSION";
+/// Per-session token minted here, stored by the daemon at `agent_register`,
+/// and presented by short-lived CLI processes (`claudebase agent chat`) to
+/// prove which agent they belong to without the daemon trusting a bare id.
+const ENV_SESSION_TOKEN: &str = "CLAUDEBASE_SESSION_TOKEN";
+
+/// Entry point for `claudebase run`.
+pub fn run(args: &RunArgs) -> Result<std::process::ExitCode> {
+    let identity = identity::derive(args.nick.as_deref());
+    tracing::info!(agent_id = %identity.agent_id, name = %identity.name, "supervisor identity");
+
+    let (rows, cols) = term::win_size().unwrap_or((24, 80));
+    let pty = native_pty_system();
+    let pair = pty
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .context("openpty")?;
+
+    let mut cmd = CommandBuilder::new("claude");
+    // NOTE: no `--channels`. The whole point of this transport is that Claude
+    // Code runs unmodified and unaware.
+    if !args.no_skip_permissions {
+        cmd.arg("--dangerously-skip-permissions");
+    }
+    for a in &args.args {
+        cmd.arg(a);
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        cmd.cwd(cwd);
+    }
+    cmd.env(ENV_AGENT_ID, &identity.agent_id);
+    cmd.env(ENV_SESSION, &identity.name);
+    cmd.env(ENV_SESSION_TOKEN, &identity.session_token);
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .context("spawn `claude` — is the Claude Code CLI on PATH?")?;
+    drop(pair.slave);
+
+    let mut reader = pair.master.try_clone_reader().context("clone pty reader")?;
+    let writer = Arc::new(Mutex::new(pair.master.take_writer().context("pty writer")?));
+    let master = Arc::new(Mutex::new(pair.master));
+
+    let done = Arc::new(AtomicBool::new(false));
+    let draft = Arc::new(DraftTracker::new());
+    let modal = Arc::new(ModalDetector::new());
+
+    // Raw mode last: any failure above still prints on a sane terminal. The
+    // guard restores termios on every exit path, including panics.
+    let raw = term::RawGuard::enter()?;
+    let interactive = raw.is_some();
+    if !interactive {
+        tracing::warn!("stdin is not a TTY — operator proxying disabled, injection still active");
+    }
+
+    // ---- pty -> our stdout, feeding the modal detector on the way ----
+    let done_out = done.clone();
+    let modal_out = modal.clone();
+    let pump_out = std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        let mut out = std::io::stdout();
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    modal_out.feed(&buf[..n]);
+                    if out.write_all(&buf[..n]).is_err() || out.flush().is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        done_out.store(true, Ordering::SeqCst);
+    });
+
+    // ---- operator's stdin -> pty, feeding the draft tracker on the way ----
+    //
+    // Detached: a blocking read on a real terminal cannot be interrupted
+    // portably, so this thread is left parked on read(2) at exit and reaped
+    // by the OS.
+    if interactive {
+        let writer_in = writer.clone();
+        let done_in = done.clone();
+        let draft_in = draft.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            let mut stdin = std::io::stdin();
+            loop {
+                if done_in.load(Ordering::SeqCst) {
+                    break;
+                }
+                match stdin.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        draft_in.observe_operator_input(&buf[..n]);
+                        let Ok(mut w) = writer_in.lock() else { break };
+                        if w.write_all(&buf[..n]).is_err() || w.flush().is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // ---- window-size follower ----
+    let master_rs = master.clone();
+    let done_rs = done.clone();
+    std::thread::spawn(move || {
+        let mut last = (rows, cols);
+        while !done_rs.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(500));
+            if let Some(cur) = term::win_size() {
+                if cur != last {
+                    if let Ok(m) = master_rs.lock() {
+                        let _ = m.resize(PtySize {
+                            rows: cur.0,
+                            cols: cur.1,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        });
+                    }
+                    last = cur;
+                }
+            }
+        }
+    });
+
+    // ---- injector: the only writer of inbound messages ----
+    let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>();
+    let injector = Injector::new(writer.clone(), draft.clone(), modal.clone(), done.clone());
+    let inject_thread = std::thread::spawn(move || injector.run(inbound_rx));
+
+    // ---- daemon leg: register, subscribe, forward notifications ----
+    //
+    // Runs on its own tokio runtime in a dedicated thread so the blocking
+    // terminal pumps above never share a scheduler with the socket.
+    let subscribe_extra = args.subscribe.clone();
+    let identity_for_daemon = identity.clone();
+    let done_daemon = done.clone();
+    let daemon_thread = std::thread::spawn(move || {
+        crate::daemon::run_tokio(daemon_leg(
+            identity_for_daemon,
+            subscribe_extra,
+            inbound_tx,
+            done_daemon,
+        ));
+    });
+
+    let status = child.wait().context("wait for claude")?;
+    done.store(true, Ordering::SeqCst);
+    let _ = pump_out.join();
+    let _ = inject_thread.join();
+    let _ = daemon_thread.join();
+    drop(raw);
+
+    tracing::info!(?status, "claude exited; supervisor shutting down");
+    Ok(if status.success() {
+        std::process::ExitCode::SUCCESS
+    } else {
+        std::process::ExitCode::FAILURE
+    })
+}
+
+/// Own the daemon connection for the session's lifetime: register this agent,
+/// subscribe to the threads it should hear about, and forward every inbound
+/// channel notification to the injector.
+///
+/// Every failure here is non-fatal by design — a session whose daemon is down
+/// must still be a usable `claude` session, just without inbound messages.
+async fn daemon_leg(
+    identity: identity::AgentIdentity,
+    extra_threads: Vec<String>,
+    tx: mpsc::Sender<InboundMessage>,
+    done: Arc<AtomicBool>,
+) {
+    use crate::daemon::subscribe_client::SubscribeClient;
+
+    while !done.load(Ordering::SeqCst) {
+        let mut client = match SubscribeClient::connect().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "daemon unreachable; retrying in 5s");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+
+        if let Err(e) = client
+            .call(
+                "agent_register",
+                json!({
+                    "agent_id": identity.agent_id,
+                    "name": identity.name,
+                    "session_token": identity.session_token,
+                    "cwd": std::env::current_dir().ok().map(|p| p.display().to_string()),
+                    // Where this session runs, so the daemon can tell a live
+                    // session from a row left by one that died while it was down.
+                    "host": crate::daemon::agent_registry::this_host(),
+                    "pid": std::process::id() as i64,
+                }),
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "agent_register failed (continuing)");
+        }
+
+        client.subscribe_all(&identity, &extra_threads).await;
+
+        // Pump notifications until the connection dies, then reconnect and
+        // re-subscribe — a daemon restart must not silently end delivery
+        // (the failure mode documented in docs/issues/006).
+        if let Err(e) = client
+            .pump(&identity, &extra_threads, &tx, &done)
+            .await
+        {
+            tracing::warn!(error = %e, "daemon connection ended; will reconnect");
+        }
+        if done.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Threads this session listens on: every paired Telegram chat, every Telegram
+/// thread already in chat.db, this agent's own inbox, plus whatever the
+/// operator named with `--subscribe`.
+/// Threads this session listens on.
+///
+/// **Only what is addressed to THIS session.** An earlier version subscribed to
+/// every Telegram thread in `access.json` plus every thread in `chat.db`, on the
+/// theory that more subscriptions can only help. It does the opposite:
+///
+/// * a session in an unrelated project received the operator's chat even though
+///   `/switch` had bound that chat to a different session — observed live
+///   2026-08-16, an `fbscout` session receiving traffic meant for `planner`;
+/// * `chat_subscribe` DRAINS the thread's backlog and marks it delivered, so
+///   whichever session subscribed first swallowed messages meant for another
+///   one — they were not merely copied, they were taken.
+///
+/// So the scope is: this agent's own inbox, the Telegram chats `/switch`-bound
+/// to it, and whatever the operator named explicitly with `--subscribe`
+/// (testing, or a chat the binding does not know about yet).
+///
+/// Consequence worth knowing: until the operator runs `/switch`, no session is
+/// bound and Telegram messages reach nobody. That is the daemon's designed
+/// behaviour — the bot answers "No CLI is bound to this chat/topic" — and it is
+/// better than the alternative of every session hearing every chat.
+pub(crate) fn threads_to_subscribe(identity: &identity::AgentIdentity, extra: &[String]) -> Vec<String> {
+    let mut threads: Vec<String> = Vec::new();
+    threads.push(format!("agent:{}", identity.agent_id));
+
+    if let Ok(conn) = crate::daemon::chat::open_chat_db() {
+        threads.extend(bound_telegram_threads(&conn, &identity.agent_id));
+    }
+
+    threads.extend(extra.iter().cloned());
+    threads.sort();
+    threads.dedup();
+    threads
+}
+
+/// Telegram chats whose routing key points at `agent_id` — i.e. the chats the
+/// operator `/switch`-ed to this session.
+fn bound_telegram_threads(conn: &rusqlite::Connection, agent_id: &str) -> Vec<String> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT routing_chat_id FROM agent_registry \
+         WHERE agent_id = ?1 AND routing_chat_id IS NOT NULL",
+    ) else {
+        return Vec::new();
+    };
+    let rows = stmt.query_map([agent_id], |row| row.get::<_, i64>(0));
+    match rows {
+        Ok(rows) => rows
+            .filter_map(|r| r.ok())
+            .map(|chat_id| format!("telegram:{chat_id}"))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Is `thread` still addressed to this session?
+///
+/// Checked at INJECTION time, not only at subscribe time, because there is no
+/// unsubscribe: after the operator `/switch`-es a chat away, the previous
+/// session keeps its subscription until it reconnects. Without this check it
+/// would go on injecting messages that now belong to someone else.
+pub(crate) fn thread_belongs_to(agent_id: &str, thread: &str) -> bool {
+    let Some(chat) = thread.strip_prefix("telegram:") else {
+        // `agent:<self>` and explicit `--subscribe` threads are ours by
+        // construction; only Telegram chats carry a routing binding.
+        return true;
+    };
+    let Ok(chat_id) = chat.parse::<i64>() else {
+        return true;
+    };
+    let Ok(conn) = crate::daemon::chat::open_chat_db() else {
+        return true;
+    };
+    let bound: Option<String> = conn
+        .query_row(
+            "SELECT agent_id FROM agent_registry \
+             WHERE routing_chat_id = ?1 AND state = 'alive' \
+             ORDER BY last_pinged_at DESC LIMIT 1",
+            [chat_id],
+            |row| row.get(0),
+        )
+        .ok();
+    match bound {
+        // Bound elsewhere -> not ours. Unbound -> nobody claimed it, and the
+        // daemon broadcasts to whoever subscribed; keep it.
+        Some(owner) => owner == agent_id,
+        None => true,
+    }
+}
+
+pub mod identity {
+    /// Session identity. `agent_id` is UNIQUE PER PROCESS — this is the fix for
+    /// root cause 1 in docs/issues/006, where a pinned `session_id` in
+    /// `.claudebase/config.json` made every session of a project
+    /// indistinguishable and broadcasts landed on stale bridges. The `name`
+    /// stays stable so `/switch` bindings and `agent list-alive` remain
+    /// human-readable across restarts.
+    #[derive(Clone, Debug)]
+    pub struct AgentIdentity {
+        pub agent_id: String,
+        pub name: String,
+        /// Capability handed to the child process; see ENV_SESSION_TOKEN.
+        pub session_token: String,
+    }
+
+    /// Make the nick unique among sessions that are actually running.
+    ///
+    /// The base nick comes from the project, so every session opened in one repo
+    /// is called the same thing — and `/switch` then shows N identical buttons
+    /// while silently binding to whichever registered last. A suffix is added
+    /// only when a LIVE session already holds the name; restarting a session
+    /// reuses the plain nick because the old row is superseded at register.
+    fn disambiguate(base: String) -> String {
+        let Ok(conn) = crate::daemon::chat::open_chat_db() else {
+            return base;
+        };
+        let host = crate::daemon::agent_registry::this_host();
+        let Ok(online) = crate::daemon::agent_registry::list_online(&conn, &host) else {
+            return base;
+        };
+        let taken: std::collections::HashSet<String> =
+            online.into_iter().map(|a| a.agent_name).collect();
+        if !taken.contains(&base) {
+            return base;
+        }
+        // `planner-2`, `planner-3`, … — bounded so a pathological registry
+        // cannot spin here.
+        (2..100)
+            .map(|n| format!("{base}-{n}"))
+            .find(|candidate| !taken.contains(candidate))
+            .unwrap_or(base)
+    }
+
+    /// `explicit` comes from `--nick` and is used verbatim: the operator chose
+    /// it so they can find it in `/switch`, and silently suffixing it would make
+    /// the menu entry not match what they typed. A collision with a live session
+    /// surfaces at register time as an error rather than being papered over.
+    /// The nick previously chosen for this directory, if it is still free.
+    ///
+    /// Read-only and best-effort: the daemon may not have run yet, and a
+    /// session that cannot consult the memory must still start — it simply
+    /// starts under the project default.
+    fn recall_chosen_nick(cwd: &std::path::Path) -> Option<String> {
+        let conn = crate::daemon::chat::open_chat_db_readonly().ok()?;
+        let host = crate::daemon::agent_registry::this_host();
+        let nick =
+            crate::daemon::agent_registry::recall_nick(&conn, &host, &cwd.to_string_lossy()).ok()??;
+        // Someone else in this directory is already using it. Two live sessions
+        // cannot share a name, so fall through to the disambiguated default.
+        match crate::daemon::agent_registry::nick_is_taken(&conn, &nick, None) {
+            Ok(true) => None,
+            Ok(false) => Some(nick),
+            Err(_) => None,
+        }
+    }
+
+    pub fn derive(explicit: Option<&str>) -> AgentIdentity {
+        if let Some(nick) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+            return AgentIdentity {
+                agent_id: uuid::Uuid::new_v4().to_string(),
+                name: nick.to_string(),
+                session_token: uuid::Uuid::new_v4().to_string(),
+            };
+        }
+
+        let cwd = std::env::current_dir().ok();
+
+        // A nick deliberately chosen for this directory wins over the project
+        // default. Without this, every restart came back as `<project>` (or
+        // `<project>-2`), and the Telegram binding `/switch` made against the
+        // old name resolved to nobody — the operator had to `/switch` again
+        // after every restart. Recalling the name is what makes
+        // `restore_bindings_for` find anything to restore.
+        let remembered = cwd.as_ref().and_then(|c| recall_chosen_nick(c));
+
+        let name = remembered.unwrap_or_else(|| {
+            let derived = cwd
+                .as_ref()
+                .and_then(|cwd| {
+                    crate::project_config::load(cwd)
+                        .map(|cfg| cfg.name)
+                        .or_else(|| {
+                            cwd.file_name()
+                                .map(|n| n.to_string_lossy().trim().to_string())
+                                .filter(|s| !s.is_empty())
+                        })
+                })
+                .unwrap_or_else(|| "claude".to_string());
+            disambiguate(derived)
+        });
+
+        AgentIdentity {
+            agent_id: uuid::Uuid::new_v4().to_string(),
+            name,
+            session_token: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+}
+
+#[cfg(unix)]
+mod term {
+    use anyhow::Result;
+
+    /// Saved termios of the real terminal, restored on drop.
+    pub struct RawGuard {
+        fd: i32,
+        saved: libc::termios,
+    }
+
+    impl RawGuard {
+        pub fn enter() -> Result<Option<Self>> {
+            let fd = libc::STDIN_FILENO;
+            if unsafe { libc::isatty(fd) } != 1 {
+                return Ok(None);
+            }
+            let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+            if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
+                anyhow::bail!("tcgetattr: {}", std::io::Error::last_os_error());
+            }
+            let mut raw = saved;
+            unsafe { libc::cfmakeraw(&mut raw) };
+            if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+                anyhow::bail!("tcsetattr: {}", std::io::Error::last_os_error());
+            }
+            Ok(Some(Self { fd, saved }))
+        }
+    }
+
+    impl Drop for RawGuard {
+        fn drop(&mut self) {
+            unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved) };
+        }
+    }
+
+    pub fn win_size() -> Option<(u16, u16)> {
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut ws) };
+        if rc != 0 || ws.ws_row == 0 || ws.ws_col == 0 {
+            return None;
+        }
+        Some((ws.ws_row, ws.ws_col))
+    }
+}
+
+#[cfg(not(unix))]
+mod term {
+    use anyhow::Result;
+    /// Windows: raw-mode handling is deferred (plan risk R-3). The supervisor
+    /// still spawns the child through ConPTY and still injects; only the
+    /// operator-side proxying is degraded.
+    pub struct RawGuard;
+    impl RawGuard {
+        pub fn enter() -> Result<Option<Self>> {
+            Ok(None)
+        }
+    }
+    pub fn win_size() -> Option<(u16, u16)> {
+        None
+    }
+}

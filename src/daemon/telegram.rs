@@ -515,7 +515,10 @@ pub(crate) fn handle_switch(
     // 1. Find the target CLI by name (case-insensitive). Multiple alive
     //    rows with the same name → tiebreak by spawned_at DESC per the
     //    Slice 7 @-mention convention (most recently spawned wins).
-    let alive = agent_registry::list_alive(tx, None)?;
+    // Liveness-aware: `list_alive` answers "who registered and was never
+    // cleaned up", which offered `/switch` buttons for sessions that had been
+    // gone for hours.
+    let alive = agent_registry::list_online(tx, &agent_registry::this_host())?;
     let target_name_lower = target_name.to_ascii_lowercase();
     let target = alive
         .into_iter()
@@ -564,6 +567,17 @@ pub(crate) fn handle_switch(
 
     // 3. Atomic rebind inside the caller's tx.
     agent_registry::bind_routing_key_in_tx(tx, &target.agent_id, chat_id, thread_id)?;
+    // Also record the binding by NICK. The routing key above lives on the
+    // agent's row and dies with the process; the nick binding is what a
+    // restarted session re-acquires, so the operator does not `/switch` again
+    // after every restart.
+    agent_registry::bind_chat_to_name(
+        tx,
+        chat_id,
+        thread_id,
+        &target.agent_name,
+        crate::daemon::chat::now_millis(),
+    )?;
     Ok(format!(
         "Switched: this chat/topic is now bound to {} (agent_id={}). Subsequent inbound messages route to that CLI.",
         target.agent_name, target.agent_id
@@ -587,9 +601,12 @@ pub(crate) fn handle_agents(
     chat_id: i64,
     thread_id: Option<i64>,
 ) -> anyhow::Result<String> {
-    let alive = crate::daemon::agent_registry::list_alive(conn, None)?;
+    let alive = crate::daemon::agent_registry::list_online(
+        conn,
+        &crate::daemon::agent_registry::this_host(),
+    )?;
     if alive.is_empty() {
-        return Ok("No CLIs registered in the daemon.".to_string());
+        return Ok("No CLI sessions are online. Start one with `claudebase run`.".to_string());
     }
     let bound_agent_id: Option<String> =
         crate::daemon::agent_registry::list_routings_for(conn, chat_id, thread_id)?
@@ -597,7 +614,7 @@ pub(crate) fn handle_agents(
             .next()
             .map(|r| r.agent_id);
     let mut lines = Vec::with_capacity(alive.len() + 1);
-    lines.push("Registered CLIs (alive):".to_string());
+    lines.push("Online CLI sessions:".to_string());
     for r in alive {
         let marker = match bound_agent_id.as_deref() {
             Some(b) if b == r.agent_id => " (current)",
@@ -2541,7 +2558,10 @@ mod tests {
         let conn = rusqlite::Connection::open_in_memory().expect("conn");
         chat::ensure_chat_db_schema(&conn).expect("schema");
         let reply = handle_agents(&conn, 999, None).expect("agents empty");
-        assert!(reply.contains("No CLIs registered"), "got: {reply}");
+        // Wording follows the v0.10 semantics: the list is "who is ONLINE",
+        // verified against the process table, not "who ever registered".
+        assert!(reply.contains("No CLI sessions are online"), "got: {reply}");
+        assert!(reply.contains("claudebase run"), "tell the operator how to fix it: {reply}");
     }
 
     #[test]

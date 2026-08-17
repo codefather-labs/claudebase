@@ -16,10 +16,24 @@
 
 use claudebase::registry::{registry_path, resolve_project_path, upsert_project, ProjectEntry};
 use std::fs;
+use std::sync::{Mutex, MutexGuard};
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use tempfile::TempDir;
+
+/// Process-wide lock serialising every test that pins $HOME.
+///
+/// `std::env::set_var` mutates state shared by the whole test binary, and cargo
+/// runs tests in parallel threads by default — so without this, two tests
+/// racing on HOME make each other read the other's tempdir. That was a live
+/// flake: the suite passed under `--test-threads=1` and failed with
+/// `No such file or directory` in parallel.
+///
+/// A plain Mutex rather than a `serial_test` dependency: the need is one lock
+/// in one file. The poison is ignored because a panicking test has already
+/// restored nothing — the next guard re-pins HOME anyway.
+static HOME_LOCK: Mutex<()> = Mutex::new(());
 
 /// RAII guard that saves $HOME / $USERPROFILE, points them at a tempdir for
 /// the duration of the test, and restores them on Drop. Mirrors the manual
@@ -27,6 +41,7 @@ use tempfile::TempDir;
 /// panic in the test body cannot leak env state into the next test in the
 /// same binary.
 struct HomeGuard {
+    _lock: MutexGuard<'static, ()>,
     _tmp: TempDir,
     home_path: PathBuf,
     saved_home: Option<std::ffi::OsString>,
@@ -35,6 +50,7 @@ struct HomeGuard {
 
 impl HomeGuard {
     fn new() -> Self {
+        let lock = HOME_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let tmp = TempDir::new().expect("home tempdir");
         let home_path = tmp.path().to_path_buf();
         let saved_home = std::env::var_os("HOME");
@@ -45,6 +61,7 @@ impl HomeGuard {
         fs::create_dir_all(home_path.join(".claude/knowledge"))
             .expect("mkdir knowledge");
         Self {
+            _lock: lock,
             _tmp: tmp,
             home_path,
             saved_home,

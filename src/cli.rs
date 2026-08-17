@@ -399,9 +399,6 @@ pub enum Command {
     /// subcommands (install/uninstall/start/stop/status/logs/config)
     /// land in Slice 2.
     Daemon(DaemonArgs),
-    /// Claude Code MCP plugin entry point. Slice 1b implements the
-    /// STDIO↔daemon bridge; Slice 1a ships a stub that errors out.
-    Plugin(PluginArgs),
     /// Chat introspection (Slice 3 of agent-chat-daemon). Reads
     /// `~/.claude/knowledge/chat.db` directly — daemon NOT required.
     /// Subcommands:
@@ -414,12 +411,108 @@ pub enum Command {
     /// The SDLC SessionStart onboarding hook (if installed) auto-fires on
     /// session boot — nothing extra wired here. Exec replaces this process.
     Run(RunArgs),
+    /// `claudebase telegram ...` — the agent-facing outbound channel
+    /// (pty-transport Slice 1). Replaces the `chat_reply` MCP tool:
+    ///   `telegram send --text "…"`  — reply to the operator
+    ///   `telegram status`           — show the resolved default target
+    Telegram(TelegramArgs),
     /// `claudebase agent ...` — cli-to-cli routing discovery surface
     /// (Slice 6 of cli-to-cli-routing). Reads chat.db directly so this
     /// works whether or not the daemon is running:
     ///   `agent list-alive --project current|all|<slug>` — peer discovery
     ///   `agent inspect <agent_id>` — registry snapshot + queue depth
     Agent(AgentArgs),
+}
+
+/// `claudebase telegram …` — outbound surface for the running agent.
+#[derive(Args, Debug)]
+pub struct TelegramArgs {
+    #[command(subcommand)]
+    pub sub: TelegramSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TelegramSubcommand {
+    /// Send a message to the operator's Telegram chat.
+    Send(TelegramSendArgs),
+    /// Show which chat this session would send to, and why.
+    Status,
+    /// Register a Telegram bot token in the claudebase registry. The token is
+    /// verified against Telegram before being stored, and re-adding the same
+    /// bot rotates its token rather than duplicating the entry.
+    Addbot(TelegramAddbotArgs),
+    /// List registered bots (secrets are never printed).
+    Bots,
+    /// Ask Telegram to identify the registered bot (`getMe`) and print the raw
+    /// API response. Verifies the token without waiting for silence in the
+    /// channel. Named `get_me` to match Telegram's own method name; `get-me`
+    /// is accepted as an alias for muscle memory.
+    #[command(name = "get_me", alias = "get-me")]
+    GetMe(TelegramGetMeArgs),
+    /// Approve a pending pairing request by its code.
+    Pair(TelegramPairArgs),
+    /// Show the channel access gate: policy, allowlist, pending pairings.
+    Access,
+    /// Set the DM policy (`pairing` | `allowlist` | `disabled`).
+    Policy(TelegramPolicyArgs),
+    /// Add a numeric Telegram user id to the allowlist.
+    Allow(TelegramSenderArgs),
+    /// Remove a sender from the allowlist.
+    Revoke(TelegramSenderArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct TelegramGetMeArgs {
+    /// Check this token instead of the registered default bot.
+    #[arg(long)]
+    pub token: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct TelegramPairArgs {
+    /// Pairing code the bot replied with.
+    pub code: String,
+}
+
+#[derive(Args, Debug)]
+pub struct TelegramPolicyArgs {
+    /// `pairing` (strangers get a code), `allowlist` (only listed senders),
+    /// or `disabled` (drop all DMs).
+    pub value: String,
+}
+
+#[derive(Args, Debug)]
+pub struct TelegramSenderArgs {
+    /// Numeric Telegram user id.
+    pub sender_id: String,
+}
+
+#[derive(Args, Debug)]
+pub struct TelegramAddbotArgs {
+    /// Bot token from @BotFather (`<bot_id>:<secret>`).
+    pub token: String,
+
+    /// Optional human label, e.g. which project or persona the bot serves.
+    #[arg(long)]
+    pub label: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct TelegramSendArgs {
+    /// Message body. Mutually exclusive with `--stdin`.
+    #[arg(long)]
+    pub text: Option<String>,
+
+    /// Read the message body from stdin instead of `--text`. Use for
+    /// multi-line content — quoting a long block through a shell is where
+    /// agent-authored commands break.
+    #[arg(long, conflicts_with = "text")]
+    pub stdin: bool,
+
+    /// Target thread (`telegram:<chat_id>`). Omit to let the session's
+    /// binding decide; see `telegram status`.
+    #[arg(long)]
+    pub thread: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -436,6 +529,19 @@ pub struct RunArgs {
     /// context with channel notifications coming in).
     #[arg(long)]
     pub no_skip_permissions: bool,
+
+    /// Name this session, instead of deriving it from the project (every
+    /// session opened in one repo derives the same name). Shown in
+    /// `claudebase agent list` and in the Telegram `/switch` menu.
+    #[arg(long)]
+    pub nick: Option<String>,
+
+    /// Extra thread to subscribe to for this session, repeatable
+    /// (`--subscribe telegram:123 --subscribe agent:foo`). Paired Telegram
+    /// chats and known telegram threads are subscribed automatically; this is
+    /// for testing and for threads the access file does not know about yet.
+    #[arg(long)]
+    pub subscribe: Vec<String>,
 
     /// Additional arguments forwarded verbatim to `claude`. Use `--` to
     /// separate them from claudebase's own flags:
@@ -515,6 +621,69 @@ pub enum AgentSubcommand {
     /// queue depth of undelivered messages. Read-only. Exit 1 if the
     /// agent_id is not present in the registry.
     Inspect(AgentInspectArgs),
+    /// Send a direct message to another Claude session on this daemon:
+    /// `agent send "текст" --agent_nick <nick>`. Replaces the `agent_send`
+    /// MCP tool so cli-to-cli routing survives the plugin bridge's removal.
+    Send(AgentSendArgs),
+    /// List every known session with nick, id and online/offline status.
+    List(AgentListArgs),
+    /// Publish what this session is working on, so peers see it in `agent list`.
+    Describe(AgentDescribeArgs),
+    /// Rename THIS session, so `/switch` and `--agent_nick` address it by a
+    /// name you chose instead of the project name every session shares.
+    Rename(AgentRenameArgs),
+    /// Print this session's own nick, id, and whether the nick was chosen or
+    /// merely derived from the directory name. Read-only; works without the
+    /// daemon.
+    Whoami,
+}
+
+#[derive(Args, Debug)]
+pub struct AgentSendArgs {
+    /// Message body, as a positional argument:
+    /// `claudebase agent send "текст" --agent_nick mira`.
+    pub text: Option<String>,
+
+    /// Read the message body from stdin (multi-line content).
+    #[arg(long, conflicts_with = "text")]
+    pub stdin: bool,
+
+    /// Target session by NICK, as shown by `claudebase agent list`. Ambiguity
+    /// is an error listing the candidates, never a silent pick.
+    #[arg(long = "agent_nick", alias = "agent")]
+    pub agent_nick: Option<String>,
+
+    /// Target session by exact agent id — use when two live sessions share a
+    /// nick.
+    #[arg(long = "agent_id", alias = "agent-id", conflicts_with = "agent_nick")]
+    pub agent_id: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct AgentRenameArgs {
+    /// New nick, e.g. `backend` or `ui-refactor`.
+    pub nick: String,
+}
+
+#[derive(Args, Debug)]
+pub struct AgentDescribeArgs {
+    /// Short human label, e.g. "pty transport slice 6".
+    pub description: String,
+
+    /// Optional branch override; omit to keep the value captured at register.
+    #[arg(long)]
+    pub branch: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct AgentListArgs {
+    /// Show offline sessions too (default: online only).
+    #[arg(long)]
+    pub all: bool,
+
+    /// Machine-readable output.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -683,25 +852,6 @@ pub struct DaemonConfigShowArgs {
     pub json: bool,
 }
 
-/// `claudebase plugin ...` — plugin subcommands. Slice 1a only exposes
-/// `serve`; the stub returns an error so harness wiring is testable
-/// without committing to the full MCP shape.
-#[derive(Args, Debug)]
-pub struct PluginArgs {
-    #[command(subcommand)]
-    pub sub: PluginSubcommand,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum PluginSubcommand {
-    /// Bridge stdin/stdout JSON-RPC frames to the daemon UDS.
-    Serve(PluginServeArgs),
-}
-
-/// `claudebase plugin serve` — no flags in Slice 1a. Slice 1b adds
-/// `--daemon-socket` override etc.
-#[derive(Args, Debug)]
-pub struct PluginServeArgs {}
 
 #[derive(Args, Debug)]
 pub struct InsightArgs {

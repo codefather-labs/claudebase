@@ -21,6 +21,12 @@ fn spawn_daemon_with_runtime_dir(tempdir: &Path) -> Result<Child> {
     let bin = env!("CARGO_BIN_EXE_claudebase");
     let mut cmd = Command::new(bin);
     cmd.args(["daemon", "serve"]);
+    // HOME isolation is as load-bearing as the socket: without it the spawned
+    // daemon opens the OPERATOR's chat.db, finds their registered bot and
+    // starts polling Telegram — stealing the getUpdates slot from the real
+    // daemon for the length of the test run (observed live 2026-08-16 as
+    // "Conflict: terminated by other getUpdates request").
+    cmd.env("HOME", tempdir);
 
     #[cfg(unix)]
     {

@@ -19,11 +19,14 @@
 pub mod agent_registry;
 pub mod asr;
 pub mod channel_state;
+pub mod bots;
 pub mod chat;
+pub mod client;
 pub mod config;
 pub mod ipc;
 pub mod pending_asks;
 pub mod server;
+pub mod subscribe_client;
 pub mod service;
 pub mod telegram;
 

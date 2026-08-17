@@ -161,6 +161,12 @@ Once the bootstrap (§2) is done, every subsequent release is:
 
 - [ ] `Cargo.toml` `version` bumped per §3.
 - [ ] `Cargo.lock` regenerated and committed.
+- [ ] `CLAUDEBASE_VERSION` in `install.sh` and `$Script:ClaudebaseVersion` in
+      `install.ps1` bumped to the SAME version. These pin the release the
+      installer downloads: leave them behind and the new tag ships an installer
+      that fetches the previous binary, which looks like a successful install
+      and is not one.
+- [ ] `CHANGELOG.md` `[Unreleased]` promoted to the released version with a date.
 - [ ] Tag pushed: `git push origin claudebase-vX.Y.Z`.
 - [ ] GitHub Actions `claudebase release` workflow completes green.
 - [ ] All 4 binary artifacts visible on the Releases page.

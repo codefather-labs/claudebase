@@ -4,19 +4,7 @@ All notable changes to claudebase will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.8.1] - 2026-06-07
-
-### Fixed
-
-- **Telegram voice-note transcription now works.** Whisper speech-to-text was shipped but never functional on any platform — the `asr-whisper` backend is an opt-in build feature and none of the release/installer build commands enabled it, so every binary contained a stub that reported the feature as not compiled in. Release builds and `install.sh --local` / `install.ps1 -Local` now build with `--features asr-whisper`, and a daemon with no `[asr]` config block defaults to the whisper backend. Send the bot a voice note → it transcribes (model auto-downloads on first use, or pre-fetch with `claudebase daemon warmup --asr`).
-
-## [0.8.0] - 2026-06-07
-
-### Added
-
-- **Agent-to-agent (CLI-to-CLI) communication.** Multiple Claude Code CLIs now discover each other by a stable cross-clone `project_id` (resolved from the git remote-origin URL, a `.claudebase/config.json` override, or a path hash) and message one another directly through new MCP tools — `agent_send` (deliver a message to another live agent), `agent_describe` (publish/read what a peer is working on), and `agent_set_dnd` (do-not-disturb). `claudebase agent list-alive --project current` lists peers on the same repo. Two Claude Code hooks form the read/write boundary: `agent-routing-reminder` (PreToolUse:EnterPlanMode) surfaces who else is working on what before you plan, and `feature-describe` (PostToolUse:ExitPlanMode) publishes your decided plan via `agent_describe` and mirrors it to the scratchpad.
-
-## [Unreleased]
+## [0.9.0] - 2026-08-18
 
 ### Changed
 
@@ -167,16 +155,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **`cognitive-self-check.md` ships from claudebase.** The three-protocol rule (Facts / Decisions / Inbound) lives in claudebase `prompts/rules/`, joining `knowledge-base.md` / `knowledge-base-tool.md` / `tool-limitations.md` as claudebase's cognitive-infrastructure layer. End-user effect: file still lands at `~/.claude/rules/cognitive-self-check.md` via the claudebase installer.
 - **`/update-claudebase` slash-command skill.** New `prompts/commands/update-claudebase.md` skill that updates the locally-installed claudebase to the latest version by **reading the current repository README** (the authoritative, never-stale install/update procedure) and executing the path that matches the machine — `git pull` + `install.sh --local` for a checkout, or the README's remote one-liner otherwise — then verifying the version delta and reporting what changed. Reads-the-README-first by design so the skill never drifts from how the installer actually works; honors operator opt-out env vars; never `git rebase`, never `--force`, never publishes.
 
-### Changed
-
-### Fixed
-
-### Deprecated
-
 ### Known Limitations
 
 - `/update-claudebase` skill ships in v0.9 but its end-to-end upgrade path will be empirically verified only in v0.10 → v0.11; v0.7+v0.8 are deprecated paths and v0.6 has no skill to upgrade from (operator directive 2026-06-04).
 - KP2/KP3 Telegram forum-topic routing is architecturally complete but live-evidence is pending v0.10 (deferred scope).
+
+## [0.8.1] - 2026-06-07
+
+### Fixed
+
+- **Telegram voice-note transcription now works.** Whisper speech-to-text was shipped but never functional on any platform — the `asr-whisper` backend is an opt-in build feature and none of the release/installer build commands enabled it, so every binary contained a stub that reported the feature as not compiled in. Release builds and `install.sh --local` / `install.ps1 -Local` now build with `--features asr-whisper`, and a daemon with no `[asr]` config block defaults to the whisper backend. Send the bot a voice note → it transcribes (model auto-downloads on first use, or pre-fetch with `claudebase daemon warmup --asr`).
+
+## [0.8.0] - 2026-06-07
+
+### Added
+
+- **Agent-to-agent (CLI-to-CLI) communication.** Multiple Claude Code CLIs now discover each other by a stable cross-clone `project_id` (resolved from the git remote-origin URL, a `.claudebase/config.json` override, or a path hash) and message one another directly through new MCP tools — `agent_send` (deliver a message to another live agent), `agent_describe` (publish/read what a peer is working on), and `agent_set_dnd` (do-not-disturb). `claudebase agent list-alive --project current` lists peers on the same repo. Two Claude Code hooks form the read/write boundary: `agent-routing-reminder` (PreToolUse:EnterPlanMode) surfaces who else is working on what before you plan, and `feature-describe` (PostToolUse:ExitPlanMode) publishes your decided plan via `agent_describe` and mirrors it to the scratchpad.
 
 ## [0.6.0] - 2026-05-24
 

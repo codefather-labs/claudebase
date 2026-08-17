@@ -116,6 +116,25 @@ function Install-Prompts {
             Write-Ok "$sub\$($_.Name)"
         }
     }
+
+    # Skills ship as DIRECTORIES (SKILL.md filename is fixed). See the sh twin
+    # for why access control is deliberately not among them.
+    $skillsRoot = Join-Path $Script:ClaudeDir 'skills'
+    $skillsSrc = Join-Path $Script:ScriptDir 'prompts\skills'
+    if (Test-Path $skillsSrc) {
+        New-Item -ItemType Directory -Force -Path $skillsRoot | Out-Null
+        Get-ChildItem $skillsSrc -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            $src = Join-Path $_.FullName 'SKILL.md'
+            if (-not (Test-Path $src)) {
+                Write-Warn "skills\$($_.Name) has no SKILL.md - skipping"
+                return
+            }
+            $dest = Join-Path $skillsRoot $_.Name
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            Copy-Item -Force $src $dest
+            Write-Ok "skills\$($_.Name)"
+        }
+    }
 }
 
 # ============================================================================
@@ -236,7 +255,11 @@ function Register-Alias {
 # ============================================================================
 function Register-BashAllowlist {
     $settings = Join-Path $Script:ClaudeDir 'settings.json'
-    $entry = '~/.claude/tools/claudebase/claudebase *'
+    # Two forms on purpose: the absolute path (how hooks and older prompts call
+    # it) and the bare name (how an agent calls it after Register-Alias put a
+    # wrapper on PATH - `claudebase telegram send ...`). Without the bare form
+    # every reply to a Telegram message raises a permission prompt.
+    $entries = @('~/.claude/tools/claudebase/claudebase *', 'claudebase *')
 
     # Issue 003: Set-Content -Encoding UTF8 writes UTF-8 WITH BOM on
     # Windows PowerShell 5.1; some JSON parsers (notably Claude Code's
@@ -244,7 +267,7 @@ function Register-BashAllowlist {
     # [System.IO.File]::WriteAllText with an explicit no-BOM UTF8Encoding
     # so we get clean output on both PS 5.1 and PS 7+.
     if (-not (Test-Path $settings)) {
-        $obj = @{ permissions = @{ allow = @($entry) } }
+        $obj = @{ permissions = @{ allow = $entries } }
         $json = $obj | ConvertTo-Json -Depth 10
         [System.IO.File]::WriteAllText($settings, $json, [System.Text.UTF8Encoding]::new($false))
         Write-Ok "settings.json (created with claudebase allowlist)"
@@ -256,8 +279,9 @@ function Register-BashAllowlist {
         if ($null -eq $obj.permissions) { $obj | Add-Member -NotePropertyName permissions -NotePropertyValue @{ allow = @() } -Force }
         if ($null -eq $obj.permissions.allow) { $obj.permissions | Add-Member -NotePropertyName allow -NotePropertyValue @() -Force }
 
-        if ($obj.permissions.allow -notcontains $entry) {
-            $obj.permissions.allow = @($obj.permissions.allow) + $entry
+        $missing = @($entries | Where-Object { $obj.permissions.allow -notcontains $_ })
+        if ($missing.Count -gt 0) {
+            $obj.permissions.allow = @($obj.permissions.allow) + $missing
             $json = $obj | ConvertTo-Json -Depth 10
             [System.IO.File]::WriteAllText($settings, $json, [System.Text.UTF8Encoding]::new($false))
             Write-Ok "settings.json (claudebase allowlist merged)"
@@ -288,7 +312,7 @@ function Install-ClaudebaseHooks {
 
     # Deploy both variants of the self-check reminder + read-insights reminder;
     # Windows wires the .ps1 variants.
-    foreach ($hook in 'claudebase-selfcheck-reminder.sh', 'claudebase-selfcheck-reminder.ps1', 'claudebase-read-insights-reminder.sh', 'claudebase-read-insights-reminder.ps1', 'claudebase-agent-routing-reminder.sh', 'claudebase-agent-routing-reminder.ps1', 'claudebase-feature-describe.sh', 'claudebase-feature-describe.ps1') {
+    foreach ($hook in 'claudebase-selfcheck-reminder.sh', 'claudebase-selfcheck-reminder.ps1', 'claudebase-read-insights-reminder.sh', 'claudebase-read-insights-reminder.ps1', 'claudebase-agent-routing-reminder.sh', 'claudebase-agent-routing-reminder.ps1', 'claudebase-channel-contract.sh', 'claudebase-channel-contract.ps1', 'claudebase-feature-describe.sh', 'claudebase-feature-describe.ps1') {
         $src = Join-Path $Script:ScriptDir "hooks\$hook"
         $dst = Join-Path $hooksDir $hook
         if (-not (Test-Path $src)) { Write-Warn "hooks/$hook missing in source — skipping"; continue }
@@ -300,6 +324,9 @@ function Install-ClaudebaseHooks {
     $selfcheckCmd = "powershell -NoProfile -File `"$(Join-Path $hooksDir 'claudebase-selfcheck-reminder.ps1')`""
     $readinsCmd = "powershell -NoProfile -File `"$(Join-Path $hooksDir 'claudebase-read-insights-reminder.ps1')`""
     $routingCmd = "powershell -NoProfile -File `"$(Join-Path $hooksDir 'claudebase-agent-routing-reminder.ps1')`""
+    # pty-transport v0.10 -- the external-channel contract must be in context
+    # BEFORE the first [telegram_message]: line arrives, so it rides SessionStart.
+    $channelCmd = "powershell -NoProfile -File `"$(Join-Path $hooksDir 'claudebase-channel-contract.ps1')`""
     $describeCmd = "powershell -NoProfile -File `"$(Join-Path $hooksDir 'claudebase-feature-describe.ps1')`""
 
     if (-not (Test-Path $settings)) {
@@ -351,7 +378,20 @@ function Install-ClaudebaseHooks {
             $json.hooks.SessionStart = @($ssExisting) + $ssNewEntry
         }
 
-        # PreToolUse:EnterPlanMode -> agent-routing-reminder (cli-to-cli read side).
+        # SessionStart -> channel-contract (how telegram / peer messages arrive
+        # and how to answer them). Same idempotent command-string match.
+        $ccExisting = @($json.hooks.SessionStart)
+        $ccAlready = $false
+        foreach ($entry in $ccExisting) {
+            if ($entry.hooks) { foreach ($h in $entry.hooks) { if ($h.command -eq $channelCmd) { $ccAlready = $true; break } } }
+            if ($ccAlready) { break }
+        }
+        if (-not $ccAlready) {
+            $ccNewEntry = [pscustomobject]@{ matcher = 'startup|resume|compact'; hooks = @([pscustomobject]@{ type = 'command'; command = $channelCmd }) }
+            $json.hooks.SessionStart = @($ccExisting) + $ccNewEntry
+        }
+
+        # PreToolUse:EnterPlanMode -> agent-routing-reminder (peer read side).
         if (-not ($json.hooks.PSObject.Properties.Name -contains 'PreToolUse')) {
             $json.hooks | Add-Member -NotePropertyName 'PreToolUse' -NotePropertyValue @() -Force
         }
@@ -396,7 +436,7 @@ function Install-ClaudebaseHooks {
         }
 
         $json | ConvertTo-Json -Depth 12 | Set-Content -Path $settings -Encoding UTF8
-        Write-Ok "settings.json (UserPromptSubmit[selfcheck] + SessionStart[read-insights] wired; retired Stop[insight-capture] unwired)"
+        Write-Ok "settings.json (UserPromptSubmit[selfcheck] + SessionStart[read-insights, channel-contract] wired; retired Stop[insight-capture] unwired)"
     } catch {
         Write-Warn "settings.json hook merge failed ($($_.Exception.Message)); add manually:"
         Write-Warn "  hooks.Stop[*].hooks[*].command = $stopCmd"
@@ -585,188 +625,63 @@ function Install-WhisperStack {
 }
 
 # ============================================================================
-# Install the Rust port of the official Anthropic Telegram plugin.
-# Mirrors install.sh's install_telegram_plugin - always downloads server-rs
-# from the matching claudebase release asset; no cargo build fallback.
-# Opt-out: $env:CLAUDEBASE_SKIP_TELEGRAM=1.
-# Requires: `claude` CLI on PATH.
-# Idempotent. Patches `.mcp.json` with direct exec of server-rs.exe.
+# Undo the old plugin-slot hijack (v0.10 reverse migration)
 # ============================================================================
-function Install-TelegramPlugin {
-    if ($env:CLAUDEBASE_SKIP_TELEGRAM -eq '1') {
-        Write-Info "CLAUDEBASE_SKIP_TELEGRAM=1 - skipping telegram plugin install"
-        return
-    }
-    if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
-        Write-Info "claude CLI not on PATH; skipping telegram plugin install"
-        Write-Info "  to install manually after Claude Code is installed:"
-        Write-Info "    claude plugin install telegram@claude-plugins-official"
-        Write-Info "    then re-run this installer to patch the Rust binary"
-        return
-    }
+# Until v0.10 the installer wrote our own binary into the OFFICIAL Anthropic
+# Telegram plugin's cache and rewrote its `.mcp.json` so the plugin's MCP
+# server was `claudebase plugin serve`. That transport is gone: Telegram lives
+# inside the daemon and messages reach Claude Code through the PTY supervisor
+# (`claudebase run`).
+#
+# The patch is actively UNDONE rather than merely stopped: an operator who
+# upgrades would otherwise keep a third-party plugin permanently pointing at
+# our binary. `.mcp.json` is restored from the backup saved at patch time, and
+# `server-rs` is deleted. With no backup the file is left alone and the
+# operator is told to reinstall the plugin -- guessing upstream's command line
+# would be worse than saying so plainly.
+#
+# Also drops the v0.6-era `claudebase@claudebase-dev` registration.
+# Idempotent: every step no-ops when its artefact is already absent.
+function Invoke-UnpatchOfficialTelegramPlugin {
+    if (-not (Get-Command claude -ErrorAction SilentlyContinue)) { return }
 
-    # ----- 1. Install official plugin if not already -----
-    $marketplaceAlready = $false
-    try {
-        $mpList = & claude plugin marketplace list 2>&1
-        if ($mpList -match "claude-plugins-official") { $marketplaceAlready = $true }
-    } catch {}
-    if (-not $marketplaceAlready) {
-        Write-Info "Adding marketplace anthropics/claude-plugins-official..."
-        try { & claude plugin marketplace add anthropics/claude-plugins-official 2>&1 | Out-Null } catch {}
-    }
-    Write-Info "Installing telegram@claude-plugins-official (idempotent)..."
-    try { & claude plugin install telegram@claude-plugins-official 2>&1 | Out-Null } catch {}
+    $prevErrPref = $ErrorActionPreference
+    $ErrorActionPreference = 'SilentlyContinue'
+    try { & claude plugin uninstall claudebase@claudebase-dev 2>&1 | Out-Null } catch {}
+    try { & claude plugin marketplace remove codefather-labs/claudebase 2>&1 | Out-Null } catch {}
+    $ErrorActionPreference = $prevErrPref
 
-    # ----- 2. Locate installed plugin dir (newest version) -----
     $pluginRoot = Join-Path $Script:ClaudeDir 'plugins\cache\claude-plugins-official\telegram'
     if (-not (Test-Path $pluginRoot)) {
-        Write-Warn "official telegram plugin not found at $pluginRoot - skipping Rust patch"
+        Write-Ok "no official telegram plugin cache - nothing to unpatch"
         return
     }
-    $versionDir = Get-ChildItem -Path $pluginRoot -Directory -ErrorAction SilentlyContinue `
-        | Sort-Object -Property Name -Descending `
-        | Select-Object -First 1
-    if (-not $versionDir) {
-        Write-Warn "no version subdir found under $pluginRoot - skipping Rust patch"
-        return
-    }
-    $pluginDir = $versionDir.FullName
-    Write-Info "patching plugin v$($versionDir.Name) at $pluginDir"
 
-    # ----- 3. Resolve binary: download from GH release first; cargo build
-    #         fallback only if download fails (no release with this asset
-    #         yet, offline, etc). Mirrors install.sh download-first pattern. -----
-    $platform = $null
-    switch ("$(if ([System.Environment]::Is64BitOperatingSystem) {'x64'} else {'x86'})") {
-        'x64' { $platform = 'windows-x64' }
-        default {
-            Write-Warn "unsupported Windows arch; skipping telegram-plugin-rs"
-            return
+    $restored = 0; $removed = 0; $orphaned = 0
+    Get-ChildItem $pluginRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        $mcp    = Join-Path $_.FullName '.mcp.json'
+        $backup = Join-Path $_.FullName '.mcp.json.upstream-backup'
+        if (Test-Path $backup) {
+            Move-Item -Force $backup $mcp
+            $restored++
+        } elseif ((Test-Path $mcp) -and (Select-String -Path $mcp -Pattern 'claudebase' -Quiet)) {
+            $orphaned++
+        }
+        foreach ($name in 'server-rs', 'server-rs.exe') {
+            $bin = Join-Path $_.FullName $name
+            if (Test-Path $bin) { Remove-Item -Force $bin; $removed++ }
         }
     }
-    $targetBin = Join-Path $pluginDir 'server-rs.exe'
-    $url = "$($Script:ReleaseBase)/claudebase-v$($Script:ClaudebaseVersion)/telegram-plugin-rs-$platform.exe"
-    $downloaded = $false
-    $tmp = New-TemporaryFile
 
-    Write-Info "downloading telegram-plugin-rs binary from GH release for $platform..."
-    try {
-        Invoke-WebRequest -Uri $url -OutFile $tmp.FullName -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
-        $downloaded = $true
-    } catch {
-        Write-Warn "telegram-plugin-rs download failed: $($_.Exception.Message)"
-    }
-
-    if ($downloaded -and (Test-Path $tmp.FullName) -and ((Get-Item $tmp.FullName).Length -gt 0)) {
-        # Rename-trick for a running plugin: when the operator already has
-        # a Claude Code session running with the channel plugin loaded,
-        # server-rs.exe is held open by `claude.exe` and Move-Item -Force
-        # cannot overwrite it (Windows file lock). NTFS DOES allow rename
-        # of a running PE file though, so we rename the existing binary
-        # out of the way first, then place the fresh one at the target
-        # path. The renamed file is marked for delete on next reboot via
-        # Remove-Item below (best-effort; if that also fails, Windows
-        # cleans it up eventually).
-        if (Test-Path $targetBin) {
-            $stash = "$targetBin.old.$([guid]::NewGuid().ToString('N').Substring(0,8)).locked"
-            try {
-                Move-Item -Force $targetBin $stash
-                # The stash file may still be locked by the running plugin;
-                # we don't wait for it. Mark for cleanup attempt; failure
-                # is non-fatal (Windows reboot purges it).
-                Remove-Item -Force $stash -ErrorAction SilentlyContinue
-            } catch {
-                Write-Warn "could not stash existing server-rs.exe ($($_.Exception.Message)); attempting in-place overwrite anyway"
-            }
-        }
-        Move-Item -Force $tmp.FullName $targetBin
-        Write-Ok "server-rs.exe downloaded ($((Get-Item $targetBin).Length) bytes) -> $targetBin"
+    if ($restored -gt 0 -or $removed -gt 0) {
+        Write-Ok "official telegram plugin unpatched (.mcp.json restored: $restored, server-rs removed: $removed)"
     } else {
-        if (Test-Path $tmp.FullName) { Remove-Item -Force $tmp.FullName }
-        Write-Warn "telegram-plugin-rs download failed for $platform from $url"
-        Write-Warn "  the upstream TSX plugin will run unchanged via bun"
-        Write-Warn "  to force a build from source locally: cargo build --release -p telegram-plugin-rs"
-        Write-Warn "  then copy target\release\telegram-plugin-rs.exe -> $targetBin"
-        return
+        Write-Ok "official telegram plugin carries no claudebase patch (idempotent)"
     }
-
-    # ----- 5. Patch .mcp.json (backup upstream first) -----
-    $mcpJson = Join-Path $pluginDir '.mcp.json'
-    $mcpBackup = Join-Path $pluginDir '.mcp.json.upstream-backup'
-    if ((Test-Path $mcpJson) -and (-not (Test-Path $mcpBackup))) {
-        Copy-Item $mcpJson $mcpBackup
-        Write-Ok ".mcp.json.upstream-backup preserved"
+    if ($orphaned -gt 0) {
+        Write-Warn "$orphaned plugin dir(s) still point at claudebase with no upstream backup"
+        Write-Warn "  restore upstream with: claude plugin install telegram@claude-plugins-official"
     }
-    # multi-agent-telegram-on-v0.6 architecture decision (operator
-    # 2026-06-03): TG communication MUST go through the daemon. The
-    # plugin slot in Claude Code is wired to `claudebase plugin serve`
-    # (the daemon-bridge) instead of `server-rs.exe` (the standalone
-    # TG poller). Daemon owns the bot connection via teloxide; bridge
-    # subscribes to the daemon's chat bus and relays
-    # notifications/claude/channel frames to CC's input stream as the
-    # operator-facing channel events.
-    #
-    # server-rs.exe is left in the plugin dir but unused — kept for
-    # backward-compat in case an operator wants to revert to the
-    # standalone plugin path manually.
-    #
-    # `env.HOME = $env:USERPROFILE` injected because the daemon-bridge
-    # (and the v0.6 plugin if it were still in use) reads the raw HOME
-    # env var to locate ~/.claude paths. Without this, claude.exe child
-    # processes on Windows have no HOME (Windows uses USERPROFILE).
-    $claudebaseBin = Join-Path $Script:ClaudeDir 'tools\claudebase\claudebase.exe'
-    $cfg = @{
-        mcpServers = @{
-            telegram = @{
-                command = $claudebaseBin
-                args = @('plugin', 'serve')
-                env = @{
-                    HOME = $env:USERPROFILE
-                }
-            }
-        }
-    }
-    $json = $cfg | ConvertTo-Json -Depth 6
-    # Issue 003: write UTF-8 WITHOUT BOM. Set-Content -Encoding UTF8
-    # on PS 5.1 writes a BOM that Claude Code's MCP loader rejects,
-    # producing a silent failure mode (plugin appears installed but
-    # never spawns as a child of claude.exe).
-    [System.IO.File]::WriteAllText($mcpJson, $json, [System.Text.UTF8Encoding]::new($false))
-    Write-Ok ".mcp.json patched (wired to claudebase plugin serve daemon-bridge + HOME env)"
-
-    Write-Info "to enable: launch Claude Code with"
-    Write-Info "  claude --channels plugin:telegram@claude-plugins-official"
-}
-
-# ============================================================================
-# Cleanup legacy claudebase-dev plugin + marketplace from prior installs
-# ============================================================================
-# The v0.6 baseline used to register a `claudebase-dev` Claude Code
-# plugin marketplace and install `claudebase@claudebase-dev` as a channel
-# plugin (the "daemon-as-channel-plugin" architecture that v0.7 then
-# removed and that issue 002 documents as broken in CC 2.1.144). The
-# multi-agent-telegram-on-v0.6 rebuild uses the OFFICIAL Anthropic
-# `telegram@claude-plugins-official` plugin slot only.
-#
-# This function removes the legacy plugin + marketplace from operators
-# who installed an earlier claudebase version, so the system does not
-# carry dead registrations. Idempotent: if the plugin / marketplace are
-# already absent, both `claude plugin uninstall` and
-# `claude plugin marketplace remove` no-op (with stderr noise on PS 5.1
-# - hence the temporary ErrorActionPreference relax).
-function Cleanup-LegacyClaudebasePlugin {
-    if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
-        return
-    }
-    $prevErrPref = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    # Uninstall the plugin first; marketplace removal will then succeed
-    # without 'plugin still installed from this source' rejections.
-    & claude plugin uninstall claudebase@claudebase-dev 2>&1 | Out-Null
-    & claude plugin marketplace remove codefather-labs/claudebase 2>&1 | Out-Null
-    $ErrorActionPreference = $prevErrPref
-    Write-Ok "legacy claudebase-dev plugin + marketplace cleaned (idempotent)"
 }
 
 # ============================================================================
@@ -799,8 +714,7 @@ Register-BashAllowlist
 Install-Pdfium
 Install-WhisperStack
 Preload-Encoder
-Cleanup-LegacyClaudebasePlugin
-Install-TelegramPlugin
+Invoke-UnpatchOfficialTelegramPlugin
 
 # Post-install daemon spawn (default-on, current-user, no admin needed)
 #

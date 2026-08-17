@@ -75,6 +75,7 @@ WHAT GETS INSTALLED:
   ~/.claude/commands/consolidate.md         /consolidate skill (drift detection)
   ~/.claude/agents/reflection.md            reflection agent (Drift persona)
   ~/.claude/agents/consolidator.md          consolidator agent (Mnem persona)
+  ~/.claude/hooks/claudebase-channel-contract.sh  SessionStart hook - message contract
   /usr/local/bin/claudebase                 Global alias (symlink)
   ~/.claude/settings.json                   Bash allowlist entry merged
 HELPEOF
@@ -143,6 +144,27 @@ install_prompts() {
     cp "$f" "$CLAUDE_DIR/agents/"
     log_ok "agents/$(basename "$f")"
   done
+
+  # Skills. `~/.claude/skills/<name>/SKILL.md` is a first-class skill source in
+  # Claude Code, independent of plugins — which is why claudebase needs no
+  # marketplace to ship one. Each skill is a DIRECTORY (the SKILL.md filename is
+  # fixed), so copy per-directory rather than per-file.
+  #
+  # Scope note: skills here are operator conveniences that wrap a deterministic
+  # CLI call. Access control deliberately does NOT ship as a skill — see the
+  # v0.10 plan, Slice 10: granting access must not be a decision taken by a model
+  # whose context contains messages from the channel being gated.
+  if [ -d "$SCRIPT_DIR/prompts/skills" ]; then
+    mkdir -p "$CLAUDE_DIR/skills"
+    for d in "$SCRIPT_DIR"/prompts/skills/*/; do
+      [ -d "$d" ] || continue
+      name="$(basename "$d")"
+      [ -f "$d/SKILL.md" ] || { log_warn "skills/$name has no SKILL.md — skipping"; continue; }
+      mkdir -p "$CLAUDE_DIR/skills/$name"
+      cp "$d/SKILL.md" "$CLAUDE_DIR/skills/$name/"
+      log_ok "skills/$name"
+    done
+  fi
 }
 
 # ============================================================================
@@ -306,12 +328,17 @@ register_alias() {
 # ============================================================================
 register_bash_allowlist() {
   local settings="$CLAUDE_DIR/settings.json"
+  # Two forms on purpose: the absolute path (how hooks and older prompts call
+  # it) and the bare name (how an agent calls it after `register_alias` put a
+  # symlink on PATH — `claudebase telegram send ...`). Without the bare form
+  # every reply to a Telegram message would raise a permission prompt.
   local entry='~/.claude/tools/claudebase/claudebase *'
+  local entry_bare='claudebase *'
 
   if [ ! -f "$settings" ]; then
     mkdir -p "$CLAUDE_DIR"
     cat > "$settings" <<EOF
-{"permissions":{"allow":["$entry"]}}
+{"permissions":{"allow":["$entry","$entry_bare"]}}
 EOF
     chmod 0644 "$settings"
     log_ok "settings.json (created with claudebase allowlist)"
@@ -320,8 +347,8 @@ EOF
 
   if command -v jq >/dev/null 2>&1; then
     local tmp; tmp="$(mktemp)"
-    if jq --arg new "$entry" \
-         '(.permissions //= {}) | (.permissions.allow //= []) | .permissions.allow = ((.permissions.allow + [$new]) | unique)' \
+    if jq --arg new "$entry" --arg bare "$entry_bare" \
+         '(.permissions //= {}) | (.permissions.allow //= []) | .permissions.allow = ((.permissions.allow + [$new, $bare]) | unique)' \
          "$settings" > "$tmp" \
        && jq -e '.' "$tmp" >/dev/null 2>&1; then
       mv "$tmp" "$settings"
@@ -366,7 +393,7 @@ install_claudebase_hooks() {
   # UserPromptSubmit reminder).
   rm -f "$hooks_dir/claudebase-insight-capture.sh" "$hooks_dir/claudebase-insight-capture.ps1"
 
-  local hook_files=(claudebase-selfcheck-reminder.sh claudebase-selfcheck-reminder.ps1 claudebase-read-insights-reminder.sh claudebase-read-insights-reminder.ps1 claudebase-agent-routing-reminder.sh claudebase-agent-routing-reminder.ps1 claudebase-feature-describe.sh claudebase-feature-describe.ps1)
+  local hook_files=(claudebase-selfcheck-reminder.sh claudebase-selfcheck-reminder.ps1 claudebase-read-insights-reminder.sh claudebase-read-insights-reminder.ps1 claudebase-agent-routing-reminder.sh claudebase-agent-routing-reminder.ps1 claudebase-feature-describe.sh claudebase-feature-describe.ps1 claudebase-channel-contract.sh claudebase-channel-contract.ps1)
   for hook in "${hook_files[@]}"; do
     local src="$SCRIPT_DIR/hooks/$hook"
     local dst="$hooks_dir/$hook"
@@ -390,6 +417,7 @@ install_claudebase_hooks() {
     log_warn '  hooks.Stop[*].hooks[*].command = ~/.claude/hooks/claudebase-insight-capture.sh'
     log_warn '  hooks.UserPromptSubmit[*].hooks[*].command = ~/.claude/hooks/claudebase-selfcheck-reminder.sh'
     log_warn '  hooks.SessionStart[*].hooks[*].command = ~/.claude/hooks/claudebase-read-insights-reminder.sh'
+    log_warn '  hooks.SessionStart[*].hooks[*].command = ~/.claude/hooks/claudebase-channel-contract.sh'
     log_warn '  (and remove any hooks.Stop entry pointing at claudebase-insight-capture.sh)'
     return 0
   fi
@@ -399,6 +427,10 @@ install_claudebase_hooks() {
   local readins_cmd="$HOME/.claude/hooks/claudebase-read-insights-reminder.sh"
   local routing_cmd="$HOME/.claude/hooks/claudebase-agent-routing-reminder.sh"
   local describe_cmd="$HOME/.claude/hooks/claudebase-feature-describe.sh"
+  # The transport contract. Without it a session receives `[telegram_message]:`
+  # lines it was never told about, and answers into a terminal the sender
+  # cannot see -- the reply only leaves the machine through a CLI call.
+  local channel_cmd="$HOME/.claude/hooks/claudebase-channel-contract.sh"
   local tmp; tmp="$(mktemp)"
 
   # (1) Ensure .hooks.UserPromptSubmit has exactly one matcher block with our
@@ -415,6 +447,7 @@ install_claudebase_hooks() {
       --arg readins_cmd "$readins_cmd" \
       --arg routing_cmd "$routing_cmd" \
       --arg describe_cmd "$describe_cmd" \
+      --arg channel_cmd "$channel_cmd" \
       '
       .hooks //= {}
       | .hooks.Stop //= []
@@ -434,6 +467,11 @@ install_claudebase_hooks() {
           (if any(.[]?; (.hooks // []) | any(.command == $readins_cmd))
            then .
            else . + [{"matcher": "startup|resume|compact", "hooks": [{"type": "command", "command": $readins_cmd}]}]
+           end)
+      | .hooks.SessionStart |=
+          (if any(.[]?; (.hooks // []) | any(.command == $channel_cmd))
+           then .
+           else . + [{"matcher": "startup|resume|compact", "hooks": [{"type": "command", "command": $channel_cmd}]}]
            end)
       | .hooks.PreToolUse //= []
       | .hooks.PreToolUse |=
@@ -459,7 +497,7 @@ install_claudebase_hooks() {
      && jq -e . "$tmp" >/dev/null 2>&1; then
     mv "$tmp" "$settings"
     chmod 0644 "$settings"
-    log_ok "settings.json (UserPromptSubmit[selfcheck] + SessionStart[read-insights] wired; retired Stop[insight-capture] unwired)"
+    log_ok "settings.json (UserPromptSubmit[selfcheck] + SessionStart[read-insights,channel-contract] wired; retired Stop[insight-capture] unwired)"
   else
     rm -f "$tmp"
     log_warn "settings.json hook merge failed; please add manually"
@@ -557,32 +595,69 @@ install_pdfium() {
 }
 
 # ============================================================================
-# Cleanup legacy claudebase-dev plugin + marketplace from prior installs
+# Undo the old plugin-slot hijack (v0.10 reverse migration)
 # ============================================================================
-# The v0.6 baseline used to register a `claudebase-dev` Claude Code
-# plugin marketplace and install `claudebase@claudebase-dev` as a channel
-# plugin (the "daemon-as-channel-plugin" architecture that v0.7 then
-# removed and that docs/issues/002-channel-surface-not-firing-2.1.144.md
-# documents as broken on CC 2.1.144). The multi-agent-telegram-on-v0.6
-# rebuild uses the OFFICIAL Anthropic `telegram@claude-plugins-official`
-# plugin slot only — server-rs replaces its TSX server via
-# install_telegram_plugin below.
+# Until v0.10 the installer wrote our own binary into the OFFICIAL Anthropic
+# Telegram plugin's cache and rewrote its `.mcp.json` so the plugin's MCP
+# server was `claudebase plugin serve`. That transport is gone: Telegram lives
+# inside the daemon and messages reach Claude Code through the PTY supervisor
+# (`claudebase run`).
 #
-# This function removes the legacy plugin + marketplace from operators
-# who installed an earlier claudebase version, so the system does not
-# carry dead registrations. Idempotent: if the plugin / marketplace are
-# already absent, the underlying CLI commands no-op gracefully.
-cleanup_legacy_claudebase_plugin() {
+# The patch must be actively UNDONE, not merely stopped. An operator who
+# upgrades would otherwise keep a third-party plugin permanently pointing at
+# our binary — mess we created, so we clean it:
+#
+#   * `.mcp.json` is restored from the `.mcp.json.upstream-backup` saved at
+#     patch time. With no backup the file is left alone and the operator is
+#     told to reinstall the plugin — guessing upstream's command line would be
+#     worse than saying so plainly.
+#   * `server-rs` (our binary) is deleted from the plugin's cache directory.
+#
+# Also drops the even older `claudebase@claudebase-dev` marketplace + plugin
+# registration from the v0.6 era. Idempotent: every step no-ops when its
+# artefact is already absent.
+unpatch_official_telegram_plugin() {
   if ! command -v claude >/dev/null 2>&1; then
     return 0
   fi
-  # Uninstall the plugin first; marketplace removal then succeeds without
-  # 'plugin still installed from this source' rejections.
+
+  # v0.6-era leftovers: uninstall before removing the marketplace, otherwise
+  # the removal is rejected with 'plugin still installed from this source'.
   claude plugin uninstall claudebase@claudebase-dev >/dev/null 2>&1 || true
   claude plugin marketplace remove codefather-labs/claudebase >/dev/null 2>&1 || true
-  log_ok "legacy claudebase-dev plugin + marketplace cleaned (idempotent)"
-}
 
+  local plugin_root="$CLAUDE_DIR/plugins/cache/claude-plugins-official/telegram"
+  if [ ! -d "$plugin_root" ]; then
+    log_ok "no official telegram plugin cache — nothing to unpatch"
+    return 0
+  fi
+
+  local restored=0 removed=0 orphaned=0
+  local version_dir
+  for version_dir in "$plugin_root"/*/; do
+    [ -d "$version_dir" ] || continue
+    if [ -f "${version_dir}.mcp.json.upstream-backup" ]; then
+      mv -f "${version_dir}.mcp.json.upstream-backup" "${version_dir}.mcp.json"
+      restored=$((restored + 1))
+    elif grep -q "claudebase" "${version_dir}.mcp.json" 2>/dev/null; then
+      orphaned=$((orphaned + 1))
+    fi
+    if [ -f "${version_dir}server-rs" ] || [ -f "${version_dir}server-rs.exe" ]; then
+      rm -f "${version_dir}server-rs" "${version_dir}server-rs.exe"
+      removed=$((removed + 1))
+    fi
+  done
+
+  if [ "$restored" -gt 0 ] || [ "$removed" -gt 0 ]; then
+    log_ok "official telegram plugin unpatched (.mcp.json restored: $restored, server-rs removed: $removed)"
+  else
+    log_ok "official telegram plugin carries no claudebase patch (idempotent)"
+  fi
+  if [ "$orphaned" -gt 0 ]; then
+    log_warn "$orphaned plugin dir(s) still point at claudebase with no upstream backup"
+    log_warn "  restore upstream with: claude plugin install telegram@claude-plugins-official"
+  fi
+}
 # ============================================================================
 # Pre-warm e5 encoder so first `claudebase ingest` doesn't pay ~30s cold start
 # ============================================================================
@@ -686,172 +761,6 @@ install_whisper_stack() {
 }
 
 # ============================================================================
-# Install the Rust port of the official Anthropic Telegram plugin.
-# ============================================================================
-# Strategy (per operator brief — always download from GH release):
-#   1. install the OFFICIAL upstream plugin (telegram@claude-plugins-official)
-#   2. download our pre-built Rust binary from the matching claudebase
-#      release asset (telegram-plugin-rs-<platform>); never cargo-build
-#   3. copy it into the plugin cache as `server-rs` alongside upstream `server.ts`
-#   4. patch `.mcp.json` with a bash toggle that defaults to Rust (server-rs)
-#      and falls back to bun (TSX) if env var TELEGRAM_USE_TSX_SERVER=1 OR
-#      if the Rust binary is missing
-#
-# Skipped (best-effort):
-#   - `claude` CLI not on PATH → log + return 0 (no plugin to patch into)
-#   - CLAUDEBASE_SKIP_TELEGRAM=1 → silent skip (for headless CI)
-#   - download fails → log warn + leave upstream TSX plugin in place; no
-#     cargo-build fallback (operator must wait for a release or build
-#     manually if they want Rust before release artifacts exist)
-#
-# Idempotent: re-running re-downloads, recopies, re-patches.
-# Backup of upstream `.mcp.json` is preserved at `.mcp.json.upstream-backup`.
-# ============================================================================
-install_telegram_plugin() {
-  if [ "${CLAUDEBASE_SKIP_TELEGRAM:-0}" = "1" ]; then
-    log_info "CLAUDEBASE_SKIP_TELEGRAM=1 — skipping telegram plugin install"
-    return 0
-  fi
-
-  if ! command -v claude >/dev/null 2>&1; then
-    log_info "claude CLI not on PATH; skipping telegram plugin install"
-    log_info "  to install manually after Claude Code is installed:"
-    log_info "    claude plugin install telegram@claude-plugins-official"
-    log_info "    then re-run this installer to patch the Rust binary"
-    return 0
-  fi
-
-  # ----- 1. Install official plugin if not already -----
-  local marketplace_already=false
-  if claude plugin marketplace list 2>/dev/null | grep -q "claude-plugins-official"; then
-    marketplace_already=true
-  fi
-  if [ "$marketplace_already" = false ]; then
-    log_info "Adding marketplace anthropics/claude-plugins-official..."
-    claude plugin marketplace add anthropics/claude-plugins-official 2>&1 | tail -2 || true
-  fi
-  log_info "Installing telegram@claude-plugins-official (idempotent)..."
-  claude plugin install telegram@claude-plugins-official 2>&1 | tail -2 || true
-
-  # ----- 2. Locate the installed plugin dir -----
-  # Prefer installed_plugins.json (authoritative — points to the currently
-  # ACTIVE version, not whatever orphan dirs leftover in cache). Fall back
-  # to newest-version glob if jq/python3 absent or manifest unreadable.
-  local plugin_root="$CLAUDE_DIR/plugins/cache/claude-plugins-official/telegram"
-  if [ ! -d "$plugin_root" ]; then
-    log_warn "official telegram plugin not found at $plugin_root after install — skipping Rust patch"
-    return 0
-  fi
-  local plugin_dir=""
-  local installed_manifest="$CLAUDE_DIR/plugins/installed_plugins.json"
-  if [ -f "$installed_manifest" ]; then
-    if command -v jq >/dev/null 2>&1; then
-      plugin_dir=$(jq -r '.plugins["telegram@claude-plugins-official"][0].installPath // empty' "$installed_manifest" 2>/dev/null)
-    elif command -v python3 >/dev/null 2>&1; then
-      plugin_dir=$(python3 -c "import json,sys; d=json.load(open('$installed_manifest')); p=d.get('plugins',{}).get('telegram@claude-plugins-official',[]); print(p[0]['installPath'] if p else '')" 2>/dev/null)
-    fi
-  fi
-  if [ -z "$plugin_dir" ] || [ ! -d "$plugin_dir" ]; then
-    # Fallback: newest version subdir (semver-sortable).
-    local version_dir
-    version_dir=$(ls -1 "$plugin_root" 2>/dev/null | sort -V | tail -1)
-    if [ -z "$version_dir" ] || [ ! -d "$plugin_root/$version_dir" ]; then
-      log_warn "no version subdir found under $plugin_root — skipping Rust patch"
-      return 0
-    fi
-    plugin_dir="$plugin_root/$version_dir"
-    log_info "manifest lookup unavailable; falling back to newest-version glob: $plugin_dir"
-  fi
-  log_info "patching plugin at $plugin_dir"
-
-  # ----- 3. Resolve binary: download from GH release first; fall back to
-  #         cargo build only if download fails (e.g. offline, asset missing
-  #         for this platform, claudebase version with no telegram-plugin-rs
-  #         artifacts yet). Cargo fallback requires `cargo` on PATH AND the
-  #         repo's plugins/telegram-rs/ source tree (present in local-mode
-  #         install or fresh clone). -----
-  local platform=""
-  local exe_ext=""
-  case "$(uname -ms)" in
-    "Darwin arm64")  platform="darwin-arm64"  ;;
-    "Darwin x86_64") platform="darwin-x64"    ;;
-    "Linux x86_64")  platform="linux-x64"     ;;
-    "Linux aarch64") platform="linux-arm64"   ;;
-    MINGW*|MSYS*|CYGWIN*)
-      case "$(uname -m)" in
-        x86_64) platform="windows-x64"; exe_ext=".exe" ;;
-        *)      log_warn "unsupported Windows arch: $(uname -m); skipping telegram-plugin-rs"; return 0 ;;
-      esac
-      ;;
-    *) log_warn "telegram-plugin-rs binary unavailable for $(uname -ms); skipping"; return 0 ;;
-  esac
-
-  local target_bin="$plugin_dir/server-rs${exe_ext}"
-  local url="${RELEASE_BASE}/claudebase-v${CLAUDEBASE_VERSION}/telegram-plugin-rs-${platform}${exe_ext}"
-  local downloaded=false
-  local tmp_download
-  tmp_download="$(mktemp)"
-
-  log_info "downloading telegram-plugin-rs binary from GH release for $platform..."
-  if command -v curl >/dev/null 2>&1; then
-    if curl --proto '=https' --tlsv1.2 -fsSL --max-redirs 5 --max-time 120 "$url" -o "$tmp_download" 2>/dev/null; then
-      downloaded=true
-    fi
-  elif command -v wget >/dev/null 2>&1; then
-    if wget --https-only --secure-protocol=TLSv1_2 --max-redirect=5 --timeout=120 -q -O "$tmp_download" "$url" 2>/dev/null; then
-      downloaded=true
-    fi
-  fi
-
-  if [ "$downloaded" = true ] && [ -s "$tmp_download" ]; then
-    mv "$tmp_download" "$target_bin"
-    chmod 0755 "$target_bin"
-    log_ok "server-rs downloaded ($(wc -c <"$target_bin" | tr -d ' ') bytes) → $target_bin"
-  else
-    rm -f "$tmp_download"
-    log_warn "telegram-plugin-rs download failed for $platform from $url"
-    log_warn "  the upstream TSX plugin will run unchanged via bun"
-    log_warn "  to force a build from source locally: cargo build --release -p telegram-plugin-rs"
-    log_warn "  then copy target/release/telegram-plugin-rs${exe_ext} → $target_bin"
-    return 0
-  fi
-
-  # ----- 5. Patch .mcp.json with toggle (backup upstream version first) -----
-  local mcp_json="$plugin_dir/.mcp.json"
-  local mcp_backup="$plugin_dir/.mcp.json.upstream-backup"
-  if [ -f "$mcp_json" ] && [ ! -f "$mcp_backup" ]; then
-    cp "$mcp_json" "$mcp_backup"
-    log_ok ".mcp.json.upstream-backup preserved"
-  fi
-  # multi-agent-telegram-on-v0.6 architecture decision (operator
-  # 2026-06-03): TG comms via daemon. Plugin slot wired to
-  # `claudebase plugin serve` (the daemon-bridge from
-  # src/plugin/bridge.rs) instead of `server-rs` (standalone TG
-  # poller). Daemon owns the bot connection; bridge subscribes to the
-  # daemon's chat bus and forwards notifications/claude/channel frames
-  # to CC's stdin → input stream. server-rs is left in the plugin dir
-  # but unused (backward-compat fallback — restore the upstream
-  # backup or hand-edit .mcp.json to revert if needed).
-  local claudebase_bin="$CLAUDE_DIR/tools/claudebase/claudebase"
-  cat > "$mcp_json" <<EOF
-{
-  "mcpServers": {
-    "telegram": {
-      "command": "$claudebase_bin",
-      "args": ["plugin", "serve"]
-    }
-  }
-}
-EOF
-  chmod 0644 "$mcp_json"
-  log_ok ".mcp.json patched (wired to claudebase daemon-bridge — daemon owns TG inbound)"
-
-  log_info "to enable: launch Claude Code with"
-  log_info "  claude --channels plugin:telegram@claude-plugins-official"
-  log_info "Rust binary stderr → /tmp/telegram-rs.log"
-}
-
-# ============================================================================
 # Main
 # ============================================================================
 echo ""
@@ -880,8 +789,7 @@ register_bash_allowlist
 install_pdfium
 install_whisper_stack
 preload_encoder
-cleanup_legacy_claudebase_plugin
-install_telegram_plugin
+unpatch_official_telegram_plugin
 
 # ============================================================================
 # Post-install daemon-as-service (default-on, idempotent full lifecycle)

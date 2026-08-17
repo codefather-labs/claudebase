@@ -2,7 +2,7 @@
 #
 # Fires after Claude Code invokes the ExitPlanMode tool. Injects a
 # system-reminder mandating the agent to publish the feature
-# description to the daemon via the agent_describe MCP tool AND
+# description to the daemon via the `claudebase agent describe` CLI AND
 # mirror it to <project>/.claude/scratchpad.md in the SAME turn.
 #
 # Fallback chain (per FR-C2C-7.2) if PostToolUse:ExitPlanMode does
@@ -34,7 +34,7 @@ if (Test-Path $planPath) {
     }
 }
 
-$ctx = "[claudebase feature-describe mandate]`n`nA plan has just been approved via ExitPlanMode. Before continuing, you MUST publish the feature description to the daemon AND mirror it to scratchpad in the SAME turn:`n`n1. Call MCP tool agent_describe with description=<feature label>. Suggested: '" + $featureHeading + "'. The daemon binds your agent_id from connection_id (FR-C2C-4.6); callers cannot impersonate.`n2. Update .claude/scratchpad.md '## Feature:' line to match the same description.`n`nBoth writes happen in this turn so the daemon (visible to peer CLIs via 'claudebase agent list-alive') and your personal scratchpad never drift. Skipping breaks cross-agent discovery."
+$ctx = "[claudebase feature-describe mandate]`n`nA plan has just been approved via ExitPlanMode. Before continuing, you MUST publish the feature description to the daemon AND mirror it to scratchpad in the SAME turn:`n`n1. Run: claudebase agent describe "<feature label>". Suggested: '" + $featureHeading + "'. The daemon binds your identity from the session token exported by 'claudebase run'; callers cannot impersonate.`n2. Update .claude/scratchpad.md '## Feature:' line to match the same description.`n`nBoth writes happen in this turn so the daemon (visible to peer CLIs via 'claudebase agent list') and your personal scratchpad never drift. Skipping breaks cross-agent discovery."
 
 $payload = @{
     hookSpecificOutput = @{

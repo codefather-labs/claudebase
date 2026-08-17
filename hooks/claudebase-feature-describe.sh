@@ -3,7 +3,7 @@
 #
 # Fires after Claude Code invokes the ExitPlanMode tool. Injects a
 # system-reminder mandating the agent to publish the feature
-# description to the daemon via the agent_describe MCP tool AND
+# description to the daemon via `claudebase agent describe` AND
 # mirror it to <project>/.claude/scratchpad.md in the SAME turn.
 #
 # Fallback chain (per FR-C2C-7.2) if PostToolUse:ExitPlanMode does
@@ -12,7 +12,7 @@
 #                (no transcript access at hook time; limited)
 #   Fallback B — Stop hook + content-marker check
 #   Fallback C — operator-driven via /bootstrap-feature orchestrator
-#                (Mira calls agent_describe as a final bootstrap step;
+#                (the agent runs `claudebase agent describe` as a final bootstrap step;
 #                already de-facto in place this session)
 #
 # ASCII-only constraint applies to the .ps1 sibling; this .sh script
@@ -30,7 +30,7 @@ else
     FEATURE_HEADING="(no .claude/plan.md found in cwd)"
 fi
 
-CTX="[claudebase feature-describe mandate]\n\nA plan has just been approved via ExitPlanMode. Before continuing, you MUST publish the feature description to the daemon AND mirror it to scratchpad in the SAME turn:\n\n1. Call MCP tool agent_describe with description=<feature label>. Suggested: \"${FEATURE_HEADING}\". The daemon binds your agent_id from connection_id (FR-C2C-4.6); callers cannot impersonate.\n2. Update .claude/scratchpad.md '## Feature:' line to match the same description.\n\nBoth writes happen in this turn so the daemon (visible to peer CLIs via 'claudebase agent list-alive') and your personal scratchpad never drift. Skipping breaks cross-agent discovery."
+CTX="[claudebase feature-describe mandate]\n\nA plan has just been approved via ExitPlanMode. Before continuing, you MUST publish the feature description to the daemon AND mirror it to scratchpad in the SAME turn:\n\n1. Run: claudebase agent describe \"${FEATURE_HEADING}\" -- publishes the label into your registry row. The daemon binds your identity from the session token exported by 'claudebase run'; callers cannot impersonate.\n2. Update .claude/scratchpad.md '## Feature:' line to match the same description.\n\nBoth writes happen in this turn so the daemon (visible to peers via 'claudebase agent list') and your personal scratchpad never drift. Skipping breaks cross-agent discovery."
 
 # Escape for JSON: replace literal newlines with \\n and double quotes
 # with \\\". We use printf so the backslash sequences land in the

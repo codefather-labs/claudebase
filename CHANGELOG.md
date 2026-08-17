@@ -4,6 +4,20 @@ All notable changes to claudebase will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-08-18
+
+### Fixed
+
+- **`claudebase daemon callback status` no longer fails with `database is locked`.** It only reads,
+  but opened `chat.db` read-write, and that path runs a schema-ensuring WRITE transaction on every
+  open — so a reader competed for the lock with the daemon, exactly when an operator would run the
+  command. `status` and `token` now use the read-only handle; a missing database reads as the normal
+  post-install state instead of a database error.
+- **Agent sockets now sit beside `daemon.sock`.** The module computed its own runtime directory and
+  fell back to `~/.claude/run` where the daemon falls back to `/tmp/claudebase-<uid>`, so with
+  `XDG_RUNTIME_DIR` unset — the normal case in a container — the sockets landed somewhere the
+  documentation did not describe. Both now derive from one function.
+
 ## [0.9.0] - 2026-08-18
 
 ### Changed

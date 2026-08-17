@@ -186,14 +186,29 @@ jobs:
 
           # Wait for the SOCKET, not for `daemon status`: that command answers
           # exit 0 with `state: not-installed` before the daemon is up, so
-          # polling it raced the schema creation and the next command hit a
-          # locked database.
-          sock="${XDG_RUNTIME_DIR:-$HOME/.claude/run}/claudebase/daemon.sock"
+          # polling it raced schema creation and the next command hit a locked
+          # database.
+          #
+          # The path is NOT guessed. The daemon uses $XDG_RUNTIME_DIR/claudebase
+          # and falls back to /tmp/claudebase-<uid> when it is unset — which is
+          # the container case, and guessing `~/.claude/run` here is what failed
+          # the previous run while the daemon was in fact up and listening.
+          find_sock() {
+            for c in "${XDG_RUNTIME_DIR:-}/claudebase/daemon.sock" \
+                     "/tmp/claudebase-$(id -u)/daemon.sock"; do
+              [ -S "$c" ] && { echo "$c"; return 0; }
+            done
+            return 1
+          }
           for _ in $(seq 1 60); do
-            [ -S "$sock" ] && break
+            sock=$(find_sock) && break
             sleep 1
           done
-          test -S "$sock" || { echo "daemon never created $sock"; exit 1; }
+          sock=$(find_sock) || { echo "daemon never created a socket"; exit 1; }
+          echo "daemon socket: $sock"
+
+          # And the agent sockets must sit beside it, not somewhere else.
+          test -d "$(dirname "$sock")" 
           "$HOME/.claude/tools/claudebase/claudebase" daemon status
           "$HOME/.claude/tools/claudebase/claudebase" daemon callback status
 

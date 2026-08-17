@@ -2,7 +2,7 @@
 //! session's input.
 //!
 //! ```text
-//! echo 'build finished' | nc -U "$XDG_RUNTIME_DIR/claudebase/agents/mira.sock"
+//! printf 'build finished' | socat - UNIX-CONNECT:"$XDG_RUNTIME_DIR/claudebase/agents/mira.sock"
 //! ```
 //!
 //! Deliberately the plain version of the HTTP callback endpoint: no token, no
@@ -14,12 +14,14 @@
 //! anyone who can route to it; a socket under the user's runtime directory is
 //! not.
 //!
-//! `echo … > socket` does NOT work, and this is worth knowing before debugging
-//! it: shell redirection performs `open(2)` on the path, which the kernel
-//! refuses for a socket with `ENXIO`. Writers need `nc -U`, `socat`, or any
-//! socket library. (A FIFO would accept plain redirection, but it has no
-//! message boundaries, no way to answer the writer, and a writer blocks
-//! whenever nothing is reading.)
+//! Two things that look like they should work and do not, both measured:
+//!
+//! * `echo … > socket` — shell redirection performs `open(2)` on the path, which
+//!   the kernel refuses for a socket with `ENXIO`. (A FIFO would accept it, but
+//!   it has no message boundaries, no way to answer the writer, and a writer
+//!   blocks whenever nothing is reading.)
+//! * `nc -U …` on Ubuntu — the shipped AppArmor profile `nc.openbsd` denies the
+//!   connection. Use `socat` or a socket library.
 //!
 //! Lifecycle is a reconciliation loop rather than hooks on register/disconnect:
 //! it is shorter, and it self-heals after a daemon crash, a rename, or a
@@ -45,22 +47,23 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 /// pasting it into a terminal would be a bigger one.
 const MAX_BODY: usize = 64 * 1024;
 
-/// `$XDG_RUNTIME_DIR/claudebase/agents`, falling back to `~/.claude/run/agents`
-/// where there is no runtime directory.
+/// `<daemon runtime dir>/agents`.
 ///
-/// The runtime directory is the right home: it is per-user, mode 0700 already,
-/// on tmpfs, and cleared at logout — so a stale socket cannot outlive the
-/// session that owned it by more than a reboot.
+/// Derived from `server::parent_dir()` rather than recomputed here, so the agent
+/// sockets always sit beside `daemon.sock`. An earlier version invented its own
+/// fallback (`~/.claude/run`) and diverged from the daemon whenever
+/// `XDG_RUNTIME_DIR` was unset — which is the normal case in a container, and
+/// which made the documented path wrong exactly where someone would be
+/// debugging. Two conventions for "where runtime sockets live" in one daemon is
+/// a bug waiting to be written down as fact.
+///
+/// The runtime directory is the right home: per-user, 0700 already, on tmpfs,
+/// and cleared at logout — so a stale socket cannot outlive its session by more
+/// than a reboot.
 pub fn socket_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/tmp"));
-            home.join(".claude").join("run")
-        });
-    base.join("claudebase").join("agents")
+    super::server::parent_dir()
+        .unwrap_or_else(|_| PathBuf::from("/tmp/claudebase"))
+        .join("agents")
 }
 
 /// The socket a given nick answers on.
@@ -178,8 +181,8 @@ fn spawn_listener(nick: String, bus: SharedBus) -> Result<JoinHandle<()>> {
 /// One connection carries exactly one message.
 ///
 /// The message ends when the writer closes (or half-closes) the connection —
-/// which is what `echo x | nc -U …` does on its own, and what any library does
-/// on drop. No length prefix, no delimiter, nothing for a caller to get wrong.
+/// what `socat` does on stdin EOF, and what any library does on drop. No length
+/// prefix, no delimiter, nothing for a caller to get wrong.
 async fn handle_one(
     mut stream: tokio::net::UnixStream,
     nick: &str,
@@ -254,11 +257,15 @@ mod tests {
         assert!(socket_path("mira").is_some());
     }
 
+    /// The agent sockets must sit beside `daemon.sock`, not in a directory this
+    /// module invented — a second convention would make the documented path
+    /// wrong wherever `XDG_RUNTIME_DIR` is unset.
     #[test]
-    fn the_socket_is_named_after_the_nick() {
+    fn the_socket_sits_beside_the_daemon_socket() {
         let p = socket_path("mira").expect("path");
         assert_eq!(p.file_name().unwrap(), "mira.sock");
-        assert!(p.ends_with("claudebase/agents/mira.sock"));
+        let daemon_dir = crate::daemon::server::parent_dir().expect("runtime dir");
+        assert_eq!(p.parent().unwrap(), daemon_dir.join("agents"));
     }
 
     #[test]

@@ -1,8 +1,8 @@
 ---
-name: 🔌 Plugin / Claude Code integration question
-about: "Question about claudebase as a Claude Code plugin, MCP wire format, or the Telegram channel bridge"
+name: 🔌 Claude Code integration question
+about: "Question about how claudebase integrates with Claude Code: the PTY supervisor, the Telegram channel, or peer messaging"
 title: '[plugin] '
-labels: ['plugin', 'question']
+labels: ['integration', 'question']
 assignees: []
 ---
 
@@ -28,13 +28,17 @@ assignees: []
 |---|---|
 | claudebase version | `<claudebase --version>` |
 | Claude Code version | `<claude --version>` |
-| Plugin installed | output of `claude plugin list` |
-| Telegram plugin in use | `plugin:telegram@claude-plugins-official` mode? Rust binary or TSX? |
+| Daemon | output of `claudebase daemon status` |
+| Bot registered | output of `claudebase telegram bots` (secrets are never printed) |
+| Session launched with | `claudebase run` or bare `claude`? Inbound messages only arrive under the former. |
 | OS | mac / linux / windows |
 
 ## Relevant logs
 
-<!-- /tmp/telegram-rs.log if telegram-related; ~/.claude/logs/ for general claudebase -->
+<!-- `claudebase daemon logs` for the daemon side (Telegram polling, delivery);
+     `~/.claude/logs/claudebase-run-<pid>.log` for the supervisor side (subscriptions,
+     `injected inbound block`, gate stalls) — it is written there by default so the
+     terminal stays clean. -->
 
 ```text
 <paste tail of log here>

@@ -58,6 +58,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   held while the operator has a half-typed line (it silently concatenated otherwise) and while a
   Claude Code modal is up (the message vanished and the submit key answered the dialog). Nothing is
   dropped — messages queue and land when the input is clear.
+- **A UNIX socket per session.** Every live agent gets
+  `$XDG_RUNTIME_DIR/claudebase/agents/<nick>.sock` (0600, in a 0700 directory), created and removed
+  automatically as sessions come and go, and following a rename. Connect, write, close — the close
+  is the message boundary — and the text lands in that session's input as `[callback]:` through the
+  same gate and queue as everything else. No token and no enabling: the socket is not reachable from
+  the network, and its directory permissions already require being the owning user, so a secret
+  would only attest what the kernel enforces. Note that `echo > socket` cannot work (the kernel
+  refuses `open(2)` on a socket) and that Ubuntu's AppArmor profile denies `nc -U`; use `socat` or
+  any socket library.
+- **HTTP callback endpoint — external systems can write into a session's input.**
+  `POST http://<bind>/callback/<nick>?label=<label>` with an `X-Api-Token` header, and the body
+  arrives in that session's terminal as `[callback:<label>]: <text>` (the label is optional). It is
+  a thin front over the path peer messages already take, so the injection gate and the
+  queue-rather-than-drop guarantee apply unchanged. Off by default — a token exists for every
+  session from its first registration, but opening a port is a separate act:
+  `claudebase daemon callback enable --bind 127.0.0.1:8585`, then restart the daemon.
+
+  A token belongs to a **nick**, not to an `agent_id`: the id is new on every restart, so a script
+  embedding one would break the next time the session reopened. The nick survives restarts, and a
+  rename carries the token with it. One token per session, so a leaked debugging script exposes one
+  session rather than all of them. Binding anywhere but loopback needs
+  `--i-know-this-is-remote` and warns that the token travels in cleartext — prefer an SSH tunnel.
+
+  The HTTP status is always `200`; the body says what happened (`{"ok":true,...}` /
+  `{"ok":false,"error":...}`), so a mistyped nick is distinguishable from a delivery.
+  Two skills ship with it: `/claudebase-daemon-setup-auth-token` (get the token, enable the
+  endpoint) and `/claudebase-daemon-callback-info` (the contract, a self-test curl, and what to
+  check when a callback does not arrive).
 - **Nicks are remembered.** `claudebase agent rename "<nick>"` now records the choice against the
   working directory, so the next session started there comes back under the same name. This is what
   keeps a Telegram `/switch` binding alive across a restart: bindings are keyed by nick precisely so
@@ -114,6 +142,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   a read-only handle that opens no write transaction, the database waits for contended locks instead
   of failing, and an unresolved sender degrades to its **full** id, which `--agent_nick` accepts,
   rather than an 8-character stub that nothing could resolve.
+- **A closed terminal no longer leaves `claude` running.** The supervisor blocked on `child.wait()`
+  with no signal handlers, and the stdin pump swallowed EOF — so nothing connected the operator's
+  terminal going away to the `claude` on the inner pty, which cannot observe it. The session stayed
+  alive in the background holding its transcript, and Claude Code does not offer a still-running
+  conversation to `/resume`: the operator lost access to their own history until the process was
+  found and killed by hand. `SIGHUP`/`SIGTERM`/`SIGINT` and stdin EOF now escalate to the child —
+  `SIGHUP`, then `SIGTERM`, then `SIGKILL` — aimed at the pid captured at spawn and nothing else.
 - `install.sh` never installed the `claudebase-channel-contract` hook it advertised in its own help
   text, so a fresh install on Linux/macOS left sessions receiving `[telegram_message]:` lines they
   had not been told about. The PowerShell installer already wired it.

@@ -36,6 +36,11 @@ In scope:
 - The Telegram bridge and the session-to-session transport inside the daemon (`src/daemon/`),
   including the pairing / access gate and the PTY supervisor that writes inbound messages into a
   session's input (`src/supervisor/`)
+- The HTTP callback endpoint (`src/daemon/callback.rs`) — token issuance and comparison, the
+  per-nick scoping that stops one token opening another session, and the sanitising of request
+  bodies and labels before they are pasted into a terminal. Note it is **off by default** and binds
+  loopback unless the operator explicitly opts out; reports should say which configuration they
+  assume
 
 Out of scope (file separately upstream):
 - Vulnerabilities in dependencies — file with the dep author, then ping us so we bump

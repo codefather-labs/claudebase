@@ -70,6 +70,15 @@ bash install.sh --local --yes      # or .\install.ps1 -Yes -Local on Windows
 
 > The installer downloads the pre-built `claudebase` binary from the latest GitHub release, drops the agent toolkit (rules / commands / agents / hooks) into `~/.claude/`, installs PDFium + the e5 encoder cache, best-effort installs `ffmpeg` + `whisper-cli` for voice transcription, and registers the daemon as a user service. It does NOT touch Claude Code's plugins. No Rust toolchain required on the install machine.
 
+**Building from source instead** (`install.sh --local`) needs a Rust toolchain, a C compiler,
+`pkg-config`, plus `cmake` and `clang` — the last two for the bundled whisper speech-to-text. The
+installer checks for these, names what is missing, prints the exact command for the detected package
+manager, and installs only with your consent.
+
+No OpenSSL: the TLS stack is rustls, so the binary links only glibc and libstdc++ and runs on any
+distribution regardless of its OpenSSL version. A CI job installs onto clean Ubuntu 24.04 and 26.04
+containers on every change to the installer and fails if that stops being true.
+
 **Supported binary platforms** (release matrix):
 - **macOS**: arm64 only (M1/M2/M3/M4+). **Intel Mac (`x86_64-apple-darwin`) deprecated as of v0.7.1** — `ort 2.0.0-rc.12` stopped shipping prebuilt binaries for that target. If you're on Intel Mac, either run the Linux binary under Rosetta-via-VM, or build from source: `cargo install --path .` (requires Rust toolchain).
 - **Linux**: x64 + arm64.
@@ -137,6 +146,8 @@ graph LR
 | Books-corpus storage | Single `index.db` SQLite file per project — no co-located figure files; image bytes as BLOB |
 | Insights-corpus storage | Separate `insights.db` per project — same engine + an `insights` metadata table (type / agent / salience / feature / session / source-artifact); cascade-deletes through chunks and chunks_vec |
 | Telegram bridge | `src/daemon/telegram.rs` — long-poll, ASR and outbound queue inside the daemon; no external plugin |
+| Session transport | `src/supervisor/` — `claudebase run` owns the pty in which `claude` runs; inbound text is pasted through bracketed paste behind a gate (no modal, no half-typed operator line), and closing the terminal is propagated to the child so a session never outlives its window |
+| HTTP callbacks | `src/daemon/callback.rs` — per-nick token, `X-Api-Token`, off until enabled; hands the body to the same delivery path peer messages use |
 | Inter-process IPC | UDS (named pipe on Windows), length-prefixed JSON frames; TCP + pre-shared-key auth designed in Slice 9 of [`the v0.10 plan`](docs/plans/claudebase-v0.10-pty-transport.md) |
 
 Deep-dive (L2/cosine equivalence math, RRF derivation, e5 prefix asymmetry contract): [`docs/architecture/technical-decisions.md`](docs/architecture/technical-decisions.md). Benchmarks (+75% Recall@5 vs lexical baseline on the 12-query golden set): [`docs/benchmarks/2026-05-10-baseline.md`](docs/benchmarks/2026-05-10-baseline.md).
@@ -439,6 +450,106 @@ Two hooks wire this into every claudebase-aware session:
 
 Trust model is single-box, single-user: peer messages are untrusted-but-friendly, read as data rather
 than orders.
+
+---
+
+## 🪝 HTTP callbacks — something outside pings a session
+
+A CI job, a webhook or a script can write directly into a session's terminal input:
+
+```bash
+curl -sS -X POST 'http://127.0.0.1:8585/callback/<nick>?label=ci' \
+     -H "X-Api-Token: $(cat ~/.claude/callback-tokens/<nick>)" \
+     --data-binary 'build failed on lint'
+```
+
+arrives as `[callback:ci]: build failed on lint`. The label is optional; without it the prefix is
+plain `[callback]`.
+
+This is a thin front over the path peer messages already take, so the injection gate and the
+queue-rather-than-drop guarantee apply unchanged: a callback sent while the agent is generating
+lands when it finishes, and one sent while the operator is mid-keystroke waits for a clear line.
+
+### A UNIX socket per session — the local, zero-setup path
+
+Every live session also gets a socket, created automatically and needing no
+token, no port and no enabling:
+
+```
+$XDG_RUNTIME_DIR/claudebase/agents/<nick>.sock      # 0600, in a 0700 directory
+```
+
+Connect, write the message, close. The connection closing IS the end of the
+message — no length prefix, no delimiter:
+
+```python
+import socket
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect("/run/user/1000/claudebase/agents/mira.sock")
+s.sendall(b"build finished")
+s.shutdown(socket.SHUT_WR)
+print(s.recv(4096))     # {"ok":true,"delivery":"delivered",...}
+```
+
+or `socat - UNIX-CONNECT:/run/user/1000/claudebase/agents/mira.sock`. A
+`{"text": "...", "label": "..."}` body works here too, exactly as over HTTP.
+
+**There is no token, and that is deliberate.** The socket lives in the user's own
+runtime directory at mode 0700/0600, so being able to open it already means
+being that user — the kernel is enforcing what a token would only attest. The
+HTTP endpoint needs a token because a TCP port is reachable by anyone who can
+route to it; a socket here is not.
+
+Two things that do NOT work, both verified rather than assumed:
+
+- `echo text > …/mira.sock` — shell redirection calls `open(2)` on the path and
+  the kernel refuses it for a socket with `ENXIO`. Use a socket library.
+- `nc -U …` on Ubuntu — the shipped AppArmor profile `nc.openbsd` denies netcat
+  the connection (`apparmor="DENIED" operation="connect"`). Nothing claudebase
+  can fix; use `socat` or a library.
+
+### Setup
+
+```bash
+claudebase daemon callback enable --bind 127.0.0.1:8585   # off by default
+claudebase daemon restart
+claudebase daemon callback token <nick> --reveal          # token + a ready-to-run curl
+```
+
+Or ask the session itself: `/claudebase-daemon-setup-auth-token` hands over the token and the curl,
+and `/claudebase-daemon-callback-info` explains the contract and can send a self-test.
+
+### What the token is
+
+**A token belongs to a nick, not to an `agent_id`.** The id is new on every restart, so a script
+embedding one would break the next time the session reopened; the nick survives, and a rename
+carries the token with it. Each session has its own, minted automatically at first registration —
+a leaked debugging script exposes one session rather than all of them.
+
+Tokens exist from the start, but **the port does not**: opening it is a separate, deliberate act.
+Binding anywhere but loopback needs `--i-know-this-is-remote`, because the token travels in
+cleartext over plain HTTP — to reach a session from another machine, keep the daemon on `127.0.0.1`
+and tunnel:
+
+```bash
+ssh -N -L 8585:127.0.0.1:8585 <user>@<daemon-host>
+```
+
+### Responses
+
+The HTTP status is always `200`; the body says what happened.
+
+```json
+{"ok": true,  "delivery": "delivered", "message_id": "…", "target": "mira"}
+{"ok": false, "error": "no alive agent matches `mria`", "candidates": []}
+```
+
+That distinction matters in the workflow this exists for: a mistyped nick answering exactly like a
+success is time spent chasing a delivery that never started.
+
+**Callback bodies are untrusted data.** They reach a session running with
+`--dangerously-skip-permissions`, so the prefix marks them as a message to interpret, never as
+instructions to obey — and control characters are stripped, since the body is pasted into a pty.
 
 ---
 

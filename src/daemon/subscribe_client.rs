@@ -384,6 +384,18 @@ fn classify(meta: &Value, sender_hint: Option<String>) -> (String, Source) {
         }
     };
 
+    // An explicit source beats every inference below. The callback builder
+    // states it outright precisely because inferring the source from the shape
+    // of some other field is what produced F-14.
+    if field("source").as_deref() == Some("callback") {
+        let label = field("label").filter(|l| !l.is_empty());
+        let thread = thread_field
+            .clone()
+            .or_else(|| chat_field.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        return (thread, Source::Callback { label });
+    }
+
     if let Some(thread) = thread_field {
         if thread.starts_with("telegram:") {
             return (thread, Source::Telegram);
@@ -731,6 +743,32 @@ mod classify_tests {
 
         assert_eq!(thread, "agent:target-agent-id");
         assert!(matches!(source, Source::Agent { .. }), "peer traffic keeps its sender");
+    }
+
+    /// Built with the real builder, like the other two: a callback carries the
+    /// same `agent:<id>` thread as peer traffic, so ONLY the explicit
+    /// `meta.source` separates them. Infer it from the thread and every callback
+    /// would arrive labelled as another agent — F-14 in a new costume.
+    #[test]
+    fn a_real_callback_notification_is_a_callback() {
+        let frame = crate::daemon::chat::build_channel_notification_callback(
+            "build failed",
+            Some("ci"),
+            "target-agent-id",
+            "msg-9",
+        );
+        let (thread, source) = classify(&meta_of(&frame), None);
+        assert_eq!(thread, "agent:target-agent-id");
+        assert_eq!(source, Source::Callback { label: Some("ci".to_string()) });
+    }
+
+    #[test]
+    fn a_callback_without_a_label_stays_unlabelled() {
+        let frame = crate::daemon::chat::build_channel_notification_callback(
+            "ping", None, "target-agent-id", "msg-10",
+        );
+        let (_, source) = classify(&meta_of(&frame), None);
+        assert_eq!(source, Source::Callback { label: None });
     }
 
     #[test]

@@ -415,6 +415,30 @@ pub async fn serve(_args: &DaemonServeArgs) -> anyhow::Result<()> {
     // handler. Lives for the daemon's entire lifetime.
     let bus: SharedBus = Arc::new(ChatBus::new());
 
+    // v0.11 — one UNIX socket per live agent. Unlike the HTTP endpoint this is
+    // always on: it is not reachable from the network, and the directory it
+    // lives in is the user's own runtime dir at 0700, so opening it already
+    // requires being this user. Nothing to enable, nothing to authenticate.
+    #[cfg(unix)]
+    {
+        let bus_sock = bus.clone();
+        tokio::spawn(crate::daemon::agent_socket::reconcile_loop(bus_sock));
+    }
+
+    // v0.11 — the HTTP callback endpoint, but ONLY if the operator enabled it.
+    // Tokens exist from first registration; an open port is a separate act, so
+    // the default installation listens on nothing.
+    match crate::daemon::chat::open_chat_db()
+        .and_then(|c| crate::daemon::callback::configured_bind(&c))
+    {
+        Ok(Some(bind)) => {
+            let bus_cb = bus.clone();
+            tokio::spawn(crate::daemon::callback::serve(bind, bus_cb));
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(error = %e, "could not read the callback bind setting"),
+    }
+
     // Slice 4 — spawn the Telegram long-poll task IFF a perm-checked
     // secrets.toml is present. The spawn is fire-and-forget: ASYNC_INVARIANTS
     // Rule 3 wraps the long-poll body so a fatal Telegram error logs
@@ -1434,6 +1458,16 @@ async fn handle_agent_register(
         // it. Without this the operator had to `/switch` after every restart,
         // and anything sent in between reached nobody — the binding pointed at
         // the previous process's row.
+        // Every session has a callback token from its first registration, so
+        // the operator never has to "turn it on" to get one. Minting it here —
+        // not on first use — means the token exists before anything asks for it.
+        if let Err(e) = crate::daemon::callback::ensure_token(
+            &conn,
+            &name_for_capture,
+            crate::daemon::chat::now_millis(),
+        ) {
+            tracing::warn!(error = %e, "could not ensure a callback token (non-fatal)");
+        }
         match crate::daemon::agent_registry::restore_bindings_for(
             &conn,
             &agent_id_for_capture,
@@ -1560,6 +1594,11 @@ async fn handle_agent_rename(
         }
 
         if let Some(old) = old_name.filter(|o| o != &new_name) {
+            // Scripts hold a token addressed to the old nick; the session's
+            // address changed, not its identity.
+            if let Err(e) = crate::daemon::callback::rename(&conn, &old, &new_name) {
+                tracing::warn!(error = %e, "could not move the callback token to the new nick");
+            }
             match crate::daemon::agent_registry::migrate_bindings(&conn, &old, &new_name) {
                 Ok(moved) if moved > 0 => {
                     tracing::info!(%old, new = %new_name, moved, "moved chat bindings to the new nick")

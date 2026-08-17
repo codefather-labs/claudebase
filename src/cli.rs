@@ -723,6 +723,9 @@ pub enum DaemonSubcommand {
     Serve(DaemonServeArgs),
     /// `daemon config edit` / `daemon config show` — manage daemon.toml.
     Config(DaemonConfigArgs),
+    /// `daemon callback …` — the HTTP endpoint external systems use to write
+    /// into a session's terminal input.
+    Callback(DaemonCallbackArgs),
     /// `daemon doctor [--asr]` — health-check runtime backends without
     /// performing actual work. Exit 0 = healthy, 1 = unhealthy. The
     /// `--asr` flag scopes to the ASR backend (the only doctor target
@@ -1255,31 +1258,90 @@ pub struct Cli {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// The working directory is per-PROCESS, not per-thread, and cargo runs the
+    /// tests in one binary on parallel threads — so a test that changes it
+    /// changes it for every other test running at that moment.
+    ///
+    /// A comment here used to claim these tests "run serially per Cargo
+    /// defaults", which is not true and is exactly why
+    /// `resolve_default_returns_canonical_cwd` failed on 2026-08-17 seeing
+    /// `/tmp/.tmpSCg9eY` where it expected the repository root: the sibling test
+    /// had cwd pointed at its tempdir at that instant. Any test touching cwd
+    /// takes this lock.
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn resolve_returns_canonical_pathbuf_for_dot() {
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let tmp = tempfile::tempdir().expect("tempdir");
         let prev = std::env::current_dir().expect("cwd");
 
-        // Note: setting cwd in tests is process-global; tests in this `cfg(test)`
-        // module are intentionally minimal and run serially per Cargo defaults
-        // for the same compilation unit. We restore cwd at the end.
         std::env::set_current_dir(tmp.path()).expect("set cwd");
 
         let resolved = resolve_project_root(Some(Path::new("."))).expect("resolve `.`");
         let expected = std::fs::canonicalize(tmp.path()).expect("canonicalize tmp");
 
+        // Restore BEFORE asserting: a panic here would otherwise leave every
+        // later test running from a deleted tempdir.
+        std::env::set_current_dir(prev).expect("restore cwd");
+
         assert_eq!(resolved, expected);
         assert!(resolved.is_absolute(), "resolved path must be absolute");
-
-        std::env::set_current_dir(prev).expect("restore cwd");
     }
 
     #[test]
     fn resolve_default_returns_canonical_cwd() {
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let resolved = resolve_project_root(None).expect("resolve default");
         let cwd = std::env::current_dir().expect("cwd");
         let canonical = std::fs::canonicalize(&cwd).expect("canonicalize cwd");
         assert_eq!(resolved, canonical);
     }
+}
+
+#[derive(Args, Debug)]
+pub struct DaemonCallbackArgs {
+    #[command(subcommand)]
+    pub sub: DaemonCallbackSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DaemonCallbackSubcommand {
+    /// Start listening. Off by default: a token exists for every session from
+    /// its first registration, but an open port is a separate, deliberate act.
+    Enable(CallbackEnableArgs),
+    /// Stop listening. Tokens are kept, so re-enabling does not break scripts.
+    Disable,
+    /// Bind address, token fingerprints, and whether the listener is up.
+    Status,
+    /// Print the token for a nick. Shows a fingerprint unless `--reveal`.
+    Token(CallbackTokenArgs),
+    /// Issue a new token for a nick; the previous one stops working at once.
+    Rotate(CallbackTokenArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct CallbackEnableArgs {
+    /// `host:port`. Defaults to loopback — a callback endpoint reachable from
+    /// the network writes into a session running with permissions skipped.
+    #[arg(long, default_value = "127.0.0.1:8585")]
+    pub bind: String,
+
+    /// Required to bind anything other than loopback. The token travels in
+    /// cleartext over plain HTTP, so prefer a localhost bind and an SSH tunnel.
+    #[arg(long = "i-know-this-is-remote")]
+    pub allow_remote: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct CallbackTokenArgs {
+    /// Session nick, as shown by `claudebase agent list`.
+    pub nick: String,
+
+    /// Print the token itself rather than its fingerprint. Whatever captures
+    /// this command's output keeps the secret.
+    #[arg(long)]
+    pub reveal: bool,
 }

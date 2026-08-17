@@ -133,6 +133,26 @@ fn main() -> std::process::ExitCode {
                 cli::DaemonConfigSubcommand::Edit(a) => run_daemon_config_edit(&a),
                 cli::DaemonConfigSubcommand::Show(a) => run_daemon_config_show(&a),
             },
+            cli::DaemonSubcommand::Callback(a) => match a.sub {
+                cli::DaemonCallbackSubcommand::Enable(a) => simple(
+                    claudebase::callback_cli::enable(&a.bind, a.allow_remote),
+                    "daemon callback enable",
+                ),
+                cli::DaemonCallbackSubcommand::Disable => {
+                    simple(claudebase::callback_cli::disable(), "daemon callback disable")
+                }
+                cli::DaemonCallbackSubcommand::Status => {
+                    simple(claudebase::callback_cli::status(), "daemon callback status")
+                }
+                cli::DaemonCallbackSubcommand::Token(a) => simple(
+                    claudebase::callback_cli::token(&a.nick, a.reveal),
+                    "daemon callback token",
+                ),
+                cli::DaemonCallbackSubcommand::Rotate(a) => simple(
+                    claudebase::callback_cli::rotate(&a.nick, a.reveal),
+                    "daemon callback rotate",
+                ),
+            },
             cli::DaemonSubcommand::Doctor(a) => run_daemon_doctor(&a),
             cli::DaemonSubcommand::Warmup(a) => run_daemon_warmup(&a),
             cli::DaemonSubcommand::Install(a) => run_daemon_install(&a),

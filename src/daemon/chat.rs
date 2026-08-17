@@ -569,6 +569,8 @@ COMMIT;
     // pty-transport Slice 14 — remember the nick a session was DELIBERATELY
     // given, so the next session in the same directory starts under it again.
     apply_nick_memory_migration(conn)?;
+    // v0.11 — per-nick callback tokens for the HTTP endpoint.
+    crate::daemon::callback::apply_migration(conn)?;
     // Slice 8 — `pending_asks` table for `chat_ask` MCP tool. Additive,
     // idempotent. Architect AR-6: chat.db single-database discipline.
     crate::daemon::pending_asks::apply_pending_asks_migration(conn)?;
@@ -615,6 +617,45 @@ fn apply_chat_bindings_migration(conn: &Connection) -> rusqlite::Result<()> {
            PRIMARY KEY (chat_id, thread_id)
          );",
     )
+}
+
+/// Inbound HTTP callback, on its way to a session's terminal input.
+///
+/// A THIRD notification shape, and the reason this one is written with F-14 in
+/// mind: the two existing builders disagree about where the thread lives, which
+/// is how a Telegram message once arrived labelled as peer traffic. This one
+/// states the source explicitly in `meta.source` instead of leaving the
+/// subscriber to infer it from the shape of some other field.
+pub fn build_channel_notification_callback(
+    content: &str,
+    label: Option<&str>,
+    target_agent_id: &str,
+    message_id: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/claude/channel",
+        "params": {
+            "content": content,
+            "meta": {
+                "source": "callback",
+                "label": label,
+                // Only read by supervisors that predate `source: callback` —
+                // they fall through to the peer branch and would otherwise
+                // render `[agent-to-agent:unknown]`, which tells the operator
+                // nothing. A mixed-version machine is the normal case: sessions
+                // stay open for hours across a binary upgrade.
+                "from_agent": match label {
+                    Some(l) => format!("callback-{l}"),
+                    None => "callback".to_string(),
+                },
+                "chat_id": format!("agent:{target_agent_id}"),
+                "thread": format!("agent:{target_agent_id}"),
+                "message_id": message_id,
+                "ts": chrono::Utc::now().to_rfc3339(),
+            }
+        }
+    })
 }
 
 /// `nick_memory` — the nick an operator (or the session itself) CHOSE for a

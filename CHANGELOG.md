@@ -8,6 +8,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **Voice notes never transcribed on a machine without `daemon.toml`.** `AsrConfig::default()` has
+  selected whisper since v0.8.1 so a clean install works out of the box, but all three call sites
+  guarded on the file existing and either fell back to no backend (the daemon) or exited with
+  "daemon.toml not found" (`daemon doctor --asr`, `daemon warmup --asr`). The default was therefore
+  unreachable, and the failure was loudest on exactly the machines where nothing had been configured
+  — including the diagnostic that would have explained it. One loader now holds that policy for all
+  three; a malformed file is still an error, since "you wrote nothing" and "you wrote something
+  wrong" deserve different answers.
+- **Installers pointed at a model path the daemon never reads.** Both suggested pre-downloading
+  `ggml-medium.bin` to `whisper-cpp/models/`, while the daemon looks under
+  `~/.claude/tools/claudebase/models/whisper/`. Anyone who followed the advice put 1.5 GB somewhere
+  claudebase ignores.
+
+### Added
+
+- **Installers fetch the whisper model.** ~1.5 GB, previously left for the first voice note to
+  download lazily — which looks like nothing happening for several minutes. It is now fetched during
+  install via the idempotent `daemon warmup --asr`, skipped when the model is already present, and
+  opt-out via `CLAUDEBASE_SKIP_ASR_MODEL=1` / `-SkipAsrModel`. A failure is a warning, not a failed
+  install: the lazy path still works.
+
 - **Installing during a release no longer leaves you without a binary.** The version pin lands on
   `main` the moment a tag is pushed, but the release build takes minutes — and the installers are
   fetched from `main`. Anyone installing in that window asked for a release that did not exist yet,

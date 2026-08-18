@@ -793,10 +793,12 @@ preload_encoder() {
 #   - If both binaries are already on PATH → log + return 0 (idempotent).
 #   - If a package manager is detected → attempt install; warn on failure.
 #   - If no package manager → log clear manual-install hint + return 0.
-# The actual whisper model (~1.5 GB ggml-medium.bin) is NOT downloaded
-# here — too heavy for the install path. The plugin downloads it lazily
-# on first voice message, or the operator drops it at
-# ~/.local/share/whisper-cpp/models/ggml-medium.bin ahead of time.
+# The model itself is fetched by `install_asr_model` below, not here.
+#
+# NOTE: this comment used to point operators at
+# ~/.local/share/whisper-cpp/models/ggml-medium.bin. The daemon has never read
+# that path — it looks in ~/.claude/tools/claudebase/models/whisper/ — so
+# anyone who followed the advice put 1.5 GB somewhere claudebase ignores.
 #
 # Opt-out: set CLAUDEBASE_SKIP_WHISPER=1 to bypass entirely (no install,
 # no log spam). For headless CI where audio deps would just add minutes
@@ -860,9 +862,46 @@ install_whisper_stack() {
     fi
   fi
 
-  if command -v ffmpeg >/dev/null 2>&1 && command -v whisper-cli >/dev/null 2>&1; then
-    log_info "voice transcription stack ready — whisper model auto-downloads on first voice msg"
-    log_info "  (or pre-download to ~/.local/share/whisper-cpp/models/ggml-medium.bin)"
+  return 0
+}
+
+# ============================================================================
+# Fetch the whisper model so the first voice note does not pay for it
+# ============================================================================
+# ~1.5 GB, and it used to be left for the first voice message to fetch lazily.
+# That is a poor first impression: the operator sends a voice note and nothing
+# happens for several minutes with no indication that a download is running.
+# Doing it here makes the cost visible and one-time.
+#
+# `daemon warmup --asr` is the supported path and is idempotent — it reports
+# "model present" and returns immediately when the file is already there, so
+# re-running the installer costs nothing.
+#
+# Opt out with CLAUDEBASE_SKIP_ASR_MODEL=1 (or CLAUDEBASE_SKIP_WHISPER=1, which
+# skips the whole voice stack). A failure here is a warning, never fatal: the
+# lazy path still works, and an install should not fail over an optional model.
+install_asr_model() {
+  if [ "${CLAUDEBASE_SKIP_WHISPER:-0}" = "1" ] || [ "${CLAUDEBASE_SKIP_ASR_MODEL:-0}" = "1" ]; then
+    log_info "skipping the whisper model download (opt-out set)"
+    return 0
+  fi
+
+  local bin="$CLAUDE_DIR/tools/claudebase/claudebase"
+  [ -x "$bin" ] || { log_warn "no binary; skipping the whisper model download"; return 0; }
+
+  local model="$CLAUDE_DIR/tools/claudebase/models/whisper/ggml-medium.bin"
+  if [ -f "$model" ]; then
+    log_ok "whisper model already present"
+    return 0
+  fi
+
+  log_info "downloading the whisper model (~1.5 GB, one time) ..."
+  log_info "  skip with CLAUDEBASE_SKIP_ASR_MODEL=1; voice notes still work without it"
+  if "$bin" daemon warmup --asr >/dev/null 2>&1; then
+    log_ok "whisper model ready ($model)"
+  else
+    log_warn "whisper model download failed; it will be fetched on the first voice note"
+    log_warn "  retry manually: claudebase daemon warmup --asr"
   fi
   return 0
 }
@@ -902,6 +941,7 @@ register_alias
 register_bash_allowlist
 install_pdfium
 install_whisper_stack
+install_asr_model
 preload_encoder
 unpatch_official_telegram_plugin
 

@@ -111,6 +111,35 @@ fn the_installers_announce_every_skill_they_ship() {
     }
 }
 
+/// Both installers used to tell operators to pre-download the whisper model to
+/// `whisper-cpp/models/`, a path the daemon has never read — it looks under
+/// `.claude/tools/claudebase/models/whisper/`. Anyone who followed the advice
+/// put 1.5 GB somewhere claudebase ignores, then watched voice notes fail with
+/// "MISSING model file" pointing at a different path entirely.
+#[test]
+fn the_installers_name_the_model_path_the_daemon_actually_reads() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for installer in ["install.sh", "install.ps1"] {
+        let text = std::fs::read_to_string(root.join(installer))
+            .unwrap_or_else(|e| panic!("read {installer}: {e}"));
+        for line in text.lines() {
+            // The one surviving mention is the comment explaining that the path
+            // was wrong; anything that still POINTS there is the bug.
+            let points_at_it = line.contains("whisper-cpp")
+                && (line.contains("pre-download") || line.contains("drops it"));
+            assert!(
+                !points_at_it,
+                "{installer} still directs operators at a whisper-cpp path the daemon never reads:\n  {line}"
+            );
+        }
+        assert!(
+            text.contains("models/whisper/ggml-medium.bin")
+                || text.contains("models\\whisper\\ggml-medium.bin"),
+            "{installer} never names the model path the daemon reads"
+        );
+    }
+}
+
 /// The installer is a `.ps1` too, and it was the one nobody checked.
 ///
 /// PowerShell 5.1 — still the default on Windows — reads a BOM-less script in

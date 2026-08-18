@@ -20,6 +20,8 @@
 param(
     [switch]$Yes,
     [switch]$Local,
+    # Skip the ~1.5 GB whisper model; voice notes then fetch it on first use.
+    [switch]$SkipAsrModel,
     [switch]$Help
 )
 
@@ -612,7 +614,9 @@ function Preload-Encoder {
 # Install whisper-cli + ffmpeg (voice transcription dependencies). Mirrors
 # install.sh's install_whisper_stack. Best-effort + idempotent.
 # Opt-out: set $env:CLAUDEBASE_SKIP_WHISPER=1.
-# Model (~1.5 GB ggml-medium.bin) is NOT downloaded here - lazy on first voice.
+# The model itself is fetched by Install-AsrModel below, not here. The old
+# comment pointed at ~\AppData\Local\whisper-cpp\models\, which the daemon has
+# never read -- it looks in ~\.claude\tools\claudebase\models\whisper\.
 # ============================================================================
 function Install-WhisperStack {
     if ($env:CLAUDEBASE_SKIP_WHISPER -eq '1') {
@@ -692,9 +696,44 @@ function Install-WhisperStack {
         }
     }
 
-    if ((Get-Command ffmpeg -ErrorAction SilentlyContinue) -and (Get-Command whisper-cli -ErrorAction SilentlyContinue)) {
-        Write-Info "voice transcription stack ready - model auto-downloads on first voice msg"
-        Write-Info "  (or pre-download to ~\AppData\Local\whisper-cpp\models\ggml-medium.bin)"
+}
+
+# ============================================================================
+# Fetch the whisper model so the first voice note does not pay for it
+# ============================================================================
+# ~1.5 GB, previously left for the first voice message to fetch lazily -- which
+# means the operator sends a voice note and nothing happens for minutes with no
+# sign that a download is running. Doing it here makes the cost visible and
+# one-time. `daemon warmup --asr` is idempotent: it returns immediately when the
+# model is already present, so re-running the installer costs nothing.
+#
+# Opt out with -SkipAsrModel or CLAUDEBASE_SKIP_ASR_MODEL=1. A failure is a
+# warning, never fatal: the lazy path still works and an install must not fail
+# over an optional model.
+function Install-AsrModel {
+    if ($SkipAsrModel -or $env:CLAUDEBASE_SKIP_ASR_MODEL -eq '1' -or $env:CLAUDEBASE_SKIP_WHISPER -eq '1') {
+        Write-Info "skipping the whisper model download (opt-out set)"
+        return
+    }
+    $bin = Join-Path $Script:ClaudeDir 'tools\claudebase\claudebase.exe'
+    if (-not (Test-Path $bin)) {
+        Write-Warn "no binary; skipping the whisper model download"
+        return
+    }
+    $model = Join-Path $Script:ClaudeDir 'tools\claudebase\models\whisper\ggml-medium.bin'
+    if (Test-Path $model) {
+        Write-Ok "whisper model already present"
+        return
+    }
+    Write-Info "downloading the whisper model (~1.5 GB, one time) ..."
+    Write-Info "  skip with -SkipAsrModel; voice notes still work without it"
+    try {
+        & $bin daemon warmup --asr 2>&1 | Out-Null
+        if (Test-Path $model) { Write-Ok "whisper model ready" }
+        else { throw "warmup finished but the model is not there" }
+    } catch {
+        Write-Warn "whisper model download failed; it will be fetched on the first voice note"
+        Write-Warn "  retry manually: claudebase daemon warmup --asr"
     }
 }
 
@@ -789,6 +828,7 @@ Register-Alias
 Register-BashAllowlist
 Install-Pdfium
 Install-WhisperStack
+Install-AsrModel
 Preload-Encoder
 Invoke-UnpatchOfficialTelegramPlugin
 

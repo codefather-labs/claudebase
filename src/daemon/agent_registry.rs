@@ -76,6 +76,15 @@ impl AgentState {
 #[derive(Debug, Clone)]
 pub struct RegisterOutcome {
     pub spawned_at: i64,
+    /// The name the row actually carries after this call.
+    ///
+    /// It differs from the name the caller supplied whenever the session has
+    /// been renamed since it first registered — the rename owns the name, and
+    /// a reconnect must not undo it. Everything keyed by nick (the callback
+    /// token, the chat bindings, the stale-slot sweep) has to follow THIS, or
+    /// the reconnect that stopped reverting the registry starts splitting it
+    /// against everything else instead.
+    pub effective_name: String,
 }
 
 /// Outcome of a successful `agent_unregister` call.
@@ -172,6 +181,24 @@ pub fn validate_agent_name(name: &str) -> anyhow::Result<()> {
 /// The `metadata` JSON value (if any) is serialised to TEXT for storage;
 /// SQLite's JSON1 hint type is intentionally not used (TEXT + serde
 /// round-trip is the canonical pattern).
+/// Register a session, or refresh the registration of one that is already
+/// known.
+///
+/// **The supplied name is the INITIAL name only.** Once a row exists for this
+/// `agent_id`, the name belongs to the row and only `rename` changes it.
+///
+/// It used to be overwritten on every conflict, and the supervisor re-registers
+/// on every reconnect — which it does whenever the daemon restarts or the
+/// connection drops — carrying the name it captured at startup. So a rename
+/// survived only until the next reconnect, and then the row silently reverted.
+///
+/// That single line produced two separate bug reports on 2026-08-18. The
+/// operator saw sessions "losing" a nick they had been given. A peer session saw
+/// its HTTP callbacks stop: the callback token and the UNIX socket had followed
+/// the new name, while the alive-matcher resolves through
+/// `agent_registry.agent_name`, which had reverted — so `/callback/<new-name>`
+/// answered "no alive agent matches" while `/callback/<old-name>` still worked.
+/// Three maps for one identity, one of them quietly rolling back.
 pub fn register(
     conn: &Connection,
     agent_id: &str,
@@ -223,7 +250,6 @@ pub fn register(
           permission_relayer, spawned_at, last_pinged_at, state, metadata) \
          VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?5, 'alive', ?6) \
          ON CONFLICT(agent_id) DO UPDATE SET \
-           agent_name = excluded.agent_name, \
            connection_id = excluded.connection_id, \
            chat_thread_id = excluded.chat_thread_id, \
            last_pinged_at = excluded.last_pinged_at, \
@@ -242,7 +268,11 @@ pub fn register(
                     "agent_register rename-cleanup marked old rows dead"
                 );
             }
-            Ok(RegisterOutcome { spawned_at: now })
+            let effective_name: String = tx_name_after(conn, agent_id)?;
+            Ok(RegisterOutcome {
+                spawned_at: now,
+                effective_name,
+            })
         }
         Err(e) => {
             // tx auto-rolls back on drop, so the rename-cleanup UPDATE is
@@ -257,6 +287,15 @@ pub fn register(
             Err(e.into())
         }
     }
+}
+
+/// The name on a row, read back after a write.
+fn tx_name_after(conn: &Connection, agent_id: &str) -> anyhow::Result<String> {
+    Ok(conn.query_row(
+        "SELECT agent_name FROM agent_registry WHERE agent_id = ?1",
+        params![agent_id],
+        |r| r.get(0),
+    )?)
 }
 
 /// Mark an agent as `dead` (terminal state). Returns the previous
@@ -1440,6 +1479,55 @@ pub fn reap_on_boot(conn: &Connection) -> anyhow::Result<usize> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A rename must outlive the next reconnect.
+    ///
+    /// The supervisor re-registers whenever the daemon restarts or the
+    /// connection drops, and it carries the name it captured at startup. While
+    /// register overwrote the name on conflict, every rename was silently
+    /// undone by the next reconnect — which is how a session lost a nick the
+    /// operator had given it, and how its HTTP callbacks started answering
+    /// "no alive agent matches" under the new name.
+    #[test]
+    fn a_reconnect_does_not_undo_a_rename() {
+        let conn = rusqlite::Connection::open_in_memory().expect("conn");
+        crate::daemon::chat::ensure_chat_db_schema(&conn).expect("schema");
+
+        register(&conn, "id-1", "cutover", "conn-1", None, None).expect("first register");
+        rename(&conn, "id-1", "fbscout").expect("rename");
+
+        // The supervisor reconnects and re-registers under its startup name.
+        register(&conn, "id-1", "cutover", "conn-2", None, None).expect("re-register");
+
+        let name: String = conn
+            .query_row(
+                "SELECT agent_name FROM agent_registry WHERE agent_id = 'id-1'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("row");
+        assert_eq!(name, "fbscout", "the reconnect reverted the rename");
+
+        // And the name the callback endpoint resolves through agrees.
+        assert_eq!(resolve_target(&conn, "fbscout").expect("resolve"), "id-1");
+    }
+
+    /// The name is still applied when the row is new — otherwise a session
+    /// could never be named at all.
+    #[test]
+    fn the_supplied_name_is_used_when_the_session_is_new() {
+        let conn = rusqlite::Connection::open_in_memory().expect("conn");
+        crate::daemon::chat::ensure_chat_db_schema(&conn).expect("schema");
+        register(&conn, "id-2", "planner", "conn-1", None, None).expect("register");
+        let name: String = conn
+            .query_row(
+                "SELECT agent_name FROM agent_registry WHERE agent_id = 'id-2'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("row");
+        assert_eq!(name, "planner");
+    }
     use super::*;
     use serde_json::json;
 

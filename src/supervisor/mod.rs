@@ -394,6 +394,11 @@ async fn daemon_leg(
                 json!({
                     "agent_id": identity.agent_id,
                     "name": identity.name,
+                    // `--nick` was never remembered: only a rename wrote the
+                    // memory, so a session started under a chosen name came
+                    // back as the project default next time. Saying so here
+                    // lets the daemon -- the only writer -- record it.
+                    "nick_chosen": identity.chosen,
                     "session_token": identity.session_token,
                     "cwd": std::env::current_dir().ok().map(|p| p.display().to_string()),
                     // Where this session runs, so the daemon can tell a live
@@ -557,6 +562,14 @@ pub mod identity {
         pub name: String,
         /// Capability handed to the child process; see ENV_SESSION_TOKEN.
         pub session_token: String,
+        /// True when the operator named this session rather than the project
+        /// naming it — `--nick`, or a name recalled from a previous choice.
+        ///
+        /// The daemon uses it to decide whether the name is worth remembering
+        /// for the next session in this directory. A derived default is not:
+        /// it is re-derived anyway, and remembering a disambiguated `-2` form
+        /// would pin that suffix on the directory forever.
+        pub chosen: bool,
     }
 
     /// Make the nick unique among sessions that are actually running.
@@ -616,6 +629,7 @@ pub mod identity {
                 agent_id: uuid::Uuid::new_v4().to_string(),
                 name: nick.to_string(),
                 session_token: uuid::Uuid::new_v4().to_string(),
+                chosen: true,
             };
         }
 
@@ -628,6 +642,7 @@ pub mod identity {
         // after every restart. Recalling the name is what makes
         // `restore_bindings_for` find anything to restore.
         let remembered = cwd.as_ref().and_then(|c| recall_chosen_nick(c));
+        let chosen = remembered.is_some();
 
         let name = remembered.unwrap_or_else(|| {
             let derived = cwd
@@ -649,6 +664,7 @@ pub mod identity {
             agent_id: uuid::Uuid::new_v4().to_string(),
             name,
             session_token: uuid::Uuid::new_v4().to_string(),
+            chosen,
         }
     }
 }

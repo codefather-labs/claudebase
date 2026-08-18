@@ -1457,7 +1457,10 @@ async fn handle_agent_register(
     let client_pid = args.get("pid").and_then(|v| v.as_i64());
     let cid_str = connection_id.to_string();
     let agent_id_for_capture = agent_id.clone();
-    let name_for_capture = name.clone();
+    let nick_chosen = args
+        .get("nick_chosen")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
         let conn = crate::daemon::chat::open_chat_db()?;
         let outcome = crate::daemon::agent_registry::register(
@@ -1468,6 +1471,17 @@ async fn handle_agent_register(
             thread.as_deref(),
             metadata.as_ref(),
         )?;
+        // What the row is CALLED after the write, which is not what was asked
+        // for when this session has been renamed since it first registered.
+        // Everything below is keyed by nick and must follow the row.
+        let name_for_capture = outcome.effective_name.clone();
+        if name_for_capture != name {
+            tracing::info!(
+                supplied = %name,
+                effective = %name_for_capture,
+                "session re-registered under a name it was renamed away from; keeping the rename"
+            );
+        }
         if let Some(token) = session_token.as_deref() {
             crate::daemon::agent_registry::set_session_token(&conn, &agent_id_for_capture, token)?;
         }
@@ -1516,6 +1530,24 @@ async fn handle_agent_register(
             Ok(0) => {}
             Ok(n) => tracing::info!(buried = n, "superseded stale registry rows for this slot"),
             Err(e) => tracing::warn!(error = %e, "supersede sweep failed (non-fatal)"),
+        }
+        // `--nick` used to be forgotten the moment the session ended: only a
+        // rename wrote the memory, so a session started under a chosen name
+        // came back as the project default. A DERIVED default is deliberately
+        // not remembered — it is re-derived anyway, and pinning a
+        // disambiguated `-2` form on the directory would be worse than the bug.
+        if nick_chosen {
+            if let (Some(host), Some(cwd_str)) = (client_host.as_deref(), cwd_arg.as_deref()) {
+                if let Err(e) = crate::daemon::agent_registry::remember_nick(
+                    &conn,
+                    host,
+                    cwd_str,
+                    &name_for_capture,
+                    crate::daemon::chat::now_millis(),
+                ) {
+                    tracing::warn!(error = %e, "could not remember the chosen nick");
+                }
+            }
         }
         if let Some(cwd_str) = cwd_arg {
             let cwd_path = std::path::PathBuf::from(&cwd_str);

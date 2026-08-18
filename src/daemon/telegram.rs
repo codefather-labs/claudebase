@@ -527,6 +527,17 @@ pub(crate) fn handle_switch(
     let target = match target {
         Some(t) => t,
         None => {
+            // Every routing decision is logged, including the refusals. Until
+            // now `/switch` decided in silence: when a switch did not take
+            // effect there was no way to tell "the tap never reached the daemon"
+            // from "the daemon refused it", and the operator was left comparing
+            // database rows to guess which.
+            tracing::info!(
+                chat_id,
+                ?thread_id,
+                requested = %target_name,
+                "switch refused: no alive CLI by that name"
+            );
             return Ok(format!(
                 "CLI '{target_name}' not found among alive CLIs. Use /agents to list bound CLIs in this chat/topic."
             ));
@@ -542,6 +553,7 @@ pub(crate) fn handle_switch(
         // requested it. Closes the surprising "operator typed /switch
         // own-agent-name and got denied" case.
         if current_agent_id == &target.agent_id {
+            tracing::info!(chat_id, ?thread_id, agent = %target.agent_name, "switch no-op: already bound");
             return Ok(format!(
                 "Already bound to {} — no change.",
                 target.agent_name
@@ -558,6 +570,15 @@ pub(crate) fn handle_switch(
         match last_user_id {
             Some(lid) if lid == sender_user_id => { /* authorized */ }
             _ => {
+                tracing::warn!(
+                    chat_id,
+                    ?thread_id,
+                    requested = %target.agent_name,
+                    current = %current_agent_name,
+                    sender_user_id,
+                    ?last_user_id,
+                    "switch DENIED by the last-user gate"
+                );
                 return Ok(format!(
                     "Denied: only the user who last messaged this chat/topic via the bound CLI ({current_agent_name}) may /switch. Have them rebind, or wait for chat-admin fallback (deferred sub-slice)."
                 ));
@@ -578,6 +599,13 @@ pub(crate) fn handle_switch(
         &target.agent_name,
         crate::daemon::chat::now_millis(),
     )?;
+    tracing::info!(
+        chat_id,
+        ?thread_id,
+        agent = %target.agent_name,
+        agent_id = %target.agent_id,
+        "switch applied"
+    );
     Ok(format!(
         "Switched: this chat/topic is now bound to {} (agent_id={}). Subsequent inbound messages route to that CLI.",
         target.agent_name, target.agent_id

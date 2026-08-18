@@ -291,9 +291,29 @@ impl SubscribeClient {
             let params = value.get("params").cloned().unwrap_or(Value::Null);
             let meta = params.get("meta").cloned().unwrap_or(Value::Null);
 
-            if let Some(target) = meta.get("target_agent_id").and_then(|v| v.as_str()) {
-                if target != self_agent_id {
-                    tracing::debug!(%target, "notification addressed to another agent; skipping");
+            // EVERY message names one recipient, and only that recipient is
+            // delivered to. An absent recipient is not "send to whoever
+            // subscribed" — it is a message with nobody to receive it, and it is
+            // dropped.
+            //
+            // The old rule enforced the target only when it happened to be
+            // present, so anything published without one fell through to
+            // delivery-by-subscription. That is how sessions read each other's
+            // replies to the operator: publishing to a thread was treated as
+            // permission to send to everyone listening on it. Being subscribed
+            // is not the same as being addressed.
+            let target = meta.get("target_agent_id").and_then(|v| v.as_str());
+            match target {
+                Some(t) if t == self_agent_id => {}
+                Some(t) => {
+                    tracing::debug!(target = %t, "addressed to another agent; skipping");
+                    continue;
+                }
+                None => {
+                    tracing::debug!(
+                        thread = %meta.get("thread").and_then(|v| v.as_str()).unwrap_or("?"),
+                        "no recipient named; not delivering to anyone"
+                    );
                     continue;
                 }
             }
@@ -937,6 +957,43 @@ mod classify_tests {
             Source::Telegram,
             "the operator pressed the button; it must not render as a peer"
         );
+    }
+
+    /// Every frame that is meant for a session must NAME that session.
+    ///
+    /// Delivery is by recipient, not by subscription: a message without a
+    /// recipient is not "for whoever is listening", it is a message nobody is
+    /// entitled to receive, and the subscriber drops it. That rule only works if
+    /// the builders hold up their end, so this asserts they do — a new builder
+    /// that forgets the field would otherwise produce messages that silently go
+    /// nowhere.
+    #[test]
+    fn every_addressed_builder_names_its_recipient() {
+        use crate::daemon::chat;
+
+        let frames = vec![
+            (
+                "callback",
+                chat::build_channel_notification_callback("x", Some("ci"), "target-id", "m1"),
+            ),
+            (
+                "continue control",
+                chat::build_control_notification_continue("target-id", "продолжи"),
+            ),
+            (
+                "agent-to-agent",
+                chat::build_channel_notification_agent_to_agent("x", "from-id", "target-id", "m2", false),
+            ),
+        ];
+
+        for (name, frame) in frames {
+            let meta = meta_of(&frame);
+            assert_eq!(
+                meta.get("target_agent_id").and_then(|v| v.as_str()),
+                Some("target-id"),
+                "the {name} frame must name its recipient, or it is delivered to nobody"
+            );
+        }
     }
 
     #[test]

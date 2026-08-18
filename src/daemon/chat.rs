@@ -652,6 +652,7 @@ pub fn build_control_notification_continue(target_agent_id: &str, text: &str) ->
             "meta": {
                 "control": "continue",
                 "source": "telegram",
+                "target_agent_id": target_agent_id,
                 "chat_id": format!("agent:{target_agent_id}"),
                 "thread": format!("agent:{target_agent_id}"),
                 "message_id": uuid::Uuid::new_v4().to_string(),
@@ -682,6 +683,11 @@ pub fn build_channel_notification_callback(
             "meta": {
                 "source": "callback",
                 "label": label,
+                // Every frame names ONE recipient. Encoding the id inside the
+                // thread string was not enough: the subscriber has to be able to
+                // answer "is this for me" from the frame alone, without asking
+                // the database — which is where broadcast crept back in.
+                "target_agent_id": target_agent_id,
                 // Only read by supervisors that predate `source: callback` —
                 // they fall through to the peer branch and would otherwise
                 // render `[agent-to-agent:unknown]`, which tells the operator

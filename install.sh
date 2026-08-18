@@ -880,29 +880,81 @@ install_whisper_stack() {
 # Opt out with CLAUDEBASE_SKIP_ASR_MODEL=1 (or CLAUDEBASE_SKIP_WHISPER=1, which
 # skips the whole voice stack). A failure here is a warning, never fatal: the
 # lazy path still works, and an install should not fail over an optional model.
+# Pre-fetch the speech model for whichever ASR backend is configured.
+#
+# The download itself is `claudebase daemon warmup --asr`, which goes through
+# the Asr trait — so this function does not know, and must not know, which model
+# or which URL. It used to: the whisper path was written here AND in main.rs,
+# and the two disagreed for a release (the installer pointed at
+# whisper-cpp/models/, which the daemon has never read).
+#
+# CLAUDEBASE_ASR_BACKEND=parakeet selects the NVIDIA Parakeet backend before the
+# fetch. It is opt-in because it needs a binary built with `--features
+# asr-sherpa`; the released binary ships whisper.
 install_asr_model() {
   if [ "${CLAUDEBASE_SKIP_WHISPER:-0}" = "1" ] || [ "${CLAUDEBASE_SKIP_ASR_MODEL:-0}" = "1" ]; then
-    log_info "skipping the whisper model download (opt-out set)"
+    log_info "skipping the speech model download (opt-out set)"
     return 0
   fi
 
   local bin="$CLAUDE_DIR/tools/claudebase/claudebase"
-  [ -x "$bin" ] || { log_warn "no binary; skipping the whisper model download"; return 0; }
+  [ -x "$bin" ] || { log_warn "no binary; skipping the speech model download"; return 0; }
 
-  local model="$CLAUDE_DIR/tools/claudebase/models/whisper/ggml-medium.bin"
-  if [ -f "$model" ]; then
-    log_ok "whisper model already present"
-    return 0
+  local backend="${CLAUDEBASE_ASR_BACKEND:-}"
+  if [ -n "$backend" ]; then
+    set_asr_backend "$backend" || return 0
   fi
 
-  log_info "downloading the whisper model (~1.5 GB, one time) ..."
+  local whisper_model="$CLAUDE_DIR/tools/claudebase/models/whisper/ggml-medium.bin"
+  local parakeet_model="$CLAUDE_DIR/tools/claudebase/models/parakeet/encoder.int8.onnx"
+  case "$backend" in
+    parakeet|sherpa-nemo)
+      [ -f "$parakeet_model" ] && { log_ok "parakeet model already present"; return 0; }
+      log_info "downloading the parakeet model (~640 MB, one time) ..." ;;
+    *)
+      [ -f "$whisper_model" ] && { log_ok "whisper model already present"; return 0; }
+      log_info "downloading the whisper model (~1.5 GB, one time) ..." ;;
+  esac
   log_info "  skip with CLAUDEBASE_SKIP_ASR_MODEL=1; voice notes still work without it"
+
   if "$bin" daemon warmup --asr >/dev/null 2>&1; then
-    log_ok "whisper model ready ($model)"
+    log_ok "speech model ready"
   else
-    log_warn "whisper model download failed; it will be fetched on the first voice note"
+    log_warn "speech model download failed; it will be fetched on the first voice note"
     log_warn "  retry manually: claudebase daemon warmup --asr"
   fi
+  return 0
+}
+
+# Write `[asr] backend = "<name>"` into daemon.toml without disturbing the rest.
+#
+# Append-and-let-the-last-win is wrong for TOML, so an existing [asr] block is
+# rewritten in place. A daemon.toml the operator wrote by hand keeps every other
+# setting it had.
+set_asr_backend() {
+  local backend="$1"
+  case "$backend" in
+    whisper|parakeet|sherpa-nemo) ;;
+    *) log_warn "unknown CLAUDEBASE_ASR_BACKEND='$backend'; leaving daemon.toml alone"; return 1 ;;
+  esac
+
+  local toml="$CLAUDE_DIR/claudebase/daemon.toml"
+  mkdir -p "$(dirname "$toml")"
+  if [ ! -f "$toml" ]; then
+    printf '[asr]\nbackend = "%s"\n' "$backend" > "$toml"
+    log_ok "daemon.toml created with backend = $backend"
+    return 0
+  fi
+  if grep -qE '^\s*backend\s*=' "$toml"; then
+    local tmp="$toml.tmp.$$"
+    sed -E "s|^[[:space:]]*backend[[:space:]]*=.*|backend = \"$backend\"|" "$toml" > "$tmp" && mv "$tmp" "$toml"
+  elif grep -qE '^\s*\[asr\]' "$toml"; then
+    local tmp="$toml.tmp.$$"
+    awk -v b="$backend" '{print} /^[[:space:]]*\[asr\]/ && !done {print "backend = \"" b "\""; done=1}' "$toml" > "$tmp" && mv "$tmp" "$toml"
+  else
+    printf '\n[asr]\nbackend = "%s"\n' "$backend" >> "$toml"
+  fi
+  log_ok "daemon.toml set to backend = $backend"
   return 0
 }
 

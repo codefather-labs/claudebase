@@ -175,6 +175,16 @@ whisper-rs = { version = "0.16", optional = true }
 # direct dep so the model-download path can use the blocking client
 # without depending on teloxide internals.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "stream"] }
+# Parakeet ASR, behind `asr-sherpa`.
+#
+# `default-features = false` + `shared` on purpose: the crate's default is a
+# STATIC sherpa-onnx, which bundles its own copy of ONNX Runtime and its onnx
+# protobuf helpers. claudebase already links ONNX Runtime through fastembed for
+# the e5 retrieval encoder, and two static copies collide at link time --
+# `duplicate symbol: onnx::ParseData<double>` out of tensor_util.cc, defined in
+# both libort_sys and libsherpa_onnx_sys. Linking sherpa-onnx as a shared
+# library keeps one ONNX Runtime in the process instead of two in the archive.
+sherpa-onnx = { version = "1.13", optional = true, default-features = false, features = ["shared"] }
 
 # Slice 2 — Windows Service install/uninstall/lifecycle via the
 # `windows-service` crate. Gated behind `cfg(windows)` so the build graph
@@ -200,7 +210,7 @@ windows-service = "0.8"
 # non-ASR-bearing CI run with a ~2-3 minute whisper.cpp compile).
 default = []
 asr-whisper = ["dep:whisper-rs"]
-asr-sherpa = []
+asr-sherpa = ["dep:sherpa-onnx"]
 asr-nim = []
 
 [dev-dependencies]

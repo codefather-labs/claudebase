@@ -48,6 +48,9 @@ pub mod decoder;
 #[cfg(feature = "asr-whisper")]
 pub mod whisper;
 
+#[cfg(feature = "asr-sherpa")]
+pub mod parakeet;
+
 /// Speech-recognition trait — one method per pipeline stage that the
 /// downstream needs to drive.
 ///
@@ -61,6 +64,20 @@ pub trait Asr: Send + Sync + 'static {
     /// transcript string. `sample_rate` is passed for forward-compat —
     /// v1 backends assert 16 000 and treat anything else as an error.
     async fn transcribe(&self, pcm: Vec<f32>, sample_rate: u32) -> Result<String>;
+
+    /// Which backend this is, for logs, `daemon doctor` and installer output.
+    fn name(&self) -> &'static str;
+
+    /// Fetch whatever this backend needs before its first transcription, and
+    /// return once it is on disk.
+    ///
+    /// This lives on the trait because it used to live OUTSIDE it: `daemon
+    /// warmup --asr` had whisper's model path and download call written into
+    /// `main.rs`, with an `if backend != "whisper" { bail }` guard in front. So
+    /// the installers, which drive warmup, could only ever pre-fetch one
+    /// backend — and a second backend would have needed a second special case
+    /// in the same place rather than an implementation of its own.
+    fn warmup(&self) -> Result<()>;
 
     /// Synchronous health check for `daemon doctor --asr`. Backends
     /// verify their own preconditions:
@@ -76,7 +93,8 @@ pub trait Asr: Send + Sync + 'static {
 /// Dispatch:
 /// - `Some("whisper")` + feature ON  → Box::new(WhisperAsr::new(...))
 /// - `Some("whisper")` + feature OFF → Err("asr-whisper feature not compiled in")
-/// - `Some("sherpa-nemo")`           → Err("backend 'sherpa-nemo' not implemented in v1 — see Wave 6")
+/// - `Some("parakeet")` / `Some("sherpa-nemo")` + feature ON → ParakeetAsr
+/// - `Some("parakeet")` / `Some("sherpa-nemo")` + feature OFF → Err(naming the feature)
 /// - `Some("nim")`                   → Err("backend 'nim' not implemented in v1 — see Wave 6")
 /// - `Some(other)`                   → Err("unknown asr backend: <other>")
 /// - `None`                          → Err("no ASR backend configured in daemon.toml")
@@ -94,9 +112,10 @@ pub fn make_asr(config: &Config) -> Result<Box<dyn Asr>> {
         // Wave-6 stubs. ALWAYS runtime-Err in v1 regardless of feature
         // state — preserves the namespace without crashing the daemon
         // when an operator points daemon.toml at them.
-        "sherpa-nemo" => {
-            bail!("backend 'sherpa-nemo' not implemented in v1 — see Wave 6")
-        }
+        // `sherpa-nemo` was the reserved name; `parakeet` is what it actually
+        // runs and what the docs say. Both resolve, so a daemon.toml written
+        // against the reservation keeps working.
+        "parakeet" | "sherpa-nemo" => make_parakeet(config.asr.n_threads),
         "nim" => {
             bail!("backend 'nim' not implemented in v1 — see Wave 6")
         }
@@ -107,6 +126,16 @@ pub fn make_asr(config: &Config) -> Result<Box<dyn Asr>> {
 #[cfg(feature = "asr-whisper")]
 fn make_whisper(n_threads: Option<usize>) -> Result<Box<dyn Asr>> {
     Ok(Box::new(whisper::WhisperAsr::new(n_threads)?))
+}
+
+#[cfg(feature = "asr-sherpa")]
+fn make_parakeet(n_threads: Option<usize>) -> Result<Box<dyn Asr>> {
+    Ok(Box::new(parakeet::ParakeetAsr::new(n_threads)?))
+}
+
+#[cfg(not(feature = "asr-sherpa"))]
+fn make_parakeet(_n_threads: Option<usize>) -> Result<Box<dyn Asr>> {
+    bail!("backend 'parakeet' selected but asr-sherpa feature not compiled in — rebuild with `cargo build --features asr-sherpa`")
 }
 
 #[cfg(not(feature = "asr-whisper"))]

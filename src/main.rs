@@ -1315,7 +1315,7 @@ fn run_daemon_doctor(_args: &cli::DaemonDoctorArgs) -> std::process::ExitCode {
 /// model so the first voice note doesn't pay the cold-start download
 /// stall (PRD FR-ACD-7.9). Exit 0 on success, 1 on failure.
 fn run_daemon_warmup(_args: &cli::DaemonWarmupArgs) -> std::process::ExitCode {
-    use claudebase::daemon::config;
+    use claudebase::daemon::{asr, config};
 
     // A missing daemon.toml means defaults, not failure: the file is optional
     // and the default backend is whisper. Refusing to run here removed the one
@@ -1330,44 +1330,27 @@ fn run_daemon_warmup(_args: &cli::DaemonWarmupArgs) -> std::process::ExitCode {
         }
     };
 
-    let backend_name = cfg.asr.backend.as_deref().unwrap_or("<none>");
-    if backend_name != "whisper" {
-        // Slice 6-MVP: only whisper has a warmup path. sherpa/nim
-        // would have their own model file conventions; we surface
-        // an informative exit 1 so the operator knows there's no-op.
-        eprintln!(
-            "warmup: backend '{backend_name}' has no warmup path in v1 — see Wave 6"
-        );
-        return std::process::ExitCode::FAILURE;
-    }
-
-    #[cfg(feature = "asr-whisper")]
-    {
-        use claudebase::daemon::asr::whisper;
-        let path = match whisper::model_path() {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("warmup: cannot resolve model path: {e}");
-                return std::process::ExitCode::FAILURE;
-            }
-        };
-        match whisper::ensure_model(&path) {
-            Ok(()) => {
-                println!("whisper: model present at {}", path.display());
-                std::process::ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("warmup: whisper model download failed: {e}");
-                std::process::ExitCode::FAILURE
-            }
+    // Through the factory and the trait, so warming up a backend needs an
+    // implementation rather than another branch here. This function used to
+    // hold whisper's model path and download call inline behind an
+    // `if backend != "whisper" { bail }`, which is why the installers could
+    // pre-fetch exactly one backend's model.
+    let backend = match asr::make_asr(&cfg) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("warmup: {e}");
+            return std::process::ExitCode::FAILURE;
         }
-    }
-    #[cfg(not(feature = "asr-whisper"))]
-    {
-        eprintln!(
-            "warmup: asr-whisper feature not compiled in — rebuild with `cargo build --features asr-whisper`"
-        );
-        std::process::ExitCode::FAILURE
+    };
+    match backend.warmup() {
+        Ok(()) => {
+            println!("{}: model ready", backend.name());
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("warmup: {} model download failed: {e:#}", backend.name());
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 

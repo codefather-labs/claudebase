@@ -125,6 +125,14 @@ impl Asr for WhisperAsr {
         .context("whisper: spawn_blocking join failed")?
     }
 
+    fn name(&self) -> &'static str {
+        "whisper"
+    }
+
+    fn warmup(&self) -> Result<()> {
+        ensure_model(&self.model_path)
+    }
+
     fn health_check(&self) -> Result<()> {
         if !self.model_path.exists() {
             bail!(

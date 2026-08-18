@@ -710,29 +710,83 @@ function Install-WhisperStack {
 # Opt out with -SkipAsrModel or CLAUDEBASE_SKIP_ASR_MODEL=1. A failure is a
 # warning, never fatal: the lazy path still works and an install must not fail
 # over an optional model.
+# Write [asr] backend into daemon.toml without disturbing anything else.
+# Append-and-let-the-last-win is wrong for TOML, so an existing key is replaced
+# in place and a hand-written daemon.toml keeps every other setting it had.
+function Set-AsrBackend {
+    param([string]$Backend)
+    if ($Backend -notin @('whisper', 'parakeet', 'sherpa-nemo')) {
+        Write-Warn "unknown CLAUDEBASE_ASR_BACKEND='$Backend'; leaving daemon.toml alone"
+        return $false
+    }
+    $toml = Join-Path $Script:ClaudeDir 'claudebase\daemon.toml'
+    $dir = Split-Path -Parent $toml
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+
+    if (-not (Test-Path $toml)) {
+        Set-Content -Path $toml -Value "[asr]`nbackend = `"$Backend`"" -Encoding UTF8
+        Write-Ok "daemon.toml created with backend = $Backend"
+        return $true
+    }
+    $lines = Get-Content -Path $toml
+    if ($lines -match '^\s*backend\s*=') {
+        $lines = $lines -replace '^\s*backend\s*=.*', "backend = `"$Backend`""
+    } elseif ($lines -match '^\s*\[asr\]') {
+        $out = @()
+        $done = $false
+        foreach ($line in $lines) {
+            $out += $line
+            if (-not $done -and $line -match '^\s*\[asr\]') { $out += "backend = `"$Backend`""; $done = $true }
+        }
+        $lines = $out
+    } else {
+        $lines += @('', '[asr]', "backend = `"$Backend`"")
+    }
+    Set-Content -Path $toml -Value $lines -Encoding UTF8
+    Write-Ok "daemon.toml set to backend = $Backend"
+    return $true
+}
+
+# Pre-fetch the speech model for whichever ASR backend is configured.
+#
+# The download is `claudebase daemon warmup --asr`, which goes through the Asr
+# trait -- so this function does not know which model or which URL, and must
+# not. It used to: the whisper path was written here AND in the binary, and the
+# two disagreed for a release.
 function Install-AsrModel {
     if ($SkipAsrModel -or $env:CLAUDEBASE_SKIP_ASR_MODEL -eq '1' -or $env:CLAUDEBASE_SKIP_WHISPER -eq '1') {
-        Write-Info "skipping the whisper model download (opt-out set)"
+        Write-Info "skipping the speech model download (opt-out set)"
         return
     }
     $bin = Join-Path $Script:ClaudeDir 'tools\claudebase\claudebase.exe'
     if (-not (Test-Path $bin)) {
-        Write-Warn "no binary; skipping the whisper model download"
+        Write-Warn "no binary; skipping the speech model download"
         return
     }
-    $model = Join-Path $Script:ClaudeDir 'tools\claudebase\models\whisper\ggml-medium.bin'
-    if (Test-Path $model) {
-        Write-Ok "whisper model already present"
-        return
+
+    $backend = $env:CLAUDEBASE_ASR_BACKEND
+    if ($backend) {
+        if (-not (Set-AsrBackend -Backend $backend)) { return }
     }
-    Write-Info "downloading the whisper model (~1.5 GB, one time) ..."
+
+    $whisperModel = Join-Path $Script:ClaudeDir 'tools\claudebase\models\whisper\ggml-medium.bin'
+    $parakeetModel = Join-Path $Script:ClaudeDir 'tools\claudebase\models\parakeet\encoder.int8.onnx'
+    if ($backend -in @('parakeet', 'sherpa-nemo')) {
+        if (Test-Path $parakeetModel) { Write-Ok "parakeet model already present"; return }
+        Write-Info "downloading the parakeet model (~640 MB, one time) ..."
+        $expected = $parakeetModel
+    } else {
+        if (Test-Path $whisperModel) { Write-Ok "whisper model already present"; return }
+        Write-Info "downloading the whisper model (~1.5 GB, one time) ..."
+        $expected = $whisperModel
+    }
     Write-Info "  skip with -SkipAsrModel; voice notes still work without it"
     try {
         & $bin daemon warmup --asr 2>&1 | Out-Null
-        if (Test-Path $model) { Write-Ok "whisper model ready" }
+        if (Test-Path $expected) { Write-Ok "speech model ready" }
         else { throw "warmup finished but the model is not there" }
     } catch {
-        Write-Warn "whisper model download failed; it will be fetched on the first voice note"
+        Write-Warn "speech model download failed; it will be fetched on the first voice note"
         Write-Warn "  retry manually: claudebase daemon warmup --asr"
     }
 }

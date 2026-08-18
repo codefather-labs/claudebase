@@ -20,7 +20,15 @@ use common::{payload, socket_under, spawn_daemon_with_home, stop, wait_for_socke
 use rusqlite::Connection;
 use serde_json::json;
 
-const THREAD: &str = "telegram:99999";
+/// A peer thread, deliberately not a Telegram one.
+///
+/// An agent's post onto a `telegram:` thread is not broadcast to that chat's
+/// other subscribers — the text has already reached the operator over the Bot
+/// API, and fanning it out made every other session read one agent's reply to
+/// the operator as if the operator had written it to them. On an `agent:<id>`
+/// thread the broadcast IS the delivery, which is what this test exercises.
+/// `chat_broadcast_test` pins the suppression itself.
+const THREAD: &str = "agent:99999";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn post_then_subscribe_delivers_and_persists() {

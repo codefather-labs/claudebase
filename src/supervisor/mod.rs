@@ -497,10 +497,25 @@ pub(crate) fn thread_belongs_to(agent_id: &str, thread: &str) -> bool {
     let Ok(chat_id) = chat.parse::<i64>() else {
         return true;
     };
-    let Ok(conn) = crate::daemon::chat::open_chat_db() else {
-        return true;
+    // Read-only: `open_chat_db` runs the schema ensure, a WRITE transaction, on
+    // every open, so asking "who owns this chat" used to compete for the lock
+    // with the daemon writing the very message being routed.
+    let conn = match crate::daemon::chat::open_chat_db_readonly() {
+        Ok(c) => c,
+        Err(e) => {
+            // Fail CLOSED. This used to `return true`, which turned a busy
+            // database into "nobody owns this chat" and delivered the message to
+            // every subscriber — the operator then watched two sessions answer
+            // each other in their own Telegram. A message withheld is recovered
+            // from the backlog on the next reconnect; a message delivered to the
+            // wrong session cannot be taken back.
+            tracing::warn!(error = %e, thread, "cannot determine chat ownership; withholding");
+            return false;
+        }
     };
-    let bound: Option<String> = conn
+
+    use rusqlite::OptionalExtension;
+    let bound: Option<String> = match conn
         .query_row(
             "SELECT agent_id FROM agent_registry \
              WHERE routing_chat_id = ?1 AND state = 'alive' \
@@ -508,10 +523,22 @@ pub(crate) fn thread_belongs_to(agent_id: &str, thread: &str) -> bool {
             [chat_id],
             |row| row.get(0),
         )
-        .ok();
+        .optional()
+    {
+        Ok(v) => v,
+        Err(e) => {
+            // Same reasoning, and this is the path that actually fired: `.ok()`
+            // collapsed a failed query into `None`, which the match below read
+            // as "unbound" and broadcast.
+            tracing::warn!(error = %e, thread, "ownership query failed; withholding");
+            return false;
+        }
+    };
+
     match bound {
-        // Bound elsewhere -> not ours. Unbound -> nobody claimed it, and the
-        // daemon broadcasts to whoever subscribed; keep it.
+        // Bound elsewhere -> not ours. Genuinely unbound -> nobody claimed it,
+        // and the daemon broadcasts to whoever subscribed; keep it. That is a
+        // real answer from the database, not a failure dressed as one.
         Some(owner) => owner == agent_id,
         None => true,
     }
@@ -685,5 +712,58 @@ mod term {
     }
     pub fn win_size() -> Option<(u16, u16)> {
         None
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::thread_belongs_to;
+    use std::sync::Mutex;
+
+    static HOME_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Ownership must FAIL CLOSED.
+    ///
+    /// The check used to `return true` when the database could not be read and
+    /// collapsed a failed query into "unbound" via `.ok()`. Either turned a
+    /// transient lock into "nobody owns this chat", and the message went to every
+    /// subscriber — which on 2026-08-18 had two sessions answering each other
+    /// inside the operator's own Telegram chat. `open_chat_db` runs a write
+    /// transaction on every open, so contention was not hypothetical.
+    ///
+    /// Pointing HOME at an empty directory makes the database unopenable, which
+    /// is the same observable condition as an unreadable one.
+    #[test]
+    fn ownership_withholds_when_the_database_cannot_be_read() {
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let empty = tempfile::tempdir().expect("tempdir");
+        let prev_home = std::env::var_os("HOME");
+        let prev_xdg = std::env::var_os("XDG_RUNTIME_DIR");
+        std::env::set_var("HOME", empty.path());
+        std::env::remove_var("XDG_RUNTIME_DIR");
+
+        let verdict = thread_belongs_to("some-agent", "telegram:434566766");
+
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        if let Some(v) = prev_xdg {
+            std::env::set_var("XDG_RUNTIME_DIR", v);
+        }
+
+        assert!(
+            !verdict,
+            "an undeterminable owner must withhold the message, not broadcast it: \
+             a withheld message returns via the backlog, a misdelivered one cannot be recalled"
+        );
+    }
+
+    /// Threads that carry no routing binding are ours by construction and must
+    /// not be caught by the stricter rule.
+    #[test]
+    fn non_telegram_threads_are_always_ours() {
+        assert!(thread_belongs_to("me", "agent:me"));
+        assert!(thread_belongs_to("me", "some-explicit-subscription"));
     }
 }

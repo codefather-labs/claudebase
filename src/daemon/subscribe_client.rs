@@ -321,6 +321,33 @@ impl SubscribeClient {
 
             let (thread, source) = classify(&meta, sender_hint.clone());
 
+            // On a TELEGRAM thread only the operator is inbound. Every other
+            // sender there is an agent whose reply the daemon published to the
+            // same thread — an OUTBOUND message to the operator, not something
+            // addressed to us.
+            //
+            // The filter above catches only our OWN id, which was right for
+            // `agent:` threads (a peer's message there is legitimate inbound)
+            // and wrong for telegram ones. Observed live on 2026-08-18: a
+            // sibling session answered the operator, its reply arrived here
+            // marked `[telegram_message]`, and both sessions then answered each
+            // other through the operator's chat while the operator watched.
+            // `chat_messages` shows eight distinct agent ids that have written
+            // to that thread, so every one of them was visible to whichever
+            // session held the binding.
+            if thread.starts_with("telegram:") {
+                if let Some(from) = meta.get("from_agent").and_then(|v| v.as_str()) {
+                    if !from.starts_with("telegram:") {
+                        tracing::debug!(
+                            %thread,
+                            from,
+                            "agent outbound on a telegram thread; not inbound for us"
+                        );
+                        continue;
+                    }
+                }
+            }
+
             let message_id = meta
                 .get("message_id")
                 .and_then(|m| m.as_str())
@@ -783,6 +810,50 @@ mod classify_tests {
         let meta = meta_of(&frame);
         assert!(meta.get("voice").is_none(), "text meta must stay unchanged");
         assert_eq!(classify(&meta, None).1, Source::Telegram);
+    }
+
+    /// A sibling session answering the operator must not land in OUR input.
+    ///
+    /// The daemon publishes an agent's outbound reply to the same telegram
+    /// thread it was sent on. The old filter dropped only our own id, so every
+    /// other session's replies arrived here marked `[telegram_message]` — and on
+    /// 2026-08-18 two sessions spent several turns answering each other through
+    /// the operator's chat, each believing the other's words were the operator's.
+    #[test]
+    fn another_agents_reply_to_the_operator_is_not_our_inbound() {
+        let msg = crate::daemon::chat::ChatMessage {
+            id: "m1".to_string(),
+            thread_id: "telegram:434566766".to_string(),
+            from_agent: "404f985e-4aa7-4242-8524-e9285401becb".to_string(),
+            content: "answer meant for the operator".to_string(),
+            reply_to: None,
+            created_at: 0,
+        };
+        let frame = crate::daemon::chat::build_channel_notification(&msg);
+        let meta = meta_of(&frame);
+        let from = meta.get("from_agent").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            !from.starts_with("telegram:"),
+            "an agent id is what marks this as outbound; the guard keys on that"
+        );
+    }
+
+    /// And the operator's own message on the same thread IS inbound — the guard
+    /// must not swallow the traffic it exists to carry.
+    #[test]
+    fn the_operator_on_a_telegram_thread_is_still_inbound() {
+        let msg = crate::daemon::chat::ChatMessage {
+            id: "m2".to_string(),
+            thread_id: "telegram:434566766".to_string(),
+            from_agent: "telegram:codefather_dev".to_string(),
+            content: "a real question".to_string(),
+            reply_to: None,
+            created_at: 0,
+        };
+        let frame = crate::daemon::chat::build_channel_notification(&msg);
+        let meta = meta_of(&frame);
+        let from = meta.get("from_agent").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(from.starts_with("telegram:"), "the operator must stay inbound");
     }
 
     #[test]

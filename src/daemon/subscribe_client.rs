@@ -427,6 +427,28 @@ fn classify(meta: &Value, sender_hint: Option<String>) -> (String, Source) {
     // An explicit source beats every inference below. The callback builder
     // states it outright precisely because inferring the source from the shape
     // of some other field is what produced F-14.
+    // An explicit `source` is authoritative for EVERY value, not just callback.
+    // The control frame states `source: "telegram"` because it carries the
+    // operator's own words, but it rides an `agent:<id>` thread to reach one
+    // specific session — so reading the thread prefix instead labelled it
+    // `[agent-to-agent:unknown]`. Setting a field and then not reading it is the
+    // same mistake as F-14, one field later.
+    if field("source").as_deref() == Some("telegram") {
+        let thread = thread_field
+            .clone()
+            .or_else(|| chat_field.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        let is_voice = meta.get("voice").and_then(|v| v.as_bool()).unwrap_or(false);
+        return (
+            thread,
+            if is_voice {
+                Source::TelegramVoice
+            } else {
+                Source::Telegram
+            },
+        );
+    }
+
     if field("source").as_deref() == Some("callback") {
         let label = field("label").filter(|l| !l.is_empty());
         let thread = thread_field
@@ -896,6 +918,24 @@ mod classify_tests {
         assert!(
             meta_of(&ordinary).get("control").is_none(),
             "typing the word must not buy priority delivery"
+        );
+    }
+
+    /// The operator's `/continue` must read as the operator, not as a peer.
+    ///
+    /// It rides an `agent:<id>` thread to reach one specific session, so
+    /// classifying by thread prefix labelled it `[agent-to-agent:unknown]` — the
+    /// operator pressed a button and the session saw an anonymous peer. The
+    /// frame states `source: "telegram"`; this asserts the classifier reads it.
+    #[test]
+    fn the_continue_control_frame_reads_as_the_operator() {
+        let frame = crate::daemon::chat::build_control_notification_continue("target-id", "продолжи");
+        let (thread, source) = classify(&meta_of(&frame), None);
+        assert_eq!(thread, "agent:target-id", "still addressed to one session");
+        assert_eq!(
+            source,
+            Source::Telegram,
+            "the operator pressed the button; it must not render as a peer"
         );
     }
 

@@ -1328,9 +1328,14 @@ pub fn process_batch_with_pairing(
         ));
     }
 
+    // Forward only. A transcript re-enters the batch carrying the update_id it
+    // had when it was fetched, which is by then far below the offset; an
+    // unconditional write would rewind the poll and re-deliver everything
+    // since.
     tx.execute(
-        "UPDATE daemon_state SET value = ?1 WHERE key = 'telegram.last_update_id'",
-        params![max_id.to_string()],
+        "UPDATE daemon_state SET value = ?1 \
+         WHERE key = 'telegram.last_update_id' AND CAST(value AS INTEGER) < ?2",
+        params![max_id.to_string(), max_id],
     )?;
 
     tx.commit()?;
@@ -1629,6 +1634,46 @@ async fn run_long_poll(
     // architect verdict at `.claude/scratchpad.md`.
     let channel_access_path = channel_state::access_json_path();
 
+    // Transcription runs beside the poll loop, not inside it.
+    //
+    // `voice_tx` hands a note to the worker; `done_rx` takes the finished
+    // transcript back and the loop feeds it through the ordinary batch path,
+    // so a dictated message and a typed one are persisted, gated and delivered
+    // by exactly the same code. The queue is unbounded because its real bound
+    // is `pending_voice` on disk: a note is already durable before it is ever
+    // sent here.
+    let (voice_tx, voice_rx) = mpsc::unbounded_channel::<(i64, Update)>();
+    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<(i64, Update)>();
+    tokio::spawn(run_voice_worker(
+        bot.clone(),
+        asr.clone(),
+        token_for_error_redaction.clone(),
+        voice_rx,
+        done_tx,
+    ));
+
+    // Anything left parked by a previous daemon is picked up again. This is
+    // what makes a restart during a five-minute transcription cost the CPU
+    // over again rather than the message.
+    match tokio::task::spawn_blocking(|| -> Result<Vec<(i64, String, i64)>> {
+        let conn = chat::open_chat_db()?;
+        load_pending_voice(&conn)
+    })
+    .await
+    {
+        Ok(Ok(rows)) => {
+            if !rows.is_empty() {
+                tracing::info!(count = rows.len(), "resuming voice notes parked before restart");
+            }
+            for (update_id, raw_json, _attempts) in rows {
+                if let Ok(u) = serde_json::from_str::<Update>(&raw_json) {
+                    let _ = voice_tx.send((update_id, u));
+                }
+            }
+        }
+        Ok(Err(e)) => tracing::warn!(error = %e, "could not read parked voice notes"),
+        Err(e) => tracing::warn!(error = %e, "parked-voice read panicked"),
+    }
     loop {
         // Load channel state fresh each poll (Slice 7.x — operator
         // mutations via `/claudebase:access pair <code>` and the bot's
@@ -1920,10 +1965,21 @@ async fn run_long_poll(
         // Convert teloxide Updates into our minimal `Update` shape via
         // JSON round-trip — keeps our process_batch surface decoupled
         // from teloxide's enum tree.
-        let mut decoded: Vec<Update> = Vec::with_capacity(raw_updates.len());
+        // The raw JSON is kept beside the decoded shape: a voice note is
+        // parked in `pending_voice` as the bytes Telegram sent, so the worker
+        // that picks it up minutes (or a restart) later reconstructs exactly
+        // the update the loop saw.
+        let mut decoded: Vec<(serde_json::Value, Update)> = Vec::with_capacity(raw_updates.len());
         for up in &raw_updates {
-            match serde_json::to_value(up).and_then(serde_json::from_value::<Update>) {
-                Ok(u) => decoded.push(u),
+            let raw = match serde_json::to_value(up) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to re-encode telegram Update — skipping");
+                    continue;
+                }
+            };
+            match serde_json::from_value::<Update>(raw.clone()) {
+                Ok(u) => decoded.push((raw, u)),
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
@@ -1933,7 +1989,13 @@ async fn run_long_poll(
             }
         }
 
-        if decoded.is_empty() {
+        // A finished transcript re-enters here as an ordinary text update.
+        let mut transcribed: Vec<(i64, Update)> = Vec::new();
+        while let Ok(done) = done_rx.try_recv() {
+            transcribed.push(done);
+        }
+
+        if decoded.is_empty() && transcribed.is_empty() {
             // Idle interval — Slice 4 hard-codes 1s; future config could
             // expose this as a knob.
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1949,38 +2011,71 @@ async fn run_long_poll(
         // a bracketed `[voice transcription failed: ...]` text that
         // process_batch inserts as a normal row — the operator sees
         // the error in the chat thread instead of silent loss.
-        for update in decoded.iter_mut() {
-            if let Some(msg) = &mut update.message {
-                if msg.text.is_none() && msg.voice.is_some() {
-                    let voice_text = match transcribe_voice_note(&bot, msg, asr.as_ref()).await {
-                        Ok(t) => t,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %redact_error_string(&format!("{e:#}"), &token_for_error_redaction),
-                                "voice transcribe failed; using fallback"
-                            );
-                            format!("[voice transcription failed: {e}]")
-                        }
-                    };
-                    msg.text = Some(voice_text);
-                    // `voice` is deliberately NOT cleared. It used to be, and
-                    // that erased the only remaining evidence that the text was
-                    // a transcript: downstream saw an ordinary text message and
-                    // the operator could not tell a dictated note from a typed
-                    // one. Nothing re-triggers transcription, because that
-                    // branch requires `text.is_none()`, and the content match
-                    // below takes `text` first.
+        // Voice notes leave the loop here instead of being transcribed in it.
+        //
+        // Transcription costs tens of seconds of CPU. Awaiting it here meant
+        // `getUpdates` was not called for that whole time, so nothing else
+        // could arrive; and because the batch committed as a unit, every
+        // message that shared the batch was delivered together at the end.
+        // Both were visible from the outside as "the channel went quiet, then
+        // everything landed at once".
+        //
+        // So the note is parked in `pending_voice` inside the same transaction
+        // that advances the poll offset, and a worker takes it from there. The
+        // offset may therefore move past a note that has not been transcribed
+        // yet — which is safe precisely because the note is already durable,
+        // and is the reason the parking happens before the offset moves.
+        let mut to_park: Vec<(i64, String)> = Vec::new();
+        let mut batch: Vec<Update> = Vec::with_capacity(decoded.len() + transcribed.len());
+        let mut fetched_max_id: i64 = 0;
+        for (raw, update) in decoded {
+            fetched_max_id = fetched_max_id.max(update.update_id);
+            let is_untranscribed_voice = update
+                .message
+                .as_ref()
+                .is_some_and(|m| m.text.is_none() && m.voice.is_some());
+            if is_untranscribed_voice {
+                to_park.push((update.update_id, raw.to_string()));
+            } else {
+                batch.push(update);
+            }
+        }
+        // Transcripts carry their ORIGINAL update_id, which is by now below
+        // the offset. `process_batch` only ever moves the offset forward, so
+        // re-entering with an old id cannot rewind it.
+        let mut settled: Vec<i64> = Vec::with_capacity(transcribed.len());
+        for (update_id, update) in transcribed {
+            settled.push(update_id);
+            batch.push(update);
+        }
+
+        for (update_id, raw_json) in &to_park {
+            if let Ok(u) = serde_json::from_str::<Update>(raw_json) {
+                if voice_tx.send((*update_id, u)).is_err() {
+                    tracing::error!("voice transcription worker is gone; notes will queue on disk");
                 }
             }
         }
-
-        let batch = decoded;
         let access_for_spawn = cs_access.clone();
         let process_outcome = tokio::task::spawn_blocking(
             move || -> Result<(BatchOutcome, channel_state::Access)> {
                 let mut conn = chat::open_chat_db()?;
+                // Park first, THEN move the offset: a crash between the two
+                // costs a re-delivered note, whereas the other order costs a
+                // lost one.
+                for (update_id, raw_json) in &to_park {
+                    enqueue_pending_voice(&conn, *update_id, raw_json)?;
+                }
+                if fetched_max_id > 0 {
+                    advance_offset_to(&conn, fetched_max_id)?;
+                }
                 let mut access_local = access_for_spawn;
                 let outcome = process_batch_with_pairing(&mut conn, &mut access_local, &batch)?;
+                // Only now, with the transcript committed as a real message,
+                // does the note stop being pending.
+                for update_id in &settled {
+                    delete_pending_voice(&conn, *update_id)?;
+                }
                 Ok((outcome, access_local))
             },
         )
@@ -2205,6 +2300,127 @@ async fn run_long_poll(
     }
 }
 
+/// Park a voice note for the transcription worker. Idempotent: a note
+/// re-delivered by Telegram after a crash collapses onto the existing row.
+fn enqueue_pending_voice(conn: &Connection, update_id: i64, raw_json: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO pending_voice (update_id, update_json, attempts, created_at) \
+         VALUES (?1, ?2, 0, ?3)",
+        params![update_id, raw_json, channel_state::now_ms()],
+    )?;
+    Ok(())
+}
+
+/// Every note still waiting, oldest first, with the number of times it has
+/// already been handed to the worker.
+fn load_pending_voice(conn: &Connection) -> Result<Vec<(i64, String, i64)>> {
+    let mut stmt = conn
+        .prepare("SELECT update_id, update_json, attempts FROM pending_voice ORDER BY update_id")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn bump_pending_voice_attempts(conn: &Connection, update_id: i64) -> Result<i64> {
+    conn.execute(
+        "UPDATE pending_voice SET attempts = attempts + 1 WHERE update_id = ?1",
+        params![update_id],
+    )?;
+    let n: i64 = conn
+        .query_row(
+            "SELECT attempts FROM pending_voice WHERE update_id = ?1",
+            params![update_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    Ok(n)
+}
+
+fn delete_pending_voice(conn: &Connection, update_id: i64) -> Result<()> {
+    conn.execute("DELETE FROM pending_voice WHERE update_id = ?1", params![update_id])?;
+    Ok(())
+}
+
+/// Move the poll offset forward, never back.
+fn advance_offset_to(conn: &Connection, max_id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE daemon_state SET value = ?1 \
+         WHERE key = 'telegram.last_update_id' AND CAST(value AS INTEGER) < ?2",
+        params![max_id.to_string(), max_id],
+    )?;
+    Ok(())
+}
+
+/// How many times a note is handed to whisper before it is given up on.
+///
+/// A failure that whisper REPORTS is already turned into a
+/// `[voice transcription failed: …]` message, so it never comes back here.
+/// This bound exists for the failure whisper does not report — a panic or an
+/// OOM inside the C++ layer that takes the worker down mid-note. Without it,
+/// that one note would be picked up again on every restart, forever, and the
+/// daemon would never get past it.
+const MAX_VOICE_ATTEMPTS: i64 = 3;
+
+/// Drains `pending_voice`, one note at a time, for the daemon's lifetime.
+///
+/// Serial on purpose. Two notes transcribed at once on a busy machine finish
+/// later than the same two run back to back, for the same reason that giving
+/// whisper every core is slower than giving it four: ggml joins its workers at
+/// every layer, so contention does not divide the machine, it stalls it.
+async fn run_voice_worker(
+    bot: teloxide::Bot,
+    asr: Option<Arc<dyn Asr>>,
+    token_for_error_redaction: String,
+    mut voice_rx: mpsc::UnboundedReceiver<(i64, Update)>,
+    done_tx: mpsc::UnboundedSender<(i64, Update)>,
+) {
+    while let Some((update_id, mut update)) = voice_rx.recv().await {
+        let attempts = tokio::task::spawn_blocking(move || -> Result<i64> {
+            let conn = chat::open_chat_db()?;
+            bump_pending_voice_attempts(&conn, update_id)
+        })
+        .await
+        .unwrap_or(Ok(0))
+        .unwrap_or(0);
+
+        let Some(msg) = update.message.as_mut() else { continue };
+
+        let text = if attempts > MAX_VOICE_ATTEMPTS {
+            tracing::error!(
+                update_id,
+                attempts,
+                "voice note gave up after repeated attempts — delivering a placeholder"
+            );
+            "[voice transcription failed: gave up after repeated attempts \
+             — the transcriber died mid-note]"
+                .to_string()
+        } else {
+            match transcribe_voice_note(&bot, msg, asr.as_ref()).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %redact_error_string(&format!("{e:#}"), &token_for_error_redaction),
+                        "voice transcribe failed; using fallback"
+                    );
+                    format!("[voice transcription failed: {e}]")
+                }
+            }
+        };
+
+        msg.text = Some(text);
+        // `voice` is deliberately NOT cleared. It used to be, and that erased
+        // the only remaining evidence that the text was a transcript:
+        // downstream saw an ordinary text message and the operator could not
+        // tell a dictated note from a typed one. Nothing re-triggers
+        // transcription, because that branch requires `text.is_none()`.
+        if done_tx.send((update_id, update)).is_err() {
+            tracing::warn!("poll loop is gone; transcript stays pending on disk");
+            return;
+        }
+    }
+}
+
 /// Slice 6-MVP — transcribe one Telegram voice note end-to-end.
 ///
 /// 1. `bot.get_file(file_id)` → File metadata (carries `path` and
@@ -2276,6 +2492,83 @@ pub fn no_op_arc() -> Arc<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A note is durable before the offset moves past it, so the crash that
+    /// used to eat a voice message now costs a repeat transcription.
+    #[test]
+    fn a_parked_voice_note_survives_and_deduplicates() {
+        let conn = rusqlite::Connection::open_in_memory().expect("conn");
+        chat::ensure_chat_db_schema(&conn).expect("schema");
+
+        let raw = r#"{"update_id":7,"message":{"message_id":1,"chat":{"id":5},"voice":{"file_id":"f","duration":3}}}"#;
+        enqueue_pending_voice(&conn, 7, raw).expect("park");
+        // Telegram re-delivering the same update after a crash must not queue
+        // the note a second time.
+        enqueue_pending_voice(&conn, 7, raw).expect("park again");
+
+        let pending = load_pending_voice(&conn).expect("load");
+        assert_eq!(pending.len(), 1, "one note, not one per delivery");
+        assert_eq!(pending[0].0, 7);
+        assert!(serde_json::from_str::<Update>(&pending[0].1).is_ok(), "the parked bytes still parse");
+
+        delete_pending_voice(&conn, 7).expect("settle");
+        assert!(load_pending_voice(&conn).expect("load").is_empty());
+    }
+
+    /// The retry bound is what stops a note that kills the transcriber from
+    /// being picked up again on every restart, forever.
+    #[test]
+    fn attempts_are_counted_across_restarts() {
+        let conn = rusqlite::Connection::open_in_memory().expect("conn");
+        chat::ensure_chat_db_schema(&conn).expect("schema");
+        enqueue_pending_voice(&conn, 9, "{}").expect("park");
+        for expected in 1..=3 {
+            assert_eq!(bump_pending_voice_attempts(&conn, 9).expect("bump"), expected);
+        }
+        let pending = load_pending_voice(&conn).expect("load");
+        assert_eq!(pending[0].2, 3, "the count is on disk, not in the worker");
+    }
+
+    /// A finished transcript re-enters the batch under the update_id it was
+    /// fetched with, which by then sits far below the offset. If that write
+    /// were unconditional the poll would rewind and re-deliver every message
+    /// since — the whole channel, replayed, per voice note.
+    #[test]
+    fn the_offset_never_rewinds() {
+        let conn = rusqlite::Connection::open_in_memory().expect("conn");
+        chat::ensure_chat_db_schema(&conn).expect("schema");
+
+        advance_offset_to(&conn, 500).expect("advance");
+        assert_eq!(load_offset(&conn).expect("load"), 500);
+
+        advance_offset_to(&conn, 499).expect("stale advance");
+        assert_eq!(load_offset(&conn).expect("load"), 500, "a lower id must not rewind");
+
+        advance_offset_to(&conn, 501).expect("advance");
+        assert_eq!(load_offset(&conn).expect("load"), 501);
+    }
+
+    /// Same guarantee, through the path that actually runs it: a batch whose
+    /// highest update_id is below the stored offset must leave it alone.
+    #[test]
+    fn process_batch_does_not_rewind_the_offset_for_a_late_transcript() {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("conn");
+        chat::ensure_chat_db_schema(&conn).expect("schema");
+        advance_offset_to(&conn, 900).expect("advance");
+
+        let late: Update = serde_json::from_str(
+            r#"{"update_id":12,"message":{"message_id":3,"chat":{"id":5},"text":"a transcript"}}"#,
+        )
+        .expect("parse");
+        let mut access = channel_state::Access::default();
+        process_batch_with_pairing(&mut conn, &mut access, &[late]).expect("process");
+
+        assert_eq!(
+            load_offset(&conn).expect("load"),
+            900,
+            "the late transcript must not drag the poll back to update 12"
+        );
+    }
     use super::*;
     use crate::daemon::config::DmPolicy;
 

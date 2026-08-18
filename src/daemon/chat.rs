@@ -587,6 +587,9 @@ COMMIT;
     // pty-transport Slice 14 — remember the nick a session was DELIBERATELY
     // given, so the next session in the same directory starts under it again.
     apply_nick_memory_migration(conn)?;
+    // v0.11 — voice notes waiting to be transcribed, so a note survives the
+    // minutes of CPU it costs and the restart that may land in the middle.
+    apply_pending_voice_migration(conn)?;
     // v0.11 — per-nick callback tokens for the HTTP endpoint.
     crate::daemon::callback::apply_migration(conn)?;
     // Slice 8 — `pending_asks` table for `chat_ask` MCP tool. Additive,
@@ -701,6 +704,31 @@ fn apply_nick_memory_migration(conn: &Connection) -> rusqlite::Result<()> {
            nick       TEXT NOT NULL,
            updated_at INTEGER NOT NULL,
            PRIMARY KEY (host, cwd)
+         );",
+    )
+}
+
+/// `pending_voice` — voice notes accepted from Telegram but not yet transcribed.
+///
+/// Transcription costs tens of seconds of CPU, which is far too long to hold
+/// the Telegram poll loop: while it ran, nothing else could arrive, and every
+/// message in the same batch was delivered together at the end. Worse, an
+/// update that had been fetched but not yet persisted was lost outright if the
+/// daemon restarted mid-transcription.
+///
+/// So the raw update is written here first, in the same transaction that
+/// advances the poll offset, and a worker drains the table at its own pace.
+/// The row is deleted only once the transcript has been committed as a real
+/// message, which makes a crash cost a repeat transcription rather than a lost
+/// note. `update_id` is the primary key, so a re-delivery from Telegram after a
+/// crash collapses onto the existing row instead of queueing the note twice.
+fn apply_pending_voice_migration(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pending_voice (
+           update_id   INTEGER PRIMARY KEY,
+           update_json TEXT    NOT NULL,
+           attempts    INTEGER NOT NULL DEFAULT 0,
+           created_at  INTEGER NOT NULL
          );",
     )
 }

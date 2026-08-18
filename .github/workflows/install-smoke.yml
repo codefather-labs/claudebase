@@ -158,17 +158,35 @@ jobs:
               || { echo "channel contract does not teach $token"; exit 1; }
           done
 
-      - name: Skills, rules and agents are installed
+      - name: Every skill, command, rule and agent in the repo is installed
         shell: bash
         run: |
           set -eu
-          for s in claudebase-daemon-change-nick \
-                   claudebase-daemon-setup-auth-token \
-                   claudebase-daemon-callback-info; do
-            test -f "$HOME/.claude/skills/$s/SKILL.md" || { echo "missing skill: $s"; exit 1; }
+          # Derived from the repository, not from a hand-written list: a list
+          # would silently stop covering whatever was added after it was
+          # written, which is exactly how the installer came to ship three
+          # skills while announcing four unrelated commands.
+          for d in prompts/skills/*/; do
+            s=$(basename "$d")
+            test -f "$HOME/.claude/skills/$s/SKILL.md" \
+              || { echo "skill not installed: $s"; exit 1; }
           done
-          test -f "$HOME/.claude/rules/cognitive-self-check.md"
-          test -d "$HOME/.claude/agents"
+          for f in prompts/commands/*.md; do
+            c=$(basename "$f")
+            test -f "$HOME/.claude/commands/$c" \
+              || { echo "command not installed: $c"; exit 1; }
+          done
+          for f in prompts/agents/*.md; do
+            a=$(basename "$f")
+            test -f "$HOME/.claude/agents/$a" \
+              || { echo "agent not installed: $a"; exit 1; }
+          done
+          for f in prompts/rules/*.md; do
+            r=$(basename "$f")
+            test -f "$HOME/.claude/rules/$r" \
+              || { echo "rule not installed: $r"; exit 1; }
+          done
+          echo "installed: $(ls prompts/skills | wc -l) skills, $(ls prompts/commands/*.md | wc -l) commands, $(ls prompts/agents/*.md | wc -l) agents, $(ls prompts/rules/*.md | wc -l) rules"
 
       - name: The daemon starts and answers
         shell: bash
@@ -237,6 +255,93 @@ jobs:
           if command -v systemd-analyze >/dev/null 2>&1; then
             systemd-analyze verify --user-unit "$unit" || true
           fi
+
+  install-windows:
+    name: install.ps1 on windows-latest
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Nothing on Linux catches a PowerShell problem, which is how install.ps1
+      # came to be unparseable for months: PowerShell 5.1 reads a BOM-less .ps1
+      # in the system ANSI codepage, so three UTF-8 em-dashes stopped the whole
+      # installer from running and no test noticed.
+      - name: install.ps1 parses under Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $errs = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path .\install.ps1), [ref]$null, [ref]$errs)
+          if ($errs.Count -gt 0) {
+            $errs | ForEach-Object {
+              Write-Host ("line " + $_.Extent.StartLineNumber + ": " + $_.Message)
+            }
+            exit 1
+          }
+          Write-Host "install.ps1 parses clean"
+
+      - name: install.ps1 is pure ASCII
+        shell: powershell
+        run: |
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path .\install.ps1))
+          $bad = @($bytes | Where-Object { $_ -gt 127 })
+          if ($bad.Count -gt 0) {
+            Write-Host ("non-ASCII bytes: " + $bad.Count +
+                        " -- PowerShell 5.1 mis-decodes them and the script stops parsing")
+            exit 1
+          }
+          Write-Host "ASCII only"
+
+      - name: Run the installer
+        shell: powershell
+        run: .\install.ps1 -Yes
+
+      - name: The binary is installed and runs
+        shell: powershell
+        run: |
+          $exe = "$env:USERPROFILE\.claude\tools\claudebase\claudebase.exe"
+          if (-not (Test-Path $exe)) { Write-Host "binary missing"; exit 1 }
+          & $exe --version
+
+      - name: Every skill, command, rule and agent is installed
+        shell: powershell
+        run: |
+          $root = "$env:USERPROFILE\.claude"
+          $missing = @()
+          Get-ChildItem prompts\skills -Directory | ForEach-Object {
+            if (-not (Test-Path "$root\skills\$($_.Name)\SKILL.md")) { $missing += "skill: $($_.Name)" }
+          }
+          foreach ($pair in @(
+            @{ src = "prompts\commands"; dst = "$root\commands"; kind = "command" },
+            @{ src = "prompts\agents";   dst = "$root\agents";   kind = "agent"   },
+            @{ src = "prompts\rules";    dst = "$root\rules";    kind = "rule"    })) {
+            Get-ChildItem $pair.src -Filter *.md | ForEach-Object {
+              if (-not (Test-Path (Join-Path $pair.dst $_.Name))) {
+                $missing += ($pair.kind + ": " + $_.Name)
+              }
+            }
+          }
+          if ($missing.Count -gt 0) { $missing | ForEach-Object { Write-Host $_ }; exit 1 }
+          Write-Host "every shipped asset is installed"
+
+      - name: Hooks are wired into settings.json
+        shell: powershell
+        run: |
+          $s = Get-Content "$env:USERPROFILE\.claude\settings.json" -Raw | ConvertFrom-Json
+          foreach ($ev in @("SessionStart","UserPromptSubmit","PreToolUse","PostToolUse")) {
+            if (-not $s.hooks.$ev) { Write-Host "no $ev hook wired"; exit 1 }
+          }
+          Write-Host "hooks wired"
+
+      # Windows refuses to overwrite a RUNNING .exe, and the daemon from the
+      # first install is running by now -- which is what made every upgrade fail
+      # with "Cannot create a file when that file already exists".
+      - name: Installing twice succeeds while the daemon is running
+        shell: powershell
+        run: |
+          .\install.ps1 -Yes
+          $exe = "$env:USERPROFILE\.claude\tools\claudebase\claudebase.exe"
+          & $exe --version
 
   install-idempotent:
     name: installing twice changes nothing

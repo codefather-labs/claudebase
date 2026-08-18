@@ -21,6 +21,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   renaming swaps the inode and the live process keeps the old file open.) The installer now renames
   the old binary aside — which Windows does allow — puts the new one in place, and cleans the
   leftover on the next run rather than stopping a working install to upgrade it.
+- **CI now installs on Windows too.** Every PowerShell defect above lived through months of green
+  builds because the smoke workflow only ran Ubuntu containers. A `windows-latest` job now parses
+  `install.ps1` with the real PowerShell, asserts it is ASCII, runs it, checks that every skill,
+  command, agent and rule in the repository landed, checks the hooks are wired, and installs a second
+  time while the daemon is running — the case that used to fail outright. The Linux job derives its
+  asset list from `prompts/` rather than a hand-written list, so a new skill cannot go unchecked.
 - **Both installers under-reported what they install.** The closing summary listed the four
   `commands/` entries and called them skills, while the three actual `skills/` entries went
   unmentioned — so the installer's own output said claudebase ships three slash-commands when it

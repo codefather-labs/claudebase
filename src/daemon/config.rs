@@ -163,12 +163,25 @@ pub struct AsrConfig {
     /// (logged warn, voice notes fall back to a placeholder) — no crash.
     #[serde(default = "default_asr_backend")]
     pub backend: Option<String>,
+
+    /// Threads whisper.cpp inference may use. `None` means the built-in
+    /// default (see `asr::whisper::resolve_threads`), which is deliberately
+    /// NOT "every core".
+    ///
+    /// Raise it only on a machine whose cores are actually free. Measured on
+    /// a 16-core box at load ~25 running the agents this daemon serves, a 4
+    /// second note took 193s at 16 threads, 87s at 8, and 69s at 4 — more
+    /// threads was monotonically WORSE, because ggml synchronises its workers
+    /// at every layer and one descheduled worker stalls all of them.
+    #[serde(default)]
+    pub n_threads: Option<usize>,
 }
 
 impl Default for AsrConfig {
     fn default() -> Self {
         Self {
             backend: default_asr_backend(),
+            n_threads: None,
         }
     }
 }

@@ -20,6 +20,7 @@ fn config_with_backend(name: &str) -> Config {
     let mut cfg = Config::default();
     cfg.asr = AsrConfig {
         backend: Some(name.to_string()),
+        n_threads: None,
     };
     cfg
 }

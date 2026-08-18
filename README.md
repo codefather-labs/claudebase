@@ -388,8 +388,26 @@ button per option, the operator taps, and the answer is routed back to the askin
 
 ### Voice messages
 
-Voice notes are transcribed locally by whisper (`ffmpeg` + `whisper-cli`, installed best-effort) and
-arrive as ordinary `[telegram_message]:` text. Nothing leaves the machine.
+Voice notes are transcribed locally by whisper (`ffmpeg` + the bundled whisper.cpp, `ggml-medium`)
+and arrive prefixed `[telegram_voice_message]:` — deliberately not the same prefix as typed text, so
+the agent knows the words came out of speech recognition and treats exact strings in them (filenames,
+flags, identifiers) as things to confirm rather than to act on. Nothing leaves the machine.
+
+Transcription is CPU-bound and it does not get its own machine. By default it takes **4 threads**,
+not every core:
+
+```toml
+[asr]
+backend = "whisper"
+n_threads = 4          # omit for the default
+```
+
+Raise it only where the cores are genuinely idle. On a busy machine more threads is slower, not
+faster — measured on a 16-core box at load ~25 running the agents the daemon serves, the same
+4-second note took 193s at 16 threads, 87s at 8, and 69s at 4. whisper.cpp joins its workers at every
+layer, so one worker that loses its core holds all the others at the barrier.
+
+The model is loaded once and kept, and one note is transcribed at a time for the same reason.
 
 ---
 

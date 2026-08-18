@@ -47,21 +47,59 @@ use super::Asr;
 /// run without booting the model.
 pub struct WhisperAsr {
     model_path: PathBuf,
-    // The WhisperContext is intentionally NOT held here in Slice 6-MVP —
-    // every transcribe call constructs the context inline so the
-    // implementation is straightforward. Future slices can hoist the
-    // context behind a `tokio::sync::Mutex<Option<WhisperContext>>`
-    // for caching across calls.
+    n_threads: usize,
+    /// The loaded model, kept between calls.
+    ///
+    /// Re-reading 1.5 GB per voice note cost a measured 2.5s of pure
+    /// startup on a warm page cache, and evicted that much of everyone
+    /// else's cache along the way. It is held behind a plain mutex that
+    /// stays locked for the whole inference, so two notes arriving at once
+    /// run one after the other rather than fighting: on a CPU-bound box
+    /// concurrent whisper runs are strictly slower than sequential ones,
+    /// for the same reason too many threads are (see `resolve_threads`).
+    ctx: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<whisper_rs::WhisperContext>>>>,
 }
 
 impl WhisperAsr {
     /// Construct a WhisperAsr handle. Always succeeds (no I/O) so
     /// `daemon doctor` can introspect even when the model file is
     /// missing — `health_check()` is what reports model-missing.
-    pub fn new() -> Result<Self> {
+    ///
+    /// `n_threads` comes from `[asr] n_threads` in daemon.toml; `None`
+    /// takes the measured-safe default.
+    pub fn new(n_threads: Option<usize>) -> Result<Self> {
         Ok(Self {
             model_path: model_path()?,
+            n_threads: resolve_threads(n_threads),
+            ctx: Default::default(),
         })
+    }
+}
+
+/// How many threads inference gets, and why it is not "all of them".
+///
+/// whisper.cpp splits each layer across N workers and joins them at a
+/// barrier. A worker that loses its core to something else holds every
+/// other worker at that barrier, so the cost of oversubscription is not
+/// gradual — it multiplies. Measured on this project's own 16-core
+/// machine while it was running the agents the daemon serves (load ~25),
+/// transcribing the same 4-second note:
+///
+/// | threads | wall time |
+/// |---------|-----------|
+/// | 16      | 193 s     |
+/// | 8       | 87 s      |
+/// | 4       | 69 s      |
+///
+/// Taking every core made it 2.8x SLOWER than taking a quarter of them,
+/// and starved the sessions the daemon exists to serve while doing it. So
+/// the default is 4 — also whisper.cpp's own default — and an operator
+/// with genuinely idle cores raises it in daemon.toml.
+pub fn resolve_threads(configured: Option<usize>) -> usize {
+    let cores = num_cpus_safe();
+    match configured {
+        Some(n) if n > 0 => n.min(cores.max(1)),
+        _ => 4.min(cores.max(1)),
     }
 }
 
@@ -75,11 +113,13 @@ impl Asr for WhisperAsr {
             );
         }
         let model_path = self.model_path.clone();
+        let n_threads = self.n_threads;
+        let cache = self.ctx.clone();
         // whisper-rs is sync + heavy CPU; run on the blocking pool per
         // ASYNC_INVARIANTS Rule 2.
         tokio::task::spawn_blocking(move || -> Result<String> {
             ensure_model(&model_path).context("whisper: model download/verify failed")?;
-            transcribe_blocking(&model_path, &pcm)
+            transcribe_blocking(&model_path, &pcm, n_threads, &cache)
         })
         .await
         .context("whisper: spawn_blocking join failed")?
@@ -247,22 +287,40 @@ pub fn ensure_model(path: &std::path::Path) -> Result<()> {
 }
 
 /// Synchronous whisper-rs invocation. Runs on the tokio blocking pool.
-fn transcribe_blocking(model_path: &std::path::Path, pcm: &[f32]) -> Result<String> {
+fn transcribe_blocking(
+    model_path: &std::path::Path,
+    pcm: &[f32],
+    n_threads: usize,
+    cache: &std::sync::Mutex<Option<std::sync::Arc<whisper_rs::WhisperContext>>>,
+) -> Result<String> {
     use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
     let model_path_str = model_path
         .to_str()
         .context("whisper: model path is not valid UTF-8")?;
 
-    let ctx = WhisperContext::new_with_params(model_path_str, WhisperContextParameters::default())
-        .map_err(|e| anyhow::anyhow!("whisper: open model {model_path_str}: {e}"))?;
+    // Held for the whole inference, on purpose — see `WhisperAsr::ctx`.
+    let mut guard = cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("whisper: model cache poisoned by an earlier panic"))?;
+    let ctx = match guard.as_ref() {
+        Some(c) => c.clone(),
+        None => {
+            let loaded = std::sync::Arc::new(
+                WhisperContext::new_with_params(model_path_str, WhisperContextParameters::default())
+                    .map_err(|e| anyhow::anyhow!("whisper: open model {model_path_str}: {e}"))?,
+            );
+            *guard = Some(loaded.clone());
+            loaded
+        }
+    };
 
     let mut state = ctx
         .create_state()
         .map_err(|e| anyhow::anyhow!("whisper: create_state: {e}"))?;
 
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    params.set_n_threads(num_cpus_safe() as i32);
+    params.set_n_threads(n_threads as i32);
     params.set_translate(false);
     // Auto-detect the spoken language and transcribe IN that language.
     // whisper.cpp defaults `language` to "en", which forces English output
@@ -307,6 +365,32 @@ fn num_cpus_safe() -> usize {
 mod tests {
     use super::*;
 
+    /// The default must not be "every core". Measured on this project's own
+    /// box, taking all 16 made a 4-second note 2.8x slower than taking 4,
+    /// because ggml joins its workers at every layer and a descheduled
+    /// worker holds all the others.
+    #[test]
+    fn the_default_thread_count_does_not_take_every_core() {
+        let cores = num_cpus_safe();
+        let picked = resolve_threads(None);
+        assert!(picked <= 4, "default {picked} threads is too greedy");
+        assert!(picked >= 1);
+        if cores >= 4 {
+            assert_eq!(picked, 4, "on a >=4-core box the default is whisper.cpp's own 4");
+        }
+    }
+
+    /// An operator with genuinely idle cores can raise it, but not past the
+    /// machine, and not to zero (whisper.cpp treats 0 as a hard error).
+    #[test]
+    fn a_configured_thread_count_is_honoured_within_the_machine() {
+        let cores = num_cpus_safe();
+        assert_eq!(resolve_threads(Some(1)), 1);
+        assert_eq!(resolve_threads(Some(cores)), cores);
+        assert_eq!(resolve_threads(Some(cores + 99)), cores);
+        assert!(resolve_threads(Some(0)) >= 1, "0 threads must not reach whisper.cpp");
+    }
+
     #[test]
     fn model_path_uses_home_override() {
         let prev = std::env::var_os("CLAUDEBASE_HOME_OVERRIDE");
@@ -324,7 +408,7 @@ mod tests {
         let prev = std::env::var_os("CLAUDEBASE_HOME_OVERRIDE");
         let tmp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("CLAUDEBASE_HOME_OVERRIDE", tmp.path());
-        let asr = WhisperAsr::new().expect("construct");
+        let asr = WhisperAsr::new(None).expect("construct");
         let err = asr.health_check().expect_err("expected missing-model err");
         let msg = format!("{err}");
         assert!(msg.contains("MISSING") && msg.contains("model"), "got: {msg}");

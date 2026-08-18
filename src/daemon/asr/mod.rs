@@ -90,7 +90,7 @@ pub fn make_asr(config: &Config) -> Result<Box<dyn Asr>> {
         None => bail!("no ASR backend configured in daemon.toml [asr] section"),
     };
     match backend {
-        "whisper" => make_whisper(),
+        "whisper" => make_whisper(config.asr.n_threads),
         // Wave-6 stubs. ALWAYS runtime-Err in v1 regardless of feature
         // state — preserves the namespace without crashing the daemon
         // when an operator points daemon.toml at them.
@@ -105,11 +105,11 @@ pub fn make_asr(config: &Config) -> Result<Box<dyn Asr>> {
 }
 
 #[cfg(feature = "asr-whisper")]
-fn make_whisper() -> Result<Box<dyn Asr>> {
-    Ok(Box::new(whisper::WhisperAsr::new()?))
+fn make_whisper(n_threads: Option<usize>) -> Result<Box<dyn Asr>> {
+    Ok(Box::new(whisper::WhisperAsr::new(n_threads)?))
 }
 
 #[cfg(not(feature = "asr-whisper"))]
-fn make_whisper() -> Result<Box<dyn Asr>> {
+fn make_whisper(_n_threads: Option<usize>) -> Result<Box<dyn Asr>> {
     bail!("backend 'whisper' selected but asr-whisper feature not compiled in — rebuild with `cargo build --features asr-whisper`")
 }

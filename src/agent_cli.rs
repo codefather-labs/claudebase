@@ -122,7 +122,7 @@ pub async fn describe(description: &str, branch: Option<&str>) -> Result<String>
 /// Only this session: identity comes from the token the supervisor exported, so
 /// there is no way to rename a neighbour by accident. Renaming someone else is
 /// a different operation with a different trust rule and is not offered here.
-pub async fn rename(new_nick: &str) -> Result<String> {
+pub async fn rename(new_nick: &str, new_callback_token: bool) -> Result<String> {
     let nick = new_nick.trim();
     if nick.is_empty() {
         bail!("pass the new nick: claudebase agent rename <nick>");
@@ -141,13 +141,28 @@ pub async fn rename(new_nick: &str) -> Result<String> {
     client
         .call_tool(
             "agent_rename",
-            json!({ "name": nick, "from_agent_id": id, "session_token": token }),
+            json!({
+                "name": nick,
+                "from_agent_id": id,
+                "session_token": token,
+                "new_callback_token": new_callback_token,
+            }),
         )
         .await?;
-    Ok(format!(
+    let mut out = format!(
         "this session is now `{nick}` — it appears under that name in `claudebase agent list` \
          and in the Telegram /switch menu"
-    ))
+    );
+    if new_callback_token {
+        out.push_str(
+            "\n\nA fresh callback token was issued: the previous one no longer reaches this \
+             session, so update anything that was pinging it.\n\
+             Read it with: claudebase daemon callback token ",
+        );
+        out.push_str(nick);
+        out.push_str(" --reveal");
+    }
+    Ok(out)
 }
 
 /// One row of `claudebase agent list`.

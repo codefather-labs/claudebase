@@ -53,6 +53,15 @@ For scripts on this same machine, mention the alternative once: they can read
 the secret out of the script, the shell history, and git, and survives rotation
 without an edit. Do not insist — the operator chose the direct route.
 
+## After a rename
+
+A rename carries the token to the new nick, so scripts keep working. To retire
+the old one at the same time:
+
+```bash
+claudebase agent rename "<new-nick>" --new-callback-token
+```
+
 ## Rotating
 
 ```bash

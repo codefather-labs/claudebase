@@ -1592,6 +1592,10 @@ async fn handle_agent_rename(
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
+    let wants_new_token = args
+        .get("new_callback_token")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
         let conn = crate::daemon::chat::open_chat_db()?;
@@ -1619,9 +1623,31 @@ async fn handle_agent_rename(
 
         if let Some(old) = old_name.filter(|o| o != &new_name) {
             // Scripts hold a token addressed to the old nick; the session's
-            // address changed, not its identity.
+            // address changed, not its identity — so by default the token moves
+            // with it and everything pinging this session keeps working.
+            //
+            // `new_callback_token` is the opposite intent: the rename marks a
+            // change of purpose or hands the window to someone else, and
+            // whoever held the old token should stop being able to reach it. It
+            // is opt-in because the safe-looking choice — always reissue —
+            // silently breaks working integrations on what the operator thinks
+            // is a cosmetic rename.
             if let Err(e) = crate::daemon::callback::rename(&conn, &old, &new_name) {
                 tracing::warn!(error = %e, "could not move the callback token to the new nick");
+            }
+            if wants_new_token {
+                match crate::daemon::callback::rotate(
+                    &conn,
+                    &new_name,
+                    crate::daemon::chat::now_millis(),
+                ) {
+                    Ok(fresh) => tracing::info!(
+                        nick = %new_name,
+                        fingerprint = %crate::daemon::callback::fingerprint(&fresh),
+                        "issued a fresh callback token on rename"
+                    ),
+                    Err(e) => tracing::warn!(error = %e, "could not issue a fresh callback token"),
+                }
             }
             match crate::daemon::agent_registry::migrate_bindings(&conn, &old, &new_name) {
                 Ok(moved) if moved > 0 => {

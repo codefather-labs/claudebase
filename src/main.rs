@@ -201,7 +201,7 @@ fn main() -> std::process::ExitCode {
                 simple(claudebase::agent_cli::whoami(), "agent whoami")
             }
             cli::AgentSubcommand::Rename(a) => simple_async(
-                claudebase::agent_cli::rename(&a.nick),
+                claudebase::agent_cli::rename(&a.nick, a.new_callback_token),
                 "agent rename",
             ),
             cli::AgentSubcommand::Describe(a) => simple_async(

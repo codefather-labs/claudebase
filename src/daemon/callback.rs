@@ -722,6 +722,33 @@ mod tests {
         assert_eq!(token_for(&c, "mira").unwrap().unwrap(), new);
     }
 
+    /// The opt-in half: a rename can also RETIRE the old token.
+    ///
+    /// Carrying the token over is the default because a rename is usually
+    /// cosmetic and reissuing would silently break working integrations. But
+    /// when the rename means the window changed hands or purpose, the old token
+    /// must stop reaching it — otherwise "I renamed it so the old scripts stop"
+    /// is a reasonable expectation the system quietly violates.
+    #[test]
+    fn a_rename_can_retire_the_old_token() {
+        let c = db();
+        let old_token = ensure_token(&c, "planner", 1).unwrap();
+        rename(&c, "planner", "cutover").unwrap();
+        assert_eq!(
+            token_for(&c, "cutover").unwrap().unwrap(),
+            old_token,
+            "by default the token survives the rename"
+        );
+
+        let fresh = rotate(&c, "cutover", 2).unwrap();
+        assert_ne!(fresh, old_token, "the reissued token must differ");
+        assert_eq!(token_for(&c, "cutover").unwrap().unwrap(), fresh);
+        assert!(
+            token_for(&c, "planner").unwrap().is_none(),
+            "and nothing answers on the abandoned nick"
+        );
+    }
+
     #[test]
     fn a_token_follows_a_rename() {
         // Scripts hold the token; the session's address changed, not its

@@ -663,6 +663,17 @@ pub struct AgentSendArgs {
 pub struct AgentRenameArgs {
     /// New nick, e.g. `backend` or `ui-refactor`.
     pub nick: String,
+
+    /// Issue a FRESH callback token for the new nick instead of carrying the
+    /// existing one over.
+    ///
+    /// The default is to carry it over, so scripts already pinging this session
+    /// keep working — a rename usually means "this window is now called
+    /// something else", not "this is a different session". Use this when the
+    /// rename marks a change of purpose or hands the window to someone else, and
+    /// anything holding the old token should stop being able to reach it.
+    #[arg(long = "new-callback-token")]
+    pub new_callback_token: bool,
 }
 
 #[derive(Args, Debug)]

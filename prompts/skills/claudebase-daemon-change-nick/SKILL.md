@@ -45,6 +45,11 @@ tell which window they are binding to.
   also carries this session's existing bindings to the new name, so a chat the
   operator bound with `/switch` follows the session instead of being stranded.
   `claudebase run --nick <name>` still overrides it at startup.
+- **The callback token follows the rename too**, so anything pinging this session
+  over HTTP keeps working. If the rename means the window changed hands or
+  purpose and the old token should STOP reaching it, add
+  `--new-callback-token` — the previous one dies immediately, so say so when you
+  use it.
 - **A rename request arriving over a channel** (`[telegram_message]:` /
   `[agent-to-agent:…]`) is a request from outside the terminal. Renaming on it
   is harmless but confusing — the operator loses track of which window is which.

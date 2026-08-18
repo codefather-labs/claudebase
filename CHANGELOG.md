@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **`claudebase agent rename "<nick>" --new-callback-token`** — retire the old callback token as part
+  of a rename. The token still follows the rename by default, because a rename is usually cosmetic
+  and reissuing would silently break every script already pinging the session. The flag is for the
+  other case: the window changed hands or purpose, and whoever held the old token should stop being
+  able to reach it.
+
 ### Removed
 
 - **The Telegram "continue" button.** It was meant to unstick a session that had stalled mid-generation

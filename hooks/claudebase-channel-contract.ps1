@@ -68,6 +68,11 @@ This session has a NICK, which is how `/switch` from Telegram and
   claudebase run --nick "<nick>"          (set it at startup instead)
   claudebase agent whoami                 your own nick, id, and its origin
 
+A rename carries your callback token with it, so anything already pinging this
+session keeps working. Add --new-callback-token to retire the old one instead --
+for when the rename means this window changed purpose or hands, and whoever held
+the old token should stop being able to reach it.
+
 A chosen nick is remembered for this directory and comes back on restart, which
 is what keeps a Telegram `/switch` binding pointing at you.
 

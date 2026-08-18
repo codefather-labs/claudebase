@@ -48,7 +48,10 @@ $XDG_RUNTIME_DIR/claudebase/agents/<nick>.sock      # 0600, in a 0700 directory
 ```
 
 Created automatically for every live session, removed when it goes, and it
-follows a rename. Connect, write, close — **the close is the end of the
+follows a rename — as does the HTTP token, so a rename does not break anything
+already pinging the session. `claudebase agent rename "<nick>"
+--new-callback-token` is the opt-out: it retires the old token in the same step,
+for when the rename means the window changed purpose or hands. Connect, write, close — **the close is the end of the
 message**, so there is no length prefix and no delimiter to get wrong. The
 daemon writes one line of JSON back before closing.
 

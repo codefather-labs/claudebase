@@ -249,6 +249,15 @@ transcript — accepted, see Decisions.
 - **UC-CB-4-E1: the new nick is held by another live session** — the rename is refused before anything
   moves; the token stays where it is.
 
+### Alternative Flows
+
+- **UC-CB-4-A: the rename should also retire the token** — `claudebase agent
+  rename "<nick>" --new-callback-token`. The token is moved as usual and then
+  rotated, so the old one stops reaching the session immediately. This is the
+  flow for a window that changed purpose or hands; the default (carry the token
+  over) is for the far commoner case where the rename is cosmetic and breaking
+  every configured pinger would be a surprise.
+
 ### Edge Cases
 
 - **UC-CB-4-EC1**: a token already exists for the destination nick (it was used before). `UPDATE OR

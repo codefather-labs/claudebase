@@ -79,6 +79,33 @@ fn ps1_hooks_are_ascii_only() {
     }
 }
 
+/// A flag an agent is expected to reach for must be reachable from what the
+/// agent reads.
+///
+/// `--new-callback-token` retires a callback token as part of a rename. It lives
+/// in the CLI help, which an agent only sees if it already suspects the flag
+/// exists — so the places that teach renaming and tokens have to name it too, or
+/// it is a feature only its author knows about.
+#[test]
+fn the_documents_an_agent_reads_mention_the_rename_token_flag() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for doc in [
+        "hooks/claudebase-channel-contract.sh",
+        "hooks/claudebase-channel-contract.ps1",
+        "prompts/skills/claudebase-daemon-change-nick/SKILL.md",
+        "prompts/skills/claudebase-daemon-setup-auth-token/SKILL.md",
+        "prompts/skills/claudebase-daemon-callback-info/SKILL.md",
+        "README.md",
+    ] {
+        let text = std::fs::read_to_string(root.join(doc))
+            .unwrap_or_else(|e| panic!("read {doc}: {e}"));
+        assert!(
+            text.contains("--new-callback-token"),
+            "{doc} teaches renaming or tokens but never names --new-callback-token"
+        );
+    }
+}
+
 /// Both installers announce what they installed, and both under-reported it.
 ///
 /// The closing summary listed the four `commands/` entries and CALLED them

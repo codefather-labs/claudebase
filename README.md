@@ -421,6 +421,7 @@ session is asked at startup to give itself a distinctive one:
 ```bash
 claudebase agent whoami                # nick, id, and whether it was chosen or derived
 claudebase agent rename "<nick>"       # rename this session (also /claudebase-daemon-change-nick)
+claudebase agent rename "<nick>" --new-callback-token   # ...and retire the old callback token
 claudebase run --nick "<nick>"         # set it at startup instead
 ```
 
@@ -520,6 +521,10 @@ Or ask the session itself: `/claudebase-daemon-setup-auth-token` hands over the 
 and `/claudebase-daemon-callback-info` explains the contract and can send a self-test.
 
 ### What the token is
+
+A rename carries the token with it, so scripts pinging the session keep working — that is the
+default because a rename is usually cosmetic. `--new-callback-token` on the rename retires the old
+one instead, for when the window changed purpose or hands and the previous holder should lose access.
 
 **A token belongs to a nick, not to an `agent_id`.** The id is new on every restart, so a script
 embedding one would break the next time the session reopened; the nick survives, and a rename

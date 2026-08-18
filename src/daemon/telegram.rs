@@ -961,6 +961,8 @@ pub fn process_batch_with_pairing(
                 user: cb_user_display,
                 user_id: cb_user_id.to_string(),
                 ts_iso8601: ts_iso_now,
+                // A callback-button answer is never voice.
+                is_voice: false,
                 thread_id: ask.message_thread_id,
             };
 
@@ -1284,6 +1286,7 @@ pub fn process_batch_with_pairing(
             // OMITS the meta.thread_id field so DM / topic-less group inbound
             // preserves Slice 0 baseline meta shape bit-for-bit.
             thread_id: msg.message_thread_id,
+            is_voice: msg.voice.is_some(),
         };
         notifications.push((
             thread_id.clone(),
@@ -1930,7 +1933,13 @@ async fn run_long_poll(
                         }
                     };
                     msg.text = Some(voice_text);
-                    msg.voice = None;
+                    // `voice` is deliberately NOT cleared. It used to be, and
+                    // that erased the only remaining evidence that the text was
+                    // a transcript: downstream saw an ordinary text message and
+                    // the operator could not tell a dictated note from a typed
+                    // one. Nothing re-triggers transcription, because that
+                    // branch requires `text.is_none()`, and the content match
+                    // below takes `text` first.
                 }
             }
         }

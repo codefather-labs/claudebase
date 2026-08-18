@@ -302,6 +302,14 @@ pub struct TelegramMessageMeta {
     /// downstream `<channel>` surface stays bit-for-bit identical for
     /// DM / topic-less group inbound (the Slice 0 baseline shape).
     pub thread_id: Option<i64>,
+    /// True when this message reached us as a VOICE note and its text is a
+    /// whisper transcript rather than something the operator typed.
+    ///
+    /// Carried explicitly because the transcription step replaces `msg.text`
+    /// and the message then travels the ordinary text path — by the time the
+    /// meta is built there is nothing left to infer it from. Inferring a source
+    /// from the shape of unrelated fields is what produced F-14.
+    pub is_voice: bool,
 }
 
 /// Build the `notifications/claude/channel` frame with the official
@@ -338,6 +346,11 @@ pub fn build_channel_notification_telegram(
     meta.insert("user".into(), Value::String(tg_meta.user.clone()));
     meta.insert("user_id".into(), Value::String(tg_meta.user_id.clone()));
     meta.insert("ts".into(), Value::String(tg_meta.ts_iso8601.clone()));
+    // Emitted ONLY for voice, so text inbound keeps the baseline meta shape
+    // byte-for-byte (the Slice 0 evidence the surrounding comments cite).
+    if tg_meta.is_voice {
+        meta.insert("voice".into(), Value::Bool(true));
+    }
 
     // Slice 2 additive optional field per PRD §18 FR-MAT-7 (C3 wire
     // contract). Forum-topic-id emitted as string to match the v0.6
@@ -454,6 +467,11 @@ pub fn build_channel_notification_callback_response(
     meta.insert("user".into(), Value::String(tg_meta.user.clone()));
     meta.insert("user_id".into(), Value::String(tg_meta.user_id.clone()));
     meta.insert("ts".into(), Value::String(tg_meta.ts_iso8601.clone()));
+    // Emitted ONLY for voice, so text inbound keeps the baseline meta shape
+    // byte-for-byte (the Slice 0 evidence the surrounding comments cite).
+    if tg_meta.is_voice {
+        meta.insert("voice".into(), Value::Bool(true));
+    }
     if let Some(tid) = tg_meta.thread_id {
         meta.insert("thread_id".into(), Value::String(tid.to_string()));
     }
@@ -1540,6 +1558,7 @@ mod tests {
             user_id: "8791871989".to_string(),
             ts_iso8601: "2026-06-03T00:00:00.000Z".to_string(),
             thread_id,
+            is_voice: false,
         }
     }
 
@@ -1604,6 +1623,7 @@ mod tests {
             user: "alice".to_string(),
             user_id: "300".to_string(),
             ts_iso8601: "2026-06-04T00:00:00.000Z".to_string(),
+            is_voice: false,
             thread_id: None,
         }
     }

@@ -396,9 +396,20 @@ fn classify(meta: &Value, sender_hint: Option<String>) -> (String, Source) {
         return (thread, Source::Callback { label });
     }
 
+    // Explicit, never inferred: the transcript travels the ordinary text path,
+    // so only this flag distinguishes a dictated note from a typed one.
+    let is_voice = meta.get("voice").and_then(|v| v.as_bool()).unwrap_or(false);
+    let telegram_source = || {
+        if is_voice {
+            Source::TelegramVoice
+        } else {
+            Source::Telegram
+        }
+    };
+
     if let Some(thread) = thread_field {
         if thread.starts_with("telegram:") {
-            return (thread, Source::Telegram);
+            return (thread, telegram_source());
         }
         if thread.starts_with("agent:") {
             return (thread.clone(), agent_source(meta));
@@ -409,12 +420,12 @@ fn classify(meta: &Value, sender_hint: Option<String>) -> (String, Source) {
             return (chat.clone(), agent_source(meta));
         }
         if chat.starts_with("telegram:") {
-            return (chat, Source::Telegram);
+            return (chat, telegram_source());
         }
         // A bare numeric id is a Telegram chat; normalise it to the thread name
         // the rest of the supervisor uses (`thread_belongs_to`, subscriptions).
         if chat.parse::<i64>().is_ok() {
-            return (format!("telegram:{chat}"), Source::Telegram);
+            return (format!("telegram:{chat}"), telegram_source());
         }
     }
     ("unknown".to_string(), agent_source(meta))
@@ -718,6 +729,7 @@ mod classify_tests {
             user: "codefather_dev".to_string(),
             user_id: "434566766".to_string(),
             ts_iso8601: "2026-08-17T09:00:00.000Z".to_string(),
+            is_voice: false,
             thread_id: None,
         };
         let frame = build_channel_notification_telegram("привет", &tg, None);
@@ -728,6 +740,49 @@ mod classify_tests {
             thread, "telegram:434566766",
             "the bare numeric chat id must be normalised to the thread name the rest of the supervisor uses"
         );
+    }
+
+    /// Built with the REAL builder: a transcript is an ordinary Telegram text
+    /// message in every respect except one flag, so a fixture asserting the flag
+    /// by hand would prove nothing about what the daemon emits.
+    #[test]
+    fn a_real_voice_notification_is_marked_as_voice() {
+        let tg = crate::daemon::chat::TelegramMessageMeta {
+            chat_id: 434566766,
+            message_id_str: "43".to_string(),
+            user: "codefather_dev".to_string(),
+            user_id: "434566766".to_string(),
+            ts_iso8601: "2026-08-18T14:42:13.000Z".to_string(),
+            thread_id: None,
+            is_voice: true,
+        };
+        let frame = crate::daemon::chat::build_channel_notification_telegram(
+            "1,2,3,4 тест голоса",
+            &tg,
+            None,
+        );
+        let (thread, source) = classify(&meta_of(&frame), None);
+        assert_eq!(thread, "telegram:434566766");
+        assert_eq!(source, Source::TelegramVoice);
+    }
+
+    /// And typed text must NOT acquire the marker — the flag is emitted only
+    /// for voice so the text meta keeps its baseline shape.
+    #[test]
+    fn typed_text_is_not_marked_as_voice() {
+        let tg = crate::daemon::chat::TelegramMessageMeta {
+            chat_id: 434566766,
+            message_id_str: "44".to_string(),
+            user: "codefather_dev".to_string(),
+            user_id: "434566766".to_string(),
+            ts_iso8601: "2026-08-18T14:42:14.000Z".to_string(),
+            thread_id: None,
+            is_voice: false,
+        };
+        let frame = crate::daemon::chat::build_channel_notification_telegram("печатал", &tg, None);
+        let meta = meta_of(&frame);
+        assert!(meta.get("voice").is_none(), "text meta must stay unchanged");
+        assert_eq!(classify(&meta, None).1, Source::Telegram);
     }
 
     #[test]

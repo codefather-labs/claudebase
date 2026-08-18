@@ -211,6 +211,10 @@ fn channel_contract_hook_teaches_every_prefix_and_every_reply_command() {
                 // so this list grows whenever a new source is added.
                 "[callback]: <text>",
                 "[callback:<label>]: <text>",
+                // A transcript is not typed text and must not read as if it
+                // were: whisper mishears names, numbers and flags, which is
+                // exactly the content an agent would otherwise act on verbatim.
+                "[telegram_voice_message]: <text>",
                 "claudebase telegram send",
                 "claudebase agent send",
                 "claudebase agent list",

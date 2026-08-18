@@ -222,6 +222,11 @@ impl Injector {
 pub fn render(source: Source, content: &str) -> String {
     let prefix = match source {
         Source::Telegram => "[telegram_message]".to_string(),
+        // A transcript is not something the operator typed: dictation is
+        // looser, whisper mishears names and numbers, and a line that reads
+        // oddly is more likely a transcription artefact than an instruction.
+        // The prefix is the only place that difference can be stated.
+        Source::TelegramVoice => "[telegram_voice_message]".to_string(),
         Source::Agent { ref nick } => format!("[agent-to-agent:{}]", sanitize_nick(nick)),
         // The label is optional: with one caller it is noise, with several it is
         // the only way to tell them apart in the input.
@@ -235,6 +240,8 @@ pub fn render(source: Source, content: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     Telegram,
+    /// Telegram voice note, transcribed locally by whisper.
+    TelegramVoice,
     Agent { nick: String },
     /// An external system over the HTTP callback endpoint.
     Callback { label: Option<String> },
@@ -299,6 +306,21 @@ mod tests {
     fn an_empty_nick_degrades_to_unknown_rather_than_an_empty_slot() {
         let out = render(Source::Agent { nick: "  ".into() }, "x");
         assert_eq!(out, "[agent-to-agent:unknown]: x");
+    }
+
+    #[test]
+    fn a_transcript_is_marked_as_dictated() {
+        assert_eq!(
+            render(Source::TelegramVoice, "один два три"),
+            "[telegram_voice_message]: один два три"
+        );
+        // It must NOT be indistinguishable from typed text, which is what it
+        // was before: a transcript arrived as [telegram_message] and nothing
+        // said whisper had been anywhere near it.
+        assert_ne!(
+            render(Source::TelegramVoice, "x"),
+            render(Source::Telegram, "x")
+        );
     }
 
     #[test]

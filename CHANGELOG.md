@@ -23,6 +23,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **A dictated message now says so.** A transcribed voice note arrives as
+  `[telegram_voice_message]: <text>` instead of being indistinguishable from something the operator
+  typed. The transcription step replaces `msg.text` and the message then travels the ordinary text
+  path, so the fact was previously erased before the notification was built; the meta now carries an
+  explicit flag, emitted only for voice so text inbound keeps its baseline shape byte-for-byte. It
+  matters for reading: whisper mishears names, numbers and flags, and those are exactly the tokens an
+  agent would otherwise act on verbatim. The SessionStart contract teaches the new prefix and says
+  why to treat exact strings inside it with suspicion.
 - **Installers fetch the whisper model.** ~1.5 GB, previously left for the first voice note to
   download lazily — which looks like nothing happening for several minutes. It is now fetched during
   install via the idempotent `daemon warmup --asr`, skipped when the model is already present, and

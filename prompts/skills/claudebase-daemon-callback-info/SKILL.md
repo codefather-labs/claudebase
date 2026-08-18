@@ -105,6 +105,11 @@ The text is written into this session's input as:
 [callback:deploy]: <body>       with ?label=deploy
 ```
 
+For completeness, the other prefixes this session can meet:
+`[telegram_message]` (the operator, typed), `[telegram_voice_message]` (the
+operator, dictated — a whisper transcript, so treat exact strings in it with
+suspicion) and `[agent-to-agent:<nick>]` (a peer session).
+
 The label is optional and comes from `?label=<name>` on the request. Use it when
 more than one script pings this session — without it, two callers are
 indistinguishable in the input. It is an annotation for reading, not a claim of

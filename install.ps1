@@ -28,7 +28,7 @@ $ErrorActionPreference = 'Stop'
 # ============================================================================
 # Constants
 # ============================================================================
-$Script:ClaudebaseVersion       = '0.9.1'
+$Script:ClaudebaseVersion       = '0.9.2'
 $Script:ClaudebasePdfiumVersion = 'chromium/7802'
 $Script:RepoUrl                 = 'https://github.com/codefather-labs/claudebase.git'
 $Script:ReleaseBase             = 'https://github.com/codefather-labs/claudebase/releases/download'

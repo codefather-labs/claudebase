@@ -1175,6 +1175,29 @@ async fn handle_chat_post(
         }
     }
 
+    // Do NOT broadcast an agent's reply on a TELEGRAM thread.
+    //
+    // On an `agent:<id>` thread the broadcast IS the delivery — that is how a
+    // peer receives the message. On a telegram thread it delivers nothing: the
+    // text has already gone to the operator over the Bot API by the time we get
+    // here, and the only remaining audience is whichever sessions happen to
+    // subscribe to that chat. They then read another agent's reply to the
+    // operator as if the operator had written it to them.
+    //
+    // The subscriber already filters this, but only in builds new enough to have
+    // the filter — and a session runs the binary it started with, for hours.
+    // Suppressing it at the source protects every subscriber immediately,
+    // including the ones already running.
+    let author_is_agent = !msg.from_agent.starts_with("telegram:");
+    if msg.thread_id.starts_with("telegram:") && author_is_agent {
+        tracing::debug!(
+            thread = %msg.thread_id,
+            from = %msg.from_agent,
+            "outbound telegram reply not broadcast; it is addressed to the operator"
+        );
+        return (tool_text_response(id, &response_payload), None);
+    }
+
     let notif = chat::build_channel_notification(&msg);
     let thread_id = msg.thread_id.clone();
     (

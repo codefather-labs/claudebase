@@ -339,6 +339,65 @@ pub fn sanitize_nick(nick: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A shared buffer standing in for the pty, so the exact bytes the
+    /// supervisor writes can be inspected.
+    #[derive(Clone, Default)]
+    struct Recorder(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Recorder {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The operator's continue button, verified on OUR side of the wire.
+    ///
+    /// This asserts what the supervisor writes and in what order: paste the
+    /// text, submit, then a single `Ctrl-C` to promote it out of the TUI queue.
+    /// It deliberately does NOT claim that Claude Code reacts to a written
+    /// `0x03` the same way it reacts to a physical keypress — a real Ctrl-C can
+    /// reach an application as a SIGNAL from the terminal's line discipline
+    /// rather than as an input byte, and only a live session can settle that.
+    /// What this pins is that our half is correct and stays correct.
+    #[test]
+    fn the_continue_sequence_pastes_submits_then_promotes_once() {
+        let rec = Recorder::default();
+        let sink = rec.0.clone();
+        let injector = Injector::new(
+            Arc::new(Mutex::new(Box::new(rec) as Box<dyn Write + Send>)),
+            Arc::new(DraftTracker::new()),
+            Arc::new(ModalDetector::new()),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        injector.write_priority("продолжи").expect("priority write");
+
+        let bytes = sink.lock().unwrap().clone();
+        let text = String::from_utf8_lossy(&bytes).to_string();
+
+        let paste = text.find("\x1b[200~").expect("bracketed paste start");
+        let body = text.find("продолжи").expect("the message itself");
+        let cr = text.find('\r').expect("submit");
+        let ctrl_c = text.find('\u{3}').expect("promote out of the queue");
+
+        assert!(paste < body && body < cr, "paste, then the text, then submit");
+        assert!(
+            cr < ctrl_c,
+            "Ctrl-C must come AFTER the submit: it promotes a queued message, \
+             it does not cancel one — the order is the operator's, from using the TUI"
+        );
+        assert_eq!(
+            bytes.iter().filter(|b| **b == 0x03).count(),
+            1,
+            "exactly one Ctrl-C; a second quits Claude Code, and an emergency \
+             button that can kill the session is worse than the stall it fixes"
+        );
+    }
+
     #[test]
     fn telegram_messages_carry_the_telegram_prefix() {
         let out = render(Source::Telegram, "привет");

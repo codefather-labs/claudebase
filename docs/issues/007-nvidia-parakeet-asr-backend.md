@@ -1,6 +1,10 @@
 # Issue 007 — Add NVIDIA Parakeet as a faster ASR backend (future)
 
-**Status:** OPEN — parked for a future focused pass (operator request 2026-06-07)
+**Status:** SUPERSEDED 2026-08-19 by `docs/plans/claudebase-v0.10-parakeet-asr.md`.
+The load-bearing question below — does a Russian-capable Parakeet exist — is ANSWERED:
+`nvidia/parakeet-tdt-0.6b-v3` covers 25 European languages including Russian, with automatic
+language detection, and an ONNX export runnable on CPU through sherpa-onnx. See the plan for
+sources and the slices.
 **Area:** `src/daemon/asr/` (the `Asr` trait), `Cargo.toml` features `asr-sherpa` / `asr-nim`
 
 ## Goal

@@ -53,6 +53,11 @@ pub use screen::ModalDetector;
 /// that session can attribute itself without arguments (`telegram send`).
 const ENV_AGENT_ID: &str = "CLAUDEBASE_AGENT_ID";
 const ENV_SESSION: &str = "CLAUDEBASE_SESSION";
+/// How many times a reconnect tries to register before giving up until the
+/// next one. Three attempts over ~0.6s covers the daemon's startup contention
+/// without delaying a session whose daemon is genuinely down.
+const REGISTER_ATTEMPTS: u32 = 3;
+
 /// Per-session token minted here, stored by the daemon at `agent_register`,
 /// and presented by short-lived CLI processes (`claudebase agent chat`) to
 /// prove which agent they belong to without the daemon trusting a bare id.
@@ -388,28 +393,58 @@ async fn daemon_leg(
             }
         };
 
-        if let Err(e) = client
-            .call(
-                "agent_register",
-                json!({
-                    "agent_id": identity.agent_id,
-                    "name": identity.name,
-                    // `--nick` was never remembered: only a rename wrote the
-                    // memory, so a session started under a chosen name came
-                    // back as the project default next time. Saying so here
-                    // lets the daemon -- the only writer -- record it.
-                    "nick_chosen": identity.chosen,
-                    "session_token": identity.session_token,
-                    "cwd": std::env::current_dir().ok().map(|p| p.display().to_string()),
-                    // Where this session runs, so the daemon can tell a live
-                    // session from a row left by one that died while it was down.
-                    "host": crate::daemon::agent_registry::this_host(),
-                    "pid": std::process::id() as i64,
-                }),
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "agent_register failed (continuing)");
+        // Registration is retried, because failing it is not a small thing:
+        // an unregistered session is absent from `agent list`, from the
+        // `/switch` menu, and from every nick-addressed route -- it is still
+        // running, and nothing can reach it. A single attempt was enough to
+        // lose a session to one transient `database is locked` during the
+        // daemon's own startup burst, and it then stayed lost for the whole
+        // life of the connection, because nothing ever tried again.
+        let register_payload = || {
+            json!({
+                "agent_id": identity.agent_id,
+                "name": identity.name,
+                // `--nick` was never remembered: only a rename wrote the
+                // memory, so a session started under a chosen name came
+                // back as the project default next time. Saying so here
+                // lets the daemon -- the only writer -- record it.
+                "nick_chosen": identity.chosen,
+                "session_token": identity.session_token,
+                "cwd": std::env::current_dir().ok().map(|p| p.display().to_string()),
+                // Where this session runs, so the daemon can tell a live
+                // session from a row left by one that died while it was down.
+                "host": crate::daemon::agent_registry::this_host(),
+                "pid": std::process::id() as i64,
+                // The per-window key for the nick memory; see
+                // `identity::controlling_terminal`.
+                "terminal": identity::controlling_terminal(),
+            })
+        };
+        let mut registered = false;
+        for attempt in 1..=REGISTER_ATTEMPTS {
+            match client.call("agent_register", register_payload()).await {
+                Ok(_) => {
+                    registered = true;
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        attempt,
+                        of = REGISTER_ATTEMPTS,
+                        error = %e,
+                        "agent_register failed"
+                    );
+                    if attempt < REGISTER_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
+                    }
+                }
+            }
+        }
+        if !registered {
+            tracing::error!(
+                "agent_register failed every attempt — this session is running but \
+                 unreachable by nick until it reconnects"
+            );
         }
 
         client.subscribe_all(&identity, &extra_threads).await;
@@ -572,6 +607,30 @@ pub mod identity {
         pub chosen: bool,
     }
 
+    /// The terminal this session is attached to, or an empty string when there
+    /// is none.
+    ///
+    /// This is the per-window key the nick memory needs. It is available here,
+    /// BEFORE `claude` is spawned, which is what makes it usable: the nick has
+    /// to be decided at spawn time, and anything the conversation itself
+    /// generates — a session id, a transcript path — only exists afterwards.
+    pub fn controlling_terminal() -> String {
+        #[cfg(unix)]
+        {
+            let name = unsafe { libc::ttyname(libc::STDIN_FILENO) };
+            if name.is_null() {
+                return String::new();
+            }
+            unsafe { std::ffi::CStr::from_ptr(name) }
+                .to_string_lossy()
+                .into_owned()
+        }
+        #[cfg(not(unix))]
+        {
+            String::new()
+        }
+    }
+
     /// Make the nick unique among sessions that are actually running.
     ///
     /// The base nick comes from the project, so every session opened in one repo
@@ -612,8 +671,13 @@ pub mod identity {
     fn recall_chosen_nick(cwd: &std::path::Path) -> Option<String> {
         let conn = crate::daemon::chat::open_chat_db_readonly().ok()?;
         let host = crate::daemon::agent_registry::this_host();
-        let nick =
-            crate::daemon::agent_registry::recall_nick(&conn, &host, &cwd.to_string_lossy()).ok()??;
+        let nick = crate::daemon::agent_registry::recall_nick(
+            &conn,
+            &host,
+            &cwd.to_string_lossy(),
+            &controlling_terminal(),
+        )
+        .ok()??;
         // Someone else in this directory is already using it. Two live sessions
         // cannot share a name, so fall through to the disambiguated default.
         match crate::daemon::agent_registry::nick_is_taken(&conn, &nick, None) {

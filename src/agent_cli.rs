@@ -403,7 +403,7 @@ pub fn whoami() -> Result<String> {
         .unwrap_or_default();
     let host = crate::daemon::agent_registry::this_host();
     let remembered =
-        crate::daemon::agent_registry::recall_nick(&conn, &host, &cwd).unwrap_or(None);
+        crate::daemon::agent_registry::recall_nick(&conn, &host, &cwd, "").unwrap_or(None);
 
     // Chosen only if the memory names THIS nick: a stale memory pointing at a
     // name the session no longer carries must not silence the hook.

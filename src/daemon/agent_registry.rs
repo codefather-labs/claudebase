@@ -668,20 +668,63 @@ pub fn remember_nick(
     conn: &Connection,
     host: &str,
     cwd: &str,
+    terminal: &str,
     nick: &str,
     now_ms: i64,
 ) -> rusqlite::Result<usize> {
+    // Two rows on purpose. The terminal-keyed one is this window's own slot, so
+    // a second window on the same directory can no longer overwrite it. The
+    // empty-terminal one is the directory-level fallback, which is what a
+    // window opened in a NEW terminal inherits — losing that would trade one
+    // bug for another.
     conn.execute(
-        "INSERT INTO nick_memory (host, cwd, nick, updated_at) VALUES (?1, ?2, ?3, ?4) \
-         ON CONFLICT(host, cwd) DO UPDATE SET nick = excluded.nick, updated_at = excluded.updated_at",
+        "INSERT INTO nick_memory (host, cwd, terminal, nick, updated_at) VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(host, cwd, terminal) DO UPDATE SET nick = excluded.nick, updated_at = excluded.updated_at",
+        params![host, cwd, terminal, nick, now_ms],
+    )?;
+    if terminal.is_empty() {
+        return Ok(1);
+    }
+    conn.execute(
+        "INSERT INTO nick_memory (host, cwd, terminal, nick, updated_at) VALUES (?1, ?2, '', ?3, ?4) \
+         ON CONFLICT(host, cwd, terminal) DO UPDATE SET nick = excluded.nick, updated_at = excluded.updated_at",
         params![host, cwd, nick, now_ms],
     )
 }
 
-/// The nick previously chosen for this working directory, if any.
-pub fn recall_nick(conn: &Connection, host: &str, cwd: &str) -> rusqlite::Result<Option<String>> {
+/// Record which terminal a session is attached to.
+pub fn capture_terminal(conn: &Connection, agent_id: &str, terminal: &str) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE agent_registry SET terminal = ?1 WHERE agent_id = ?2",
+        params![terminal, agent_id],
+    )
+}
+
+/// The nick previously chosen for this terminal and directory, if any.
+///
+/// This window's own slot wins; the directory-level slot is the fallback, so a
+/// window opened in a new terminal still inherits the last nick chosen for the
+/// project instead of starting nameless.
+pub fn recall_nick(
+    conn: &Connection,
+    host: &str,
+    cwd: &str,
+    terminal: &str,
+) -> rusqlite::Result<Option<String>> {
+    if !terminal.is_empty() {
+        let own: Option<String> = conn
+            .query_row(
+                "SELECT nick FROM nick_memory WHERE host = ?1 AND cwd = ?2 AND terminal = ?3",
+                params![host, cwd, terminal],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if own.is_some() {
+            return Ok(own);
+        }
+    }
     conn.query_row(
-        "SELECT nick FROM nick_memory WHERE host = ?1 AND cwd = ?2",
+        "SELECT nick FROM nick_memory WHERE host = ?1 AND cwd = ?2 AND terminal = ''",
         params![host, cwd],
         |row| row.get::<_, String>(0),
     )
@@ -1480,6 +1523,47 @@ pub fn reap_on_boot(conn: &Connection) -> anyhow::Result<usize> {
 #[cfg(test)]
 mod tests {
 
+    /// Two windows on one repository each keep their own name.
+    ///
+    /// The memory was keyed by (host, cwd) alone, so the second window's rename
+    /// overwrote the first's and the first came back under the other's name.
+    #[test]
+    fn two_windows_on_one_directory_do_not_overwrite_each_other() {
+        let conn = rusqlite::Connection::open_in_memory().expect("conn");
+        crate::daemon::chat::ensure_chat_db_schema(&conn).expect("schema");
+
+        remember_nick(&conn, "h", "/work/api", "/dev/pts/1", "planner", 1).expect("first window");
+        remember_nick(&conn, "h", "/work/api", "/dev/pts/2", "builder", 2).expect("second window");
+
+        assert_eq!(
+            recall_nick(&conn, "h", "/work/api", "/dev/pts/1").expect("recall"),
+            Some("planner".to_string()),
+            "the second window's rename took the first window's name"
+        );
+        assert_eq!(
+            recall_nick(&conn, "h", "/work/api", "/dev/pts/2").expect("recall"),
+            Some("builder".to_string())
+        );
+    }
+
+    /// A window opened in a NEW terminal still inherits the directory's last
+    /// chosen nick — losing that would trade one bug for another.
+    #[test]
+    fn a_fresh_terminal_falls_back_to_the_directory_slot() {
+        let conn = rusqlite::Connection::open_in_memory().expect("conn");
+        crate::daemon::chat::ensure_chat_db_schema(&conn).expect("schema");
+        remember_nick(&conn, "h", "/work/api", "/dev/pts/1", "planner", 1).expect("remember");
+        assert_eq!(
+            recall_nick(&conn, "h", "/work/api", "/dev/pts/9").expect("recall"),
+            Some("planner".to_string())
+        );
+        // And a session with no tty at all lands in the same fallback.
+        assert_eq!(
+            recall_nick(&conn, "h", "/work/api", "").expect("recall"),
+            Some("planner".to_string())
+        );
+    }
+
     /// A rename must outlive the next reconnect.
     ///
     /// The supervisor re-registers whenever the daemon restarts or the
@@ -1591,27 +1675,27 @@ mod tests {
     #[test]
     fn a_chosen_nick_survives_the_session_that_chose_it() {
         let conn = open_test_conn();
-        remember_nick(&conn, "hostA", "/work/api", "mira", 1).expect("remember");
+        remember_nick(&conn, "hostA", "/work/api", "", "mira", 1).expect("remember");
 
         assert_eq!(
-            recall_nick(&conn, "hostA", "/work/api").expect("recall"),
+            recall_nick(&conn, "hostA", "/work/api", "").expect("recall"),
             Some("mira".to_string())
         );
         // Scoped to the directory, not global: a different project must not
         // inherit someone else's name.
-        assert_eq!(recall_nick(&conn, "hostA", "/work/ui").expect("recall"), None);
+        assert_eq!(recall_nick(&conn, "hostA", "/work/ui", "").expect("recall"), None);
         // And not to a different machine, since pids and bindings are per-host.
-        assert_eq!(recall_nick(&conn, "hostB", "/work/api").expect("recall"), None);
+        assert_eq!(recall_nick(&conn, "hostB", "/work/api", "").expect("recall"), None);
     }
 
     #[test]
     fn renaming_again_replaces_the_memory_rather_than_accumulating() {
         let conn = open_test_conn();
-        remember_nick(&conn, "hostA", "/work/api", "mira", 1).expect("first");
-        remember_nick(&conn, "hostA", "/work/api", "atlas", 2).expect("second");
+        remember_nick(&conn, "hostA", "/work/api", "", "mira", 1).expect("first");
+        remember_nick(&conn, "hostA", "/work/api", "", "atlas", 2).expect("second");
 
         assert_eq!(
-            recall_nick(&conn, "hostA", "/work/api").expect("recall"),
+            recall_nick(&conn, "hostA", "/work/api", "").expect("recall"),
             Some("atlas".to_string()),
             "the latest choice wins"
         );

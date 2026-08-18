@@ -587,6 +587,9 @@ COMMIT;
     // pty-transport Slice 14 — remember the nick a session was DELIBERATELY
     // given, so the next session in the same directory starts under it again.
     apply_nick_memory_migration(conn)?;
+    // v0.11 — which terminal a session runs on, so its nick memory is its own
+    // rather than shared with every other window on the same directory.
+    apply_agent_terminal_migration(conn)?;
     // v0.11 — remember that a message was dictated, so the marker survives a
     // delivery from the backlog.
     apply_message_is_voice_migration(conn)?;
@@ -708,6 +711,54 @@ fn apply_nick_memory_migration(conn: &Connection) -> rusqlite::Result<()> {
            updated_at INTEGER NOT NULL,
            PRIMARY KEY (host, cwd)
          );",
+    )?;
+    widen_nick_memory_to_terminals(conn)
+}
+
+/// Give each terminal its own slot in the nick memory.
+///
+/// The memory was keyed by `(host, cwd)` alone, so two windows open on one
+/// repository shared a single slot and the second rename overwrote the first —
+/// after which the first window came back under the other window's name, or
+/// under the project default.
+///
+/// The key is the controlling terminal, and it is the controlling terminal
+/// rather than the Claude conversation id for a reason worth writing down: the
+/// nick has to be chosen BEFORE `claude` is started, and the conversation does
+/// not exist until after. A conversation id can only ever be learned too late
+/// to answer "what is this session called". The terminal is known to the
+/// supervisor at spawn, which is exactly when the question is asked.
+///
+/// The old rows are kept under the empty terminal, which is also what a session
+/// with no tty writes. That row stays the fallback: a window opened in a NEW
+/// terminal on a directory that has been used before still inherits the last
+/// nick chosen there, which is the behaviour that made the memory useful.
+fn widen_nick_memory_to_terminals(conn: &Connection) -> rusqlite::Result<()> {
+    let has_terminal: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('nick_memory') WHERE name = 'terminal')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_terminal {
+        return Ok(());
+    }
+    // SQLite cannot widen a primary key in place, so the table is rebuilt.
+    // Existing rows become the directory-level fallback.
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE nick_memory_new (
+           host       TEXT NOT NULL,
+           cwd        TEXT NOT NULL,
+           terminal   TEXT NOT NULL DEFAULT '',
+           nick       TEXT NOT NULL,
+           updated_at INTEGER NOT NULL,
+           PRIMARY KEY (host, cwd, terminal)
+         );
+         INSERT INTO nick_memory_new (host, cwd, terminal, nick, updated_at)
+           SELECT host, cwd, '', nick, updated_at FROM nick_memory;
+         DROP TABLE nick_memory;
+         ALTER TABLE nick_memory_new RENAME TO nick_memory;
+         COMMIT;",
     )
 }
 
@@ -738,6 +789,24 @@ fn apply_nick_memory_migration(conn: &Connection) -> rusqlite::Result<()> {
 /// things to confirm rather than act on, because speech recognition gets
 /// precisely those wrong. An unmarked transcript is a transcript the agent
 /// trusts as if the operator had typed it.
+/// `agent_registry.terminal` — the controlling terminal a session runs on.
+///
+/// Written at registration, read by anything that needs this window's own nick
+/// slot. Empty when there is no tty (a service, a test, Windows), which lands
+/// the session in the shared directory-level slot — the old behaviour, kept as
+/// the fallback rather than as the only option.
+fn apply_agent_terminal_migration(conn: &Connection) -> rusqlite::Result<()> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('agent_registry') WHERE name = 'terminal')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        conn.execute_batch("ALTER TABLE agent_registry ADD COLUMN terminal TEXT DEFAULT NULL")?;
+    }
+    Ok(())
+}
+
 fn apply_message_is_voice_migration(conn: &Connection) -> rusqlite::Result<()> {
     let exists: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('chat_messages') WHERE name = 'is_voice')",
@@ -1595,8 +1664,9 @@ mod tests {
         // adds 5 more (project_id / branch / working_dir /
         // feature_description / dnd_until_ts). pty-transport Slice 1 adds
         // `session_token` (capability for short-lived CLI senders).
-        // Total = 9 + 6 + 5 + 1 = 21.
-        assert_eq!(n, 21, "agent_registry should have exactly 21 columns post-migration");
+        // v0.11 adds `terminal` (the per-window key for the nick memory).
+        // Total = 9 + 6 + 5 + 1 + 1 = 22.
+        assert_eq!(n, 22, "agent_registry should have exactly 22 columns post-migration");
     }
 
     #[test]

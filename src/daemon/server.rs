@@ -1455,6 +1455,11 @@ async fn handle_agent_register(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     let client_pid = args.get("pid").and_then(|v| v.as_i64());
+    let client_terminal = args
+        .get("terminal")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
     let cid_str = connection_id.to_string();
     let agent_id_for_capture = agent_id.clone();
     let nick_chosen = args
@@ -1536,12 +1541,18 @@ async fn handle_agent_register(
         // came back as the project default. A DERIVED default is deliberately
         // not remembered — it is re-derived anyway, and pinning a
         // disambiguated `-2` form on the directory would be worse than the bug.
+        let _ = crate::daemon::agent_registry::capture_terminal(
+            &conn,
+            &agent_id_for_capture,
+            &client_terminal,
+        );
         if nick_chosen {
             if let (Some(host), Some(cwd_str)) = (client_host.as_deref(), cwd_arg.as_deref()) {
                 if let Err(e) = crate::daemon::agent_registry::remember_nick(
                     &conn,
                     host,
                     cwd_str,
+                    &client_terminal,
                     &name_for_capture,
                     crate::daemon::chat::now_millis(),
                 ) {
@@ -1571,6 +1582,12 @@ async fn handle_agent_register(
         }
         Ok(Err(e)) => {
             let msg = e.to_string();
+            // Loudly. A failed registration used to be invisible from both
+            // ends: the daemon said nothing, and the supervisor's own warning
+            // goes to a pty nobody reads. The session simply vanished from
+            // `agent list`, from `/switch`, and from every nick-addressed
+            // route, with no line anywhere saying why.
+            tracing::error!(error = %msg, "agent_register FAILED — this session is not on the map");
             tool_error_response(id, -32603, &msg)
         }
         Err(e) => {
@@ -1698,17 +1715,23 @@ async fn handle_agent_rename(
         // Telegram binding that `/switch` made against it. A rename that is
         // forgotten on exit is the bug this closes, not a feature.
         use rusqlite::OptionalExtension as _;
-        let row: Option<(Option<String>, Option<String>)> = conn
+        let row: Option<(Option<String>, Option<String>, Option<String>)> = conn
             .query_row(
-                "SELECT host, cwd FROM agent_registry WHERE agent_id = ?1",
+                "SELECT host, cwd, terminal FROM agent_registry WHERE agent_id = ?1",
                 rusqlite::params![claimed],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        if let Some((Some(host), Some(cwd))) = row {
+        if let Some((Some(host), Some(cwd), terminal)) = row {
             let now = chrono::Utc::now().timestamp_millis();
-            if let Err(e) =
-                crate::daemon::agent_registry::remember_nick(&conn, &host, &cwd, &new_name, now)
+            if let Err(e) = crate::daemon::agent_registry::remember_nick(
+                &conn,
+                &host,
+                &cwd,
+                terminal.as_deref().unwrap_or(""),
+                &new_name,
+                now,
+            )
             {
                 // The rename itself succeeded; failing to memorise it costs the
                 // next restart its name, not this session its identity.

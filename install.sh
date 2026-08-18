@@ -252,20 +252,36 @@ install_binary() {
     fi
   fi
 
-  local url="${RELEASE_BASE}/claudebase-v${CLAUDEBASE_VERSION}/claudebase-${platform}${exe_ext}"
+  local asset="claudebase-${platform}${exe_ext}"
+  local url="${RELEASE_BASE}/claudebase-v${CLAUDEBASE_VERSION}/${asset}"
+  # Fallback: GitHub redirects `releases/latest/download/<asset>` to the newest
+  # published release. The pinned version can legitimately not exist yet —
+  # bumping it lands on `main` the moment the tag is pushed, while the release
+  # build takes minutes, and this script is fetched from `main`. Anyone
+  # installing in that window used to get no binary at all and an install that
+  # reported success for everything except the one file that matters.
+  local fallback_url="${REPO_URL%.git}/releases/latest/download/${asset}"
   local tmp; tmp="$(mktemp)"
 
-  if command -v curl >/dev/null 2>&1; then
-    if ! curl --proto '=https' --tlsv1.2 -fsSL --max-redirs 5 --max-time 120 "$url" -o "$tmp"; then
-      rm -f "$tmp"
-      log_warn "claudebase binary download failed (curl). Build from source: cargo install --git $REPO_URL"
-      return 0
+  fetch_binary() {
+    local from="$1"
+    if command -v curl >/dev/null 2>&1; then
+      curl --proto '=https' --tlsv1.2 -fsSL --max-redirs 5 --max-time 120 "$from" -o "$tmp"
+    elif command -v wget >/dev/null 2>&1; then
+      wget --https-only --secure-protocol=TLSv1_2 --max-redirect=5 --timeout=120 -q -O "$tmp" "$from"
+    else
+      return 1
     fi
-  elif command -v wget >/dev/null 2>&1; then
-    if ! wget --https-only --secure-protocol=TLSv1_2 --max-redirect=5 --timeout=120 -q -O "$tmp" "$url"; then
-      rm -f "$tmp"
-      log_warn "claudebase binary download failed (wget). Build from source: cargo install --git $REPO_URL"
-      return 0
+  }
+
+  if command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; then
+    if ! fetch_binary "$url"; then
+      log_warn "v${CLAUDEBASE_VERSION} not downloadable yet; falling back to the latest release"
+      if ! fetch_binary "$fallback_url"; then
+        rm -f "$tmp"
+        log_warn "claudebase binary download failed. Build from source: cargo install --git $REPO_URL"
+        return 0
+      fi
     fi
   else
     rm -f "$tmp"

@@ -216,14 +216,31 @@ function Install-Binary {
         } catch {}
     }
 
-    $url = "$($Script:ReleaseBase)/claudebase-v$($Script:ClaudebaseVersion)/claudebase-$platform.exe"
+    $asset = "claudebase-$platform.exe"
+    $url   = "$($Script:ReleaseBase)/claudebase-v$($Script:ClaudebaseVersion)/$asset"
+    # GitHub redirects releases/latest/download/<asset> to the newest published
+    # release. The pinned version can legitimately not exist yet: the bump lands
+    # on `main` when the tag is pushed, the release build takes minutes, and this
+    # script is fetched from `main`. Installing in that window used to produce no
+    # binary at all while every other step reported success.
+    $fallbackUrl = ($Script:RepoUrl -replace '\.git$','') + "/releases/latest/download/$asset"
     $tmp = Join-Path $env:TEMP ("claudebase-" + [guid]::NewGuid().ToString() + ".exe")
 
     Write-Info "Downloading claudebase.exe v$($Script:ClaudebaseVersion)..."
+    $got = $false
     try {
         Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing -MaximumRedirection 5 -TimeoutSec 120
+        $got = $true
     } catch {
-        Write-Warn "claudebase binary download failed: $($_.Exception.Message)"
+        Write-Warn "v$($Script:ClaudebaseVersion) not downloadable yet; falling back to the latest release"
+        try {
+            Invoke-WebRequest -Uri $fallbackUrl -OutFile $tmp -UseBasicParsing -MaximumRedirection 5 -TimeoutSec 120
+            $got = $true
+        } catch {
+            Write-Warn "claudebase binary download failed: $($_.Exception.Message)"
+        }
+    }
+    if (-not $got) {
         Write-Warn "  Build from source: cargo install --git $($Script:RepoUrl)"
         if (Test-Path $tmp) { Remove-Item $tmp -Force }
         return

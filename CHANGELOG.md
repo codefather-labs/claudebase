@@ -4,6 +4,18 @@ All notable changes to claudebase will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Installing during a release no longer leaves you without a binary.** The version pin lands on
+  `main` the moment a tag is pushed, but the release build takes minutes — and the installers are
+  fetched from `main`. Anyone installing in that window asked for a release that did not exist yet,
+  got no binary, and saw every other step report success. Both installers now fall back to
+  `releases/latest/download/`, which GitHub redirects to the newest published release, and say which
+  version they actually installed. Verified live: the pinned URL returned 404 while the fallback
+  returned 200, and the installer recovered on its own.
+
 ## [0.9.2] - 2026-08-18
 
 ### Fixed

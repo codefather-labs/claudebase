@@ -1275,22 +1275,17 @@ fn run_daemon_doctor(_args: &cli::DaemonDoctorArgs) -> std::process::ExitCode {
     use claudebase::daemon::asr;
     use claudebase::daemon::config;
 
-    // Load daemon.toml. Missing file → exit 1 with a clear message.
+    // A missing daemon.toml means defaults, not failure: the file is optional
+    // and the default backend is whisper. Refusing to run here removed the one
+    // command that would have explained why voice notes were not transcribing
+    // on exactly the machines where nothing had been configured.
     let toml_path = config::user_level_daemon_toml_path();
-    let cfg = if toml_path.exists() {
-        match config::load_daemon_toml(&toml_path) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("error: failed to load daemon.toml: {e}");
-                return std::process::ExitCode::FAILURE;
-            }
+    let cfg = match config::load_daemon_toml_or_default(&toml_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: failed to load daemon.toml: {e}");
+            return std::process::ExitCode::FAILURE;
         }
-    } else {
-        eprintln!(
-            "error: daemon.toml not found at {} — run `claudebase daemon config edit` first",
-            toml_path.display()
-        );
-        return std::process::ExitCode::FAILURE;
     };
 
     let backend_name = cfg.asr.backend.as_deref().unwrap_or("<none>");
@@ -1318,21 +1313,17 @@ fn run_daemon_doctor(_args: &cli::DaemonDoctorArgs) -> std::process::ExitCode {
 fn run_daemon_warmup(_args: &cli::DaemonWarmupArgs) -> std::process::ExitCode {
     use claudebase::daemon::config;
 
+    // A missing daemon.toml means defaults, not failure: the file is optional
+    // and the default backend is whisper. Refusing to run here removed the one
+    // command that would have explained why voice notes were not transcribing
+    // on exactly the machines where nothing had been configured.
     let toml_path = config::user_level_daemon_toml_path();
-    let cfg = if toml_path.exists() {
-        match config::load_daemon_toml(&toml_path) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("error: failed to load daemon.toml: {e}");
-                return std::process::ExitCode::FAILURE;
-            }
+    let cfg = match config::load_daemon_toml_or_default(&toml_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: failed to load daemon.toml: {e}");
+            return std::process::ExitCode::FAILURE;
         }
-    } else {
-        eprintln!(
-            "error: daemon.toml not found at {} — run `claudebase daemon config edit` first",
-            toml_path.display()
-        );
-        return std::process::ExitCode::FAILURE;
     };
 
     let backend_name = cfg.asr.backend.as_deref().unwrap_or("<none>");

@@ -256,6 +256,28 @@ pub fn user_level_secrets_toml_path() -> PathBuf {
 ///    where the token belongs.
 ///
 /// Returns `Ok(Config)` only when both checks pass and the TOML is valid.
+/// The daemon's configuration, with a MISSING file treated as "all defaults".
+///
+/// `daemon.toml` is optional by design: `AsrConfig::default()` selects the
+/// whisper backend precisely so that a fresh install transcribes voice notes
+/// without the operator writing any config. That default was unreachable —
+/// every caller guarded on `path.exists()` and bailed out or fell back to
+/// `None` when the file was absent, so the documented behaviour ("a daemon with
+/// no `[asr]` block defaults to whisper", v0.8.1) never happened on a clean
+/// machine. Voice notes came back as
+/// `[voice transcription failed: ASR backend not configured]` and
+/// `daemon doctor --asr` refused to run at all, which removed the one tool that
+/// would have explained why.
+///
+/// A malformed file is still an error: "you wrote something wrong" and "you
+/// wrote nothing" deserve different answers.
+pub fn load_daemon_toml_or_default(path: &Path) -> Result<Config> {
+    if !path.exists() {
+        return Ok(Config::default());
+    }
+    load_daemon_toml(path)
+}
+
 pub fn load_daemon_toml(path: &Path) -> Result<Config> {
     // SEC-15 step 1: symlink refuse via lstat (symlink_metadata reads the
     // link itself, not the target).
@@ -364,6 +386,54 @@ pub fn load_secrets_toml(path: &Path) -> Result<Secrets> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole point of the default: a machine with no daemon.toml still gets
+    /// whisper, so a voice note transcribes out of the box.
+    ///
+    /// Every caller used to guard on `path.exists()` and bail, which made the
+    /// documented default unreachable — voice notes returned
+    /// `[voice transcription failed: ASR backend not configured]` and
+    /// `daemon doctor --asr` refused to run on exactly the machines that needed
+    /// the explanation.
+    #[test]
+    fn a_missing_config_still_selects_the_whisper_backend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absent = dir.path().join("daemon.toml");
+        assert!(!absent.exists(), "the point of the test is that it is absent");
+
+        let cfg = load_daemon_toml_or_default(&absent).expect("a missing file is not an error");
+        assert_eq!(
+            cfg.asr.backend.as_deref(),
+            Some("whisper"),
+            "a clean install must transcribe without the operator writing config"
+        );
+    }
+
+    /// "You wrote nothing" and "you wrote something wrong" deserve different
+    /// answers: silently defaulting over a typo would hide it until a voice note
+    /// failed for a reason the operator could not see.
+    #[test]
+    fn a_malformed_config_is_still_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bad = dir.path().join("daemon.toml");
+        std::fs::write(&bad, "[asr\nbackend = ").expect("write");
+
+        assert!(
+            load_daemon_toml_or_default(&bad).is_err(),
+            "a broken file must not be silently replaced by defaults"
+        );
+    }
+
+    /// An explicit choice still wins over the default.
+    #[test]
+    fn an_explicit_backend_overrides_the_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("daemon.toml");
+        std::fs::write(&path, "[asr]\nbackend = \"nim\"\n").expect("write");
+
+        let cfg = load_daemon_toml_or_default(&path).expect("valid file");
+        assert_eq!(cfg.asr.backend.as_deref(), Some("nim"));
+    }
 
     #[test]
     fn redacted_token_display_emits_three_asterisks() {

@@ -454,27 +454,28 @@ pub async fn serve(_args: &DaemonServeArgs) -> anyhow::Result<()> {
         // (text messages keep working) and voice notes get the
         // `[voice transcription failed: ...]` placeholder per the
         // transcribe_voice_note error path.
+        // A MISSING daemon.toml means "use the defaults", not "no ASR". The
+        // default backend is whisper, so a clean install transcribes voice
+        // notes without the operator writing any config — which is what the
+        // v0.8.1 note promised and what the `path.exists()` guard here
+        // quietly prevented.
         let asr_opt: Option<std::sync::Arc<dyn crate::daemon::asr::Asr>> = {
             let toml_path = crate::daemon::config::user_level_daemon_toml_path();
-            if toml_path.exists() {
-                match crate::daemon::config::load_daemon_toml(&toml_path) {
-                    Ok(cfg) => match crate::daemon::asr::make_asr(&cfg) {
-                        Ok(b) => Some(std::sync::Arc::from(b)),
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "ASR factory failed; voice notes will use fallback placeholder"
-                            );
-                            None
-                        }
-                    },
+            match crate::daemon::config::load_daemon_toml_or_default(&toml_path) {
+                Ok(cfg) => match crate::daemon::asr::make_asr(&cfg) {
+                    Ok(b) => Some(std::sync::Arc::from(b)),
                     Err(e) => {
-                        tracing::warn!(error = %e, "daemon.toml reload failed in server.serve");
+                        tracing::warn!(
+                            error = %e,
+                            "ASR factory failed; voice notes will use fallback placeholder"
+                        );
                         None
                     }
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, "daemon.toml reload failed in server.serve");
+                    None
                 }
-            } else {
-                None
             }
         };
 

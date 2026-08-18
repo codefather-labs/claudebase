@@ -79,6 +79,36 @@ fn ps1_hooks_are_ascii_only() {
     }
 }
 
+/// The installer is a `.ps1` too, and it was the one nobody checked.
+///
+/// PowerShell 5.1 — still the default on Windows — reads a BOM-less script in
+/// the system ANSI codepage, not UTF-8. Three em-dashes in comments and one
+/// string were therefore mis-decoded, and the parser died with
+/// `Missing closing '}'` at a function that was perfectly balanced. The Windows
+/// installer did not run AT ALL, and nothing caught it: this test existed but
+/// covered only `hooks/`.
+///
+/// Verified on a real Windows 11 box on 2026-08-18: the same bytes parse clean
+/// as UTF-8 and fail as ANSI.
+#[test]
+fn the_windows_installer_is_ascii_only() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("install.ps1");
+    let bytes = std::fs::read(&path).expect("read install.ps1");
+    let offenders: Vec<(usize, u8)> = bytes
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| **b > 127)
+        .map(|(i, b)| (i, *b))
+        .take(5)
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "install.ps1 must be pure ASCII — PowerShell 5.1 reads a BOM-less script as ANSI and \
+         mis-decodes anything else, which stops the installer from parsing at all. \
+         First offending bytes (offset, value): {offenders:?}"
+    );
+}
+
 #[test]
 fn routing_hook_documents_the_cli_peer_contract() {
     for name in [

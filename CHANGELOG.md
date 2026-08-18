@@ -4,6 +4,27 @@ All notable changes to claudebase will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The Windows installer could not run at all.** `install.ps1` failed to parse with
+  `Missing closing '}'` at a function whose braces were perfectly balanced. PowerShell 5.1 — still
+  the default on Windows — reads a BOM-less script in the system ANSI codepage rather than UTF-8, so
+  three em-dashes in comments and one string were mis-decoded and took the parser with them. The file
+  is pure ASCII now, and a test pins it: `ps1_hooks_are_ascii_only` existed but covered only
+  `hooks/`, never the installer itself. Confirmed on a real Windows 11 box — the same bytes parse
+  clean as UTF-8 and fail as ANSI.
+- **Upgrading on Windows failed whenever the daemon was running**, which is the normal state after a
+  previous install: Windows refuses to overwrite a running `.exe`, so `Move-Item -Force` reported
+  `Cannot create a file when that file already exists`. (The same operation works on Unix, where
+  renaming swaps the inode and the live process keeps the old file open.) The installer now renames
+  the old binary aside — which Windows does allow — puts the new one in place, and cleans the
+  leftover on the next run rather than stopping a working install to upgrade it.
+- **The daemon never auto-started on Windows.** The spawn passed the same file to
+  `-RedirectStandardOutput` and `-RedirectStandardError`, which `Start-Process` refuses outright; the
+  installer logged a warning and carried on. Separate files.
+
 ## [0.9.1] - 2026-08-18
 
 ### Fixed

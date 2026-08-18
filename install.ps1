@@ -238,7 +238,33 @@ function Install-Binary {
         return
     }
 
+    # Windows will not let a RUNNING .exe be overwritten, and the daemon from a
+    # previous install is normally running -- so `Move-Item -Force` failed with
+    # "Cannot create a file when that file already exists" on every upgrade.
+    # (On Unix the same operation works: renaming swaps the inode and the live
+    # process keeps the old one open.)
+    #
+    # Windows does permit RENAMING a running executable, which is the standard
+    # self-update route: move the old one aside, put the new one in place, then
+    # delete the leftover best-effort. Deleting fails while the old process
+    # lives, so the stale file is cleaned on the next run instead of blocking
+    # this one. Stopping the daemon first would also work, but it would take a
+    # working install down to upgrade it.
+    if (Test-Path $targetBin) {
+        $stale = "$targetBin.old"
+        if (Test-Path $stale) { Remove-Item $stale -Force -ErrorAction SilentlyContinue }
+        try {
+            Move-Item -Force $targetBin $stale -ErrorAction Stop
+        } catch {
+            Write-Err "cannot replace $targetBin ($($_.Exception.Message))"
+            Write-Err "  a claudebase process is holding it and could not be moved aside."
+            Write-Err "  Stop it and re-run:  claudebase daemon stop"
+            Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+            return
+        }
+    }
     Move-Item -Force $tmp $targetBin
+    Remove-Item "$targetBin.old" -Force -ErrorAction SilentlyContinue
     Write-Ok "tools\claudebase\claudebase.exe ($platform)"
 }
 
@@ -328,7 +354,7 @@ function Register-BashAllowlist {
 #   - PostToolUse:ExitPlanMode -> claudebase-feature-describe.ps1
 # The retired Stop[insight-capture] hook is actively UNWIRED and its files
 # deleted -- see below.
-# Idempotent — dedup by command-string equality so re-running never duplicates.
+# Idempotent -- dedup by command-string equality so re-running never duplicates.
 # ============================================================================
 function Install-ClaudebaseHooks {
     $hooksDir = Join-Path $Script:ClaudeDir 'hooks'
@@ -346,7 +372,7 @@ function Install-ClaudebaseHooks {
     foreach ($hook in 'claudebase-selfcheck-reminder.sh', 'claudebase-selfcheck-reminder.ps1', 'claudebase-read-insights-reminder.sh', 'claudebase-read-insights-reminder.ps1', 'claudebase-agent-routing-reminder.sh', 'claudebase-agent-routing-reminder.ps1', 'claudebase-channel-contract.sh', 'claudebase-channel-contract.ps1', 'claudebase-feature-describe.sh', 'claudebase-feature-describe.ps1') {
         $src = Join-Path $Script:ScriptDir "hooks\$hook"
         $dst = Join-Path $hooksDir $hook
-        if (-not (Test-Path $src)) { Write-Warn "hooks/$hook missing in source — skipping"; continue }
+        if (-not (Test-Path $src)) { Write-Warn "hooks/$hook missing in source -- skipping"; continue }
         Copy-Item -Force $src $dst
         Write-Ok "hooks/$hook"
     }
@@ -371,7 +397,7 @@ function Install-ClaudebaseHooks {
             $json | Add-Member -NotePropertyName 'hooks' -NotePropertyValue ([pscustomobject]@{}) -Force
         }
 
-        # Helper — idempotent merge of one event by command-string equality.
+        # Helper -- idempotent merge of one event by command-string equality.
         $mergeEvent = {
             param($eventName, $command)
             if (-not ($json.hooks.PSObject.Properties.Name -contains $eventName)) {
@@ -803,12 +829,18 @@ if ($env:CLAUDEBASE_SKIP_DAEMON -eq "1") {
             New-Item -ItemType Directory -Path $logDir -Force | Out-Null
         }
         $logFile = Join-Path $logDir 'claudebase-daemon.log'
+        # Start-Process REFUSES the same path for both streams ("Give different
+        # inputs and Run your command again"), so pointing both here meant the
+        # daemon never auto-started on Windows at all -- the install reported a
+        # warning and moved on. Separate files; the daemon's own output is
+        # structured JSON either way.
+        $errFile = Join-Path $logDir 'claudebase-daemon.err.log'
         try {
             Start-Process -FilePath $claudebaseExe `
                 -ArgumentList 'daemon', 'serve' `
                 -WindowStyle Hidden `
                 -RedirectStandardOutput $logFile `
-                -RedirectStandardError $logFile `
+                -RedirectStandardError $errFile `
                 -ErrorAction Stop | Out-Null
             # Brief wait for the daemon to bind its named pipe so the
             # operator sees a positive `daemon status` immediately after

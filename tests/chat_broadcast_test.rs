@@ -19,7 +19,16 @@ use std::time::Duration;
 use common::{payload, socket_under, spawn_daemon_with_home, stop, wait_for_socket, Client};
 use serde_json::json;
 
-const THREAD: &str = "telegram:99999";
+/// A peer thread, not a Telegram one, and that distinction is the point.
+///
+/// On an `agent:<id>` thread the broadcast IS the delivery — it is how a peer
+/// session receives a message. On a `telegram:` thread an agent's post is
+/// deliberately NOT broadcast: the text has already reached the operator over
+/// the Bot API, and the only remaining audience is whichever other sessions
+/// happen to subscribe to that chat, who would read one agent's reply to the
+/// operator as if the operator had written it to them. That suppression is
+/// asserted by its own test below.
+const THREAD: &str = "agent:99999";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_post_reaches_every_subscriber_of_the_thread() {
@@ -111,6 +120,53 @@ async fn a_post_does_not_reach_subscribers_of_other_threads() {
     assert!(
         leaked.is_err(),
         "subscriber of another thread must not receive this post, got: {leaked:?}"
+    );
+
+    stop(&mut daemon);
+}
+
+/// An agent's post on a TELEGRAM thread must not fan out to that chat's other
+/// subscribers.
+///
+/// This is the shape of a real incident: with several sessions subscribed to
+/// one operator chat, every reply any of them sent to the operator was
+/// delivered to all the others as inbound, and each read it as something the
+/// operator had said to them. The suppression lives at the source rather than
+/// only in the subscriber, because a session runs the binary it started with
+/// for hours — filtering it daemon-side protects the ones already running.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agents_post_on_a_telegram_thread_is_not_broadcast() {
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let home = tmpdir.path();
+    let socket = socket_under(home);
+
+    let mut daemon = spawn_daemon_with_home(home).expect("daemon spawned");
+    wait_for_socket(&socket, Duration::from_secs(10))
+        .await
+        .expect("socket appeared");
+
+    let tg_thread = "telegram:99999";
+    let mut listener = Client::connect(&socket).await.expect("connect listener");
+    listener
+        .call("chat_subscribe", json!({ "thread": tg_thread }), 1)
+        .await
+        .expect("subscribe");
+
+    let mut poster = Client::connect(&socket).await.expect("connect poster");
+    let post = poster
+        .call(
+            "chat_post",
+            json!({ "thread": tg_thread, "content": "an answer to the operator", "from": "mira" }),
+            2,
+        )
+        .await
+        .expect("post");
+    assert!(post.get("error").is_none(), "the post itself must still succeed: {post}");
+
+    let leaked = listener.next_notification(Duration::from_millis(800)).await;
+    assert!(
+        leaked.is_err(),
+        "another agent's reply to the operator reached this session as inbound: {leaked:?}"
     );
 
     stop(&mut daemon);

@@ -455,16 +455,19 @@ async fn deliver_resolved(
     let content = body.to_string();
     let agent_for_send = agent_id.to_string();
     let from_for_send = from.clone();
+    // Through the daemon's single writer: callbacks, the Telegram long-poll and
+    // the per-agent sockets are all in this process and all write here.
     let stored = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-        let conn = super::chat::open_chat_db()?;
-        let outcome = super::agent_registry::send_message(
-            &conn,
-            &from_for_send,
-            &agent_for_send,
-            &content,
-            super::chat::now_millis(),
-        )?;
-        Ok(outcome.message_id)
+        super::chat::with_writer(|conn| {
+            let outcome = super::agent_registry::send_message(
+                conn,
+                &from_for_send,
+                &agent_for_send,
+                &content,
+                super::chat::now_millis(),
+            )?;
+            Ok(outcome.message_id)
+        })
     })
     .await;
 

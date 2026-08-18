@@ -900,6 +900,61 @@ fn apply_concurrency_pragmas(conn: &Connection) -> rusqlite::Result<()> {
 /// called" read into a writer competing with the daemon, which is what made the
 /// nick lookup contend in the first place. Callers that only read use this and
 /// contend with nobody.
+/// The daemon's single writer: one connection, one at a time.
+///
+/// chat.db is a MULTI-PROCESS surface — the daemon, every `claudebase run`
+/// supervisor and every short-lived CLI open it directly — so no in-process
+/// gate can serialise all of it. What this does serialise is the daemon itself,
+/// where the concurrent writers actually are: Telegram long-poll, the callback
+/// endpoint, the per-agent sockets and every IPC handler live in one process and
+/// used to open their own connection per operation.
+///
+/// SQLite already serialises writers, and since every writer now takes
+/// `BEGIN IMMEDIATE` they queue on `busy_timeout` rather than failing. So this
+/// is not what makes writes correct — it removes the open-and-close churn and
+/// gives the daemon one place where writing happens.
+///
+/// **Re-entry returns an error instead of deadlocking.** A plain mutex here
+/// would hang the daemon the first time a handler opened a nested writer, and a
+/// hung daemon is far worse than a failed operation — so the thread-local depth
+/// counter turns that mistake into a visible error, in production as well as in
+/// tests.
+pub fn with_writer<T>(f: impl FnOnce(&Connection) -> anyhow::Result<T>) -> anyhow::Result<T> {
+    use std::cell::Cell;
+    use std::sync::{Mutex, OnceLock};
+
+    static WRITER: OnceLock<Mutex<Connection>> = OnceLock::new();
+    thread_local! {
+        static DEPTH: Cell<u32> = const { Cell::new(0) };
+    }
+
+    if DEPTH.with(|d| d.get()) > 0 {
+        anyhow::bail!(
+            "with_writer re-entered on the same thread — the inner call would deadlock; \
+             pass the existing &Connection down instead of opening another writer"
+        );
+    }
+
+    let cell = WRITER.get_or_init(|| {
+        // Panicking here would take the daemon down at first write; instead the
+        // connection is created eagerly and any failure surfaces on use.
+        Mutex::new(
+            open_chat_db().unwrap_or_else(|e| {
+                panic!("cannot open chat.db for the daemon writer: {e}")
+            }),
+        )
+    });
+
+    let guard = cell
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    DEPTH.with(|d| d.set(1));
+    let result = f(&guard);
+    DEPTH.with(|d| d.set(0));
+    result
+}
+
 pub fn open_chat_db_readonly() -> anyhow::Result<Connection> {
     // Two layers, because they cover different failures.
     //
@@ -1209,6 +1264,43 @@ pub type SharedBus = Arc<ChatBus>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Re-entering the writer must ERROR, not hang.
+    ///
+    /// A plain mutex would deadlock the daemon the first time a handler opened a
+    /// nested writer, and a hung daemon is worse than a failed operation: the
+    /// Telegram poller, the callback endpoint and every agent socket live in
+    /// that one process and would all stop with no error anywhere.
+    #[test]
+    fn the_writer_refuses_re_entry_instead_of_deadlocking() {
+        let _guard = crate::daemon::chat::with_writer(|_outer| {
+            let inner = crate::daemon::chat::with_writer(|_| Ok(()));
+            assert!(
+                inner.is_err(),
+                "a nested writer must be refused; deadlocking here would freeze the daemon"
+            );
+            let msg = format!("{}", inner.err().expect("err"));
+            assert!(
+                msg.contains("re-entered"),
+                "the error must say what happened; got: {msg}"
+            );
+            Ok(())
+        });
+    }
+
+    /// And the ordinary case still works, twice in a row — the depth counter
+    /// must be released, not leaked, or the second call would be refused.
+    #[test]
+    fn the_writer_can_be_used_again_after_returning() {
+        for _ in 0..2 {
+            let n: i64 = crate::daemon::chat::with_writer(|conn| {
+                Ok(conn.query_row("SELECT 1", [], |r| r.get(0))?)
+            })
+            .expect("writer usable");
+            assert_eq!(n, 1);
+        }
+    }
+
     use rusqlite::Connection;
 
     fn fresh_db() -> Connection {

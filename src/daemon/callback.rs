@@ -571,7 +571,7 @@ pub async fn serve(bind: String, bus: SharedBus) {
 /// closes the connection every time, so there is no keep-alive state machine to
 /// get wrong.
 async fn handle_connection(mut stream: tokio::net::TcpStream, bus: &SharedBus) -> Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
 
     const MAX_HEAD: usize = 8 * 1024;
     const MAX_BODY: usize = 64 * 1024;

@@ -400,14 +400,27 @@ not every core:
 [asr]
 backend = "whisper"
 n_threads = 4          # omit for the default
+max_concurrent = 1     # notes transcribed at once; omit for the default
 ```
 
-Raise it only where the cores are genuinely idle. On a busy machine more threads is slower, not
-faster — measured on a 16-core box at load ~25 running the agents the daemon serves, the same
-4-second note took 193s at 16 threads, 87s at 8, and 69s at 4. whisper.cpp joins its workers at every
-layer, so one worker that loses its core holds all the others at the barrier.
+Raise it only where the cores are genuinely idle, and measure rather than assume — the right number
+depends on what else the machine is doing. Same 16-core box, same 4-second note, two different loads:
 
-The model is loaded once and kept, and one note is transcribed at a time for the same reason.
+| threads | at load ~25 | at load ~7 |
+|---|---|---|
+| 16 | 193 s | 72 s |
+| 8 | 87 s | **37 s** |
+| 4 | **69 s** | 42 s |
+
+Taking every core loses badly in both. The default is 4 because this machine spends most of its time
+under load; 8 is the better setting on a quieter one. whisper.cpp joins its workers at every layer,
+so one worker that loses its core holds all the others at the barrier — contention does not divide
+the machine, it stalls it.
+
+`examples/whisper_probe.rs` runs that table on your own machine.
+
+The model is loaded once and kept. Fetching and decoding a note overlap freely; only the inference is
+bounded, by `max_concurrent`, for the same reason the thread count is.
 
 ---
 
@@ -443,14 +456,35 @@ claudebase agent rename "<nick>" --new-callback-token   # ...and retire the old 
 claudebase run --nick "<nick>"         # set it at startup instead
 ```
 
-A **chosen** nick is remembered for that working directory and comes back on restart. That is not a
+A **chosen** nick belongs to the CONVERSATION, not to the window or the checkout. Resume that
+conversation a week later, in another terminal, and it answers to the same name. That is not a
 convenience: Telegram chat bindings are keyed by nick precisely so they outlive a process, so a
 session returning under a different name would silently stop receiving. For the same reason a rename
 carries its bindings with it — the chat follows the session rather than being stranded on the old
 name.
 
+Three keys, in the order they apply:
+
+| Key | Set by | Answers |
+|---|---|---|
+| Claude conversation id | the SessionStart hook, once `claude` is running | what has this conversation always been called |
+| controlling terminal | the supervisor, before `claude` starts | what is this window called right now |
+| working directory | either | what was last chosen in this project |
+
+The conversation id is the durable one — on this machine a single id spans two months and 363
+separate runs — but it cannot name a session at startup, because the supervisor has to choose a name
+before `claude` exists to say which conversation it is resuming. So the terminal supplies the opening
+name and the conversation corrects it a moment later, renaming the session and moving its bindings.
+The directory-level entry is the fallback for a window opened somewhere new.
+
+Resuming rather than starting fresh is what keeps that identity: `claudebase run -- --continue`
+forwards `--continue` to `claude`, which continues the last conversation instead of creating a new
+one. A fresh `claudebase run` starts a new conversation, and starting one only to `/resume` the real
+one leaves an empty stub behind in the `/resume` list.
+
 A nick is held only by a session whose process is actually alive, so a crashed window does not keep
-its name reserved.
+its name reserved. A rename also survives a reconnect: the name the supervisor reports at
+registration is the INITIAL name only, so a daemon restart cannot roll a rename back.
 
 **Identity is enforced, not declared.** The daemon resolves the sender from the connection, or from a
 `(agent_id, session_token)` pair it minted itself at registration and handed to the session through

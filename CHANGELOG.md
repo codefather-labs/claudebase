@@ -6,6 +6,72 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-08-19
+
+### Added
+
+- **A nick belongs to the conversation.** `conversation_nick` maps a Claude conversation to the name
+  it answers to; a SessionStart hook reports the conversation via `claudebase agent bind-session`, and
+  the daemon renames the session back to whatever that conversation has always been called. Measured
+  rather than assumed: on the development machine one conversation id spans two months and 363
+  separate runs, so it survives restarts, reboots and being resumed in another terminal. It cannot
+  name a session at STARTUP — the supervisor has to choose a name before `claude` exists to say which
+  conversation it is resuming — so the terminal-keyed memory supplies the opening name and the
+  conversation corrects it a moment later.
+- **A nick slot per window.** The nick memory was keyed by (host, working directory) alone, so two
+  windows open on one repository shared a slot: the second rename overwrote the first, and the first
+  window came back under the other's name. The key is now (host, directory, controlling terminal),
+  with the directory-level entry kept as the fallback for a window opened somewhere new.
+- **`[asr] n_threads` and `[asr] max_concurrent`.** How many threads whisper may use, and how many
+  notes may be inside it at once. Both default low on purpose; `examples/whisper_probe.rs` measures
+  the right values for a given machine.
+- **`--nick` is remembered.** Only a rename used to write the nick memory, so a session started under
+  a chosen name came back as the project default — while the README offered the two as equivalents.
+
+### Fixed
+
+- **`/start` could flood the chat with inline keyboards.** A poll offset that had run ahead of
+  reality — in this case poisoned by a test's fabricated `update_id` — meant a real update was never
+  confirmed, so Telegram re-delivered it forever and every pass re-ran the command. The two paths are
+  now separated by who is speaking: an update Telegram hands back is authoritative and repairs a
+  runaway offset, while a transcript re-entering from our own queue keeps the forward-only rule that
+  stops an old id rewinding the poll.
+- **A reconnect undid a rename.** `agent_register` overwrote the stored name on every conflict, and
+  the supervisor re-registers on each reconnect carrying the name it captured at startup — so a
+  rename survived only until the next daemon restart. That single line produced two separate
+  symptoms: nicks silently reverting, and HTTP callbacks answering "no alive agent matches" under a
+  new name while the old one still worked, because the token and the socket had followed the rename
+  and the registry had rolled back. The supplied name is now the initial name only.
+- **A failed registration was silent and permanent.** The daemon returned the error without logging
+  it and the supervisor tried exactly once per connection, so one transient `database is locked`
+  during the daemon's startup left a session running but absent from `agent list`, from `/switch` and
+  from every nick-addressed route — and unable to rename itself out of it. Now logged loudly and
+  retried.
+- **`database is locked`, at the root.** `ensure_chat_db_schema` began its transaction with a plain
+  `BEGIN` — deferred — and it runs on EVERY database open. A deferred transaction starts as a reader
+  and upgrades on its first write, which SQLite refuses instantly with `SQLITE_BUSY`; `busy_timeout`
+  does not apply to that upgrade. Nothing had to hold a lock for five seconds: a millisecond of
+  another process's write was enough, because the loser did not wait at all.
+- **Voice notes blocked the whole Telegram channel, and could be lost.** Transcription was awaited
+  inside the poll loop, so for its whole duration — measured at 5.5 minutes for a ninety-second note
+  — nothing else could arrive, and everything sharing the batch was delivered together at the end. An
+  update fetched but not yet persisted lived only in the loop's local memory and was lost outright if
+  the daemon restarted. Notes are now parked in `pending_voice` inside the same transaction that
+  advances the offset, and a worker drains it; a crash costs a repeated transcription rather than the
+  message.
+- **A transcript delivered from the backlog lost its `[telegram_voice_message]` marker**, arriving
+  indistinguishable from typed text — which matters, because the channel contract tells an agent to
+  confirm exact strings in dictated lines rather than act on them.
+
+### Changed
+
+- **whisper no longer takes every core.** Measured on a 16-core machine at load ~25, the same
+  4-second note took 193s at 16 threads, 87s at 8 and 69s at 4 — taking every core was 2.8x slower
+  than taking a quarter of them, and starved the sessions the daemon exists to serve while doing it.
+  whisper.cpp joins its workers at every layer, so contention does not divide the machine, it stalls
+  it. The model is also loaded once and kept instead of re-read per note.
+
+
 ### Added
 
 - **`claudebase agent rename "<nick>" --new-callback-token`** — retire the old callback token as part

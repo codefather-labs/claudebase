@@ -1847,11 +1847,11 @@ fn rename_in_place(
                 Err(e) => tracing::warn!(error = %e, "could not move chat bindings to the new nick"),
             }
         }
-        // Remember the choice against this working directory, so the next
-        // session started here comes back under the same name and keeps the
-        // Telegram binding that `/switch` made against it. A rename that is
-        // forgotten on exit is the bug this closes, not a feature.
-        use rusqlite::OptionalExtension as _;
+        // Remember the choice against this window and this directory, so the
+        // next session started here opens under the same name and keeps the
+        // Telegram binding that `/switch` made against it. The conversation
+        // binding below is the durable one; these two are what supply a name
+        // at startup, before the conversation is known.
         let row: Option<(Option<String>, Option<String>, Option<String>)> = conn
             .query_row(
                 "SELECT host, cwd, terminal FROM agent_registry WHERE agent_id = ?1",

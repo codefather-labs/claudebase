@@ -37,9 +37,11 @@ tell which window they are binding to.
   the operator pick another name — do not auto-suffix it yourself.
 - **Only sessions started with `claudebase run` have a nick.** A bare `claude`
   session is not registered with the daemon; the command will say so.
-- **The rename persists for this directory.** The daemon records the choice
-  against (host, working directory), so the next session started here comes back
-  under the same name. That is load-bearing rather than convenient: Telegram
+- **The rename persists for this CONVERSATION.** The daemon binds the name to
+  the Claude conversation this session belongs to, so resuming it later — in any
+  terminal, after any number of restarts — brings the name back. It is also
+  recorded against (host, terminal) and (host, working directory), which is what
+  supplies a name at startup before the conversation is known. That is load-bearing rather than convenient: Telegram
   chat bindings are keyed by NICK so they outlive a process, and a session
   returning under a different name would silently stop receiving. The rename
   also carries this session's existing bindings to the new name, so a chat the
@@ -62,6 +64,5 @@ claudebase agent whoami      # this session's nick, id, and whether it was chose
 claudebase agent list        # NICK column, plus who else is online
 ```
 
-`origin: chosen` confirms the name is remembered for this directory; `origin:
-auto` means it still falls out of the directory name and every window here
-answers to it.
+`origin: chosen` confirms the name is remembered; `origin: auto` means it still
+falls out of the directory name and every window here answers to it.

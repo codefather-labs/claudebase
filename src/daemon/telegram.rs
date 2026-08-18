@@ -2082,8 +2082,11 @@ async fn run_long_poll(
                 for (update_id, raw_json) in &to_park {
                     enqueue_pending_voice(&conn, *update_id, raw_json)?;
                 }
+                // Only from a real fetch. A batch that carries nothing but a
+                // re-entering transcript leaves the offset alone, which is what
+                // `process_batch`'s forward-only write is there to guarantee.
                 if fetched_max_id > 0 {
-                    advance_offset_to(&conn, fetched_max_id)?;
+                    set_offset_from_fetch(&conn, fetched_max_id)?;
                 }
                 let mut access_local = access_for_spawn;
                 let outcome = process_batch_with_pairing(&mut conn, &mut access_local, &batch)?;
@@ -2358,12 +2361,41 @@ fn delete_pending_voice(conn: &Connection, update_id: i64) -> Result<()> {
     Ok(())
 }
 
-/// Move the poll offset forward, never back.
-fn advance_offset_to(conn: &Connection, max_id: i64) -> Result<()> {
+/// Set the poll offset from a batch Telegram just handed us.
+///
+/// Unconditional, and that is the point. Telegram is the authority on what it
+/// still considers unconfirmed: if it hands back an update whose id is at or
+/// below the stored offset, the stored offset is AHEAD OF REALITY and has to
+/// come down, or that update is never confirmed and Telegram re-delivers it
+/// forever.
+///
+/// That is not hypothetical. On 2026-08-19 a synthetic voice note parked for a
+/// queue test carried the fabricated `update_id` 900000001; it re-entered the
+/// batch path and set the offset to 900000001, four hundred million past any
+/// real update. Every subsequent poll re-fetched the same genuine update,
+/// re-ran `/start`, and sent the operator another inline keyboard — several per
+/// second until the offset was repaired by hand. The forward-only rule, which
+/// exists for a real reason (see `process_batch`), is what made a bad value
+/// permanent instead of self-correcting.
+fn set_offset_from_fetch(conn: &Connection, max_id: i64) -> Result<()> {
+    let stored: i64 = conn
+        .query_row(
+            "SELECT CAST(value AS INTEGER) FROM daemon_state WHERE key = 'telegram.last_update_id'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if max_id < stored {
+        tracing::warn!(
+            stored,
+            fetched = max_id,
+            "the stored telegram offset was ahead of what Telegram still has; \
+             repairing it, or this update would be re-delivered forever"
+        );
+    }
     conn.execute(
-        "UPDATE daemon_state SET value = ?1 \
-         WHERE key = 'telegram.last_update_id' AND CAST(value AS INTEGER) < ?2",
-        params![max_id.to_string(), max_id],
+        "UPDATE daemon_state SET value = ?1 WHERE key = 'telegram.last_update_id'",
+        params![max_id.to_string()],
     )?;
     Ok(())
 }
@@ -2595,18 +2627,44 @@ mod tests {
     /// were unconditional the poll would rewind and re-deliver every message
     /// since — the whole channel, replayed, per voice note.
     #[test]
-    fn the_offset_never_rewinds() {
+    fn a_re_entering_transcript_never_rewinds_the_offset() {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("conn");
+        chat::ensure_chat_db_schema(&conn).expect("schema");
+        set_offset_from_fetch(&conn, 500).expect("fetch sets it");
+
+        let late: Update = serde_json::from_str(
+            r#"{"update_id":12,"message":{"message_id":3,"chat":{"id":5},"text":"a transcript"}}"#,
+        )
+        .expect("parse");
+        let mut access = channel_state::Access::default();
+        process_batch_with_pairing(&mut conn, &mut access, &[late]).expect("process");
+        assert_eq!(load_offset(&conn).expect("load"), 500, "a transcript must not rewind it");
+    }
+
+    /// ...but an update TELEGRAM hands back must always be confirmable, even
+    /// when the stored offset somehow ran ahead of reality.
+    ///
+    /// A synthetic voice note parked with a fabricated `update_id` of 900000001
+    /// pushed the offset four hundred million past any real update. Every poll
+    /// then re-fetched the same genuine `/start`, re-ran it, and sent another
+    /// inline keyboard — several per second, until the offset was repaired by
+    /// hand. Forward-only made a bad value permanent instead of self-correcting.
+    #[test]
+    fn a_fetched_batch_repairs_an_offset_that_ran_ahead() {
         let conn = rusqlite::Connection::open_in_memory().expect("conn");
         chat::ensure_chat_db_schema(&conn).expect("schema");
 
-        advance_offset_to(&conn, 500).expect("advance");
-        assert_eq!(load_offset(&conn).expect("load"), 500);
+        set_offset_from_fetch(&conn, 900_000_001).expect("poisoned");
+        assert_eq!(load_offset(&conn).expect("load"), 900_000_001);
 
-        advance_offset_to(&conn, 499).expect("stale advance");
-        assert_eq!(load_offset(&conn).expect("load"), 500, "a lower id must not rewind");
-
-        advance_offset_to(&conn, 501).expect("advance");
-        assert_eq!(load_offset(&conn).expect("load"), 501);
+        // Telegram keeps handing back a real update far below that. Handing it
+        // back is proof it is still unconfirmed, so the offset must come down.
+        set_offset_from_fetch(&conn, 499_608_389).expect("repair");
+        assert_eq!(
+            load_offset(&conn).expect("load"),
+            499_608_389,
+            "the offset stayed ahead, so this update would be re-delivered forever"
+        );
     }
 
     /// Same guarantee, through the path that actually runs it: a batch whose
@@ -2615,7 +2673,7 @@ mod tests {
     fn process_batch_does_not_rewind_the_offset_for_a_late_transcript() {
         let mut conn = rusqlite::Connection::open_in_memory().expect("conn");
         chat::ensure_chat_db_schema(&conn).expect("schema");
-        advance_offset_to(&conn, 900).expect("advance");
+        set_offset_from_fetch(&conn, 900).expect("advance");
 
         let late: Update = serde_json::from_str(
             r#"{"update_id":12,"message":{"message_id":3,"chat":{"id":5},"text":"a transcript"}}"#,

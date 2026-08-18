@@ -21,6 +21,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   renaming swaps the inode and the live process keeps the old file open.) The installer now renames
   the old binary aside — which Windows does allow — puts the new one in place, and cleans the
   leftover on the next run rather than stopping a working install to upgrade it.
+- **Both installers under-reported what they install.** The closing summary listed the four
+  `commands/` entries and called them skills, while the three actual `skills/` entries went
+  unmentioned — so the installer's own output said claudebase ships three slash-commands when it
+  ships seven. Commands and skills are now listed separately and completely, and a test pins the
+  summary against `prompts/skills/` so a new skill cannot ship unannounced.
 - **The daemon never auto-started on Windows.** The spawn passed the same file to
   `-RedirectStandardOutput` and `-RedirectStandardError`, which `Start-Process` refuses outright; the
   installer logged a warning and carried on. Separate files.

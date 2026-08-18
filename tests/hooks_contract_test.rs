@@ -79,6 +79,38 @@ fn ps1_hooks_are_ascii_only() {
     }
 }
 
+/// Both installers announce what they installed, and both under-reported it.
+///
+/// The closing summary listed the four `commands/` entries and CALLED them
+/// skills, while the three real `skills/` entries went unmentioned — so an
+/// operator reading the installer's own output would conclude claudebase ships
+/// three slash-commands when it ships seven. This test pins the summary against
+/// what the repository actually carries, so adding a skill without announcing it
+/// fails here rather than being discovered by someone counting directories.
+#[test]
+fn the_installers_announce_every_skill_they_ship() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let shipped: Vec<String> = std::fs::read_dir(root.join("prompts/skills"))
+        .expect("prompts/skills")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(!shipped.is_empty(), "no skills found to check against");
+
+    for installer in ["install.sh", "install.ps1"] {
+        let text = std::fs::read_to_string(root.join(installer))
+            .unwrap_or_else(|e| panic!("read {installer}: {e}"));
+        for skill in &shipped {
+            assert!(
+                text.contains(skill.as_str()),
+                "{installer} never mentions the skill `{skill}` it installs — \
+                 its summary tells the operator less than it ships"
+            );
+        }
+    }
+}
+
 /// The installer is a `.ps1` too, and it was the one nobody checked.
 ///
 /// PowerShell 5.1 — still the default on Windows — reads a BOM-less script in

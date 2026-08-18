@@ -587,6 +587,9 @@ COMMIT;
     // pty-transport Slice 14 — remember the nick a session was DELIBERATELY
     // given, so the next session in the same directory starts under it again.
     apply_nick_memory_migration(conn)?;
+    // v0.11 — remember that a message was dictated, so the marker survives a
+    // delivery from the backlog.
+    apply_message_is_voice_migration(conn)?;
     // v0.11 — voice notes waiting to be transcribed, so a note survives the
     // minutes of CPU it costs and the restart that may land in the middle.
     apply_pending_voice_migration(conn)?;
@@ -722,6 +725,33 @@ fn apply_nick_memory_migration(conn: &Connection) -> rusqlite::Result<()> {
 /// message, which makes a crash cost a repeat transcription rather than a lost
 /// note. `update_id` is the primary key, so a re-delivery from Telegram after a
 /// crash collapses onto the existing row instead of queueing the note twice.
+/// `chat_messages.is_voice` — was this message dictated?
+///
+/// The live notification carries `meta.voice`, which is what turns a transcript
+/// into `[telegram_voice_message]:` instead of `[telegram_message]:`. A message
+/// delivered from the BACKLOG is rebuilt from its stored row instead, and the
+/// row had nowhere to keep the flag — so a transcript that arrived while its
+/// session was restarting reached the agent looking exactly like typed text.
+///
+/// That distinction is not cosmetic. The channel contract tells an agent to
+/// treat exact strings in a dictated line — filenames, flags, identifiers — as
+/// things to confirm rather than act on, because speech recognition gets
+/// precisely those wrong. An unmarked transcript is a transcript the agent
+/// trusts as if the operator had typed it.
+fn apply_message_is_voice_migration(conn: &Connection) -> rusqlite::Result<()> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('chat_messages') WHERE name = 'is_voice')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        conn.execute_batch(
+            "ALTER TABLE chat_messages ADD COLUMN is_voice INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
+    Ok(())
+}
+
 fn apply_pending_voice_migration(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS pending_voice (
@@ -1048,18 +1078,28 @@ pub struct ChatMessage {
     pub content: String,
     pub reply_to: Option<String>,
     pub created_at: i64,
+    /// True when the content is a speech transcript rather than typed text.
+    pub is_voice: bool,
 }
 
 impl ChatMessage {
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut v = json!({
             "id": self.id,
             "thread_id": self.thread_id,
             "from_agent": self.from_agent,
             "content": self.content,
             "reply_to": self.reply_to,
             "created_at": self.created_at,
-        })
+        });
+        // Added only when true, so an ordinary message's backlog shape stays
+        // byte-for-byte what every existing consumer already parses. The key
+        // is `meta.voice` because that is where the live notification puts it
+        // and where the classifier looks — one name, one meaning, both paths.
+        if self.is_voice {
+            v["meta"] = json!({ "voice": true });
+        }
+        v
     }
 }
 
@@ -1095,6 +1135,7 @@ pub fn insert_message(
         content: content.to_string(),
         reply_to: reply_to.map(|s| s.to_string()),
         created_at: now,
+        is_voice: false,
     })
 }
 
@@ -1138,7 +1179,7 @@ pub fn drain_backlog(conn: &mut Connection, thread_id: &str) -> rusqlite::Result
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let messages: Vec<ChatMessage> = {
         let mut stmt = tx.prepare(
-            "SELECT id, thread_id, from_agent, content, reply_to, created_at
+            "SELECT id, thread_id, from_agent, content, reply_to, created_at, is_voice, is_voice
              FROM chat_messages
              WHERE thread_id = ?1 AND delivered_at IS NULL
              ORDER BY created_at ASC, id ASC",
@@ -1151,6 +1192,7 @@ pub fn drain_backlog(conn: &mut Connection, thread_id: &str) -> rusqlite::Result
                 content: row.get(3)?,
                 reply_to: row.get(4)?,
                 created_at: row.get(5)?,
+                is_voice: row.get::<_, i64>(6).unwrap_or(0) != 0,
             })
         })?;
         let mut out = Vec::new();
@@ -1181,7 +1223,7 @@ pub fn list_messages(
     limit: Option<i64>,
 ) -> rusqlite::Result<Vec<ChatMessage>> {
     let mut sql = String::from(
-        "SELECT id, thread_id, from_agent, content, reply_to, created_at
+        "SELECT id, thread_id, from_agent, content, reply_to, created_at, is_voice
          FROM chat_messages WHERE thread_id = ?1",
     );
     if since.is_some() {
@@ -1208,6 +1250,7 @@ pub fn list_messages(
             content: row.get(3)?,
             reply_to: row.get(4)?,
             created_at: row.get(5)?,
+            is_voice: row.get::<_, i64>(6).unwrap_or(0) != 0,
         })
     };
     let rows = match (since, limit) {
@@ -1296,6 +1339,34 @@ pub type SharedBus = Arc<ChatBus>;
 
 #[cfg(test)]
 mod tests {
+
+    /// A transcript delivered from the backlog must still say it was dictated.
+    ///
+    /// The live notification carries `meta.voice`; the backlog rebuilds the
+    /// frame from the row, so without the column the marker was lost exactly
+    /// when a session had been restarting — and an unmarked transcript is one
+    /// the agent trusts as if it had been typed.
+    #[test]
+    fn a_backlog_frame_still_says_the_message_was_dictated() {
+        let dictated = ChatMessage {
+            id: "m1".to_string(),
+            thread_id: "telegram:5".to_string(),
+            from_agent: "telegram:codefather".to_string(),
+            content: "разверни стенд".to_string(),
+            reply_to: None,
+            created_at: 1,
+            is_voice: true,
+        };
+        let v = dictated.to_json();
+        assert_eq!(v["meta"]["voice"], serde_json::json!(true));
+
+        let typed = ChatMessage { is_voice: false, ..dictated };
+        let v = typed.to_json();
+        assert!(
+            v.get("meta").is_none(),
+            "an ordinary message keeps the baseline backlog shape every consumer already parses"
+        );
+    }
     use super::*;
 
     /// Re-entering the writer must ERROR, not hang.

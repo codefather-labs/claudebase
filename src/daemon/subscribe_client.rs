@@ -874,6 +874,7 @@ mod classify_tests {
             content: "answer meant for the operator".to_string(),
             reply_to: None,
             created_at: 0,
+            is_voice: false,
         };
         let frame = crate::daemon::chat::build_channel_notification(&msg);
         let meta = meta_of(&frame);

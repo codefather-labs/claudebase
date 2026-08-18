@@ -21,6 +21,7 @@ fn config_with_backend(name: &str) -> Config {
     cfg.asr = AsrConfig {
         backend: Some(name.to_string()),
         n_threads: None,
+        max_concurrent: None,
     };
     cfg
 }

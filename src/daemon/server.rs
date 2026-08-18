@@ -459,19 +459,23 @@ pub async fn serve(_args: &DaemonServeArgs) -> anyhow::Result<()> {
         // notes without the operator writing any config — which is what the
         // v0.8.1 note promised and what the `path.exists()` guard here
         // quietly prevented.
+        let mut asr_max_concurrent: Option<usize> = None;
         let asr_opt: Option<std::sync::Arc<dyn crate::daemon::asr::Asr>> = {
             let toml_path = crate::daemon::config::user_level_daemon_toml_path();
             match crate::daemon::config::load_daemon_toml_or_default(&toml_path) {
-                Ok(cfg) => match crate::daemon::asr::make_asr(&cfg) {
-                    Ok(b) => Some(std::sync::Arc::from(b)),
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "ASR factory failed; voice notes will use fallback placeholder"
-                        );
-                        None
+                Ok(cfg) => {
+                    asr_max_concurrent = cfg.asr.max_concurrent;
+                    match crate::daemon::asr::make_asr(&cfg) {
+                        Ok(b) => Some(std::sync::Arc::from(b)),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "ASR factory failed; voice notes will use fallback placeholder"
+                            );
+                            None
+                        }
                     }
-                },
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "daemon.toml reload failed in server.serve");
                     None
@@ -480,7 +484,7 @@ pub async fn serve(_args: &DaemonServeArgs) -> anyhow::Result<()> {
         };
 
         let _ =
-            crate::daemon::telegram::spawn_long_poll(token, bus_for_tg, asr_opt);
+            crate::daemon::telegram::spawn_long_poll(token, bus_for_tg, asr_opt, asr_max_concurrent);
         tracing::info!("telegram long-poll spawned");
     }
 

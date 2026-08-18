@@ -1162,11 +1162,22 @@ pub fn process_batch_with_pairing(
             "INSERT OR IGNORE INTO chat_threads (id, created_at) VALUES (?1, ?2)",
             params![thread_id, row_now],
         )?;
+        // `is_voice` is written here, not inferred later: the transcript
+        // travels the ordinary text path, so the row is the only place the
+        // distinction can survive to a backlog delivery.
         tx.execute(
             "INSERT INTO chat_messages \
-             (id, thread_id, from_agent, content, reply_to, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, thread_id, from_agent, content, Option::<String>::None, row_now],
+             (id, thread_id, from_agent, content, reply_to, created_at, is_voice) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                id,
+                thread_id,
+                from_agent,
+                content,
+                Option::<String>::None,
+                row_now,
+                msg.voice.is_some() as i64
+            ],
         )?;
         inserted += 1;
 
@@ -1420,6 +1431,7 @@ pub fn spawn_long_poll(
     token: RedactedToken,
     bus: SharedBus,
     asr: Option<Arc<dyn Asr>>,
+    asr_max_concurrent: Option<usize>,
 ) -> tokio::task::JoinHandle<()> {
     // Initialise the outbound bridge BEFORE spawning so server.rs's MCP
     // chat_reply handler can enqueue immediately (race-free: any push
@@ -1473,7 +1485,9 @@ pub fn spawn_long_poll(
         // unhandled error logs structured (without leaking the token) and
         // the daemon's other tasks keep running.
         let token_str = token.as_str().to_string();
-        if let Err(e) = run_long_poll(token, bus, asr, outbound_rx, kb_rx).await {
+        if let Err(e) =
+            run_long_poll(token, bus, asr, asr_max_concurrent, outbound_rx, kb_rx).await
+        {
             tracing::error!(
                 error = %redact_error_string(&format!("{e:#}"), &token_str),
                 "telegram long-poll fatal"
@@ -1572,6 +1586,7 @@ async fn run_long_poll(
     token: RedactedToken,
     bus: SharedBus,
     asr: Option<Arc<dyn Asr>>,
+    asr_max_concurrent: Option<usize>,
     mut outbound_rx: mpsc::UnboundedReceiver<(i64, Option<i64>, String, Option<String>)>,
     mut kb_rx: mpsc::UnboundedReceiver<KeyboardOutbound>,
 ) -> Result<()> {
@@ -1647,6 +1662,7 @@ async fn run_long_poll(
     tokio::spawn(run_voice_worker(
         bot.clone(),
         asr.clone(),
+        asr_max_concurrent.unwrap_or(1).max(1),
         token_for_error_redaction.clone(),
         voice_rx,
         done_tx,
@@ -2371,11 +2387,49 @@ const MAX_VOICE_ATTEMPTS: i64 = 3;
 async fn run_voice_worker(
     bot: teloxide::Bot,
     asr: Option<Arc<dyn Asr>>,
+    max_concurrent: usize,
     token_for_error_redaction: String,
     mut voice_rx: mpsc::UnboundedReceiver<(i64, Update)>,
     done_tx: mpsc::UnboundedSender<(i64, Update)>,
 ) {
-    while let Some((update_id, mut update)) = voice_rx.recv().await {
+    // A note gets its own task the moment the poll loop hands it over, so
+    // fetching and decoding one overlaps with anything already in flight —
+    // that part is network, and serialising it would buy nothing.
+    //
+    // The inference is what the permit guards, and by default there is one
+    // permit. Not to keep the code simple: because it is faster. Two notes
+    // decoding at once take the cores from each other exactly the way asking
+    // whisper for 16 threads instead of 4 does, and that was measured at 2.8x
+    // slower. Serial inference also gets the FIRST note out sooner, which is
+    // the one the operator is waiting on.
+    let permits = Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1)));
+    tracing::info!(max_concurrent, "voice transcription worker started");
+
+    while let Some((update_id, update)) = voice_rx.recv().await {
+        tokio::spawn(transcribe_one(
+            bot.clone(),
+            asr.clone(),
+            permits.clone(),
+            token_for_error_redaction.clone(),
+            update_id,
+            update,
+            done_tx.clone(),
+        ));
+    }
+}
+
+/// One parked note, from the queue to a message the rest of the daemon can
+/// treat as ordinary text.
+async fn transcribe_one(
+    bot: teloxide::Bot,
+    asr: Option<Arc<dyn Asr>>,
+    permits: Arc<tokio::sync::Semaphore>,
+    token_for_error_redaction: String,
+    update_id: i64,
+    mut update: Update,
+    done_tx: mpsc::UnboundedSender<(i64, Update)>,
+) {
+    {
         let attempts = tokio::task::spawn_blocking(move || -> Result<i64> {
             let conn = chat::open_chat_db()?;
             bump_pending_voice_attempts(&conn, update_id)
@@ -2384,7 +2438,7 @@ async fn run_voice_worker(
         .unwrap_or(Ok(0))
         .unwrap_or(0);
 
-        let Some(msg) = update.message.as_mut() else { continue };
+        let Some(msg) = update.message.as_mut() else { return };
 
         let text = if attempts > MAX_VOICE_ATTEMPTS {
             tracing::error!(
@@ -2396,7 +2450,7 @@ async fn run_voice_worker(
              — the transcriber died mid-note]"
                 .to_string()
         } else {
-            match transcribe_voice_note(&bot, msg, asr.as_ref()).await {
+            match transcribe_voice_note(&bot, msg, asr.as_ref(), &permits).await {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!(
@@ -2416,7 +2470,6 @@ async fn run_voice_worker(
         // transcription, because that branch requires `text.is_none()`.
         if done_tx.send((update_id, update)).is_err() {
             tracing::warn!("poll loop is gone; transcript stays pending on disk");
-            return;
         }
     }
 }
@@ -2443,6 +2496,7 @@ async fn transcribe_voice_note(
     bot: &teloxide::Bot,
     msg: &Message,
     asr: Option<&Arc<dyn Asr>>,
+    permits: &tokio::sync::Semaphore,
 ) -> Result<String> {
     use teloxide::net::Download;
     use teloxide::requests::Requester;
@@ -2480,6 +2534,13 @@ async fn transcribe_voice_note(
     // Step 4: hand the PCM to the configured ASR backend. The trait's
     // own implementation chooses how to dispatch (sync blocking pool
     // for whisper; HTTP for nim; etc.).
+    // Everything above — fetching the file, decoding Opus — ran without a
+    // permit, because it is I/O and overlapping it is free. The permit starts
+    // here, where the work becomes cores.
+    let _permit = permits
+        .acquire()
+        .await
+        .context("voice transcribe: the inference permit was closed")?;
     let transcript = asr.transcribe(pcm, 16_000).await.context("voice transcribe: ASR failed")?;
     Ok(transcript)
 }
@@ -2631,6 +2692,7 @@ mod tests {
             content: "hi".to_string(),
             reply_to: None,
             created_at: 100,
+            is_voice: false,
         };
         let frame = chat::build_channel_notification_routed(&msg, None);
         // params.content is the inbound text (voice-control wire shape).
@@ -2667,6 +2729,7 @@ mod tests {
             content: "hi".to_string(),
             reply_to: None,
             created_at: 100,
+            is_voice: false,
         };
         let frame = chat::build_channel_notification_routed(&msg, Some("uuid-abc"));
         let target = frame

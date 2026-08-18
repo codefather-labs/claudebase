@@ -175,6 +175,19 @@ pub struct AsrConfig {
     /// at every layer and one descheduled worker stalls all of them.
     #[serde(default)]
     pub n_threads: Option<usize>,
+
+    /// How many voice notes may be inside whisper at the same time.
+    /// `None` means 1.
+    ///
+    /// Fetching and decoding a note DOES overlap regardless — that part is
+    /// network and it costs nothing to run at once. This bounds only the
+    /// inference. Two notes decoding simultaneously do not finish sooner than
+    /// the same two run back to back; they finish later, because they take the
+    /// cores from each other exactly the way too many threads do (see
+    /// `n_threads`). Raise it only where `n_threads` is also generous because
+    /// the machine is genuinely idle.
+    #[serde(default)]
+    pub max_concurrent: Option<usize>,
 }
 
 impl Default for AsrConfig {
@@ -182,6 +195,7 @@ impl Default for AsrConfig {
         Self {
             backend: default_asr_backend(),
             n_threads: None,
+            max_concurrent: None,
         }
     }
 }

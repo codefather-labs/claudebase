@@ -692,6 +692,56 @@ pub fn remember_nick(
     )
 }
 
+/// Record which Claude conversation a session belongs to.
+pub fn capture_claude_session(
+    conn: &Connection,
+    agent_id: &str,
+    session_id: &str,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE agent_registry SET claude_session_id = ?1 WHERE agent_id = ?2",
+        params![session_id, agent_id],
+    )
+}
+
+/// The nick this conversation has been answering to, across every run of it.
+pub fn recall_conversation_nick(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT nick FROM conversation_nick WHERE session_id = ?1",
+        params![session_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+}
+
+/// Bind a nick to a conversation.
+pub fn remember_conversation_nick(
+    conn: &Connection,
+    session_id: &str,
+    nick: &str,
+    now_ms: i64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "INSERT INTO conversation_nick (session_id, nick, updated_at) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(session_id) DO UPDATE SET nick = excluded.nick, updated_at = excluded.updated_at",
+        params![session_id, nick, now_ms],
+    )
+}
+
+/// The conversation a session belongs to, if it has reported one.
+pub fn claude_session_of(conn: &Connection, agent_id: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT claude_session_id FROM agent_registry WHERE agent_id = ?1",
+        params![agent_id],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .optional()
+    .map(|o| o.flatten())
+}
+
 /// Record which terminal a session is attached to.
 pub fn capture_terminal(conn: &Connection, agent_id: &str, terminal: &str) -> rusqlite::Result<usize> {
     conn.execute(

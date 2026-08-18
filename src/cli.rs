@@ -636,6 +636,26 @@ pub enum AgentSubcommand {
     /// merely derived from the directory name. Read-only; works without the
     /// daemon.
     Whoami,
+    /// Tell the daemon which Claude conversation this session is, so the
+    /// conversation's nick is restored.
+    ///
+    /// Run by the SessionStart hook, not by hand: the conversation id only
+    /// exists once `claude` is running, which is after the session has already
+    /// been named.
+    #[command(name = "bind-session")]
+    BindSession(AgentBindSessionArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct AgentBindSessionArgs {
+    /// The conversation id. Usually omitted in favour of `--stdin`.
+    #[arg(long = "session-id")]
+    pub session_id: Option<String>,
+
+    /// Read the SessionStart hook's JSON payload from stdin and take
+    /// `session_id` out of it.
+    #[arg(long, conflicts_with = "session_id")]
+    pub stdin: bool,
 }
 
 #[derive(Args, Debug)]

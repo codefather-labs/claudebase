@@ -204,6 +204,10 @@ fn main() -> std::process::ExitCode {
                 claudebase::agent_cli::rename(&a.nick, a.new_callback_token),
                 "agent rename",
             ),
+            cli::AgentSubcommand::BindSession(a) => simple_async(
+                claudebase::agent_cli::bind_session(a.session_id.clone(), a.stdin),
+                "agent bind-session",
+            ),
             cli::AgentSubcommand::Describe(a) => simple_async(
                 claudebase::agent_cli::describe(&a.description, a.branch.as_deref()),
                 "agent describe",

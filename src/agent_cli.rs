@@ -122,6 +122,70 @@ pub async fn describe(description: &str, branch: Option<&str>) -> Result<String>
 /// Only this session: identity comes from the token the supervisor exported, so
 /// there is no way to rename a neighbour by accident. Renaming someone else is
 /// a different operation with a different trust rule and is not offered here.
+/// Report this session's Claude conversation id to the daemon.
+///
+/// Called from the SessionStart hook with the hook's own JSON on stdin. Quiet
+/// and forgiving on purpose: it runs on every session start, and a session that
+/// cannot reach the daemon, or a Claude Code build whose hook payload carries no
+/// `session_id`, must still start normally. The cost of failing is that this
+/// conversation does not get its name back, which is exactly where things stood
+/// before this existed.
+pub async fn bind_session(session_id: Option<String>, from_stdin: bool) -> Result<String> {
+    let session_id = match (session_id, from_stdin) {
+        (Some(s), _) => s.trim().to_string(),
+        (None, true) => {
+            use std::io::Read as _;
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            match serde_json::from_str::<serde_json::Value>(&buf) {
+                Ok(v) => v
+                    .get("session_id")
+                    .or_else(|| v.get("sessionId"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                Err(_) => String::new(),
+            }
+        }
+        (None, false) => bail!("pass --session-id <id> or --stdin"),
+    };
+    if session_id.is_empty() {
+        // Not an error: this build's hook payload simply does not name the
+        // conversation, and saying so on every session start would be noise.
+        return Ok("no session_id in the hook payload — nothing to bind".to_string());
+    }
+
+    let id = std::env::var(AGENT_ID_ENV).ok().filter(|s| !s.is_empty());
+    let token = std::env::var(SESSION_TOKEN_ENV).ok().filter(|s| !s.is_empty());
+    let (id, token) = match (id, token) {
+        (Some(i), Some(t)) => (i, t),
+        // A bare `claude` has no claudebase identity and no nick to restore.
+        _ => return Ok("this session has no claudebase identity — nothing to bind".to_string()),
+    };
+
+    let mut client = DaemonClient::connect().await?;
+    let resp = client
+        .call_tool(
+            "agent_bind_session",
+            json!({
+                "from_agent_id": id,
+                "session_token": token,
+                "session_id": session_id,
+            }),
+        )
+        .await?;
+    let text = resp
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("bound")
+        .to_string();
+    Ok(if resp.get("restored").and_then(|v| v.as_bool()) == Some(true) {
+        format!("this conversation is called `{text}` — restored")
+    } else {
+        format!("this conversation is called `{text}`")
+    })
+}
+
 pub async fn rename(new_nick: &str, new_callback_token: bool) -> Result<String> {
     let nick = new_nick.trim();
     if nick.is_empty() {

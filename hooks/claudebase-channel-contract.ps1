@@ -73,8 +73,10 @@ session keeps working. Add --new-callback-token to retire the old one instead --
 for when the rename means this window changed purpose or hands, and whoever held
 the old token should stop being able to reach it.
 
-A chosen nick is remembered for this directory and comes back on restart, which
-is what keeps a Telegram `/switch` binding pointing at you.
+A chosen nick belongs to this CONVERSATION, not to the window or the checkout:
+it comes back whenever this conversation is resumed, however many restarts
+later and in whichever terminal, which is what keeps a Telegram `/switch`
+binding pointing at you.
 
 Only sessions started with `claudebase run` can send: identity comes from
 CLAUDEBASE_AGENT_ID / CLAUDEBASE_SESSION_TOKEN, which that command exports.
@@ -112,6 +114,19 @@ is for rather than a random word. Do it once -- the name is then remembered for
 this directory and you will not be asked again.
 "@
 }
+
+# Tell the daemon which Claude conversation this is, so the session gets back
+# the nick that conversation has always been called. Best-effort: never allowed
+# to fail or to delay the session start.
+try {
+    $cbPayload = [Console]::In.ReadToEnd()
+    if ($cbPayload -and (Get-Command claudebase -ErrorAction SilentlyContinue)) {
+        Start-Job -ScriptBlock {
+            param($p)
+            $p | claudebase agent bind-session --stdin 2>$null | Out-Null
+        } -ArgumentList $cbPayload | Out-Null
+    }
+} catch { }
 
 $out = [ordered]@{
     hookSpecificOutput = [ordered]@{

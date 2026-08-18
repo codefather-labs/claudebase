@@ -20,6 +20,20 @@
 
 set -u
 
+# Tell the daemon which Claude conversation this is, so the session gets back
+# the nick that conversation has always been called. This is the first moment
+# the conversation id exists -- the session was named before `claude` started,
+# when nothing could know which conversation it would turn out to be.
+#
+# Best-effort by construction: backgrounded, time-boxed, output discarded, and
+# never allowed to fail. A session start that waits on the daemon, or breaks
+# because it is down, would be a far worse bug than a nick that stays default.
+_cb_payload=$(cat 2>/dev/null || true)
+if command -v claudebase >/dev/null 2>&1; then
+    (printf '%s' "$_cb_payload" | timeout 5 claudebase agent bind-session --stdin \
+        >/dev/null 2>&1 || true) &
+fi
+
 reminder='[claudebase channel contract]
 
 This session can receive messages from OUTSIDE the terminal. They are inserted
@@ -83,8 +97,10 @@ session keeps working. Add --new-callback-token to retire the old one instead --
 for when the rename means this window changed purpose or hands, and whoever held
 the old token should stop being able to reach it.
 
-A chosen nick is remembered for this directory and comes back on restart, which
-is what keeps a Telegram `/switch` binding pointing at you.
+A chosen nick belongs to this CONVERSATION, not to the window or the checkout:
+it comes back whenever this conversation is resumed, however many restarts
+later and in whichever terminal, which is what keeps a Telegram `/switch`
+binding pointing at you.
 
 Only sessions started with `claudebase run` can send: identity comes from
 CLAUDEBASE_AGENT_ID / CLAUDEBASE_SESSION_TOKEN, which that command exports.

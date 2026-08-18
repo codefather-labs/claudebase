@@ -762,6 +762,10 @@ where
                     let resp = handle_agent_rename(echo_id, &args).await;
                     let _ = outbound_tx.send(resp);
                 }
+                "agent_bind_session" => {
+                    let resp = handle_agent_bind_session(echo_id, &args).await;
+                    let _ = outbound_tx.send(resp);
+                }
                 "agent_describe" => {
                     let resp = handle_agent_describe(echo_id, &args, connection_id).await;
                     let _ = outbound_tx.send(resp);
@@ -1655,6 +1659,139 @@ async fn handle_agent_rename(
         if !crate::daemon::agent_registry::resolve_session_token(&conn, &claimed, &token)? {
             anyhow::bail!("session_token does not match an alive agent");
         }
+        rename_in_place(&conn, &claimed, &new_name, wants_new_token)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(name)) => tool_text_response(id, &serde_json::json!({"renamed": true, "name": name})),
+        Ok(Err(e)) => tool_error_response(id, -32603, &e.to_string()),
+        Err(e) => {
+            tracing::error!(error = %e, "agent_rename spawn_blocking panicked");
+            tool_error_response(id, -32603, "internal error")
+        }
+    }
+}
+
+/// Handle `agent_bind_session` — tell the daemon which Claude conversation this
+/// session is.
+///
+/// Reported by the SessionStart hook, because that is the first moment the
+/// conversation id exists: the supervisor has to name the session before
+/// `claude` is spawned, so the opening name comes from the terminal-keyed
+/// memory and is corrected here.
+///
+/// If the conversation has been named before, the session takes that name back
+/// — that is the whole point, and it is what makes a nick outlive restarts,
+/// reboots, and being resumed in a different window. If it has not, the name it
+/// currently has becomes the conversation's name.
+async fn handle_agent_bind_session(
+    id: serde_json::Value,
+    args: &serde_json::Value,
+) -> serde_json::Value {
+    let claimed = match args.get("from_agent_id").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_error_response(id, -32602, "from_agent_id required"),
+    };
+    let session_id = match args.get("session_id").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => return tool_error_response(id, -32602, "session_id required"),
+    };
+    let token = args
+        .get("session_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        let conn = crate::daemon::chat::open_chat_db()?;
+        if !crate::daemon::agent_registry::resolve_session_token(&conn, &claimed, &token)? {
+            anyhow::bail!("session_token does not match an alive agent");
+        }
+        crate::daemon::agent_registry::capture_claude_session(&conn, &claimed, &session_id)?;
+
+        let current: Option<String> = {
+            use rusqlite::OptionalExtension as _;
+            conn.query_row(
+                "SELECT agent_name FROM agent_registry WHERE agent_id = ?1",
+                rusqlite::params![claimed],
+                |r| r.get(0),
+            )
+            .optional()?
+        };
+        let current = current.unwrap_or_default();
+        let now = chrono::Utc::now().timestamp_millis();
+
+        match crate::daemon::agent_registry::recall_conversation_nick(&conn, &session_id)? {
+            Some(remembered) if remembered == current => {
+                Ok(serde_json::json!({"bound": true, "name": current, "restored": false}))
+            }
+            Some(remembered) => {
+                // Taken by someone else who is genuinely running: two live
+                // sessions cannot share a name, so this one keeps the name it
+                // started under rather than stealing one.
+                if crate::daemon::agent_registry::nick_is_taken(
+                    &conn,
+                    &remembered,
+                    Some(&claimed),
+                )? {
+                    tracing::warn!(
+                        conversation_nick = %remembered,
+                        keeping = %current,
+                        "this conversation's nick is held by another live session"
+                    );
+                    return Ok(serde_json::json!({
+                        "bound": true, "name": current, "restored": false,
+                        "note": format!("`{remembered}` is held by another live session")
+                    }));
+                }
+                let name = rename_in_place(&conn, &claimed, &remembered, false)?;
+                tracing::info!(
+                    from = %current,
+                    to = %name,
+                    "restored this conversation's nick"
+                );
+                Ok(serde_json::json!({"bound": true, "name": name, "restored": true}))
+            }
+            None => {
+                crate::daemon::agent_registry::remember_conversation_nick(
+                    &conn,
+                    &session_id,
+                    &current,
+                    now,
+                )?;
+                Ok(serde_json::json!({"bound": true, "name": current, "restored": false}))
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(payload)) => tool_text_response(id, &payload),
+        Ok(Err(e)) => tool_error_response(id, -32603, &e.to_string()),
+        Err(e) => {
+            tracing::error!(error = %e, "agent_bind_session spawn_blocking panicked");
+            tool_error_response(id, -32603, "internal error")
+        }
+    }
+}
+
+/// Everything a rename has to move, in one place.
+///
+/// Extracted so the conversation-restore path renames by exactly the same code:
+/// a rename touches the registry row, the Telegram bindings, the callback
+/// token and both nick memories, and a second implementation that forgot one of
+/// them is precisely the split-brain that made `/callback/<new-name>` answer
+/// "no alive agent matches" while the old name still worked.
+fn rename_in_place(
+    conn: &rusqlite::Connection,
+    claimed: &str,
+    new_name: &str,
+    wants_new_token: bool,
+) -> anyhow::Result<String> {
+    let claimed = claimed.to_string();
+    let new_name = new_name.to_string();
+    {
         use rusqlite::OptionalExtension as _;
         // Captured BEFORE the rename: any Telegram chat `/switch`-bound to the
         // old name was bound to THIS session, since names are unique among live
@@ -1738,17 +1875,22 @@ async fn handle_agent_rename(
                 tracing::warn!(error = %e, "could not remember nick for this directory");
             }
         }
-        Ok(new_name)
-    })
-    .await;
-
-    match result {
-        Ok(Ok(name)) => tool_text_response(id, &serde_json::json!({"renamed": true, "name": name})),
-        Ok(Err(e)) => tool_error_response(id, -32603, &e.to_string()),
-        Err(e) => {
-            tracing::error!(error = %e, "agent_rename spawn_blocking panicked");
-            tool_error_response(id, -32603, "internal error")
+        // The conversation this session belongs to now answers to the new
+        // name, so resuming it anywhere brings the name along.
+        if let Ok(Some(session_id)) =
+            crate::daemon::agent_registry::claude_session_of(conn, &claimed)
+        {
+            let now = chrono::Utc::now().timestamp_millis();
+            if let Err(e) = crate::daemon::agent_registry::remember_conversation_nick(
+                conn,
+                &session_id,
+                &new_name,
+                now,
+            ) {
+                tracing::warn!(error = %e, "could not bind the nick to this conversation");
+            }
         }
+        Ok(new_name)
     }
 }
 

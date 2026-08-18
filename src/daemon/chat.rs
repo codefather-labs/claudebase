@@ -503,7 +503,22 @@ pub enum CallbackAnswer<'a> {
 
 /// Apply schema v5 + v6 to a chat.db connection. Idempotent — all
 /// statements use `IF NOT EXISTS` / `INSERT OR IGNORE`. Wrapped in a
-/// BEGIN/COMMIT transaction so partial-failure recovery is clean.
+/// BEGIN IMMEDIATE/COMMIT transaction so partial-failure recovery is clean.
+///
+/// IMMEDIATE, not the default DEFERRED, and this one mattered more than the
+/// others: it runs on EVERY `open_chat_db`, so every CLI invocation, every
+/// supervisor start and every daemon handler passed through it. A deferred
+/// transaction begins as a reader and upgrades on its first write — here the
+/// first `CREATE TABLE IF NOT EXISTS` — and SQLite refuses that upgrade
+/// INSTANTLY with SQLITE_BUSY, because waiting could deadlock two readers each
+/// trying to upgrade. `busy_timeout` does not apply to it.
+///
+/// That is the whole of the `database is locked` that kept appearing in the
+/// daemon journal at startup and that, on 2026-08-19, made `agent bind-session`
+/// fail outright. Nothing was holding a lock for five seconds; nothing had to.
+/// A write lock held for a millisecond by another process was enough, because
+/// the loser did not wait at all. Taking the lock up front is what makes them
+/// queue instead of fail.
 ///
 /// v5 tables: chat_threads, chat_messages, chat_messages_thread_time_idx,
 ///            daemon_state + bootstrap row.
@@ -515,7 +530,7 @@ pub enum CallbackAnswer<'a> {
 pub fn ensure_chat_db_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         r#"
-BEGIN;
+BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS chat_threads (
   id TEXT PRIMARY KEY,
   created_at INTEGER NOT NULL
@@ -587,6 +602,9 @@ COMMIT;
     // pty-transport Slice 14 — remember the nick a session was DELIBERATELY
     // given, so the next session in the same directory starts under it again.
     apply_nick_memory_migration(conn)?;
+    // v0.11 — the Claude conversation a session belongs to, and the nick that
+    // conversation answers to.
+    apply_conversation_nick_migration(conn)?;
     // v0.11 — which terminal a session runs on, so its nick memory is its own
     // rather than shared with every other window on the same directory.
     apply_agent_terminal_migration(conn)?;
@@ -789,6 +807,43 @@ fn widen_nick_memory_to_terminals(conn: &Connection) -> rusqlite::Result<()> {
 /// things to confirm rather than act on, because speech recognition gets
 /// precisely those wrong. An unmarked transcript is a transcript the agent
 /// trusts as if the operator had typed it.
+/// `conversation_nick` — the nick a Claude conversation answers to.
+///
+/// The conversation id is the durable identity here, and measurably so: on this
+/// machine one id spans 06-24 to 08-17 across 363 separate runs, appending to
+/// the same transcript throughout. It survives restarts, reboots, and being
+/// resumed in a different terminal — which none of the other candidate keys do.
+///
+/// It cannot be the key at SPAWN time, because the supervisor has to name the
+/// session before `claude` exists to say which conversation it is resuming. So
+/// the terminal-keyed memory still supplies the opening name, and this table
+/// corrects it the moment the SessionStart hook reports the conversation: the
+/// session is renamed to whatever that conversation has always been called.
+///
+/// Keyed by conversation, not by directory or window, so moving a conversation
+/// to another terminal — or another machine's copy of the repo — carries its
+/// name with it.
+fn apply_conversation_nick_migration(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS conversation_nick (
+           session_id TEXT PRIMARY KEY,
+           nick       TEXT NOT NULL,
+           updated_at INTEGER NOT NULL
+         );",
+    )?;
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('agent_registry') WHERE name = 'claude_session_id')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        conn.execute_batch(
+            "ALTER TABLE agent_registry ADD COLUMN claude_session_id TEXT DEFAULT NULL",
+        )?;
+    }
+    Ok(())
+}
+
 /// `agent_registry.terminal` — the controlling terminal a session runs on.
 ///
 /// Written at registration, read by anything that needs this window's own nick
@@ -873,8 +928,10 @@ fn apply_routing_migration(conn: &Connection) -> rusqlite::Result<()> {
 
     // Wrap migration in its own transaction so a daemon crash mid-ALTER
     // leaves the schema either fully pre-migration or fully post — no
-    // partial-state recovery path needed.
-    conn.execute_batch("BEGIN")?;
+    // partial-state recovery path needed. IMMEDIATE for the same reason as
+    // `ensure_chat_db_schema`: a deferred transaction cannot wait for the write
+    // lock, it can only fail to take it.
+    conn.execute_batch("BEGIN IMMEDIATE")?;
     for (col, decl) in columns {
         let exists: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('agent_registry') WHERE name = ?1)",
@@ -944,7 +1001,7 @@ fn apply_agent_registry_c2c_migration(conn: &Connection) -> rusqlite::Result<()>
         ("dnd_until_ts", "INTEGER DEFAULT NULL"),
     ];
 
-    conn.execute_batch("BEGIN")?;
+    conn.execute_batch("BEGIN IMMEDIATE")?;
     for (col, decl) in columns {
         let exists: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('agent_registry') WHERE name = ?1)",
@@ -1409,6 +1466,57 @@ pub type SharedBus = Arc<ChatBus>;
 #[cfg(test)]
 mod tests {
 
+    /// Every schema transaction takes the write lock up front.
+    ///
+    /// A deferred transaction that later writes asks SQLite to upgrade a read
+    /// lock to a write lock, and SQLite refuses that INSTANTLY with
+    /// SQLITE_BUSY — `busy_timeout` does not apply, because waiting could
+    /// deadlock two readers each trying to upgrade. Since the schema-ensure
+    /// runs on every single `open_chat_db`, one deferred BEGIN there turned
+    /// every CLI call made during a daemon's startup into a coin flip.
+    #[test]
+    fn no_schema_transaction_begins_deferred() {
+        let src = include_str!("chat.rs");
+        assert!(
+            !src.contains("execute_batch(\"BEGIN\")"),
+            "a deferred BEGIN cannot wait for the write lock, only fail to take it"
+        );
+        assert!(
+            !src.contains("\nBEGIN;\n"),
+            "a deferred BEGIN in a batch has the same problem"
+        );
+    }
+
+    /// Two connections writing at once must queue, not fail.
+    #[test]
+    fn a_contended_schema_ensure_waits_instead_of_failing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("chat.db");
+
+        let a = Connection::open(&path).expect("open a");
+        apply_concurrency_pragmas(&a).expect("pragmas a");
+        ensure_chat_db_schema(&a).expect("schema a");
+
+        // `a` holds the write lock while a second process runs the
+        // schema-ensure that every open performs. Deferred, this returned
+        // SQLITE_BUSY immediately instead of waiting.
+        a.execute_batch("BEGIN IMMEDIATE").expect("a takes the write lock");
+        a.execute("INSERT INTO chat_threads (id, created_at) VALUES ('t', 1)", [])
+            .expect("a writes");
+        let result = std::thread::scope(|s| {
+            let path_b = path.clone();
+            let h = s.spawn(move || -> rusqlite::Result<()> {
+                let b = Connection::open(&path_b)?;
+                apply_concurrency_pragmas(&b)?;
+                ensure_chat_db_schema(&b)
+            });
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            a.execute_batch("COMMIT").expect("a commits");
+            h.join().expect("join")
+        });
+        assert!(result.is_ok(), "contended schema-ensure failed: {result:?}");
+    }
+
     /// A transcript delivered from the backlog must still say it was dictated.
     ///
     /// The live notification carries `meta.voice`; the backlog rebuilds the
@@ -1664,9 +1772,10 @@ mod tests {
         // adds 5 more (project_id / branch / working_dir /
         // feature_description / dnd_until_ts). pty-transport Slice 1 adds
         // `session_token` (capability for short-lived CLI senders).
-        // v0.11 adds `terminal` (the per-window key for the nick memory).
-        // Total = 9 + 6 + 5 + 1 + 1 = 22.
-        assert_eq!(n, 22, "agent_registry should have exactly 22 columns post-migration");
+        // v0.11 adds `terminal` (the per-window key for the nick memory) and
+        // `claude_session_id` (the conversation the session belongs to).
+        // Total = 9 + 6 + 5 + 1 + 2 = 23.
+        assert_eq!(n, 23, "agent_registry should have exactly 23 columns post-migration");
     }
 
     #[test]

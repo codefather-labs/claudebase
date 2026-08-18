@@ -217,7 +217,10 @@ impl SubscribeClient {
         for msg in messages {
             let (message_id, content) = (msg.id, msg.content);
             let body = render(source.clone(), &content);
-            if tx.send(InboundMessage { message_id, body }).is_err() {
+            if tx
+                .send(InboundMessage { message_id, body, priority: false })
+                .is_err()
+            {
                 return;
             }
             delivered += 1;
@@ -319,6 +322,12 @@ impl SubscribeClient {
             }
             let (content, sender_hint) = split_agent_preamble(raw_content);
 
+            // The operator's "continue" button. Stated explicitly in the meta,
+            // never inferred: it changes how the message is DELIVERED (past the
+            // gate, promoted out of the queue), so guessing it from content
+            // would let any message claim that power.
+            let is_control = meta.get("control").and_then(|c| c.as_str()) == Some("continue");
+
             let (thread, source) = classify(&meta, sender_hint.clone());
 
             // On a TELEGRAM thread only the operator is inbound. Every other
@@ -365,7 +374,11 @@ impl SubscribeClient {
             let body = render(source, &content);
 
             if tx
-                .send(InboundMessage { message_id, body })
+                .send(InboundMessage {
+                    message_id,
+                    body,
+                    priority: is_control,
+                })
                 .is_err()
             {
                 // Injector is gone — the session is ending.
@@ -854,6 +867,36 @@ mod classify_tests {
         let meta = meta_of(&frame);
         let from = meta.get("from_agent").and_then(|v| v.as_str()).unwrap_or("");
         assert!(from.starts_with("telegram:"), "the operator must stay inbound");
+    }
+
+    /// The control flag must be carried, and must be the ONLY thing that grants
+    /// gate-bypassing delivery — a message body that merely says "continue"
+    /// gets no such power.
+    #[test]
+    fn only_an_explicit_control_flag_grants_priority_delivery() {
+        let frame = crate::daemon::chat::build_control_notification_continue("target-id", "продолжи");
+        let meta = meta_of(&frame);
+        assert_eq!(
+            meta.get("control").and_then(|c| c.as_str()),
+            Some("continue"),
+            "the daemon must state it; the supervisor must not infer it"
+        );
+
+        // An ordinary Telegram message with the same words carries no flag.
+        let tg = crate::daemon::chat::TelegramMessageMeta {
+            chat_id: 1,
+            message_id_str: "1".to_string(),
+            user: "u".to_string(),
+            user_id: "1".to_string(),
+            ts_iso8601: "2026-08-18T00:00:00.000Z".to_string(),
+            thread_id: None,
+            is_voice: false,
+        };
+        let ordinary = crate::daemon::chat::build_channel_notification_telegram("продолжи", &tg, None);
+        assert!(
+            meta_of(&ordinary).get("control").is_none(),
+            "typing the word must not buy priority delivery"
+        );
     }
 
     #[test]

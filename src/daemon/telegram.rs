@@ -429,6 +429,14 @@ pub(crate) enum BotCommand {
     /// with one button per alive CLI (callback `startswitch:<agent_name>`),
     /// rebuilt at-tap-time from `agent_registry::list_alive`.
     Start,
+    /// `/continue` — the operator's manual unstick.
+    ///
+    /// A session can stall mid-generation when the API connection drops, and
+    /// the ordinary inbound path is exactly the wrong tool for it: the injector
+    /// holds text while the session is busy, so the one message meant to unstick
+    /// it would queue behind the stall. This command is delivered past the gate
+    /// and promoted out of the queue.
+    Continue,
 }
 
 /// Parse `text` as a Telegram bot command. Returns Some when `text`
@@ -457,6 +465,10 @@ pub(crate) fn parse_bot_command(text: &str) -> Option<BotCommand> {
         // Slice 12 — /start emits an inline-keyboard menu. Any positional
         // args are ignored (operators may type /start@botname in groups).
         "start" => Some(BotCommand::Start),
+        // Both spellings: the operator reaches for this while something is
+        // visibly stuck, which is the worst moment to be told a command does
+        // not exist.
+        "continue" | "prodolzhi" => Some(BotCommand::Continue),
         _ => None,
     }
 }
@@ -581,6 +593,31 @@ pub(crate) fn handle_switch(
     Ok(format!(
         "Switched: this chat/topic is now bound to {} (agent_id={}). Subsequent inbound messages route to that CLI.",
         target.agent_name, target.agent_id
+    ))
+}
+
+/// `/continue` handler — nudge the bound session past a stall.
+///
+/// Emits a control notification rather than a chat message. The distinction
+/// matters: an ordinary message would be queued behind whatever has the session
+/// stuck, which is the state the operator is pressing this to escape.
+pub(crate) fn handle_continue(
+    tx: &rusqlite::Transaction,
+    chat_id: i64,
+    thread_id: Option<i64>,
+) -> anyhow::Result<(String, Option<String>)> {
+    use crate::daemon::agent_registry;
+
+    let bound = agent_registry::list_routings_for(tx, chat_id, thread_id)?;
+    let Some(target) = bound.first() else {
+        return Ok((
+            "No CLI is bound to this chat — /switch to one first, then /continue.".to_string(),
+            None,
+        ));
+    };
+    Ok((
+        format!("Nudging {} to continue.", target.agent_name),
+        Some(target.agent_id.clone()),
     ))
 }
 
@@ -821,6 +858,26 @@ pub fn process_batch_with_pairing(
                                 error = %e,
                                 "/start:agents handler failed"
                             ),
+                        }
+                    }
+                    "continue" => {
+                        match handle_continue(&tx, cb_chat_id, None) {
+                            Ok((reply, Some(target_agent_id))) => {
+                                notifications.push((
+                                    format!("agent:{target_agent_id}"),
+                                    chat::build_control_notification_continue(
+                                        &target_agent_id,
+                                        "продолжи",
+                                    ),
+                                ));
+                                pair_replies.push((cb_chat_id, None, reply));
+                            }
+                            Ok((reply, None)) => {
+                                pair_replies.push((cb_chat_id, None, reply));
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "/start:continue failed");
+                            }
                         }
                     }
                     "switch" => {
@@ -1163,6 +1220,10 @@ pub fn process_batch_with_pairing(
                 let options = vec![
                     ("agents".to_string(), "start:agents".to_string()),
                     ("switch".to_string(), "start:switch".to_string()),
+                    // Reachable in one tap on purpose: the moment it is needed
+                    // is the moment a session is visibly stuck, and typing a
+                    // command then is exactly the friction to remove.
+                    ("continue".to_string(), "start:continue".to_string()),
                 ];
                 match enqueue_outbound_tg_keyboard(
                     chat_id,
@@ -1194,6 +1255,22 @@ pub fn process_batch_with_pairing(
                     handle_switch(&tx, chat_id, msg.message_thread_id, user_id, &name)
                 }
                 BotCommand::Start => unreachable!("handled above"),
+                BotCommand::Continue => {
+                    match handle_continue(&tx, chat_id, msg.message_thread_id) {
+                        Ok((reply, Some(target_agent_id))) => {
+                            notifications.push((
+                                format!("agent:{target_agent_id}"),
+                                chat::build_control_notification_continue(
+                                    &target_agent_id,
+                                    "продолжи",
+                                ),
+                            ));
+                            Ok(reply)
+                        }
+                        Ok((reply, None)) => Ok(reply),
+                        Err(e) => Err(e),
+                    }
+                }
             };
             match reply {
                 Ok(text) => {

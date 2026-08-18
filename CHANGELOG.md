@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Removed
+
+- **The Telegram "continue" button.** It was meant to unstick a session that had stalled mid-generation
+  by reproducing what the operator does by hand — paste, Enter, then Ctrl-C to promote the message out
+  of the TUI queue. The bytes were written in the right order (there was a test), but it did not do
+  what pressing the keys does, and a half-working emergency control is worse than none: it is reached
+  for at the exact moment something is already wrong, and it fails there. Removed entirely — command,
+  button, control frame and the gate-bypassing injection path — rather than left in place to be
+  trusted. The unresolved question, if it is ever revisited: whether a written `0x03` byte reaches the
+  application the same way a real Ctrl-C does, or whether the terminal's line discipline turns the
+  keypress into a signal that no injected byte can reproduce.
+
 ### Fixed
 
 - **Voice notes never transcribed on a machine without `daemon.toml`.** `AsrConfig::default()` has

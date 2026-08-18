@@ -637,31 +637,6 @@ fn apply_chat_bindings_migration(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
-/// The operator's `/continue` — a CONTROL frame, not a chat message.
-///
-/// `meta.control = "continue"` is what tells the supervisor to deliver past the
-/// injection gate and promote the message out of the TUI's queue. It is stated
-/// here rather than inferred downstream: delivery power should belong to a field
-/// the daemon sets, not to anything that can be spelled inside a message body.
-pub fn build_control_notification_continue(target_agent_id: &str, text: &str) -> serde_json::Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "notifications/claude/channel",
-        "params": {
-            "content": text,
-            "meta": {
-                "control": "continue",
-                "source": "telegram",
-                "target_agent_id": target_agent_id,
-                "chat_id": format!("agent:{target_agent_id}"),
-                "thread": format!("agent:{target_agent_id}"),
-                "message_id": uuid::Uuid::new_v4().to_string(),
-                "ts": chrono::Utc::now().to_rfc3339(),
-            }
-        }
-    })
-}
-
 /// Inbound HTTP callback, on its way to a session's terminal input.
 ///
 /// A THIRD notification shape, and the reason this one is written with F-14 in

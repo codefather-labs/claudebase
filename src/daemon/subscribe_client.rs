@@ -218,7 +218,7 @@ impl SubscribeClient {
             let (message_id, content) = (msg.id, msg.content);
             let body = render(source.clone(), &content);
             if tx
-                .send(InboundMessage { message_id, body, priority: false })
+                .send(InboundMessage { message_id, body })
                 .is_err()
             {
                 return;
@@ -342,11 +342,6 @@ impl SubscribeClient {
             }
             let (content, sender_hint) = split_agent_preamble(raw_content);
 
-            // The operator's "continue" button. Stated explicitly in the meta,
-            // never inferred: it changes how the message is DELIVERED (past the
-            // gate, promoted out of the queue), so guessing it from content
-            // would let any message claim that power.
-            let is_control = meta.get("control").and_then(|c| c.as_str()) == Some("continue");
 
             let (thread, source) = classify(&meta, sender_hint.clone());
 
@@ -394,11 +389,7 @@ impl SubscribeClient {
             let body = render(source, &content);
 
             if tx
-                .send(InboundMessage {
-                    message_id,
-                    body,
-                    priority: is_control,
-                })
+                .send(InboundMessage { message_id, body })
                 .is_err()
             {
                 // Injector is gone — the session is ending.
@@ -892,73 +883,6 @@ mod classify_tests {
             "an agent id is what marks this as outbound; the guard keys on that"
         );
     }
-
-    /// And the operator's own message on the same thread IS inbound — the guard
-    /// must not swallow the traffic it exists to carry.
-    #[test]
-    fn the_operator_on_a_telegram_thread_is_still_inbound() {
-        let msg = crate::daemon::chat::ChatMessage {
-            id: "m2".to_string(),
-            thread_id: "telegram:434566766".to_string(),
-            from_agent: "telegram:codefather_dev".to_string(),
-            content: "a real question".to_string(),
-            reply_to: None,
-            created_at: 0,
-        };
-        let frame = crate::daemon::chat::build_channel_notification(&msg);
-        let meta = meta_of(&frame);
-        let from = meta.get("from_agent").and_then(|v| v.as_str()).unwrap_or("");
-        assert!(from.starts_with("telegram:"), "the operator must stay inbound");
-    }
-
-    /// The control flag must be carried, and must be the ONLY thing that grants
-    /// gate-bypassing delivery — a message body that merely says "continue"
-    /// gets no such power.
-    #[test]
-    fn only_an_explicit_control_flag_grants_priority_delivery() {
-        let frame = crate::daemon::chat::build_control_notification_continue("target-id", "продолжи");
-        let meta = meta_of(&frame);
-        assert_eq!(
-            meta.get("control").and_then(|c| c.as_str()),
-            Some("continue"),
-            "the daemon must state it; the supervisor must not infer it"
-        );
-
-        // An ordinary Telegram message with the same words carries no flag.
-        let tg = crate::daemon::chat::TelegramMessageMeta {
-            chat_id: 1,
-            message_id_str: "1".to_string(),
-            user: "u".to_string(),
-            user_id: "1".to_string(),
-            ts_iso8601: "2026-08-18T00:00:00.000Z".to_string(),
-            thread_id: None,
-            is_voice: false,
-        };
-        let ordinary = crate::daemon::chat::build_channel_notification_telegram("продолжи", &tg, None);
-        assert!(
-            meta_of(&ordinary).get("control").is_none(),
-            "typing the word must not buy priority delivery"
-        );
-    }
-
-    /// The operator's `/continue` must read as the operator, not as a peer.
-    ///
-    /// It rides an `agent:<id>` thread to reach one specific session, so
-    /// classifying by thread prefix labelled it `[agent-to-agent:unknown]` — the
-    /// operator pressed a button and the session saw an anonymous peer. The
-    /// frame states `source: "telegram"`; this asserts the classifier reads it.
-    #[test]
-    fn the_continue_control_frame_reads_as_the_operator() {
-        let frame = crate::daemon::chat::build_control_notification_continue("target-id", "продолжи");
-        let (thread, source) = classify(&meta_of(&frame), None);
-        assert_eq!(thread, "agent:target-id", "still addressed to one session");
-        assert_eq!(
-            source,
-            Source::Telegram,
-            "the operator pressed the button; it must not render as a peer"
-        );
-    }
-
     /// Every frame that is meant for a session must NAME that session.
     ///
     /// Delivery is by recipient, not by subscription: a message without a
@@ -975,10 +899,6 @@ mod classify_tests {
             (
                 "callback",
                 chat::build_channel_notification_callback("x", Some("ci"), "target-id", "m1"),
-            ),
-            (
-                "continue control",
-                chat::build_control_notification_continue("target-id", "продолжи"),
             ),
             (
                 "agent-to-agent",

@@ -2566,6 +2566,31 @@ async fn transcribe_voice_note(
     // Step 4: hand the PCM to the configured ASR backend. The trait's
     // own implementation chooses how to dispatch (sync blocking pool
     // for whisper; HTTP for nim; etc.).
+    // Opt-in audio capture, for comparing ASR backends on the operator's own
+    // voice rather than on a synthetic tone.
+    //
+    // OFF unless `CLAUDEBASE_ASR_KEEP_PCM` names a directory, and deliberately
+    // so: this writes the operator's dictation to disk, and voice notes are the
+    // most private thing this system carries. Nothing deletes what it writes,
+    // which is the other reason it is not a default.
+    if let Some(dir) = std::env::var_os("CLAUDEBASE_ASR_KEEP_PCM") {
+        let dir = std::path::PathBuf::from(dir);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(error = %e, "CLAUDEBASE_ASR_KEEP_PCM: cannot create the directory");
+        } else {
+            let path = dir.join(format!("voice-{}.f32", msg.message_id));
+            let bytes: Vec<u8> = pcm.iter().flat_map(|f| f.to_le_bytes()).collect();
+            match std::fs::write(&path, &bytes) {
+                Ok(()) => tracing::info!(
+                    path = %path.display(),
+                    samples = pcm.len(),
+                    "CLAUDEBASE_ASR_KEEP_PCM: kept a copy of this note's audio"
+                ),
+                Err(e) => tracing::warn!(error = %e, "CLAUDEBASE_ASR_KEEP_PCM: write failed"),
+            }
+        }
+    }
+
     // Everything above — fetching the file, decoding Opus — ran without a
     // permit, because it is I/O and overlapping it is free. The permit starts
     // here, where the work becomes cores.

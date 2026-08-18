@@ -938,7 +938,15 @@ set_asr_backend() {
     *) log_warn "unknown CLAUDEBASE_ASR_BACKEND='$backend'; leaving daemon.toml alone"; return 1 ;;
   esac
 
-  local toml="$CLAUDE_DIR/claudebase/daemon.toml"
+  # Asked, never guessed: the binary owns where its config lives, and this
+  # installer used to hardcode a whisper model path the daemon never read.
+  local bin="$CLAUDE_DIR/tools/claudebase/claudebase"
+  local toml
+  toml="$("$bin" daemon config path 2>/dev/null)"
+  if [ -z "$toml" ]; then
+    log_warn "this binary cannot report its config path; skipping the backend switch"
+    return 1
+  fi
   mkdir -p "$(dirname "$toml")"
   if [ ! -f "$toml" ]; then
     printf '[asr]\nbackend = "%s"\n' "$backend" > "$toml"

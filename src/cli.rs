@@ -867,6 +867,13 @@ pub enum DaemonConfigSubcommand {
     /// (with token masked to `"***"` per SEC-10). Human-readable TOML
     /// by default; `--json` switches to JSON for machine consumers.
     Show(DaemonConfigShowArgs),
+    /// Print the absolute path of `daemon.toml`.
+    ///
+    /// Exists so nothing has to REPLICATE that path. The installers need to
+    /// write `[asr] backend` into it, and a second copy of the resolution rule
+    /// is how the model path ended up documented in one place and read from
+    /// another for a whole release.
+    Path,
 }
 
 #[derive(Args, Debug)]

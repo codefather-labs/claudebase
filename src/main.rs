@@ -132,6 +132,13 @@ fn main() -> std::process::ExitCode {
             cli::DaemonSubcommand::Config(config_args) => match config_args.sub {
                 cli::DaemonConfigSubcommand::Edit(a) => run_daemon_config_edit(&a),
                 cli::DaemonConfigSubcommand::Show(a) => run_daemon_config_show(&a),
+                cli::DaemonConfigSubcommand::Path => {
+                    println!(
+                        "{}",
+                        claudebase::daemon::config::user_level_daemon_toml_path().display()
+                    );
+                    std::process::ExitCode::SUCCESS
+                }
             },
             cli::DaemonSubcommand::Callback(a) => match a.sub {
                 cli::DaemonCallbackSubcommand::Enable(a) => simple(

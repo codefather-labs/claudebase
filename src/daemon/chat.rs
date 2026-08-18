@@ -901,10 +901,45 @@ fn apply_concurrency_pragmas(conn: &Connection) -> rusqlite::Result<()> {
 /// nick lookup contend in the first place. Callers that only read use this and
 /// contend with nobody.
 pub fn open_chat_db_readonly() -> anyhow::Result<Connection> {
+    // Two layers, because they cover different failures.
+    //
+    // `busy_timeout` handles a contended STATEMENT: SQLite waits for the lock
+    // instead of returning SQLITE_BUSY immediately.
+    //
+    // The retry loop handles a contended OPEN, which busy_timeout cannot: a
+    // writer mid-commit can make the file briefly unopenable, and the caller
+    // then sees "cannot open" rather than "busy". Callers of this function
+    // decide routing — who owns a chat, what an agent is called — and a failed
+    // read there used to mean a message went to every session instead of one.
+    // Failing closed makes that safe; retrying first makes it rare.
+    const ATTEMPTS: usize = 4;
     let path = crate::store::user_level_chat_db_path();
-    let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
-    Ok(conn)
+    let mut last_err = None;
+    for attempt in 0..ATTEMPTS {
+        match Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            Ok(conn) => {
+                conn.busy_timeout(std::time::Duration::from_secs(5))?;
+                return Ok(conn);
+            }
+            Err(e) => {
+                // A missing file is not contention and will not resolve by
+                // waiting — that is the fresh-install case, answered immediately.
+                if !path.exists() {
+                    return Err(anyhow::anyhow!("chat.db does not exist: {e}"));
+                }
+                last_err = Some(e);
+                if attempt + 1 < ATTEMPTS {
+                    // 20ms, 40ms, 80ms: long enough to outlast a commit, short
+                    // enough that an inbound message is not visibly delayed.
+                    std::thread::sleep(std::time::Duration::from_millis(20 << attempt));
+                }
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "open chat.db read-only after {ATTEMPTS} attempts: {}",
+        last_err.expect("loop runs at least once")
+    ))
 }
 
 /// Current wall-clock milliseconds since the UNIX epoch.
@@ -1010,7 +1045,9 @@ pub fn resolve_reply_to(
 /// SELECT but before the UPDATE keep their NULL delivered_at and surface
 /// on the broadcast channel instead of being silently consumed.
 pub fn drain_backlog(conn: &mut Connection, thread_id: &str) -> rusqlite::Result<Vec<ChatMessage>> {
-    let tx = conn.transaction()?;
+    // IMMEDIATE: see agent_registry — a DEFERRED transaction that upgrades to a
+    // write fails instantly with SQLITE_BUSY, and busy_timeout cannot help it.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let messages: Vec<ChatMessage> = {
         let mut stmt = tx.prepare(
             "SELECT id, thread_id, from_agent, content, reply_to, created_at

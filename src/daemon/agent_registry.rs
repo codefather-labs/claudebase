@@ -184,8 +184,14 @@ pub fn register(
     let now = now_millis();
     let metadata_text = metadata.map(|v| v.to_string());
 
-    let tx = conn
-        .unchecked_transaction()
+    // BEGIN IMMEDIATE, not the default DEFERRED. A deferred transaction starts
+    // as a reader and upgrades on its first write, and SQLite refuses that
+    // upgrade INSTANTLY with SQLITE_BUSY when another writer holds the lock —
+    // `busy_timeout` does not apply to it, because waiting could deadlock two
+    // readers each trying to upgrade. Measured on 2026-08-18: deferred failed in
+    // 0.00s while IMMEDIATE waited out the full 5s timeout. Taking the write
+    // lock up front is what makes writers queue instead of fail.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
         .context("agent_register: begin tx")?;
 
     // Rename-as-cleanup sweep: any alive row on THIS connection_id with
@@ -859,8 +865,14 @@ pub fn send_message(
     content: &str,
     now_ms: i64,
 ) -> anyhow::Result<SendOutcome> {
-    let tx = conn
-        .unchecked_transaction()
+    // BEGIN IMMEDIATE, not the default DEFERRED. A deferred transaction starts
+    // as a reader and upgrades on its first write, and SQLite refuses that
+    // upgrade INSTANTLY with SQLITE_BUSY when another writer holds the lock —
+    // `busy_timeout` does not apply to it, because waiting could deadlock two
+    // readers each trying to upgrade. Measured on 2026-08-18: deferred failed in
+    // 0.00s while IMMEDIATE waited out the full 5s timeout. Taking the write
+    // lock up front is what makes writers queue instead of fail.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
         .context("send_message: begin tx")?;
     let (state, dnd_until_ts): (String, Option<i64>) = tx
         .query_row(
@@ -1061,8 +1073,14 @@ pub fn drain_dnd_tick(
     now_ms: i64,
     rate_limit: usize,
 ) -> anyhow::Result<DrainStats> {
-    let tx = conn
-        .unchecked_transaction()
+    // BEGIN IMMEDIATE, not the default DEFERRED. A deferred transaction starts
+    // as a reader and upgrades on its first write, and SQLite refuses that
+    // upgrade INSTANTLY with SQLITE_BUSY when another writer holds the lock —
+    // `busy_timeout` does not apply to it, because waiting could deadlock two
+    // readers each trying to upgrade. Measured on 2026-08-18: deferred failed in
+    // 0.00s while IMMEDIATE waited out the full 5s timeout. Taking the write
+    // lock up front is what makes writers queue instead of fail.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
         .context("drain_dnd_tick: begin tx")?;
     // Step 1 — collect expired-DND agents.
     let expired: Vec<String> = {

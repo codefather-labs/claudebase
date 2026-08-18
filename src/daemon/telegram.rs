@@ -749,7 +749,9 @@ pub fn process_batch_with_pairing(
     let pruned = channel_state::prune_expired(access, now);
     let mut dirty = pruned;
 
-    let tx = conn.transaction()?;
+    // IMMEDIATE: see agent_registry — a DEFERRED transaction that upgrades to a
+    // write fails instantly with SQLITE_BUSY, and busy_timeout cannot help it.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut max_id: i64 = 0;
     let mut inserted: usize = 0;
     let mut notifications: Vec<(String, serde_json::Value)> = Vec::new();

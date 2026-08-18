@@ -108,13 +108,37 @@ fn make_asr_unknown_backend_returns_err() {
 /// path can fail explicitly rather than picking a silent default.
 #[test]
 fn make_asr_no_backend_configured_returns_err() {
-    let cfg = Config::default();
+    // Explicitly UNSET, which is what this test claims to cover.
+    //
+    // It used to build a `Config::default()` and assert an error. That default
+    // has selected whisper since v0.8.1, so the assertion only held while the
+    // `asr-whisper` feature was off — the error it observed was "feature not
+    // compiled in", not "no backend configured". The test therefore passed for
+    // the wrong reason in every run, and turned red the first time the suite was
+    // run WITH the feature, which is how the shipped binaries are built.
+    let mut cfg = Config::default();
+    cfg.asr.backend = None;
+
     let result = make_asr(&cfg);
     assert!(result.is_err(), "no backend configured should be Err");
     let msg = format!("{}", result.err().expect("expected Err"));
     assert!(
         msg.contains("backend") || msg.contains("ASR"),
         "error message should mention backend config; got: {msg}"
+    );
+}
+
+/// The other half, and the one that actually matters to an operator: the
+/// DEFAULT config must produce a working backend, because a clean install has
+/// no daemon.toml and voice notes are expected to transcribe anyway.
+#[test]
+#[cfg(feature = "asr-whisper")]
+fn the_default_config_builds_a_whisper_backend() {
+    let cfg = Config::default();
+    assert_eq!(cfg.asr.backend.as_deref(), Some("whisper"));
+    assert!(
+        make_asr(&cfg).is_ok(),
+        "a default config must yield a usable backend when the feature is built in"
     );
 }
 

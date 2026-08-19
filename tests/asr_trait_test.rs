@@ -60,23 +60,37 @@ fn make_asr_whisper_with_feature_returns_instance() {
     assert!(result.is_ok(), "make_asr(whisper) construction failed");
 }
 
-/// PRD FR-ACD-7.4 — sherpa-nemo is a Wave-6 stub. Calling `make_asr`
-/// against it returns Err with a message containing `not implemented`
-/// AND `v1` so the operator immediately understands the gap. Calling
-/// `transcribe()` on this Err path would never happen — construction
-/// fails first — but if a future change wires sherpa-nemo construction
-/// to a stub trait impl, the regression test would need to add a
-/// transcribe-returns-err case here.
+/// `sherpa-nemo` stopped being a reserved name and became Parakeet.
+///
+/// The reservation is honoured rather than dropped: a daemon.toml written
+/// against it keeps resolving, to the same backend `parakeet` selects. What the
+/// test asserts therefore flipped — it used to require the error to say "not
+/// implemented in v1", which would now be a lie.
+///
+/// Without the feature compiled in, the error must NAME the feature. That is
+/// the whole value of the message: an operator who selected a backend their
+/// binary cannot run needs the rebuild flag, not a philosophical statement
+/// about waves.
 #[test]
-fn make_asr_sherpa_returns_unimplemented_err() {
-    let cfg = config_with_backend("sherpa-nemo");
-    let result = make_asr(&cfg);
-    assert!(result.is_err(), "sherpa-nemo should be Err in v1");
-    let msg = format!("{}", result.err().expect("expected Err"));
-    assert!(
-        msg.contains("not implemented") && msg.contains("v1"),
-        "error message should mark sherpa-nemo as v1-unimplemented; got: {msg}"
-    );
+fn both_names_for_parakeet_resolve_the_same_way() {
+    for name in ["parakeet", "sherpa-nemo"] {
+        let cfg = config_with_backend(name);
+        let result = make_asr(&cfg);
+        #[cfg(feature = "asr-sherpa")]
+        assert!(result.is_ok(), "`{name}` should construct when asr-sherpa is on");
+        #[cfg(not(feature = "asr-sherpa"))]
+        {
+            let msg = format!("{}", result.err().expect("expected Err without the feature"));
+            assert!(
+                msg.contains("asr-sherpa"),
+                "the error must name the feature to rebuild with; got: {msg}"
+            );
+            assert!(
+                !msg.contains("not implemented"),
+                "parakeet IS implemented; the gap is the build, not the code: {msg}"
+            );
+        }
+    }
 }
 
 /// PRD FR-ACD-7.4 — nim is a Wave-6 stub (same contract as sherpa-nemo).

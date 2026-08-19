@@ -23,10 +23,19 @@ fn write_daemon_toml(dir: &TempDir, body: &str) {
     fs::write(cfg_dir.join("daemon.toml"), body).expect("write daemon.toml");
 }
 
-/// `backend = "sherpa-nemo"` → doctor exits 1 with `not implemented in v1`
-/// per FR-ACD-7.4. The test asserts both exit code and substring.
+/// `backend = "sherpa-nemo"` → doctor must explain what is actually wrong.
+///
+/// It used to assert "not implemented in v1", which stopped being true when
+/// Parakeet landed under that reserved name. What doctor owes the operator now
+/// depends on the build: without `asr-sherpa` the gap is the BINARY, and the
+/// message has to name the feature to rebuild with; with it, the gap is the
+/// model, and doctor reports whether the files are there.
+///
+/// Either way it exits non-zero on this machine, because a temp HOME has no
+/// model in it — so the exit code alone proves nothing and the message is the
+/// whole test.
 #[test]
-fn daemon_doctor_asr_sherpa_returns_not_implemented() {
+fn daemon_doctor_asr_sherpa_explains_the_actual_gap() {
     let tmp = TempDir::new().expect("tempdir");
     write_daemon_toml(
         &tmp,
@@ -49,9 +58,19 @@ backend = "sherpa-nemo"
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    #[cfg(not(feature = "asr-sherpa"))]
     assert!(
-        combined.contains("not implemented") && combined.contains("v1"),
-        "expected 'not implemented' + 'v1' in output; got: {combined}"
+        combined.contains("asr-sherpa"),
+        "the message must name the feature to rebuild with; got: {combined}"
+    );
+    #[cfg(feature = "asr-sherpa")]
+    assert!(
+        combined.contains("MISSING") || combined.contains("model"),
+        "with the backend compiled in, doctor should report the model state; got: {combined}"
+    );
+    assert!(
+        !combined.contains("not implemented"),
+        "parakeet IS implemented; the gap is the build or the model, not the code: {combined}"
     );
 }
 

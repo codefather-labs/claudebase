@@ -6,6 +6,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-20
+
+### Added
+
+- **Telegram forum topics as session addresses.** In a supergroup with topics enabled, a topic is
+  bound to one session: everything typed there goes to it, everything it answers comes back into the
+  same topic, and there is no `/switch` mode to remember. `/start` in a topic sends its keyboard into
+  that topic and the tap binds `(chat_id, topic)`. Bindings are durable and independent — assigning
+  another topic to another session does not disturb an existing one.
+
+  Setup requires promoting the bot to **administrator** of the group. This is not optional and its
+  absence is silent: Telegram's privacy mode is on by default and a non-admin bot receives only
+  commands addressed to it with `@botname`, so ordinary text and voice notes never arrive while the
+  group looks connected.
+
+  Known limits, both documented: one session holds one topic (the live routing key is a single pair
+  of columns on the session's row), and the access gate still decides on the SENDER — an unrecognised
+  member of a group triggers pairing and the code is replied into the topic, so a topics group is for
+  one person until that is fixed.
+
+- **Parakeet as an opt-in ASR backend** — see the 0.9.3 entry below for the measurements; it landed
+  in this cycle and is documented in the README.
+
+### Fixed
+
+- **The topic was dropped at four separate points between arriving and being used.** The assignment
+  button passed `None` into `handle_switch`, so a tap bound the whole chat; `MessageRef` did not
+  deserialise `message_thread_id` at all, so the tap's own topic was unavailable; `resolve_thread`
+  read the binding as `(chat_id, _thread_id)`, so a session bound to a topic answered into the
+  group's General; and ownership was decided per CHAT rather than per message, so with two topics
+  bound to two sessions one of them received everything and the other's messages were discarded with
+  "chat is bound to another session". Each was found in a different way — two by reading, one by the
+  operator seeing a reply in the wrong place, one by a second session reporting it had received
+  nothing.
+- **A backlog transcript lost its `[telegram_voice_message]` prefix**, arriving indistinguishable
+  from typed text, because the frame was rebuilt from a row that had nowhere to record it.
+
+
 ### Added
 
 - **Parakeet as an opt-in ASR backend.** `nvidia/parakeet-tdt-0.6b-v3` — the multilingual build,

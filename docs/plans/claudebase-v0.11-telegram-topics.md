@@ -1,6 +1,6 @@
 # Telegram topics as session addresses
 
-**Status:** planned
+**Status:** Slice 0 done and its findings fixed; Slice 1 (the group access gate) remains the blocker before anyone else joins a topics group
 **Supersedes:** the bot-pool proposal (one bot token per session), rejected below.
 
 ## The problem
@@ -85,10 +85,17 @@ Answers, in the order the questions were asked:
    `(chat_id, _thread_id)` and discarded the topic one line before it would
    have been used. Fixed; the send now logs `thread_id: Some(3)`.
 6. **Voice note in a topic?** Not yet driven.
-7. **Two topics, two sessions?** Not yet driven, but answered by reading: the
-   switch is per-topic in both tables — `bind_routing_key_in_tx` matches chat
-   AND thread when clearing, and `chat_bindings` has `ON CONFLICT(chat_id,
-   thread_id)`. A switch in one topic cannot disturb another.
+7. **Two topics, two sessions?** Driven, and it FAILED where reading said it
+   would work. The switch is indeed per-topic in both tables — that part of the
+   reading was right. What was wrong is one layer down: ownership was asked
+   about the CHAT, so `deliver_backlog` elected a single owner for the whole
+   forum and discarded the other session's messages. The peer session confirmed
+   it had received nothing at all. Fixed by storing the topic on the message row
+   and deciding delivery per message; `routing_belongs_to(agent, chat, topic)`
+   is the question that has an answer.
+
+   The lesson is worth keeping: "the switch is per-topic" was true and still
+   did not mean "two topics work". Reading verified the layer it looked at.
 
 **Limitation found while answering 7:** the live routing key is a single pair of
 columns on the agent's row, so one session can hold exactly ONE topic. Many

@@ -1,6 +1,6 @@
 # Parakeet as a second ASR backend
 
-**Status:** planned
+**Status:** Slices 0-3 done; default unchanged pending accuracy samples and the packaging decision
 **Target:** v0.10.0 (additive — a new backend, selectable at runtime)
 **Supersedes:** `docs/issues/007-nvidia-parakeet-asr-backend.md`, whose load-bearing open question is
 now answered.
@@ -38,6 +38,43 @@ operator's dictated messages on someone else's machine, and voice notes are the 
 this system carries. The reserved `asr-nim` name stays reserved.
 
 ## Slices
+
+### Slice 0 result (2026-08-19)
+
+Measured with `examples/asr_ab.rs`, both backends over the same buffer, four
+threads each, on this 16-core machine.
+
+A 7.1-second Russian voice note from the operator, load ~2.5:
+
+| | cold | warm | transcript |
+|---|---|---|---|
+| whisper-medium | 46.9 s | 45.7 s | «Так, это тест транскрипта голоса под паракет, новая модель.» |
+| parakeet-tdt-v3 | 6.7 s | **0.65 s** | «Так, это тест транскрипта голоса под Паракит. Новую модель.» |
+
+A 4-second synthetic tone, machine idle:
+
+| | cold | warm | transcript |
+|---|---|---|---|
+| whisper-medium | 22.0 s | 21.0 s | `(electronic music)` |
+| parakeet-tdt-v3 | 2.9 s | **0.17 s** | *(empty)* |
+
+**70x on real speech, warm.** Both read the sentence correctly; they differ on
+the transliteration of the product name («паракет» / «Паракит»), on a case
+ending, and on where the sentence breaks. Neither reading is demonstrably wrong
+without asking the speaker. On the non-speech tone Parakeet returning nothing is
+the more honest answer than whisper's `(electronic music)`.
+
+**The speed question is answered. The accuracy question is not.** One 7-second
+sample is a data point, not an evaluation, and the failures that matter are
+exactly the ones a single ordinary sentence cannot show: filenames, flags and
+identifiers, which the channel contract already tells agents to confirm rather
+than act on. Whisper therefore stays the default until several notes carrying
+technical strings have been through both.
+
+A second thing blocks the default independently: the released binary does not
+carry `asr-sherpa`, because shared linking means shipping ~31 MB of `.so`
+beside it (R-2). Flipping the default is a release-pipeline decision as much as
+an accuracy one.
 
 **Slice 0 — measure before building.** Fetch the int8 export, transcribe a real Russian voice note
 with `examples/whisper_probe.rs`'s sibling, and compare against whisper-medium on the same audio and

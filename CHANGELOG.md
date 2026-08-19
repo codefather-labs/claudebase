@@ -6,6 +6,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **Parakeet as an opt-in ASR backend.** `nvidia/parakeet-tdt-0.6b-v3` — the multilingual build,
+  Russian included — runs locally through sherpa-onnx behind `--features asr-sherpa`, selected with
+  `[asr] backend = "parakeet"` or `CLAUDEBASE_ASR_BACKEND=parakeet` at install time. Measured against
+  whisper-medium on the same audio at four threads each: 45.7 s → 0.65 s on a 7-second Russian note,
+  126.5 s → 10.2 s on a 92-second one. The spread between 70x and 12x is structural — whisper always
+  processes 30-second windows, so short notes benefit most.
+
+  **Whisper stays the default**, for three reasons in descending weight: the released binary cannot
+  carry Parakeet, since sherpa-onnx must be linked shared (a static build bundles a second ONNX
+  Runtime that collides with `fastembed`'s) and shipping ~31 MB of `.so` on four platforms is not
+  something claudebase does today; Parakeet dropped a phrase on the long sample, turning "whisper ai
+  medium" into "whisper", and a dropped phrase leaves no trace where a mangled one is visible; and it
+  is not more accurate on the strings that matter — neither backend got a single product name right,
+  which is exactly why transcripts arrive under their own prefix.
+
+- **`claudebase daemon config path`** — prints the absolute path of `daemon.toml`, so installers and
+  scripts ask rather than replicate the resolution rule. Introduced because the new installer code
+  wrote `[asr] backend` into `~/.claude/claudebase/daemon.toml` while the binary reads
+  `~/.config/claudebase/daemon.toml`; the same class of mistake as the whisper model path that was
+  documented in one place and read from another for a whole release.
+
+- **`examples/asr_ab.rs`** — runs both backends over one audio buffer and prints wall time and text
+  for each, cold and warm. `CLAUDEBASE_ASR_KEEP_PCM=<dir>` (off by default, and it writes dictation
+  to disk) captures a real note to feed it.
+
+### Changed
+
+- **`warmup()` and `name()` moved onto the `Asr` trait.** `daemon warmup --asr` used to hold
+  whisper's model path and download call inline behind an `if backend != "whisper" { bail }`. The
+  installers drive that command, so they could only ever pre-fetch one backend's model. Both
+  installers are now backend-aware without knowing any model URL.
+
+
 ## [0.9.3] - 2026-08-19
 
 ### Added

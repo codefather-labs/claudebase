@@ -1,6 +1,9 @@
 # Parakeet as a second ASR backend
 
-**Status:** Slices 0-3 done; default unchanged pending accuracy samples and the packaging decision
+**Status:** DELIVERED as an opt-in backend. Operator decision 2026-08-19: whisper remains the
+default and Parakeet is a self-build option, documented in the README. Slice 2 (installer support)
+and Slice 3 (selection) are done; Slice 4 (a golden audio fixture) and the packaging question in R-2
+remain open and are what a future default-flip would need.
 **Target:** v0.10.0 (additive — a new backend, selectable at runtime)
 **Supersedes:** `docs/issues/007-nvidia-parakeet-asr-backend.md`, whose load-bearing open question is
 now answered.

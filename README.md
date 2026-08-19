@@ -87,6 +87,8 @@ containers on every change to the installer and fails if that stops being true.
 **Opt-outs** (env vars before running the installer):
 - `CLAUDEBASE_VERSION=x.y.z` — pin a specific version (downgrade, repeatable CI installs). Default: latest `claudebase-v*` tag on origin (via `git ls-remote`, no API quota). Falls back to a baked-in constant if the remote lookup fails (air-gapped / GitHub unreachable).
 - `CLAUDEBASE_SKIP_WHISPER=1` — skip ffmpeg + whisper-cli install (no voice transcription)
+- `CLAUDEBASE_ASR_BACKEND=parakeet` — select the Parakeet backend and fetch its model instead of
+  whisper's. Needs a binary built with `--features asr-sherpa`; the released one has only whisper
 
 ## 🎬 Demo
 
@@ -421,6 +423,54 @@ the machine, it stalls it.
 
 The model is loaded once and kept. Fetching and decoding a note overlap freely; only the inference is
 bounded, by `max_concurrent`, for the same reason the thread count is.
+
+#### A faster backend, if you build it yourself
+
+NVIDIA's **`parakeet-tdt-0.6b-v3`** runs locally through sherpa-onnx and is dramatically faster.
+It is **not** in the released binary and is **not** the default — see why below.
+
+```bash
+cargo build --release --features asr-whisper,asr-sherpa
+```
+
+```toml
+[asr]
+backend = "parakeet"   # "whisper" is the default
+```
+
+Or at install time: `CLAUDEBASE_ASR_BACKEND=parakeet ./install.sh`, which writes that key and fetches
+the right model (~640 MB, against whisper-medium's 1.5 GB). Both backends can be compiled in at once;
+the config decides which runs.
+
+Measured on one 16-core machine, both backends over the same audio at four threads each:
+
+| audio | whisper-medium | parakeet-tdt-v3 |
+|---|---|---|
+| 7.1 s of Russian speech | 45.7 s | **0.65 s** |
+| 92.7 s of Russian speech | 126.5 s | **10.2 s** |
+
+70x on the short note and 12x on the long one, and that spread is structural rather than noise:
+whisper always processes 30-second windows, so a 7-second note costs it a whole window while a
+92-second one costs four. The advantage is largest on short notes, which is what dictation usually
+is. `examples/asr_ab.rs` reproduces the table on your own audio.
+
+**Why it is not the default, in order of weight:**
+
+1. **It is not in the release binary.** sherpa-onnx has to be linked as a shared library, because a
+   static one bundles a second copy of ONNX Runtime that collides at link time with the one
+   `fastembed` already provides for retrieval (`duplicate symbol: onnx::ParseData<double>`). Shipping
+   it would mean shipping ~31 MB of `.so` beside the binary on four platforms, which claudebase does
+   not currently do. Building it yourself is therefore the only route today.
+2. **It dropped a phrase.** On the long sample it turned "whisper ai medium" into "whisper". A
+   dropped phrase is worse than a mangled one because it leaves no trace — a wrong word is visible,
+   an absent one is not. Two samples cannot say whether that is characteristic.
+3. **It is not more accurate on the strings that matter.** Neither backend got a single product name
+   right: "nvidia parakeet" came back as `para kit` and `Parkit`, "Claude Code" as `клад кода` and
+   `клоткода`. This is the reason transcripts arrive under their own prefix — treat exact strings in
+   them as things to confirm, whichever backend produced them.
+
+What Parakeet is clearly better at, besides speed: it punctuates, capitalises and splits sentences,
+where whisper returns one unbroken lowercase run.
 
 ---
 

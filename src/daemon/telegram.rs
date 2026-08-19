@@ -290,6 +290,15 @@ pub struct CallbackQuery {
 pub struct MessageRef {
     pub message_id: i64,
     pub chat: Chat,
+    /// The forum topic the keyboard is sitting in.
+    ///
+    /// Without this the assignment button could only ever bind a whole chat.
+    /// The tap knows which topic it happened in; the code simply was not
+    /// reading it, and passed `None` all the way down to `handle_switch` — so
+    /// pressing "assign this topic to a session" assigned the entire group and
+    /// answered in General.
+    #[serde(default)]
+    pub message_thread_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -841,10 +850,14 @@ pub fn process_batch_with_pairing(
                         continue;
                     }
                 };
+                // Answer where the tap happened. In a DM this is None and
+                // nothing changes; in a forum it is the topic, and replying
+                // without it puts the answer in General where nobody is looking.
+                let cb_thread_id = cb.message.as_ref().and_then(|m| m.message_thread_id);
                 match start_suffix {
                     "agents" => {
-                        match handle_agents(&tx, cb_chat_id, None) {
-                            Ok(text) => pair_replies.push((cb_chat_id, None, text)),
+                        match handle_agents(&tx, cb_chat_id, cb_thread_id) {
+                            Ok(text) => pair_replies.push((cb_chat_id, cb_thread_id, text)),
                             Err(e) => tracing::warn!(
                                 error = %e,
                                 "/start:agents handler failed"
@@ -864,7 +877,7 @@ pub fn process_batch_with_pairing(
                         if alive.is_empty() {
                             pair_replies.push((
                                 cb_chat_id,
-                                None,
+                                cb_thread_id,
                                 "No CLIs alive — try /agents later.".to_string(),
                             ));
                         } else {
@@ -879,7 +892,7 @@ pub fn process_batch_with_pairing(
                                 .collect();
                             match enqueue_outbound_tg_keyboard(
                                 cb_chat_id,
-                                None,
+                                cb_thread_id,
                                 "Switch to:".to_string(),
                                 options,
                             ) {
@@ -911,10 +924,17 @@ pub fn process_batch_with_pairing(
                         continue;
                     }
                 };
+                let cb_thread_id = cb.message.as_ref().and_then(|m| m.message_thread_id);
                 // Use existing FR-MAT-8.6 security gate via handle_switch.
                 // user_id comes from cb.from.id (tapping operator).
-                match handle_switch(&tx, cb_chat_id, None, cb.from.id, agent_name) {
-                    Ok(text) => pair_replies.push((cb_chat_id, None, text)),
+                //
+                // The topic is the address. `chat_bindings` has always been
+                // keyed by (chat_id, thread_id) and `handle_switch` has always
+                // taken a thread — this call just never passed one, so the
+                // button bound the whole chat and every topic in the forum
+                // pointed at whichever session was assigned last.
+                match handle_switch(&tx, cb_chat_id, cb_thread_id, cb.from.id, agent_name) {
+                    Ok(text) => pair_replies.push((cb_chat_id, cb_thread_id, text)),
                     Err(e) => tracing::warn!(
                         error = %e,
                         agent_name = %agent_name,
@@ -2610,6 +2630,61 @@ pub fn no_op_arc() -> Arc<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Tapping the assignment button in a forum topic must bind THAT topic.
+    ///
+    /// The whole point of the topic design is that the topic is the address.
+    /// The callback handler passed `None` for the thread all the way into
+    /// `handle_switch`, so a tap bound the entire chat and every topic in the
+    /// forum resolved to whichever session was assigned last — the `/switch`
+    /// mode the design exists to remove, wearing a button.
+    #[test]
+    fn a_callback_query_carries_the_topic_it_was_tapped_in() {
+        let update: Update = serde_json::from_str(
+            r#"{
+              "update_id": 42,
+              "callback_query": {
+                "id": "cb-1",
+                "chat_instance": "ci-1",
+                "from": {"id": 8791871989},
+                "message": {
+                  "message_id": 7,
+                  "chat": {"id": -1001234567890, "type": "supergroup"},
+                  "message_thread_id": 314
+                },
+                "data": "startswitch:mira"
+              }
+            }"#,
+        )
+        .expect("a forum callback must parse");
+        let cb = update.callback_query.expect("callback_query");
+        let msg = cb.message.expect("message");
+        assert_eq!(
+            msg.message_thread_id,
+            Some(314),
+            "the topic must survive deserialisation or the button cannot address one"
+        );
+    }
+
+    /// A DM keyboard has no topic, and must keep working exactly as before.
+    #[test]
+    fn a_dm_callback_has_no_topic_and_that_is_not_an_error() {
+        let update: Update = serde_json::from_str(
+            r#"{
+              "update_id": 43,
+              "callback_query": {
+                "id": "cb-2",
+                "chat_instance": "ci-2",
+                "from": {"id": 8791871989},
+                "message": {"message_id": 7, "chat": {"id": 434566766}},
+                "data": "start:switch"
+              }
+            }"#,
+        )
+        .expect("a DM callback must still parse");
+        let msg = update.callback_query.expect("cb").message.expect("message");
+        assert_eq!(msg.message_thread_id, None);
+    }
 
     /// A note is durable before the offset moves past it, so the crash that
     /// used to eat a voice message now costs a repeat transcription.

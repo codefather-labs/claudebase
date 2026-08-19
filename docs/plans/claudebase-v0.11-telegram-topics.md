@@ -74,7 +74,14 @@ deletes a slice or defines it.
    promoted to administrator — this question is now "was the setup done right",
    not "is the design possible".)
 2. Does `/start` in a topic reply *into* that topic, or into the group's General?
-3. Does tapping a session in that keyboard bind `(chat_id, topic_id)`?
+3. Does tapping a session in that keyboard bind `(chat_id, topic_id)`? —
+   **ANSWERED BY READING, AND IT DID NOT.** The callback handler passed `None`
+   for the thread into `handle_switch`, so a tap bound the whole chat and every
+   topic in the forum resolved to whichever session was assigned last: the
+   `/switch` mode this design exists to remove, wearing a button. `MessageRef`
+   did not even carry `message_thread_id`, so the information was not available
+   to pass. Fixed 2026-08-19; the remaining question is whether it behaves in a
+   real forum.
 4. Does a message typed in the topic reach the bound session?
 5. Does that session's reply come back into the same topic?
 6. Does a voice note in a topic transcribe and arrive?
@@ -114,8 +121,11 @@ from a code in the channel adds nothing but a leak.
 Found by reading rather than by driving the forum, which is why it belongs here
 before Slice 0 rather than in its answers.
 
-**Slice 2 — close whatever Slice 0 found.** Most likely: threading the topic id
-through the one or two reply paths that still drop it.
+**Slice 2 — close whatever Slice 0 found.** Partly done before Slice 0 ran,
+because reading found it: the assignment button, its keyboard, the `/agents`
+reply and the switch confirmation all passed `None` for the topic and therefore
+addressed the chat. All four now carry the topic the tap happened in. What
+remains for this slice is whatever driving a real forum turns up.
 
 **Slice 3 — assignment as a first-class action.** `/start` works but reads as
 onboarding. A `/assign` (same keyboard, clearer name), plus `/whoami` in a topic

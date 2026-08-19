@@ -46,18 +46,19 @@ the number of sessions except the topics themselves, which is the point.
 
 ## What already exists
 
-Verified in the tree on 2026-08-18, not assumed:
+Verified in the tree, and re-verified on 2026-08-19 after a day of unrelated edits
+(every line reference below moved; every claim held):
 
 | Piece | Where |
 |---|---|
-| Bindings keyed by `(chat_id, thread_id)` — per topic, not per chat | `src/daemon/chat.rs:633` |
+| Bindings keyed by `(chat_id, thread_id)` — per topic, not per chat | `src/daemon/chat.rs:662` |
 | `handle_switch(tx, chat_id, thread_id, …)` already takes the topic | `src/daemon/telegram.rs:506` |
-| `/start` → `[agents, switch]` keyboard → one button per live session → `startswitch:<name>` → binds | `src/daemon/telegram.rs:426`, `:906` |
-| `message_thread_id` parsed off the inbound message and carried into notification meta | `src/daemon/telegram.rs:315`, `:1319` |
-| Outbound and bot replies carry `Option<i64> thread_id` | `BatchOutcome::pair_replies`, `src/daemon/telegram.rs:676` |
-| `agent_registry.routing_thread_id` — the reverse lookup, session → topic | `src/daemon/agent_registry.rs:1207` |
-| A supergroup forum-topic update shape already under test | `src/daemon/telegram.rs:2713` |
-| `Chat` carries only `id` — the daemon never asks whether a chat is a DM | `src/daemon/telegram.rs:333` |
+| `/start` → `[agents, switch]` keyboard → one button per live session → `startswitch:<name>` → binds | `src/daemon/telegram.rs:906` |
+| `message_thread_id` parsed off the inbound message and carried into notification meta | `src/daemon/telegram.rs:322` |
+| Outbound and bot replies carry `Option<i64> thread_id` | `BatchOutcome::pair_replies`, `BatchOutcome::pair_replies` |
+| `agent_registry.routing_thread_id` — the reverse lookup, session → topic | `src/daemon/agent_registry.rs:1357` |
+| A supergroup forum-topic update shape already under test | `src/daemon/telegram.rs:2865` |
+| `Chat` carries only `id` — the daemon never asks whether a chat is a DM | `src/daemon/telegram.rs:334` |
 
 The button flow the design calls for is the flow `/start` already implements.
 The addressing the design calls for is the addressing `chat_bindings` already
@@ -69,7 +70,9 @@ Before writing code: create the forum, add the bot, and drive it by hand.
 Everything below is a question with a yes/no answer, and each answer either
 deletes a slice or defines it.
 
-1. Does the bot see ordinary messages in a topic at all? (See Risk R-1.)
+1. Does the bot see ordinary messages in a topic at all? (R-1 says yes IF it was
+   promoted to administrator — this question is now "was the setup done right",
+   not "is the design possible".)
 2. Does `/start` in a topic reply *into* that topic, or into the group's General?
 3. Does tapping a session in that keyboard bind `(chat_id, topic_id)`?
 4. Does a message typed in the topic reach the bound session?
@@ -82,12 +85,34 @@ Record the answers in this file before starting Slice 1.
 
 ## Slices
 
-**Slice 1 — the gate for groups.** Access today is per-sender DM pairing. In a
-forum the meaningful gate is different: the group is the trust boundary, and
-whoever the operator admitted to it can talk to sessions. Decide and implement
-explicitly — an allowlisted `chat_id` plus the existing per-user checks is the
-likely shape. Do not let a group silently inherit DM semantics; that is how an
-unpaired member ends up addressing a session.
+**Slice 1 — the gate for groups. This is a blocker, not a preference.**
+
+`gate_dm` (`src/daemon/channel_state.rs:291`) decides on the SENDER alone and
+never asks what kind of chat the message came from. Read against a forum, that
+gives:
+
+- the operator, already allowlisted, passes — messages in a topic reach their
+  session, which is what the design needs;
+- **any other group member is an unknown sender, so pairing fires, and the
+  pairing code is replied into the chat the message came from — the topic.**
+
+In a DM that reply is private by construction; the sender is the only other
+party. In a group it publishes the credential into a space every member reads,
+so anyone the operator admitted can pair themselves by reading what the bot just
+posted. The gate does not fail closed here; it fails loudly and publicly.
+
+For a supergroup with one member this is moot. It stops being moot the first
+time anyone else is added, and nothing in the current code marks that moment —
+which is exactly why this cannot be left to be discovered.
+
+Minimum for the slice: the group must be gated by CHAT, not by sender-pairing.
+An allowlisted `chat_id` (the forum) plus the existing per-user allowlist is the
+likely shape, with pairing suppressed entirely outside DMs — a group is joined
+by invitation, and the invitation IS the pairing decision, so re-deriving it
+from a code in the channel adds nothing but a leak.
+
+Found by reading rather than by driving the forum, which is why it belongs here
+before Slice 0 rather than in its answers.
 
 **Slice 2 — close whatever Slice 0 found.** Most likely: threading the topic id
 through the one or two reply paths that still drop it.
@@ -107,13 +132,31 @@ installer's onboarding and in a skill, or every new machine rediscovers it.
 
 ## Risks
 
-**R-1 (high, unverified): bot privacy mode.** A bot in a group may by default
-receive only commands and replies addressed to it, not ordinary messages — in
-which case the operator must disable privacy mode in BotFather before any of
-this works, and the failure mode is silence, not an error. This is an external
-contract and has NOT been verified against the Bot API docs in this session.
-Verify it first: it decides whether the whole design is one BotFather toggle
-away or blocked.
+**R-1 (RESOLVED 2026-08-19): bot privacy mode.** It was real, and it is one
+setting away.
+
+Privacy mode is **enabled by default**, and a bot in that state receives only
+commands addressed to it, replies to its own messages, and service messages —
+not ordinary typed text and not voice notes. Without changing it, every topic
+would look connected and deliver nothing, and the failure would present as
+silence rather than as an error.
+
+Two ways out, and they are not equivalent:
+
+- `/setprivacy` in BotFather turns it off **for the bot**, in every group it will
+  ever join.
+- **Adding the bot as an administrator of the forum** exempts it: "bots that
+  were added to a group as admins" always receive all messages.
+
+Take the second. It is scoped to the one supergroup instead of to the bot's
+whole future, and admin rights are needed anyway the moment the daemon wants to
+create or manage topics itself. Source:
+https://core.telegram.org/bots/features (read 2026-08-19).
+
+The setup step is therefore: create the forum supergroup, add the bot, and
+promote it to administrator. Slice 5 has to say exactly that, because a bot
+added without admin rights produces a working-looking setup that silently
+delivers nothing.
 
 **R-2 (medium): one poll loop, many topics.** All topics share the single
 long-poll. That is the design's main advantage over the pool, and it means
@@ -140,7 +183,7 @@ plain group or a DM. The fallback for a machine without a forum is today's
 - The operator sent a message to the wrong session twice on 2026-08-18 under the `/switch` model — source: this session's transcript — salience: medium
 
 ### External contracts
-- Telegram Bot API — group privacy mode (whether a bot sees non-command messages in a group by default) — source: none opened this session — verified: no — assumption — salience: high
+- Telegram Bot API — privacy mode is ON by default; a privacy-enabled bot sees only commands addressed to it, replies and service messages; bots added as group ADMINS always receive all messages — source: https://core.telegram.org/bots/features (read 2026-08-19) — verified: yes — salience: high
 - Telegram Bot API — `message_thread_id` identifies a forum topic on both inbound and outbound — source: `src/daemon/telegram.rs:315` (in-tree usage, live-tested for inbound) — verified: partial — salience: high
 
 ### Assumptions
@@ -148,7 +191,7 @@ plain group or a DM. The fallback for a machine without a forum is today's
 - A session's outbound reply resolves its topic from `routing_thread_id` — risk: replies land in General and every topic sees every session — how to verify: Slice 0 question 5 — salience: high
 
 ### Open questions
-- What is the access rule for the group — allowlisted chat_id, per-user pairing, or both? — needs: user decision — salience: high
+- Confirmed as a defect rather than a question: DM pairing applied to a group publishes the pairing code into the group (see Slice 1). What remains for the user is the policy shape, not whether to change it — salience: high
 - Should `/switch` remain for DM use, or be removed once topics work? — needs: user decision — salience: low
 
 ## Decisions

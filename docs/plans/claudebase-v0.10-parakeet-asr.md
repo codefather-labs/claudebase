@@ -64,12 +64,42 @@ ending, and on where the sentence breaks. Neither reading is demonstrably wrong
 without asking the speaker. On the non-speech tone Parakeet returning nothing is
 the more honest answer than whisper's `(electronic music)`.
 
-**The speed question is answered. The accuracy question is not.** One 7-second
-sample is a data point, not an evaluation, and the failures that matter are
-exactly the ones a single ordinary sentence cannot show: filenames, flags and
-identifiers, which the channel contract already tells agents to confirm rather
-than act on. Whisper therefore stays the default until several notes carrying
-technical strings have been through both.
+A 92.7-second Russian note dense with technical terms, load ~3.3:
+
+| | cold | warm | vs realtime |
+|---|---|---|---|
+| whisper-medium | 128.3 s | 126.5 s | 1.36x SLOWER than the audio |
+| parakeet-tdt-v3 | 16.0 s | **10.2 s** | 9x faster than the audio |
+
+12x here rather than 70x, and the difference is structural: whisper always
+processes 30-second windows, so a 7-second note costs a full window and a
+92-second one costs four. The speedup is therefore largest on short notes, which
+is what a dictated message usually is.
+
+**On the technical strings — the ones that actually decide this — Parakeet is
+not more accurate. It is differently wrong.**
+
+| spoken | whisper | parakeet |
+|---|---|---|
+| harness | `harness` | `Харнес` |
+| Claude Code | `клад кода` | `клоткода` |
+| claudebase | `клад бейс` | `Cloud Base` |
+| колбеки | `колбеки` | `callback` |
+| loop engineering | `луп инжиниринг` | `loop engineering` |
+| nvidia parakeet | `nvidia para kit` | `Nvidia Parkit` |
+| **whisper ai medium** | `whisper ai medium` | **`whisper`** |
+
+Neither model got a single product name right. Parakeet punctuates, capitalises
+and splits sentences, where whisper returns one unbroken lowercase run — a large
+readability win. But Parakeet DROPPED "ai medium" from the model name, and a
+dropped phrase is worse than a mangled one precisely because it leaves no trace:
+a wrong word is visible, an absent one is not.
+
+**The speed question is answered. The accuracy question is answered differently
+than expected: neither backend can be trusted on exact strings, which is already
+what the channel contract tells agents.** The remaining
+argument against Parakeet is the dropped phrase, and two samples cannot say
+whether that is characteristic or a one-off.
 
 A second thing blocks the default independently: the released binary does not
 carry `asr-sherpa`, because shared linking means shipping ~31 MB of `.so`

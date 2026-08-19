@@ -602,6 +602,9 @@ COMMIT;
     // pty-transport Slice 14 — remember the nick a session was DELIBERATELY
     // given, so the next session in the same directory starts under it again.
     apply_nick_memory_migration(conn)?;
+    // v0.11 — which forum topic an inbound message came from, so ownership can
+    // be decided per message instead of per chat.
+    apply_message_thread_migration(conn)?;
     // v0.11 — the Claude conversation a session belongs to, and the nick that
     // conversation answers to.
     apply_conversation_nick_migration(conn)?;
@@ -807,6 +810,31 @@ fn widen_nick_memory_to_terminals(conn: &Connection) -> rusqlite::Result<()> {
 /// things to confirm rather than act on, because speech recognition gets
 /// precisely those wrong. An unmarked transcript is a transcript the agent
 /// trusts as if the operator had typed it.
+/// `chat_messages.message_thread_id` — the forum topic an inbound message
+/// arrived in.
+///
+/// Without it, "who owns this conversation" can only be asked about a whole
+/// chat, and in a forum that question has no single answer: topic 3 belongs to
+/// one session and topic 4 to another. The backlog check asked it anyway, took
+/// the most recently pinged session as the owner of the entire chat, and threw
+/// away the other session's messages with "chat is bound to another session".
+///
+/// The topic was present on the wire and dropped at the row — the same shape as
+/// the three other places it was dropped on the way to a session.
+fn apply_message_thread_migration(conn: &Connection) -> rusqlite::Result<()> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('chat_messages') WHERE name = 'message_thread_id')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        conn.execute_batch(
+            "ALTER TABLE chat_messages ADD COLUMN message_thread_id INTEGER DEFAULT NULL",
+        )?;
+    }
+    Ok(())
+}
+
 /// `conversation_nick` — the nick a Claude conversation answers to.
 ///
 /// The conversation id is the durable identity here, and measurably so: on this
@@ -1206,6 +1234,8 @@ pub struct ChatMessage {
     pub created_at: i64,
     /// True when the content is a speech transcript rather than typed text.
     pub is_voice: bool,
+    /// The forum topic this message arrived in, when it did.
+    pub message_thread_id: Option<i64>,
 }
 
 impl ChatMessage {
@@ -1222,8 +1252,18 @@ impl ChatMessage {
         // byte-for-byte what every existing consumer already parses. The key
         // is `meta.voice` because that is where the live notification puts it
         // and where the classifier looks — one name, one meaning, both paths.
-        if self.is_voice {
-            v["meta"] = json!({ "voice": true });
+        if self.is_voice || self.message_thread_id.is_some() {
+            let mut meta = json!({});
+            if self.is_voice {
+                meta["voice"] = json!(true);
+            }
+            // The topic travels with the backlog frame so the receiving session
+            // can decide ownership per message. A frame without it is a DM or a
+            // topic-less group, and reads exactly as it always did.
+            if let Some(t) = self.message_thread_id {
+                meta["thread_id"] = json!(t);
+            }
+            v["meta"] = meta;
         }
         v
     }
@@ -1262,6 +1302,7 @@ pub fn insert_message(
         reply_to: reply_to.map(|s| s.to_string()),
         created_at: now,
         is_voice: false,
+        message_thread_id: None,
     })
 }
 
@@ -1305,7 +1346,7 @@ pub fn drain_backlog(conn: &mut Connection, thread_id: &str) -> rusqlite::Result
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let messages: Vec<ChatMessage> = {
         let mut stmt = tx.prepare(
-            "SELECT id, thread_id, from_agent, content, reply_to, created_at, is_voice, is_voice
+            "SELECT id, thread_id, from_agent, content, reply_to, created_at, is_voice, message_thread_id, is_voice
              FROM chat_messages
              WHERE thread_id = ?1 AND delivered_at IS NULL
              ORDER BY created_at ASC, id ASC",
@@ -1319,6 +1360,7 @@ pub fn drain_backlog(conn: &mut Connection, thread_id: &str) -> rusqlite::Result
                 reply_to: row.get(4)?,
                 created_at: row.get(5)?,
                 is_voice: row.get::<_, i64>(6).unwrap_or(0) != 0,
+                message_thread_id: row.get::<_, Option<i64>>(7).unwrap_or(None),
             })
         })?;
         let mut out = Vec::new();
@@ -1349,7 +1391,7 @@ pub fn list_messages(
     limit: Option<i64>,
 ) -> rusqlite::Result<Vec<ChatMessage>> {
     let mut sql = String::from(
-        "SELECT id, thread_id, from_agent, content, reply_to, created_at, is_voice
+        "SELECT id, thread_id, from_agent, content, reply_to, created_at, is_voice, message_thread_id
          FROM chat_messages WHERE thread_id = ?1",
     );
     if since.is_some() {
@@ -1377,6 +1419,7 @@ pub fn list_messages(
             reply_to: row.get(4)?,
             created_at: row.get(5)?,
             is_voice: row.get::<_, i64>(6).unwrap_or(0) != 0,
+            message_thread_id: row.get::<_, Option<i64>>(7).unwrap_or(None),
         })
     };
     let rows = match (since, limit) {
@@ -1533,6 +1576,7 @@ mod tests {
             reply_to: None,
             created_at: 1,
             is_voice: true,
+            message_thread_id: None,
         };
         let v = dictated.to_json();
         assert_eq!(v["meta"]["voice"], serde_json::json!(true));

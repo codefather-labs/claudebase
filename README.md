@@ -381,6 +381,43 @@ the agent knows it before the first message arrives.
 
 **Group chats:** all members share one binding; `/switch` in a group rebinds it for everyone.
 
+### Forum topics — one topic per session
+
+In a supergroup with topics enabled, **a topic is a session's address**. Bind one, and everything
+typed there goes to that session and everything it answers comes back into that topic. No `/switch`
+mode to hold in your head: the topic you are typing in *is* the address.
+
+Setup, once:
+
+1. Create a supergroup with topics enabled and add the bot.
+2. **Promote the bot to administrator.** This is not optional and its absence is silent: Telegram's
+   privacy mode is on by default, and a non-admin bot receives only commands addressed to it with
+   `@botname`, plus replies. Ordinary text and voice notes never arrive, and the group looks
+   connected while delivering nothing. Admins receive everything.
+   ([Bot API](https://core.telegram.org/bots/features))
+3. In each topic: `/start` → tap `switch` → tap the session. The keyboard is sent into the topic it
+   was invoked from, and the tap binds that topic.
+
+The binding is durable and per-topic. Binding another topic to another session does not disturb it:
+the clearing SQL matches chat AND topic, and `chat_bindings` is keyed by `(chat_id, thread_id)`. A
+session that restarts re-acquires its topic by nick, so a rebind is not needed after every restart.
+
+Delivery is decided per MESSAGE, not per chat. That distinction is load-bearing: one chat carries
+several topics owned by different sessions, so "who owns this conversation" has no single answer in a
+forum, and answering it chat-wide hands every topic to whichever session pinged most recently — which
+is exactly how a second session's messages were silently discarded before v0.10.0.
+
+**One session holds one topic.** The live routing key is a single `(routing_chat_id,
+routing_thread_id)` pair on the session's row, so binding a session to a second topic MOVES it —
+the first topic keeps a durable binding row with no live addressee. Many topics to many sessions is
+the supported shape; one session spread across topics is not.
+
+> **Do not add anyone else to that group yet.** The access gate decides on the SENDER and does not
+> ask what kind of chat a message came from, so an unrecognised member triggers pairing — and the
+> pairing code is replied into the chat it came from, which in a group means published to everyone
+> reading the topic. In a DM that reply is private by construction. Fixing this is the first slice of
+> `docs/plans/claudebase-v0.11-telegram-topics.md`; until then a topics group is for one person.
+
 ### `chat_ask` — multiple-choice questions as Telegram buttons
 
 Agents can surface a multiple-choice question as native inline keyboard buttons. The daemon sends one

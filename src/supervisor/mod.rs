@@ -528,6 +528,46 @@ fn bound_telegram_threads(conn: &rusqlite::Connection, agent_id: &str) -> Vec<St
 /// unsubscribe: after the operator `/switch`-es a chat away, the previous
 /// session keeps its subscription until it reconnects. Without this check it
 /// would go on injecting messages that now belong to someone else.
+/// Does this session own `(chat_id, topic)`?
+///
+/// The chat-wide question `thread_belongs_to` asks has no single answer in a
+/// forum: topic 3 belongs to one session and topic 4 to another, and picking
+/// "the most recently pinged session in this chat" hands the whole chat to one
+/// of them. That is what silently discarded a second session's entire backlog
+/// with "chat is bound to another session".
+pub(crate) fn routing_belongs_to(agent_id: &str, chat_id: i64, topic: Option<i64>) -> bool {
+    let conn = match crate::daemon::chat::open_chat_db_readonly() {
+        Ok(c) => c,
+        Err(e) => {
+            // Fail closed, for the reason spelled out in `thread_belongs_to`:
+            // a withheld message comes back from the backlog, a misdelivered
+            // one cannot be taken back.
+            tracing::warn!(error = %e, chat_id, ?topic, "cannot determine topic ownership; withholding");
+            return false;
+        }
+    };
+    use rusqlite::OptionalExtension;
+    let bound: Option<String> = conn
+        .query_row(
+            "SELECT agent_id FROM agent_registry \
+             WHERE routing_chat_id = ?1 \
+               AND COALESCE(routing_thread_id, -1) = COALESCE(?2, -1) \
+               AND state = 'alive' \
+             ORDER BY last_pinged_at DESC LIMIT 1",
+            rusqlite::params![chat_id, topic],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap_or(None);
+    match bound {
+        Some(owner) => owner == agent_id,
+        // Nobody holds this exact topic. Withhold rather than broadcast: an
+        // unbound topic is one the operator has not assigned yet, and guessing
+        // is what the whole addressed-delivery rule exists to stop.
+        None => false,
+    }
+}
+
 pub(crate) fn thread_belongs_to(agent_id: &str, thread: &str) -> bool {
     let Some(chat) = thread.strip_prefix("telegram:") else {
         // `agent:<self>` and explicit `--subscribe` threads are ours by
@@ -557,10 +597,15 @@ pub(crate) fn thread_belongs_to(agent_id: &str, thread: &str) -> bool {
     use rusqlite::OptionalExtension;
     let bound: Option<String> = match conn
         .query_row(
+            // Any topic in this chat counts. The per-MESSAGE check decides
+            // which topic is actually ours; this one only answers "is this
+            // chat any of our business at all", and answering it with a single
+            // chat-wide owner is what discarded a second session's backlog.
             "SELECT agent_id FROM agent_registry \
              WHERE routing_chat_id = ?1 AND state = 'alive' \
-             ORDER BY last_pinged_at DESC LIMIT 1",
-            [chat_id],
+               AND agent_id = ?2 \
+             LIMIT 1",
+            rusqlite::params![chat_id, agent_id],
             |row| row.get(0),
         )
         .optional()
@@ -845,5 +890,64 @@ mod ownership_tests {
     fn non_telegram_threads_are_always_ours() {
         assert!(thread_belongs_to("me", "agent:me"));
         assert!(thread_belongs_to("me", "some-explicit-subscription"));
+    }
+}
+
+#[cfg(test)]
+mod topic_ownership_tests {
+    /// Two topics in one chat, owned by two sessions, and each must see only
+    /// its own.
+    ///
+    /// The chat-wide ownership query took "the most recently pinged session
+    /// bound to this chat" as the owner of the whole chat, so a forum with two
+    /// bound topics handed everything to one session and the other's entire
+    /// backlog was discarded with "chat is bound to another session". Confirmed
+    /// live: the operator switched a second topic to a second session, sent a
+    /// message, and that session reported receiving nothing at all.
+    #[test]
+    fn each_topic_belongs_to_its_own_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", dir.path());
+        std::env::set_var("CLAUDEBASE_HOME_OVERRIDE", dir.path());
+
+        let result = (|| -> anyhow::Result<()> {
+            let conn = crate::daemon::chat::open_chat_db()?;
+            for (id, name, topic) in [("a-1", "transport", 3i64), ("a-2", "cutover", 4)] {
+                conn.execute(
+                    "INSERT INTO agent_registry \
+                     (agent_id, agent_name, connection_id, chat_thread_id, spawned_at, \
+                      last_pinged_at, state, routing_chat_id, routing_thread_id) \
+                     VALUES (?1, ?2, ?1, NULL, 1, 1, 'alive', -1004451125152, ?3)",
+                    rusqlite::params![id, name, topic],
+                )?;
+            }
+            Ok(())
+        })();
+
+        let verdicts = if result.is_ok() {
+            Some((
+                super::routing_belongs_to("a-1", -1004451125152, Some(3)),
+                super::routing_belongs_to("a-1", -1004451125152, Some(4)),
+                super::routing_belongs_to("a-2", -1004451125152, Some(4)),
+                super::routing_belongs_to("a-2", -1004451125152, Some(3)),
+                super::routing_belongs_to("a-1", -1004451125152, Some(9)),
+            ))
+        } else {
+            None
+        };
+
+        std::env::remove_var("CLAUDEBASE_HOME_OVERRIDE");
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        let (own3, other4, own4, other3, unbound) = verdicts.expect("fixture db");
+        assert!(own3, "the session bound to topic 3 must own topic 3");
+        assert!(own4, "the session bound to topic 4 must own topic 4");
+        assert!(!other4, "topic 4 is not transport's, whoever pinged last");
+        assert!(!other3, "topic 3 is not cutover's");
+        assert!(!unbound, "an unassigned topic belongs to nobody, so withhold");
     }
 }

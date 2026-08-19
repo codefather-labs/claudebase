@@ -213,10 +213,32 @@ impl SubscribeClient {
             }
         };
 
+        // In a forum, one chat carries several topics owned by different
+        // sessions, so ownership is decided per MESSAGE. The chat-wide check
+        // above only answers "is this chat any of our business".
+        let chat_id: Option<i64> = thread
+            .strip_prefix("telegram:")
+            .and_then(|c| c.parse::<i64>().ok());
+
         let mut delivered = 0usize;
+        let mut not_ours = 0usize;
         for msg in messages {
+            if let (Some(chat_id), Some(topic)) = (chat_id, msg.topic) {
+                if !crate::supervisor::routing_belongs_to(self_agent_id, chat_id, Some(topic)) {
+                    not_ours += 1;
+                    continue;
+                }
+            }
             let (message_id, content) = (msg.id, msg.content);
-            let body = render(source.clone(), &content);
+            // A dictated note keeps its prefix here too. The backlog rebuilt
+            // the frame from the stored row and used to lose that, delivering a
+            // transcript indistinguishable from typed text.
+            let source = if msg.is_voice {
+                Source::TelegramVoice
+            } else {
+                source.clone()
+            };
+            let body = render(source, &content);
             if tx
                 .send(InboundMessage { message_id, body })
                 .is_err()
@@ -225,8 +247,8 @@ impl SubscribeClient {
             }
             delivered += 1;
         }
-        if delivered > 0 {
-            tracing::info!(%thread, delivered, "delivered backlog from subscribe");
+        if delivered > 0 || not_ours > 0 {
+            tracing::info!(%thread, delivered, not_ours, "delivered backlog from subscribe");
         }
     }
 
@@ -596,6 +618,13 @@ fn backlog_messages(response: &Value) -> Vec<BacklogMessage> {
                     .to_string(),
                 content: content.to_string(),
                 created_at: m.get("created_at").and_then(|t| t.as_i64()).unwrap_or(0),
+                // Carried so ownership can be decided per message. A DM frame
+                // has none and behaves exactly as before.
+                topic: m.pointer("/meta/thread_id").and_then(|t| t.as_i64()),
+                is_voice: m
+                    .pointer("/meta/voice")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
             })
         })
         .collect()
@@ -608,6 +637,10 @@ pub struct BacklogMessage {
     pub content: String,
     /// UNIX millis. `0` when the daemon did not report one — treated as old.
     pub created_at: i64,
+    /// The forum topic it arrived in, when it did. `None` for a DM.
+    pub topic: Option<i64>,
+    /// True when the content is a transcript rather than typed text.
+    pub is_voice: bool,
 }
 
 /// Backlog older than this is history, not a pending conversation. Replaying it
@@ -734,6 +767,8 @@ mod backlog_bounds_tests {
             id: id.to_string(),
             content: format!("body-{id}"),
             created_at: now - age_ms,
+            topic: None,
+            is_voice: false,
         }
     }
 
@@ -763,7 +798,7 @@ mod backlog_bounds_tests {
     fn messages_without_a_timestamp_are_treated_as_history() {
         let now = 1_000_000_000;
         let (kept, suppressed) = bound_backlog(
-            vec![BacklogMessage { id: "x".into(), content: "c".into(), created_at: 0 }],
+            vec![BacklogMessage { id: "x".into(), content: "c".into(), created_at: 0, topic: None, is_voice: false }],
             now,
         );
         assert!(kept.is_empty(), "unknown age must not be replayed");
@@ -875,6 +910,7 @@ mod classify_tests {
             reply_to: None,
             created_at: 0,
             is_voice: false,
+            message_thread_id: None,
         };
         let frame = crate::daemon::chat::build_channel_notification(&msg);
         let meta = meta_of(&frame);

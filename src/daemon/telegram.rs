@@ -1187,8 +1187,8 @@ pub fn process_batch_with_pairing(
         // distinction can survive to a backlog delivery.
         tx.execute(
             "INSERT INTO chat_messages \
-             (id, thread_id, from_agent, content, reply_to, created_at, is_voice) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (id, thread_id, from_agent, content, reply_to, created_at, is_voice, message_thread_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 id,
                 thread_id,
@@ -1196,7 +1196,8 @@ pub fn process_batch_with_pairing(
                 content,
                 Option::<String>::None,
                 row_now,
-                msg.voice.is_some() as i64
+                msg.voice.is_some() as i64,
+                msg.message_thread_id
             ],
         )?;
         inserted += 1;
@@ -2851,6 +2852,7 @@ mod tests {
             reply_to: None,
             created_at: 100,
             is_voice: false,
+            message_thread_id: None,
         };
         let frame = chat::build_channel_notification_routed(&msg, None);
         // params.content is the inbound text (voice-control wire shape).
@@ -2888,6 +2890,7 @@ mod tests {
             reply_to: None,
             created_at: 100,
             is_voice: false,
+            message_thread_id: None,
         };
         let frame = chat::build_channel_notification_routed(&msg, Some("uuid-abc"));
         let target = frame

@@ -61,6 +61,13 @@ For Telegram no destination argument is needed: it resolves from this session
 binding, then from the only known chat. If it is ambiguous the command refuses
 and lists the candidates -- pick one with --thread, never guess.
 
+The operator may address you from a Telegram FORUM TOPIC rather than a DM. A
+topic is bound to one session, and that binding is durable: messages typed there
+reach you, and your `claudebase telegram send` goes back into that same topic
+without you naming it. `claudebase telegram status` prints which chat and topic
+you would answer in -- worth checking before assuming a reply landed where the
+operator was looking.
+
 This session has a NICK, which is how `/switch` from Telegram and
 `--agent_nick` address it. Change it with:
 

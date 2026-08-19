@@ -403,8 +403,25 @@ impl SubscribeClient {
             // Same binding check as the backlog path: a subscription outlives
             // a `/switch` (there is no unsubscribe), so ownership is re-checked
             // per message rather than once at subscribe time.
-            if !crate::supervisor::thread_belongs_to(self_agent_id, &thread) {
-                tracing::debug!(thread = %thread, "message belongs to another session; skipping");
+            //
+            // In a forum the question has to name the TOPIC. Asking it about
+            // the chat elects a single owner for every topic in it — decided,
+            // of all things, by which session pinged the daemon most recently —
+            // and the loser silently drops messages addressed to it. Measured:
+            // two sessions 18 milliseconds apart, and the whole forum went to
+            // one of them.
+            let topic = meta.get("thread_id").and_then(|t| t.as_i64());
+            let chat = thread
+                .strip_prefix("telegram:")
+                .and_then(|c| c.parse::<i64>().ok());
+            let ours = match (chat, topic) {
+                (Some(chat), Some(topic)) => {
+                    crate::supervisor::routing_belongs_to(self_agent_id, chat, Some(topic))
+                }
+                _ => crate::supervisor::thread_belongs_to(self_agent_id, &thread),
+            };
+            if !ours {
+                tracing::debug!(thread = %thread, ?topic, "message belongs to another session; skipping");
                 continue;
             }
 

@@ -61,6 +61,71 @@ use std::process::Command;
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 
+/// Is a daemon still running, and under which pid?
+///
+/// The PID file is the authority, not the service manager: `daemon serve` takes
+/// an flock on it whichever way it was started, so this answers "is one alive"
+/// even for a daemon nobody's systemd knows about.
+fn running_daemon_pid() -> Option<i32> {
+    let path = crate::daemon::server::pid_file_path().ok()?;
+    let pid: i32 = fs::read_to_string(&path).ok()?.trim().parse().ok()?;
+    if pid <= 1 {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        // Signal 0 asks "could I signal this", which is the cheapest liveness
+        // probe there is and needs no /proc.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return Some(pid);
+        }
+        None
+    }
+    #[cfg(not(unix))]
+    {
+        Some(pid)
+    }
+}
+
+/// Stop a daemon the service manager does not own.
+///
+/// `stop()` used to be `systemctl --user stop` with its exit status discarded —
+/// `let _ = s; Ok(())`. A daemon started any other way (a test, a debugging
+/// session, a machine with no user systemd) was therefore never stopped, and
+/// the command reported success anyway. Reporting success for work that did not
+/// happen is worse than failing: the next `start` then fails on the flock the
+/// survivor still holds, and nothing connects the two events.
+///
+/// SIGTERM, then SIGKILL if it will not go. By PID from the daemon's own file —
+/// never by matching process names, which on this machine would match the
+/// operator's editor, this session's own shell, and every test daemon.
+#[cfg(unix)]
+fn terminate_by_pidfile(timeout: std::time::Duration) -> Result<bool> {
+    let Some(pid) = running_daemon_pid() else {
+        return Ok(false);
+    };
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return Ok(true);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        bail!("daemon pid {pid} survived SIGTERM and SIGKILL");
+    }
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+fn terminate_by_pidfile(_timeout: std::time::Duration) -> Result<bool> {
+    Ok(false)
+}
+
+
 // ---------------------------------------------------------------------------
 // Public argument structs (mirrored from `cli::Daemon*Args`)
 // ---------------------------------------------------------------------------
@@ -728,14 +793,25 @@ mod platform {
     }
 
     pub fn stop() -> Result<()> {
-        let s = Command::new("systemctl")
+        // Ask the service manager first: when it owns the daemon, letting it
+        // stop its own unit keeps restart policies and journal state coherent.
+        let _ = Command::new("systemctl")
             .arg("--user")
             .arg("stop")
             .arg("claudebase")
-            .status()
-            .context("invoke systemctl --user stop")?;
-        let _ = s;
-        Ok(())
+            .status();
+
+        // Then check whether that actually did anything. It does not when the
+        // daemon was started outside systemd, and the old code discarded the
+        // exit status and returned Ok regardless — so `daemon stop` reported
+        // success while the daemon kept serving.
+        match super::terminate_by_pidfile(std::time::Duration::from_secs(10))? {
+            true => {
+                eprintln!("stopped a daemon systemd did not own (by pid file)");
+                Ok(())
+            }
+            false => Ok(()),
+        }
     }
 
     pub fn restart() -> Result<()> {
@@ -913,6 +989,11 @@ mod platform {
     pub fn stop() -> Result<()> {
         let path = launchd_plist_path()?;
         let _ = Command::new("launchctl").arg("unload").arg(&path).status();
+        // Same reasoning as the Linux branch: launchctl only knows about a
+        // daemon it loaded, and a survivor holds the flock the next start needs.
+        if super::terminate_by_pidfile(std::time::Duration::from_secs(10))? {
+            eprintln!("stopped a daemon launchd did not own (by pid file)");
+        }
         Ok(())
     }
 
@@ -1367,6 +1448,52 @@ fn confirm_destructive(keep_data: bool) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+
+    /// `stop` must stop a daemon the service manager never started.
+    ///
+    /// It used to run `systemctl --user stop` and discard the exit status, so a
+    /// daemon started any other way survived while the command reported
+    /// success — and the NEXT start then failed on the flock the survivor still
+    /// held, with nothing connecting the two events.
+    #[cfg(unix)]
+    #[test]
+    fn terminate_by_pidfile_reports_when_there_is_nothing_to_stop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // An isolated runtime dir means the pid file this reads is ours, not
+        // the developer's actually-running daemon.
+        let prev = std::env::var_os("XDG_RUNTIME_DIR");
+        std::env::set_var("XDG_RUNTIME_DIR", dir.path());
+
+        let stopped = terminate_by_pidfile(std::time::Duration::from_millis(200));
+
+        match prev {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+        assert!(matches!(stopped, Ok(false)), "no pid file means nothing to stop: {stopped:?}");
+    }
+
+    /// A pid file naming a process that is gone must not be treated as alive,
+    /// or `stop` would report having stopped something it did not.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_pid_file_is_not_a_running_daemon() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prev = std::env::var_os("XDG_RUNTIME_DIR");
+        std::env::set_var("XDG_RUNTIME_DIR", dir.path());
+
+        let pid_path = crate::daemon::server::pid_file_path().expect("pid path");
+        std::fs::create_dir_all(pid_path.parent().unwrap()).expect("mkdir");
+        // A pid that cannot be running: the kernel maximum plus one.
+        std::fs::write(&pid_path, "4194305").expect("write pid");
+        let found = running_daemon_pid();
+
+        match prev {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+        assert_eq!(found, None, "a dead pid must not read as a live daemon");
+    }
     use super::*;
 
     #[test]

@@ -33,6 +33,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   for each, cold and warm. `CLAUDEBASE_ASR_KEEP_PCM=<dir>` (off by default, and it writes dictation
   to disk) captures a real note to feed it.
 
+### Fixed
+
+- **`claudebase daemon stop` reported success without stopping anything.** It ran `systemctl --user
+  stop` (or `launchctl unload`) and DISCARDED the exit status — `let _ = s; Ok(())` — so a daemon
+  started any other way, which is every test daemon and every debugging session, kept serving while
+  the command said it had stopped. The next `start` then failed on the flock the survivor still held,
+  with nothing connecting the two events. The service manager is still asked first, and the PID file
+  is now consulted afterwards: SIGTERM, then SIGKILL, by pid from the daemon's own file — never by
+  matching process names, which on a developer machine matches the editor and every test daemon too.
+- **Phantom conversations were bound to nicks.** The SessionStart hook fires more than once per
+  start, and one firing carries a session id with no transcript behind it — observed on two
+  independent sessions, each binding its real conversation and a phantom in the same minute. Harmless
+  while both point at the same nick, and not harmless afterwards: a rename updates whichever id the
+  session is on, so resuming under the other would restore a name the operator had already changed.
+  A conversation is now defined as a thing with a transcript, and a payload naming none binds
+  nothing — leaving the session on the terminal-keyed name, which is where things stood before
+  conversation binding existed.
+
 ### Changed
 
 - **`warmup()` and `name()` moved onto the `Asr` trait.** `daemon warmup --asr` used to hold

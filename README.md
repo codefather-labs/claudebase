@@ -431,6 +431,13 @@ It is **not** in the released binary and is **not** the default — see why belo
 
 ```bash
 cargo build --release --features asr-whisper,asr-sherpa
+
+# Running from the checkout works as-is. Copying the binary anywhere else needs
+# its libraries alongside it: sherpa-onnx is linked SHARED (see below), and the
+# baked-in rpath is `$ORIGIN/lib`.
+install -d ~/.claude/tools/claudebase/lib
+cp target/sherpa-onnx-prebuilt/*/lib/*.so* ~/.claude/tools/claudebase/lib/
+cp target/release/claudebase ~/.claude/tools/claudebase/claudebase
 ```
 
 ```toml

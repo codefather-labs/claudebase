@@ -138,12 +138,41 @@ pub async fn bind_session(session_id: Option<String>, from_stdin: bool) -> Resul
             let mut buf = String::new();
             std::io::stdin().read_to_string(&mut buf)?;
             match serde_json::from_str::<serde_json::Value>(&buf) {
-                Ok(v) => v
-                    .get("session_id")
-                    .or_else(|| v.get("sessionId"))
-                    .and_then(|x| x.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
+                Ok(v) => {
+                    // A conversation is a thing with a transcript.
+                    //
+                    // The hook fires more than once per session start, and one
+                    // of those firings carries a session id that has no
+                    // transcript behind it — observed on two independent
+                    // sessions, each binding its real conversation AND a
+                    // phantom in the same minute. Binding the phantom is not
+                    // merely untidy: a later rename updates whichever id the
+                    // session is currently on, so resuming under the other one
+                    // would restore a name the operator has already changed.
+                    //
+                    // `transcript_path` is what tells them apart. When the hook
+                    // payload has no usable one, this binds nothing and the
+                    // session keeps the name the terminal-keyed memory gave it
+                    // — which is exactly where things stood before conversation
+                    // binding existed, so the fallback is a known-good state
+                    // rather than a guess.
+                    let transcript = v
+                        .get("transcript_path")
+                        .or_else(|| v.get("transcriptPath"))
+                        .and_then(|x| x.as_str())
+                        .unwrap_or_default();
+                    if transcript.is_empty() || !std::path::Path::new(transcript).exists() {
+                        return Ok(
+                            "this hook payload names no transcript — not a conversation to bind"
+                                .to_string(),
+                        );
+                    }
+                    v.get("session_id")
+                        .or_else(|| v.get("sessionId"))
+                        .and_then(|x| x.as_str())
+                        .unwrap_or_default()
+                        .to_string()
+                }
                 Err(_) => String::new(),
             }
         }

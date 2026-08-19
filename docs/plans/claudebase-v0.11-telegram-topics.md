@@ -64,7 +64,39 @@ The button flow the design calls for is the flow `/start` already implements.
 The addressing the design calls for is the addressing `chat_bindings` already
 stores. **This is mostly a verification and gap-closing job, not a build.**
 
-## Slice 0 — find out how much of it already works
+## Slice 0 — DONE, driven live on 2026-08-19
+
+A forum supergroup with two topics, bot added and promoted to administrator.
+Answers, in the order the questions were asked:
+
+1. **Does the bot see ordinary messages in a topic?** Yes, once promoted to
+   administrator. Before promotion only `/start@botname` arrived — exactly the
+   privacy-mode signature R-1 predicted, and it presents as silence.
+2. **Does `/start` reply into the topic?** Yes: `keyboard sent chat_id=-100…
+   thread_id=Some(3)`. It would have been `None` before the fix landed earlier
+   the same day.
+3. **Does tapping bind `(chat_id, topic)`?** Yes: `switch applied chat_id=-100…
+   thread_id=Some(3) agent=transport`, and both tables agree —
+   `chat_bindings (-100…, 3) -> transport` and
+   `agent_registry.routing_thread_id = 3`.
+4. **Does a message typed in the topic reach the bound session?** Yes.
+5. **Does that session's reply come back into the same topic?** NOT AT FIRST —
+   it went to General. `resolve_thread` read the binding as
+   `(chat_id, _thread_id)` and discarded the topic one line before it would
+   have been used. Fixed; the send now logs `thread_id: Some(3)`.
+6. **Voice note in a topic?** Not yet driven.
+7. **Two topics, two sessions?** Not yet driven, but answered by reading: the
+   switch is per-topic in both tables — `bind_routing_key_in_tx` matches chat
+   AND thread when clearing, and `chat_bindings` has `ON CONFLICT(chat_id,
+   thread_id)`. A switch in one topic cannot disturb another.
+
+**Limitation found while answering 7:** the live routing key is a single pair of
+columns on the agent's row, so one session can hold exactly ONE topic. Many
+topics to many sessions works; one session across several topics does not — the
+second bind moves it and leaves the first topic with a durable `chat_bindings`
+row and no live addressee.
+
+## Slice 0 — the original questions
 
 Before writing code: create the forum, add the bot, and drive it by hand.
 Everything below is a question with a yes/no answer, and each answer either

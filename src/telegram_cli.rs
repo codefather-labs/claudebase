@@ -55,18 +55,25 @@ pub fn resolve_thread(
     conn: &rusqlite::Connection,
     explicit: Option<&str>,
     agent_id: Option<&str>,
-) -> Result<(String, ThreadSource)> {
+) -> Result<(String, Option<i64>, ThreadSource)> {
     if let Some(thread) = explicit {
         if !thread.starts_with("telegram:") {
             bail!("--thread must look like `telegram:<chat_id>`, got `{thread}`");
         }
-        return Ok((thread.to_string(), ThreadSource::Explicit));
+        return Ok((thread.to_string(), None, ThreadSource::Explicit));
     }
 
     // 2 — routing key of this session's agent.
+    //
+    // The topic travels with the chat id. It used to be discarded here — the
+    // binding was read as `(chat_id, _thread_id)` and only the chat survived —
+    // so a session bound to a forum TOPIC answered into the group's General
+    // instead. Inbound resolved the topic, the binding stored the topic, the
+    // registry kept the topic, and the reply threw it away one line before it
+    // would have been used.
     if let Some(agent_id) = agent_id {
-        if let Some((chat_id, _thread_id)) = routing_key_for(conn, agent_id)? {
-            return Ok((format!("telegram:{chat_id}"), ThreadSource::RoutingKey));
+        if let Some((chat_id, topic)) = routing_key_for(conn, agent_id)? {
+            return Ok((format!("telegram:{chat_id}"), topic, ThreadSource::RoutingKey));
         }
     }
 
@@ -79,7 +86,7 @@ pub fn resolve_thread(
         .collect();
 
     match telegram_threads.len() {
-        1 => Ok((telegram_threads[0].clone(), ThreadSource::OnlyThread)),
+        1 => Ok((telegram_threads[0].clone(), None, ThreadSource::OnlyThread)),
         0 => bail!(
             "no Telegram thread is known yet — the bot has never received a message.\n\
              Send anything to the bot once, then retry."
@@ -138,28 +145,33 @@ pub async fn send(text: &str, explicit_thread: Option<&str>) -> Result<String> {
 
     let agent_id = std::env::var(AGENT_ID_ENV).ok().filter(|s| !s.is_empty());
     let conn = chat::open_chat_db().context("open chat.db")?;
-    let (thread, source) = resolve_thread(&conn, explicit_thread, agent_id.as_deref())?;
+    let (thread, topic, source) = resolve_thread(&conn, explicit_thread, agent_id.as_deref())?;
     drop(conn);
 
     let mut client = DaemonClient::connect().await?;
-    let payload = client
-        .call_tool(
-            "chat_reply",
-            json!({
-                "thread": thread,
-                "content": text,
-                "from": sender_label(agent_id.as_deref()),
-            }),
-        )
-        .await?;
+    // `message_thread_id` is a string on the wire because that is what
+    // `chat_reply` parses; omitted entirely when there is no topic, so a DM
+    // send is byte-for-byte what it always was.
+    let mut args = json!({
+        "thread": thread,
+        "content": text,
+        "from": sender_label(agent_id.as_deref()),
+    });
+    if let Some(topic) = topic {
+        args["message_thread_id"] = json!(topic.to_string());
+    }
+    let payload = client.call_tool("chat_reply", args).await?;
 
     let message_id = payload
         .get("id")
         .and_then(|v| v.as_str())
         .unwrap_or("<unknown>")
         .to_string();
-    tracing::info!(%thread, ?source, %message_id, "telegram send queued");
-    Ok(format!("sent to {thread} (message {message_id})"))
+    tracing::info!(%thread, ?topic, ?source, %message_id, "telegram send queued");
+    match topic {
+        Some(t) => Ok(format!("sent to {thread} topic {t} (message {message_id})")),
+        None => Ok(format!("sent to {thread} (message {message_id})")),
+    }
 }
 
 /// Run `claudebase telegram status` — what this session would send to, and why.
@@ -174,8 +186,17 @@ pub fn status() -> Result<String> {
     ));
 
     match resolve_thread(&conn, None, agent_id.as_deref()) {
-        Ok((thread, source)) => {
-            out.push_str(&format!("default target: {thread} (resolved via {source:?})\n"));
+        Ok((thread, topic, source)) => {
+            // The topic belongs in the answer to "where would this go", or the
+            // status line says a forum-bound session targets the whole group.
+            match topic {
+                Some(t) => out.push_str(&format!(
+                    "default target: {thread} topic {t} (resolved via {source:?})\n"
+                )),
+                None => out.push_str(&format!(
+                    "default target: {thread} (resolved via {source:?})\n"
+                )),
+            }
         }
         Err(e) => out.push_str(&format!("default target: unresolved — {e}\n")),
     }
@@ -216,10 +237,56 @@ mod tests {
         .expect("insert thread");
     }
 
+
+    /// A session bound to a forum TOPIC must answer into that topic.
+    ///
+    /// The binding always knew the topic; this resolver read it as
+    /// `(chat_id, _thread_id)` and dropped it, so a reply landed in the group's
+    /// General while inbound, the binding and the registry all agreed on the
+    /// topic. Verified live in a real forum before this test was written: the
+    /// send logged `thread_id: None` and the operator confirmed the message
+    /// appeared in General.
+    #[test]
+    fn a_session_bound_to_a_topic_answers_into_that_topic() {
+        let conn = fixture();
+        conn.execute(
+            "INSERT INTO agent_registry \
+             (agent_id, agent_name, connection_id, chat_thread_id, spawned_at, last_pinged_at, \
+              state, routing_chat_id, routing_thread_id) \
+             VALUES ('a-1', 'transport', 'c-1', NULL, 1, 1, 'alive', -1004451125152, 3)",
+            [],
+        )
+        .expect("seed a topic-bound session");
+
+        let (thread, topic, src) = resolve_thread(&conn, None, Some("a-1")).expect("resolve");
+        assert_eq!(thread, "telegram:-1004451125152");
+        assert_eq!(topic, Some(3), "the reply would land in General without this");
+        assert_eq!(src, ThreadSource::RoutingKey);
+    }
+
+    /// A DM-bound session has no topic, and must stay byte-for-byte as before.
+    #[test]
+    fn a_dm_bound_session_resolves_no_topic() {
+        let conn = fixture();
+        conn.execute(
+            "INSERT INTO agent_registry \
+             (agent_id, agent_name, connection_id, chat_thread_id, spawned_at, last_pinged_at, \
+              state, routing_chat_id, routing_thread_id) \
+             VALUES ('a-2', 'mira', 'c-2', NULL, 1, 1, 'alive', 434566766, NULL)",
+            [],
+        )
+        .expect("seed a DM-bound session");
+
+        let (thread, topic, src) = resolve_thread(&conn, None, Some("a-2")).expect("resolve");
+        assert_eq!(thread, "telegram:434566766");
+        assert_eq!(topic, None);
+        assert_eq!(src, ThreadSource::RoutingKey);
+    }
+
     #[test]
     fn explicit_thread_wins_and_is_validated() {
         let conn = fixture();
-        let (t, src) = resolve_thread(&conn, Some("telegram:42"), None).expect("resolve");
+        let (t, _topic, src) = resolve_thread(&conn, Some("telegram:42"), None).expect("resolve");
         assert_eq!(t, "telegram:42");
         assert_eq!(src, ThreadSource::Explicit);
 
@@ -231,7 +298,7 @@ mod tests {
     fn single_known_thread_is_used_when_unbound() {
         let conn = fixture();
         add_thread(&conn, "telegram:99");
-        let (t, src) = resolve_thread(&conn, None, None).expect("resolve");
+        let (t, _topic, src) = resolve_thread(&conn, None, None).expect("resolve");
         assert_eq!(t, "telegram:99");
         assert_eq!(src, ThreadSource::OnlyThread);
     }

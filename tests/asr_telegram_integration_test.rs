@@ -45,6 +45,15 @@ impl Asr for MockAsr {
             Err(e) => Err(anyhow::anyhow!("{}", e)),
         }
     }
+    fn name(&self) -> &'static str {
+        "mock"
+    }
+    /// A mock has nothing to fetch, and saying so is the point: `warmup` on the
+    /// trait is what let the installers pre-fetch whichever backend is
+    /// configured without knowing any model URL.
+    fn warmup(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
     fn health_check(&self) -> anyhow::Result<()> {
         Ok(())
     }

@@ -31,6 +31,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **`claudebase run` hung forever on Windows, and always had.** The console module was a stub whose
+  `RawGuard::enter()` returned `Ok(None)` unconditionally — which the caller reads as "stdin is not a
+  TTY" and answers by never starting the keyboard-to-pty thread. So nothing the operator typed
+  reached `claude`, including the terminal's automatic answer to the cursor-position query the TUI
+  sends before drawing. Captured from the machine: the process alive, the child started, and stdout
+  containing exactly one escape sequence, `ESC[6n`. The operator saw an endless loading screen.
+
+  Windows now gets a real equivalent of raw mode — `ENABLE_LINE_INPUT`, `ENABLE_ECHO_INPUT` and
+  `ENABLE_PROCESSED_INPUT` cleared, `ENABLE_VIRTUAL_TERMINAL_INPUT` set so keys arrive as the escape
+  sequences the child expects, and `ENABLE_VIRTUAL_TERMINAL_PROCESSING` on the output side — with
+  both modes restored on drop. `win_size()` reports the console WINDOW rather than the 24x80 fallback;
+  the screen buffer is routinely taller than what is visible, and handing that to the pty makes the
+  child draw more than the operator can see.
+
 - **The topic was dropped at four separate points between arriving and being used.** The assignment
   button passed `None` into `handle_switch`, so a tap bound the whole chat; `MessageRef` did not
   deserialise `message_thread_id` at all, so the tap's own topic was unavailable; `resolve_thread`

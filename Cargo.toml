@@ -193,6 +193,7 @@ sherpa-onnx = { version = "1.13", optional = true, default-features = false, fea
 # authoring (verified via `cargo search windows-service` 2026-05-18).
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
+windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_Foundation"] }
 
 [features]
 # Slice 6-MVP — ASR backend features. `asr-whisper` enables the local

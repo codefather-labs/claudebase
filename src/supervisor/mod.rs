@@ -823,12 +823,127 @@ mod term {
     }
 }
 
-#[cfg(not(unix))]
+/// Windows console equivalent of raw mode.
+///
+/// This used to be a stub returning `Ok(None)`, which the caller reads as "not
+/// a TTY" and answers by never starting the keyboard-to-pty thread. So on
+/// Windows nothing the operator typed ever reached `claude` — including the
+/// terminal's automatic answer to the cursor-position query the TUI sends
+/// before it draws. `claudebase run` therefore printed `ESC[6n` and hung
+/// forever, which is what the operator saw as an endless loading screen.
+///
+/// Captured from the machine itself: the process was alive, the pty worked, the
+/// child had started, and stdout contained exactly one escape sequence.
+///
+/// The Windows equivalent of `cfmakeraw` is three input flags off and one on:
+/// `ENABLE_LINE_INPUT` and `ENABLE_ECHO_INPUT` make the console buffer a whole
+/// line and echo it, which a full-screen TUI must do itself;
+/// `ENABLE_PROCESSED_INPUT` lets the console eat Ctrl-C before we see it;
+/// `ENABLE_VIRTUAL_TERMINAL_INPUT` is what makes keys arrive as the escape
+/// sequences the child expects rather than as console key events. On the output
+/// side `ENABLE_VIRTUAL_TERMINAL_PROCESSING` makes the child's own sequences
+/// render instead of appearing literally.
+#[cfg(windows)]
+mod term {
+    use anyhow::{bail, Result};
+    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, SetConsoleMode, CONSOLE_MODE,
+        CONSOLE_SCREEN_BUFFER_INFO, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
+        ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_INPUT_HANDLE,
+        STD_OUTPUT_HANDLE,
+    };
+
+    /// Saved console modes, restored on drop — including on panic, which is why
+    /// this is a guard and not a pair of calls.
+    pub struct RawGuard {
+        stdin: HANDLE,
+        stdout: HANDLE,
+        saved_in: CONSOLE_MODE,
+        saved_out: CONSOLE_MODE,
+    }
+
+    impl RawGuard {
+        pub fn enter() -> Result<Option<Self>> {
+            unsafe {
+                let stdin = GetStdHandle(STD_INPUT_HANDLE);
+                let stdout = GetStdHandle(STD_OUTPUT_HANDLE);
+                if stdin == INVALID_HANDLE_VALUE || stdout == INVALID_HANDLE_VALUE {
+                    return Ok(None);
+                }
+                let mut saved_in: CONSOLE_MODE = 0;
+                let mut saved_out: CONSOLE_MODE = 0;
+                // Fails when the handle is a pipe rather than a console — the
+                // Windows answer to "is this a TTY", and the same answer the
+                // Unix branch gives via isatty: not interactive, carry on.
+                if GetConsoleMode(stdin, &mut saved_in) == 0 {
+                    return Ok(None);
+                }
+                if GetConsoleMode(stdout, &mut saved_out) == 0 {
+                    return Ok(None);
+                }
+
+                let raw_in = (saved_in
+                    & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT))
+                    | ENABLE_VIRTUAL_TERMINAL_INPUT;
+                if SetConsoleMode(stdin, raw_in) == 0 {
+                    bail!(
+                        "SetConsoleMode on stdin failed: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+                // Best effort: an older console without VT processing still
+                // delivers input, which is the half that was actually broken.
+                let _ = SetConsoleMode(stdout, saved_out | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+
+                Ok(Some(Self {
+                    stdin,
+                    stdout,
+                    saved_in,
+                    saved_out,
+                }))
+            }
+        }
+    }
+
+    impl Drop for RawGuard {
+        fn drop(&mut self) {
+            unsafe {
+                SetConsoleMode(self.stdin, self.saved_in);
+                SetConsoleMode(self.stdout, self.saved_out);
+            }
+        }
+    }
+
+    /// The console WINDOW, not the screen buffer.
+    ///
+    /// `dwSize` is the buffer, which on Windows is routinely taller than what
+    /// is visible — handing that to the pty makes the child draw a screen the
+    /// operator can only see part of.
+    pub fn win_size() -> Option<(u16, u16)> {
+        unsafe {
+            let stdout = GetStdHandle(STD_OUTPUT_HANDLE);
+            if stdout == INVALID_HANDLE_VALUE {
+                return None;
+            }
+            let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+            if GetConsoleScreenBufferInfo(stdout, &mut info) == 0 {
+                return None;
+            }
+            let cols = info.srWindow.Right - info.srWindow.Left + 1;
+            let rows = info.srWindow.Bottom - info.srWindow.Top + 1;
+            if rows <= 0 || cols <= 0 {
+                return None;
+            }
+            Some((rows as u16, cols as u16))
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 mod term {
     use anyhow::Result;
-    /// Windows: raw-mode handling is deferred (plan risk R-3). The supervisor
-    /// still spawns the child through ConPTY and still injects; only the
-    /// operator-side proxying is degraded.
+    /// Neither unix nor windows: no console handling, injection still works.
     pub struct RawGuard;
     impl RawGuard {
         pub fn enter() -> Result<Option<Self>> {

@@ -82,7 +82,11 @@ containers on every change to the installer and fails if that stops being true.
 **Supported binary platforms** (release matrix):
 - **macOS**: arm64 only (M1/M2/M3/M4+). **Intel Mac (`x86_64-apple-darwin`) deprecated as of v0.7.1** — `ort 2.0.0-rc.12` stopped shipping prebuilt binaries for that target. If you're on Intel Mac, either run the Linux binary under Rosetta-via-VM, or build from source: `cargo install --path .` (requires Rust toolchain).
 - **Linux**: x64 + arm64.
-- **Windows**: x64.
+- **Windows**: x64. `claudebase run` drives `claude` through ConPTY and puts the console into the
+  Windows equivalent of raw mode — virtual-terminal input and output, with line input and echo off —
+  restoring both when the session ends. It needs a real console: started from a pipe or an SSH
+  session with no console attached, the supervisor correctly reports that stdin is not a terminal and
+  runs without operator proxying.
 
 **Opt-outs** (env vars before running the installer):
 - `CLAUDEBASE_VERSION=x.y.z` — pin a specific version (downgrade, repeatable CI installs). Default: latest `claudebase-v*` tag on origin (via `git ls-remote`, no API quota). Falls back to a baked-in constant if the remote lookup fails (air-gapped / GitHub unreachable).

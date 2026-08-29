@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-25
+
+### Changed
+
+- **Windows is now a platform `claudebase run` actually supports, and the docs say so.** No code
+  changed since 0.10.1 — the two fixes that made it work shipped in 0.10.0 (a real console raw mode,
+  so the TUI's cursor-position query is answered and keystrokes reach the child) and 0.10.1 (the
+  console restored before the exit joins, so leaving a session gives the terminal back). This release
+  is where the claim becomes official: both were confirmed by the operator on a live Windows console,
+  which is the only place they can be — over SSH there is no console, and the supervisor correctly
+  reports stdin is not a terminal.
+
+  The v0.10 plan's risk R-3 is closed with what was actually wrong. It had been recorded as
+  "operator-side proxying is degraded"; it was not degraded, it was unusable, and the gap between
+  those two words survived until someone ran it on a real console. The README now states what the
+  Windows path does and what it needs.
+
+
 ## [0.10.1] - 2026-08-25
 
 ### Fixed

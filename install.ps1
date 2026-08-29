@@ -30,9 +30,49 @@ $ErrorActionPreference = 'Stop'
 # ============================================================================
 # Constants
 # ============================================================================
-$Script:ClaudebaseVersion       = '0.9.2'
+# Last-resort version, used only when the newest tag cannot be looked up (no
+# git, no network, air-gapped). Kept in step with Cargo.toml by
+# `the_installers_pin_the_current_version` in tests/hooks_contract_test.rs --
+# this constant sat at 0.9.2 through four releases because nothing checked it,
+# and every fresh install in that window silently got a binary two minor
+# versions old.
+$Script:ClaudebaseVersionFallback = '0.11.0'
 $Script:ClaudebasePdfiumVersion = 'chromium/7802'
+
+# Which version to install: an explicit request, else the newest published tag,
+# else the fallback above.
+#
+# The explicit request comes FIRST and is honoured verbatim, which is what
+# CLAUDEBASE_VERSION=x.y.z has always been documented to do and never did -- the
+# constant was assigned unconditionally, so the environment was overwritten
+# before it was ever read.
+function Resolve-ClaudebaseVersion {
+    if ($env:CLAUDEBASE_VERSION) { return $env:CLAUDEBASE_VERSION }
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+        try {
+            # ls-remote needs no API token and no quota.
+            $tags = & git ls-remote --tags --refs $Script:RepoUrl 'claudebase-v*' 2>$null
+            $versions = @()
+            foreach ($line in $tags) {
+                if ($line -match 'claudebase-v(\d+)\.(\d+)\.(\d+)$') {
+                    $versions += [PSCustomObject]@{
+                        Text = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
+                        Sort = [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])"
+                    }
+                }
+            }
+            if ($versions.Count -gt 0) {
+                return ($versions | Sort-Object Sort | Select-Object -Last 1).Text
+            }
+        } catch { }
+    }
+    return $Script:ClaudebaseVersionFallback
+}
 $Script:RepoUrl                 = 'https://github.com/codefather-labs/claudebase.git'
+# Resolved here, not beside the fallback constant: the lookup needs $Script:RepoUrl,
+# and reading it one line too early would hand `git ls-remote` a null and fall
+# back to the constant without saying so.
+$Script:ClaudebaseVersion       = Resolve-ClaudebaseVersion
 $Script:ReleaseBase             = 'https://github.com/codefather-labs/claudebase/releases/download'
 
 $Script:ClaudeDir = Join-Path $env:USERPROFILE '.claude'

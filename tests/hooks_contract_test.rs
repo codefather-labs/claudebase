@@ -106,6 +106,58 @@ fn the_documents_an_agent_reads_mention_the_rename_token_flag() {
     }
 }
 
+/// The installers' baked-in version must track the crate's.
+///
+/// It is only the air-gapped fallback now — the newest tag is looked up first —
+/// but it sat at 0.9.2 through four releases, and while it was ALSO the pinned
+/// default that meant every fresh install silently received a binary two minor
+/// versions old. Nothing noticed, because nothing checked. This does.
+#[test]
+fn the_installers_pin_the_current_version() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let version = env!("CARGO_PKG_VERSION");
+
+    for (file, needle) in [
+        ("install.sh", format!("CLAUDEBASE_VERSION_FALLBACK=\"{version}\"")),
+        ("install.ps1", format!("$Script:ClaudebaseVersionFallback = '{version}'")),
+    ] {
+        let text = std::fs::read_to_string(root.join(file))
+            .unwrap_or_else(|e| panic!("read {file}: {e}"));
+        assert!(
+            text.contains(&needle),
+            "{file} does not carry the current version {version}; expected a line with `{needle}`"
+        );
+    }
+}
+
+/// An explicit `CLAUDEBASE_VERSION` must reach the download URL.
+///
+/// The shell installer assigned the constant unconditionally, so the
+/// environment variable the README documents for pinning and downgrades was
+/// overwritten before it was ever read — the flag existed and did nothing.
+#[test]
+fn an_explicit_version_request_is_not_overwritten() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sh = std::fs::read_to_string(root.join("install.sh")).expect("install.sh");
+    assert!(
+        sh.contains("if [ -n \"${CLAUDEBASE_VERSION:-}\" ]; then"),
+        "install.sh must honour an explicit CLAUDEBASE_VERSION before resolving anything else"
+    );
+    // The defect was a LITERAL version assigned over the environment. Assigning
+    // the result of the resolver is the fix, not a repeat of it.
+    assert!(
+        !sh.contains("CLAUDEBASE_VERSION=\"0."),
+        "install.sh assigns a literal version to CLAUDEBASE_VERSION, which overwrites the \
+         operator's choice before it is read — resolve into it instead"
+    );
+
+    let ps1 = std::fs::read_to_string(root.join("install.ps1")).expect("install.ps1");
+    assert!(
+        ps1.contains("if ($env:CLAUDEBASE_VERSION) { return $env:CLAUDEBASE_VERSION }"),
+        "install.ps1 must honour an explicit CLAUDEBASE_VERSION first"
+    );
+}
+
 /// Both installers announce what they installed, and both under-reported it.
 ///
 /// The closing summary listed the four `commands/` entries and CALLED them

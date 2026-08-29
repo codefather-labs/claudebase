@@ -89,7 +89,7 @@ containers on every change to the installer and fails if that stops being true.
   runs without operator proxying.
 
 **Opt-outs** (env vars before running the installer):
-- `CLAUDEBASE_VERSION=x.y.z` — pin a specific version (downgrade, repeatable CI installs). Default: latest `claudebase-v*` tag on origin (via `git ls-remote`, no API quota). Falls back to a baked-in constant if the remote lookup fails (air-gapped / GitHub unreachable).
+- `CLAUDEBASE_VERSION=x.y.z` — pin a specific version (downgrade, repeatable CI installs), honoured before anything else is resolved. Default: newest `claudebase-v*` tag on origin (via `git ls-remote`, no API quota). Falls back to a baked-in constant only when that lookup cannot run — no git, no network, air-gapped.
 - `CLAUDEBASE_SKIP_WHISPER=1` — skip ffmpeg + whisper-cli install (no voice transcription)
 - `CLAUDEBASE_ASR_BACKEND=parakeet` — select the Parakeet backend and fetch its model instead of
   whisper's. Needs a binary built with `--features asr-sherpa`; the released one has only whisper

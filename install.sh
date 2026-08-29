@@ -23,10 +23,46 @@ set -u
 # ============================================================================
 # Constants
 # ============================================================================
-CLAUDEBASE_VERSION="0.9.2"
+# Last-resort version, used only when the newest tag cannot be looked up (no
+# git, no network, air-gapped). Kept in step with Cargo.toml by
+# `the_installers_pin_the_current_version` in tests/hooks_contract_test.rs —
+# this constant sat at 0.9.2 through four releases because nothing checked it,
+# and every fresh install in that window silently got a binary two minor
+# versions old.
+CLAUDEBASE_VERSION_FALLBACK="0.11.0"
 CLAUDEBASE_PDFIUM_VERSION="chromium/7802"
 REPO_URL="https://github.com/codefather-labs/claudebase.git"
 RELEASE_BASE="https://github.com/codefather-labs/claudebase/releases/download"
+
+# Which version to install: an explicit request, else the newest published tag,
+# else the fallback above.
+#
+# The explicit request comes FIRST and is honoured verbatim, which is what
+# `CLAUDEBASE_VERSION=x.y.z` has always been documented to do and never did —
+# the constant was assigned unconditionally, so the environment was overwritten
+# before it was ever read.
+resolve_claudebase_version() {
+  if [ -n "${CLAUDEBASE_VERSION:-}" ]; then
+    printf '%s' "$CLAUDEBASE_VERSION"
+    return 0
+  fi
+  if command -v git >/dev/null 2>&1; then
+    # `ls-remote` needs no API token and no quota. Sorted numerically by
+    # component rather than with `sort -V`, which BSD sort does not always have.
+    local latest
+    latest="$(git ls-remote --tags --refs "$REPO_URL" 'claudebase-v*' 2>/dev/null \
+      | sed 's|.*/claudebase-v||' \
+      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+      | sort -t. -k1,1n -k2,2n -k3,3n \
+      | tail -1)"
+    if [ -n "$latest" ]; then
+      printf '%s' "$latest"
+      return 0
+    fi
+  fi
+  printf '%s' "$CLAUDEBASE_VERSION_FALLBACK"
+}
+CLAUDEBASE_VERSION="$(resolve_claudebase_version)"
 
 CLAUDE_DIR="$HOME/.claude"
 SCRIPT_DIR=""

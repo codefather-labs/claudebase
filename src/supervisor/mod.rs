@@ -249,6 +249,13 @@ pub fn run(args: &RunArgs) -> Result<std::process::ExitCode> {
     }
 
     // ---- pty -> our stdout, feeding the modal detector on the way ----
+    //
+    // `drained_tx` says "the pty gave me everything it had". Exit waits on it
+    // BRIEFLY rather than joining: on Windows a ConPTY read does not necessarily
+    // return when the child dies — the master handle is still alive, held here
+    // and by the resize thread — so joining this thread can park the supervisor
+    // forever after `claude` has already gone.
+    let (drained_tx, drained_rx) = std::sync::mpsc::channel::<()>();
     let done_out = done.clone();
     let modal_out = modal.clone();
     let pump_out = std::thread::spawn(move || {
@@ -267,6 +274,7 @@ pub fn run(args: &RunArgs) -> Result<std::process::ExitCode> {
             }
         }
         done_out.store(true, Ordering::SeqCst);
+        let _ = drained_tx.send(());
     });
 
     // ---- operator's stdin -> pty, feeding the draft tracker on the way ----
@@ -356,10 +364,37 @@ pub fn run(args: &RunArgs) -> Result<std::process::ExitCode> {
 
     let status = child.wait().context("wait for claude")?;
     done.store(true, Ordering::SeqCst);
-    let _ = pump_out.join();
-    let _ = inject_thread.join();
-    let _ = daemon_thread.join();
+
+    // Give the terminal back FIRST, before any bookkeeping.
+    //
+    // This used to be the last statement, after three `join()`s. The child was
+    // already gone by then, so the guard had no work left to do — but any join
+    // that did not return kept the console in raw mode, with echo and line
+    // input still off. The operator saw exactly that: `claude` exited, the
+    // shell came back, and typing produced nothing but a newline, because the
+    // console was still configured for a full-screen program that was no longer
+    // running. On Windows there is no shell that quietly resets it afterwards.
+    //
+    // Restoring here costs nothing if the joins are quick and saves the
+    // operator's terminal if they are not.
     drop(raw);
+
+    // The pty pump is worth a SHORT wait: it copies the child's last output to
+    // the screen. Bounded, because on Windows the read it sits in may never
+    // return — see `drained_tx`. A truncated final line is a smaller price than
+    // a supervisor that never exits, which is what the operator reported: the
+    // session ended, the prompt came back, and the terminal was still held.
+    let _ = drained_rx.recv_timeout(std::time::Duration::from_millis(300));
+    drop(pump_out);
+
+    // The other two are NOT joined, deliberately. Both are parked on a blocking
+    // read — the injector on its channel, the daemon thread on its socket — and
+    // neither notices `done` until something arrives, which for a session that
+    // is ending may be never. They own nothing that needs unwinding: the daemon
+    // marks this agent's row dead when the connection drops, which is precisely
+    // what process exit does. Same reasoning the stdin pump already carries.
+    drop(inject_thread);
+    drop(daemon_thread);
 
     tracing::info!(?status, "claude exited; supervisor shutting down");
     Ok(if status.success() {

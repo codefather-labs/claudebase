@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-08-25
+
+### Fixed
+
+- **Leaving a claude session left the Windows terminal unusable.** The exit path ran three `join()`s
+  and only then restored the console, so the terminal was handed back last. Two of those threads sit
+  on a blocking read — the injector on its channel, the daemon thread on its socket — and neither
+  notices the shutdown flag until something arrives, which for an ending session may be never. A join
+  that did not return therefore left the console in raw mode: echo off, line input off, still
+  configured for a full-screen program that had already exited. The operator saw the prompt return
+  and typing produce nothing but a newline, with the process still holding the terminal. On Linux a
+  shell usually resets that at the next prompt and hides it; Windows has nothing that does.
+
+  The console guard is now dropped FIRST, before any bookkeeping. The two threads that can park
+  forever are no longer joined — they own nothing that needs unwinding, and the daemon marks the
+  agent's row dead when the connection drops, which is exactly what process exit does. The pty pump
+  keeps a short wait so the child's last output still reaches the screen, but through a channel with
+  a 300 ms timeout: on Windows a ConPTY read need not return when the child dies, because the master
+  handle is still alive, so joining it can park the supervisor after `claude` has gone.
+
+
 ## [0.10.0] - 2026-08-20
 
 ### Added

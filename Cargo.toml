@@ -214,6 +214,12 @@ asr-whisper = ["dep:whisper-rs"]
 asr-sherpa = ["dep:sherpa-onnx"]
 asr-nim = []
 
+# `whisper_probe` calls whisper-rs directly, so without the feature it cannot
+# compile — and an ungated example breaks a plain `cargo test`.
+[[example]]
+name = "whisper_probe"
+required-features = ["asr-whisper"]
+
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"

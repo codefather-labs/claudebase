@@ -404,6 +404,7 @@ pub enum Command {
     /// Subcommands:
     ///   `chat list --thread X` — list messages in a thread (chronological)
     ///   `chat threads`         — list all known threads with counts
+    ///   `chat clone <id|name> <name>` — copy a Claude Code conversation for /resume
     Chat(ChatArgs),
     /// Launch `claude` with the Telegram plugin preset and any extra args
     /// forwarded verbatim. Equivalent to:
@@ -530,6 +531,12 @@ pub struct RunArgs {
     #[arg(long)]
     pub no_skip_permissions: bool,
 
+    /// Opt out of the default-on `--chrome` flag (Claude in Chrome
+    /// integration). Also implied when the forwarded args already carry
+    /// `--chrome` or `--no-chrome`.
+    #[arg(long)]
+    pub no_chrome: bool,
+
     /// Name this session, instead of deriving it from the project (every
     /// session opened in one repo derives the same name). Shown in
     /// `claudebase agent list` and in the Telegram `/switch` menu.
@@ -548,6 +555,23 @@ pub struct RunArgs {
     ///   `claudebase run -- --debug --add-dir /some/path`
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
+}
+
+impl RunArgs {
+    /// Everything `claudebase run` passes to `claude`: the default-on flags,
+    /// then the forwarded args verbatim.
+    pub fn claude_args(&self) -> Vec<String> {
+        let mut argv = Vec::new();
+        if !self.no_skip_permissions {
+            argv.push("--dangerously-skip-permissions".to_owned());
+        }
+        let chrome_given = self.args.iter().any(|a| a == "--chrome" || a == "--no-chrome");
+        if !self.no_chrome && !chrome_given {
+            argv.push("--chrome".to_owned());
+        }
+        argv.extend(self.args.iter().cloned());
+        argv
+    }
 }
 
 /// `claudebase chat ...` — chat introspection subcommands (Slice 3).
@@ -570,6 +594,21 @@ pub enum ChatSubcommand {
     /// List all known threads with their message counts. Reads chat.db
     /// directly — daemon is NOT required.
     Threads(ChatThreadsArgs),
+    /// Copy a Claude Code conversation under a new id and name. The copy
+    /// shows up in `/resume` under that name and continues from the same
+    /// context; the original is not touched. Run it from the directory the
+    /// conversation was started in.
+    Clone(ChatCloneArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ChatCloneArgs {
+    /// The conversation to copy: its UUID (the transcript file name under
+    /// `~/.claude/projects/<dir>/<uuid>.jsonl`) or the name it is listed under
+    /// in `/resume`.
+    pub source: String,
+    /// The name the copy is listed under in `/resume`.
+    pub name: String,
 }
 
 #[derive(Args, Debug)]

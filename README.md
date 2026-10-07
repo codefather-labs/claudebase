@@ -275,7 +275,28 @@ claudebase search <query> --corpus all   RRF-fuse hits from books and insights
 ```text
 claudebase run [--no-telegram] [-- args...]    run `claude` under the PTY supervisor
                                                preset preloaded; forwards extra args
+               [--no-skip-permissions]         drop the default --dangerously-skip-permissions
+               [--no-chrome]                   drop the default --chrome (Claude in Chrome);
+                                               also dropped when the forwarded args already
+                                               carry --chrome or --no-chrome
 ```
+
+**Conversations:**
+
+```text
+claudebase chat clone <id|name> <new-name>     copy a Claude Code conversation under a new
+                                               id; the copy appears in /resume as <new-name>
+                                               and continues from the same context, the
+                                               original is untouched
+```
+
+`<id|name>` is the conversation's UUID (the transcript file name under
+`~/.claude/projects/<dir>/`) or the name `/resume` lists it under — the `/rename` title, or the
+auto-generated one when it was never renamed. Run it from the directory the conversation was
+started in: a name is looked up there first, and the copy is filed next to the original so
+`/resume` from that directory shows it. A name that several conversations share is refused with
+their ids. The copy carries the subagent transcripts and the `/rewind` file backups; it does not
+carry the original's Remote Control binding.
 
 All subcommands accept `--project-root <dir>` (defaults to cwd) and `--json` for structured output. Insight bodies can come from positional arg, `-`, or piped stdin (TTY without a body is rejected — designed for non-interactive agent use).
 

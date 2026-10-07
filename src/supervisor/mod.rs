@@ -205,12 +205,7 @@ pub fn run(args: &RunArgs) -> Result<std::process::ExitCode> {
     let mut cmd = CommandBuilder::new("claude");
     // NOTE: no `--channels`. The whole point of this transport is that Claude
     // Code runs unmodified and unaware.
-    if !args.no_skip_permissions {
-        cmd.arg("--dangerously-skip-permissions");
-    }
-    for a in &args.args {
-        cmd.arg(a);
-    }
+    cmd.args(args.claude_args());
     if let Ok(cwd) = std::env::current_dir() {
         cmd.cwd(cwd);
     }

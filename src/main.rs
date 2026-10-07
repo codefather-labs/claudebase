@@ -173,6 +173,7 @@ fn main() -> std::process::ExitCode {
         Command::Chat(args) => match &args.sub {
             cli::ChatSubcommand::List(a) => run_chat_list(a),
             cli::ChatSubcommand::Threads(a) => run_chat_threads(a),
+            cli::ChatSubcommand::Clone(a) => simple(run_chat_clone(a), "chat clone"),
         },
         Command::Run(args) => run_claude_with_preset(&args),
         Command::Telegram(args) => match &args.sub {
@@ -549,12 +550,7 @@ fn run_claude_with_preset(args: &cli::RunArgs) -> std::process::ExitCode {
     // as an escape hatch when the supervisor itself is suspect.
     if args.no_telegram {
         let mut argv: Vec<OsString> = vec![claude_path.clone().into()];
-        if !args.no_skip_permissions {
-            argv.push("--dangerously-skip-permissions".into());
-        }
-        for a in &args.args {
-            argv.push(OsString::from(a));
-        }
+        argv.extend(args.claude_args().into_iter().map(OsString::from));
         eprintln!("claudebase run → exec (no-telegram) {}", claude_path.display());
         #[cfg(unix)]
         {
@@ -751,6 +747,25 @@ fn run_chat_list(args: &cli::ChatListArgs) -> std::process::ExitCode {
         }
     }
     std::process::ExitCode::SUCCESS
+}
+
+/// `claudebase chat clone <id|name> <name>` — copy a Claude Code conversation.
+fn run_chat_clone(args: &cli::ChatCloneArgs) -> anyhow::Result<String> {
+    use claudebase::chat_clone;
+    let cwd = std::env::current_dir()?;
+    let report =
+        chat_clone::clone_conversation(&chat_clone::claude_dir()?, &cwd, &args.source, &args.name)?;
+    Ok(format!(
+        "cloned {} as `{}` ({} lines, {} dropped)\nnew id: {}\nfile:   {}\nresume: claude --resume {}   (or pick `{}` in /resume)",
+        report.source_id,
+        args.name.trim(),
+        report.lines_copied,
+        report.lines_dropped,
+        report.new_id,
+        report.transcript.display(),
+        report.new_id,
+        args.name.trim(),
+    ))
 }
 
 /// `claudebase chat threads` — list all known chat threads.

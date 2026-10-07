@@ -153,8 +153,10 @@ Each release attaches one binary per supported platform. Verification covers:
 | `claudebase-windows-x64.exe` | `windows-latest` | `x86_64-pc-windows-msvc` | best-effort (`continue-on-error`) |
 
 `darwin-x64` is no longer built (no prebuilt ONNX Runtime for Intel macOS).
-A source tarball is attached next to the binaries. Best-effort platforms
-that fail leave the release published without their artifact.
+Best-effort platforms that fail leave the release published without their
+artifact. The workflow also builds a source tarball and lists it in the
+release step, but it has not appeared on the 0.11.0 or 0.12.0 Releases
+pages — the four binaries are what actually ships.
 
 ### Size budget (≤ 40 MB) — NFR-1.1
 

@@ -36,7 +36,7 @@ $ErrorActionPreference = 'Stop'
 # this constant sat at 0.9.2 through four releases because nothing checked it,
 # and every fresh install in that window silently got a binary two minor
 # versions old.
-$Script:ClaudebaseVersionFallback = '0.11.0'
+$Script:ClaudebaseVersionFallback = '0.12.0'
 $Script:ClaudebasePdfiumVersion = 'chromium/7802'
 
 # Which version to install: an explicit request, else the newest published tag,
@@ -121,6 +121,7 @@ WHAT IS *REMOVED* (reverse migration, idempotent):
 
 AFTER INSTALLING:
   claudebase run                        start a session the daemon can reach
+  claudebase chat clone <id|name> <name>  copy a conversation; resume the copy via /resume
   claudebase telegram addbot "<token>"  wire up Telegram
   claudebase daemon callback enable     open the HTTP callback endpoint (off by default)
 "@ | Write-Host

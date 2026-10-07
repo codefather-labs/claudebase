@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-07
+
+### Added
+
+- **`claudebase chat clone <id|name> <new-name>` copies a Claude Code conversation.** The copy gets
+  a new id and the new name, shows up in `/resume`, and continues from the same context while the
+  original stays as it was. The source is named by its UUID or by the name `/resume` lists it under
+  (the `/rename` title, else the auto-generated one); a name shared by several conversations is
+  refused with their ids. Subagent transcripts and `/rewind` backups come along; the original's
+  title and Remote Control binding do not.
+
+### Changed
+
+- **`claudebase run` starts `claude` with `--chrome`** (Claude in Chrome integration) by default,
+  next to `--dangerously-skip-permissions`. `--no-chrome` opts out, and the default is left off when
+  the forwarded args already say `--chrome` or `--no-chrome`.
+
+### Fixed
+
+- **A plain `cargo test` compiles again.** `examples/whisper_probe.rs` calls whisper-rs directly but
+  was not gated on `asr-whisper`, so building the examples without that feature failed before a
+  single test ran. It now declares `required-features = ["asr-whisper"]`.
+
 ## [0.11.0] - 2026-08-25
 
 ### Changed

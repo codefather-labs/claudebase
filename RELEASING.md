@@ -32,7 +32,7 @@ do not overlap and are not synchronized.
 
 The release workflow is triggered automatically when any tag matching
 `claudebase-v*` is pushed to the repository (see
-`.github/workflows/claudebase-release.yml`).
+`.github/workflows/release.yml`, workflow name `claudebase release`).
 
 ---
 
@@ -98,17 +98,30 @@ references the binary from `install.sh`.
 
 Concretely, when releasing:
 
-1. Update `version` in `claudebase/Cargo.toml`.
-2. Run `cargo build --release -p claudebase --manifest-path claudebase/Cargo.toml`
-   locally to regenerate `Cargo.lock` and verify the build is clean.
-3. Commit the version bump with a `chore(core): bump claudebase to vX.Y.Z`
-   commit (or equivalent under the project's conventional-commit scopes).
-4. Cut and push the tag:
+1. Update `version` in `Cargo.toml` (the crate is at the repository root).
+2. Update the installers' fallback constants to the same version:
+   `CLAUDEBASE_VERSION_FALLBACK` in `install.sh` and
+   `$Script:ClaudebaseVersionFallback` in `install.ps1`
+   (`tests/hooks_contract_test.rs` pins them to `CARGO_PKG_VERSION`).
+3. Run `cargo build` locally to regenerate `Cargo.lock`, and
+   `cargo build --features asr-whisper --examples --bins` to check the
+   feature set the release workflow ships (whisper.cpp needs `cmake` and a
+   C++ compiler on PATH).
+4. Promote `[Unreleased]` in `CHANGELOG.md` to `[X.Y.Z] - <date>`.
+5. Commit the version bump with a `chore(core): bump claudebase to vX.Y.Z`
+   commit (or equivalent under the project's conventional-commit scopes) and
+   push `main`.
+6. Cut and push the tag:
    ```bash
    git tag claudebase-vX.Y.Z
    git push origin claudebase-vX.Y.Z
    ```
-5. The release workflow will run automatically.
+7. The release workflow will run automatically. Watch it with the account
+   that owns the repository (`codefather-labs`):
+   ```bash
+   GH_CONFIG_DIR=$HOME/.config/gh-labs gh run list --workflow release.yml --limit 1
+   GH_CONFIG_DIR=$HOME/.config/gh-labs gh run watch <run-id>
+   ```
 
 **Iter-3 alternative — automated via `release-engineer` §7 executing mode:**
 when this repo's `.claude/rules/auto-release.md` sentinel is present (it is,
@@ -128,10 +141,26 @@ agent prompts for explicit user choice. The Sensitive-tier
 
 Each release attaches one binary per supported platform. Verification covers:
 
-### Size budget (≤ 10 MB) — NFR-1.1
+### What the workflow builds
 
-The release workflow asserts `size <= 10485760` (10 MiB) as a hard gate per
-NFR-1.1. A build that exceeds the budget fails the workflow and no release is
+`cargo build --release --features asr-whisper` for four platforms:
+
+| Artifact | Runner | Target | Gate |
+|---|---|---|---|
+| `claudebase-darwin-arm64` | `macos-14` | `aarch64-apple-darwin` | required |
+| `claudebase-linux-x64` | `ubuntu-latest` | `x86_64-unknown-linux-gnu` | required |
+| `claudebase-linux-arm64` | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` | best-effort (`continue-on-error`) |
+| `claudebase-windows-x64.exe` | `windows-latest` | `x86_64-pc-windows-msvc` | best-effort (`continue-on-error`) |
+
+`darwin-x64` is no longer built (no prebuilt ONNX Runtime for Intel macOS).
+A source tarball is attached next to the binaries. Best-effort platforms
+that fail leave the release published without their artifact.
+
+### Size budget (≤ 40 MB) — NFR-1.1
+
+The release workflow asserts `size <= 41943040` (40 MiB) as a hard gate per
+NFR-1.1 (raised from the original 10 MiB when fastembed/ONNX Runtime and
+whisper.cpp were linked in). A build that exceeds the budget fails the workflow and no release is
 cut. If you hit the limit:
 
 - inspect what crates expanded (e.g., `cargo bloat --release` locally),
@@ -161,15 +190,17 @@ Once the bootstrap (§2) is done, every subsequent release is:
 
 - [ ] `Cargo.toml` `version` bumped per §3.
 - [ ] `Cargo.lock` regenerated and committed.
-- [ ] `CLAUDEBASE_VERSION` in `install.sh` and `$Script:ClaudebaseVersion` in
-      `install.ps1` bumped to the SAME version. These pin the release the
-      installer downloads: leave them behind and the new tag ships an installer
-      that fetches the previous binary, which looks like a successful install
-      and is not one.
+- [ ] `CLAUDEBASE_VERSION_FALLBACK` in `install.sh` and
+      `$Script:ClaudebaseVersionFallback` in `install.ps1` bumped to the SAME
+      version. The installers take an explicit `CLAUDEBASE_VERSION` first,
+      then the newest `claudebase-v*` tag via `git ls-remote`, and only then
+      this constant — so a stale one bites exactly the machines without git
+      or network.
 - [ ] `CHANGELOG.md` `[Unreleased]` promoted to the released version with a date.
 - [ ] Tag pushed: `git push origin claudebase-vX.Y.Z`.
 - [ ] GitHub Actions `claudebase release` workflow completes green.
-- [ ] All 4 binary artifacts visible on the Releases page.
+- [ ] Binary artifacts visible on the Releases page (darwin-arm64 and
+      linux-x64 required; linux-arm64 and windows-x64 best-effort, see §4).
 - [ ] At least one platform's binary spot-checked with `--version`.
 
 ---
@@ -183,9 +214,8 @@ the next iteration:
   and document the verification command (`sha256sum -c`) in `install.sh`.
 - **Sigstore / cosign signing.** Sign each artifact with sigstore's
   keyless-signing flow and publish the signature + certificate sidecars.
-- **Windows builds.** Add `windows-latest` (`x86_64-pc-windows-msvc`) to the
-  build matrix. iter-1 deliberately ships unix-only because the consumer
-  surface (`install.sh`) is bash-only in iter-1.
+- ~~**Windows builds.**~~ Done: `windows-x64` is in the matrix (best-effort)
+  and `install.ps1` installs it.
 - **Provenance attestations** (SLSA / GitHub-Attestations) so downstream
   consumers can verify the artifact was produced by this exact workflow run.
 

@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- **`chat clone` by a name several conversations share now says which is which.** A conversation
+  continued after its context ran out is a new file that keeps the old title, so this is the normal
+  case, not an edge one. The refusal lists the candidates newest first, each with its last activity
+  and last prompt, and marks the most recent — the one usually wanted.
+
 ## [0.12.0] - 2026-10-07
 
 ### Added

@@ -147,9 +147,27 @@ fn ambiguous_name_is_refused() {
         format!("{{\"type\":\"custom-title\",\"customTitle\":\"original\",\"sessionId\":\"{OTHER}\"}}\n"),
     )
     .unwrap();
-    clone(&env, "original", "x")
+    // The newer file is listed first and marked; each carries its last prompt.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    fs::write(
+        env.folder.join(format!("{OTHER}.jsonl")),
+        format!(
+            "{{\"type\":\"custom-title\",\"customTitle\":\"original\",\"sessionId\":\"{OTHER}\"}}\n\
+             {{\"type\":\"last-prompt\",\"lastPrompt\":\"keep going\",\"sessionId\":\"{OTHER}\"}}\n"
+        ),
+    )
+    .unwrap();
+    let out = clone(&env, "original", "x")
         .failure()
-        .stderr(predicates::str::contains("2 conversations are named `original`"));
+        .stderr(predicates::str::contains("2 conversations are named `original`"))
+        .get_output()
+        .stderr
+        .clone();
+    let err = String::from_utf8_lossy(&out);
+    let (newer, older) = (err.find(OTHER).unwrap(), err.find(SRC).unwrap());
+    assert!(newer < older, "newest first:\n{err}");
+    assert!(err.contains("(most recent)"));
+    assert!(err.contains("last prompt: \"keep going\""));
 }
 
 #[test]

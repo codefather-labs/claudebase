@@ -115,13 +115,49 @@ pub fn find_transcript_by_name(claude_dir: &Path, cwd: &Path, name: &str) -> Res
     }
     match matches.len() {
         0 => bail!("no conversation named `{name}` — pass its id instead, or check the name in /resume"),
-        1 => Ok(matches.remove(0)),
-        _ => bail!(
-            "{} conversations are named `{name}`; pass one of their ids instead:\n{}",
-            matches.len(),
-            matches.iter().map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n")
-        ),
+        1 => Ok(matches.remove(0).path),
+        _ => {
+            // Newest first: the usual question is "which one am I in right
+            // now", and a conversation continued after its context ran out is
+            // a new file carrying the old one's title.
+            matches.sort_by(|a, b| b.modified.cmp(&a.modified));
+            let list = matches
+                .iter()
+                .enumerate()
+                .map(|(i, m)| describe_match(m, i == 0))
+                .collect::<Vec<_>>()
+                .join("\n");
+            bail!(
+                "{} conversations are named `{name}` (a conversation continued after its context \
+                 ran out keeps the old title); pass one of these ids instead, newest first:\n{list}",
+                matches.len()
+            )
+        }
     }
+}
+
+/// A transcript whose title matched, with what tells it apart from the others.
+struct Match {
+    path: PathBuf,
+    modified: Option<std::time::SystemTime>,
+    last_prompt: Option<String>,
+}
+
+fn describe_match(m: &Match, newest: bool) -> String {
+    let id = m.path.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default();
+    let when = m
+        .modified
+        .map(|t| chrono::DateTime::<chrono::Local>::from(t).format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let mut prompt: String = m.last_prompt.as_deref().unwrap_or("").replace(['\n', '\r'], " ");
+    if prompt.chars().count() > 80 {
+        prompt = prompt.chars().take(79).collect::<String>() + "…";
+    }
+    format!(
+        "  {id}  last active {when}{}\n      last prompt: {}",
+        if newest { "  (most recent)" } else { "" },
+        if prompt.is_empty() { "—".to_owned() } else { format!("\"{prompt}\"") }
+    )
 }
 
 /// The working directory's project folder, then every other one.
@@ -141,40 +177,56 @@ fn search_folders(claude_dir: &Path, cwd: &Path) -> Vec<PathBuf> {
     folders
 }
 
-fn matches_in(folder: &Path, name: &str) -> Vec<PathBuf> {
+fn matches_in(folder: &Path, name: &str) -> Vec<Match> {
     let Ok(entries) = fs::read_dir(folder) else { return Vec::new() };
-    let mut out: Vec<PathBuf> = entries
+    entries
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
-        .filter(|p| transcript_title(p).as_deref() == Some(name))
-        .collect();
-    out.sort();
-    out
+        .filter_map(|path| {
+            let (title, last_prompt) = transcript_meta(&path)?;
+            (title.as_deref() == Some(name)).then(|| Match {
+                modified: fs::metadata(&path).and_then(|m| m.modified()).ok(),
+                path,
+                last_prompt,
+            })
+        })
+        .collect()
 }
 
 /// The name a transcript is listed under, as described on
-/// [`find_transcript_by_name`].
-pub fn transcript_title(path: &Path) -> Option<String> {
+/// [`find_transcript_by_name`], and its last prompt — one pass over the file.
+fn transcript_meta(path: &Path) -> Option<(Option<String>, Option<String>)> {
     let raw = fs::read(path).ok()?;
-    let (mut custom, mut ai) = (None, None);
+    let (mut custom, mut ai, mut last_prompt) = (None, None, None);
     for line in raw.split(|&b| b == b'\n') {
-        // Cheap pre-filter: transcripts run to tens of megabytes and only the
-        // title lines are of interest.
-        if !contains(line, b"\"custom-title\"") && !contains(line, b"\"ai-title\"") {
+        // Cheap pre-filters: transcripts run to hundreds of megabytes, almost
+        // all of it in long message lines, and only these few short lines are
+        // of interest. A title or last-prompt line past the cap is a pasted
+        // wall of text, not something worth matching on.
+        if line.len() > META_LINE_CAP {
+            continue;
+        }
+        if !contains(line, b"\"custom-title\"")
+            && !contains(line, b"\"ai-title\"")
+            && !contains(line, b"\"last-prompt\"")
+        {
             continue;
         }
         let Ok(v) = serde_json::from_slice::<Value>(line) else { continue };
+        let field = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_owned);
         match v.get("type").and_then(Value::as_str) {
-            Some("custom-title") => {
-                custom = v.get("customTitle").and_then(Value::as_str).map(str::to_owned)
-            }
-            Some("ai-title") => ai = v.get("aiTitle").and_then(Value::as_str).map(str::to_owned),
+            Some("custom-title") => custom = field("customTitle"),
+            Some("ai-title") => ai = field("aiTitle"),
+            Some("last-prompt") => last_prompt = field("lastPrompt"),
             _ => {}
         }
     }
-    custom.or(ai)
+    Some((custom.or(ai), last_prompt))
 }
+
+/// Longest transcript line [`transcript_meta`] looks at.
+const META_LINE_CAP: usize = 64 * 1024;
 
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)

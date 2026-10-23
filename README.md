@@ -326,6 +326,12 @@ expected entries are extracted, by sanitised path, regular files only, and nothi
 overwritten. Project-level memory (`~/.claude/projects/<dir>/memory/`) is not part of a
 conversation and does not travel.
 
+Inside a session the same is one skill away: `/claudebase-chat-dump` packs the conversation you are
+in (or one you name), and `/claudebase-chat-load <file.zip>` unpacks one into the current
+directory. Both only run the commands above; the load skill asks before importing an archive the
+operator did not make, since a loaded conversation's transcript becomes a model's context when it is
+resumed.
+
 All subcommands accept `--project-root <dir>` (defaults to cwd) and `--json` for structured output. Insight bodies can come from positional arg, `-`, or piped stdin (TTY without a body is rejected — designed for non-interactive agent use).
 
 ## 🧠 Two corpora — books and insights
@@ -809,7 +815,8 @@ claudebase/
 ├── prompts/                Claude Code agent toolkit installed into ~/.claude/
 │   ├── rules/              knowledge-base, knowledge-base-tool, tool-limitations
 │   ├── commands/           /knowledge-ingest, /reflect, /consolidate, /update-claudebase
-│   ├── skills/             /claudebase-daemon-change-nick, access, configure
+│   ├── skills/             /claudebase-daemon-{change-nick,setup-auth-token,callback-info},
+│   │                       /claudebase-chat-{dump,load}
 │   └── agents/             reflection (Drift), consolidator (Mnem)
 ├── bench/                  Benchmark harness + golden query set
 ├── docs/                   Self-contained product documentation

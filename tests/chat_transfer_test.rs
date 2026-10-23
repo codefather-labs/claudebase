@@ -180,6 +180,35 @@ fn loading_twice_is_refused_and_new_id_makes_a_copy() {
         .stderr(predicates::str::contains("x.zip"));
 }
 
+#[test]
+fn without_a_source_dump_takes_the_session_it_runs_in() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = Machine::new(tmp.path(), "a");
+    seed(&a);
+    let out = Command::cargo_bin("claudebase")
+        .unwrap()
+        .current_dir(&a.project)
+        .env("CLAUDE_CONFIG_DIR", &a.claude)
+        .env("CLAUDE_CODE_SESSION_ID", ID)
+        .args(["chat", "dump"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(String::from_utf8_lossy(&out).contains(&format!("dumped {ID}")));
+
+    Command::cargo_bin("claudebase")
+        .unwrap()
+        .current_dir(&a.project)
+        .env("CLAUDE_CONFIG_DIR", &a.claude)
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .args(["chat", "dump"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("CLAUDE_CODE_SESSION_ID is not set"));
+}
+
 fn hostile_zip(path: &Path, entries: &[(&str, &[u8])]) {
     let mut zip = zip::ZipWriter::new(fs::File::create(path).unwrap());
     let opts = zip::write::SimpleFileOptions::default();

@@ -108,7 +108,8 @@ WHAT GETS INSTALLED:
   ~/.claude/agents/                         reflection (Drift), consolidator (Mnem)
   ~/.claude/skills/                         /claudebase-daemon-change-nick,
                                             /claudebase-daemon-setup-auth-token,
-                                            /claudebase-daemon-callback-info
+                                            /claudebase-daemon-callback-info,
+                                            /claudebase-chat-dump, /claudebase-chat-load
   ~/.claude/hooks/claudebase-channel-contract.sh   SessionStart - how outside messages arrive
   ~/.claude/hooks/claudebase-read-insights-reminder.sh  SessionStart - load prior insights
   ~/.claude/hooks/claudebase-selfcheck-reminder.sh UserPromptSubmit - self-check reminder
@@ -1016,7 +1017,7 @@ echo "    tools/claudebase/   (binary + pdfium + e5 model)"
 echo "    rules/              (1 file - cognitive-self-check)"
 echo "    commands/           (4 files — knowledge-ingest, reflect, consolidate, update-claudebase)"
 echo "    agents/             (2 files — reflection, consolidator)"
-echo "    skills/             (3 skills — change-nick, setup-auth-token, callback-info)"
+echo "    skills/             (5 skills — change-nick, setup-auth-token, callback-info, chat-dump, chat-load)"
 echo "    hooks/              (5 hooks — 2x SessionStart, UserPromptSubmit, Pre/PostToolUse)"
 echo ""
 
@@ -1112,6 +1113,8 @@ echo ""
 echo "  Skills installed (~/.claude/skills/):"
 echo "    /claudebase-daemon-change-nick        Rename this session so /switch can address it"
 echo "    /claudebase-daemon-callback-info      How something outside pings this session"
+echo "    /claudebase-chat-dump                 Pack a conversation into a .zip for another machine"
+echo "    /claudebase-chat-load                 Unpack one here so /resume lists it"
 echo "    /claudebase-daemon-setup-auth-token   The HTTP callback token for a session"
 echo ""
 echo "  Agents installed:"

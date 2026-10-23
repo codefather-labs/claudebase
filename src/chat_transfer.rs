@@ -44,6 +44,9 @@ use crate::chat_clone::{
     rewrite_lines, transcript_meta, Rewrite,
 };
 
+/// Set by Claude Code in every session it runs: the id of that conversation.
+pub const SESSION_ID_ENV: &str = "CLAUDE_CODE_SESSION_ID";
+
 /// `manifest.json`'s `format` — what tells a conversation dump from any zip.
 const FORMAT: &str = "claudebase-chat-dump";
 /// Bumped when a reader of the previous version could misread the archive.

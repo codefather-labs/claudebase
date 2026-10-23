@@ -109,7 +109,8 @@ WHAT GETS INSTALLED:
   %USERPROFILE%\.claude\commands\     knowledge-ingest, reflect, consolidate, update-claudebase
   %USERPROFILE%\.claude\agents\       reflection (Drift), consolidator (Mnem)
   %USERPROFILE%\.claude\skills\       daemon-change-nick, daemon-setup-auth-token,
-                                      daemon-callback-info
+                                      daemon-callback-info, chat-dump (claudebase-chat-dump),
+                                      chat-load (claudebase-chat-load)
   %USERPROFILE%\.claude\hooks\        SessionStart x2 (channel contract, read-insights),
                                       UserPromptSubmit (self-check),
                                       Pre/PostToolUse (peer routing, feature describe)
@@ -1034,6 +1035,8 @@ Write-Host ""
 Write-Host "  Commands installed: /knowledge-ingest /reflect /consolidate /update-claudebase"
 Write-Host "  Skills installed:   /claudebase-daemon-change-nick"
 Write-Host "                      /claudebase-daemon-callback-info"
+Write-Host "                      /claudebase-chat-dump"
+Write-Host "                      /claudebase-chat-load"
 Write-Host "                      /claudebase-daemon-setup-auth-token"
 Write-Host "  Agents installed:   reflection (Drift), consolidator (Mnem)"
 Write-Host ""

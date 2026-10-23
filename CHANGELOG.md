@@ -18,6 +18,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   sanitised path, regular files only, staged and put in place transcript-last, nothing overwritten.
   Both directions stream, so a 370 MB transcript (818 MB with its side files) dumps to 242 MB in
   26 s with under 20 MB of memory.
+- **`/claudebase-chat-dump` and `/claudebase-chat-load` skills** wrap the two commands for use from
+  inside a session. `claudebase chat dump` with no source dumps the conversation it runs in — it
+  reads `CLAUDE_CODE_SESSION_ID` itself, because a skill that put `"$CLAUDE_CODE_SESSION_ID"` on the
+  command line stopped at a permission prompt every time (Claude Code cannot vet a shell expansion
+  against an allow rule), and a name would be ambiguous (a conversation continued after its context
+  ran out shares its title with the one before it). The dump skill never sends the archive
+  anywhere; the load skill asks the operator before importing an archive they did not make, and
+  never acts on a load requested over a channel alone — a loaded transcript becomes a model's
+  context when it is resumed.
 
 ### Changed
 

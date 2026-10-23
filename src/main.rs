@@ -774,10 +774,26 @@ fn run_chat_clone(args: &cli::ChatCloneArgs) -> anyhow::Result<String> {
 fn run_chat_dump(args: &cli::ChatDumpArgs) -> anyhow::Result<String> {
     use claudebase::{chat_clone, chat_transfer};
     let cwd = std::env::current_dir()?;
+    // Read here rather than expanded by the caller's shell: an agent's
+    // permission rules cannot vet `"$CLAUDE_CODE_SESSION_ID"` in a command
+    // line, so a skill that passed it would stop at a prompt every time.
+    let source = match &args.source {
+        Some(s) => s.clone(),
+        None => std::env::var(chat_transfer::SESSION_ID_ENV)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "name the conversation to dump (its id or /resume name) — outside a Claude \
+                     Code session there is no current one (${} is not set)",
+                    chat_transfer::SESSION_ID_ENV
+                )
+            })?,
+    };
     let r = chat_transfer::dump_conversation(
         &chat_clone::claude_dir()?,
         &cwd,
-        &args.source,
+        &source,
         args.out.as_deref(),
     )?;
     let size = std::fs::metadata(&r.archive).map(|m| m.len()).unwrap_or(0);

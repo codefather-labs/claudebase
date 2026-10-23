@@ -614,8 +614,9 @@ pub enum ChatSubcommand {
 #[derive(Args, Debug)]
 pub struct ChatDumpArgs {
     /// The conversation to pack: its UUID or the name it is listed under in
-    /// `/resume`.
-    pub source: String,
+    /// `/resume`. Omitted inside a Claude Code session: the conversation that
+    /// session is (`$CLAUDE_CODE_SESSION_ID`).
+    pub source: Option<String>,
     /// Where to write the archive. Default: `<name>-<id8>.zip` in the current
     /// directory. Never overwrites an existing file.
     #[arg(long, short)]

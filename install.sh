@@ -398,8 +398,16 @@ register_bash_allowlist() {
   # it) and the bare name (how an agent calls it after `register_alias` put a
   # symlink on PATH — `claudebase telegram send ...`). Without the bare form
   # every reply to a Telegram message would raise a permission prompt.
-  local entry='~/.claude/tools/claudebase/claudebase *'
-  local entry_bare='claudebase *'
+  #
+  # Each is a Bash(...) rule. Earlier installers wrote the bare command
+  # (`claudebase *`); Claude Code rejects that as a "wildcard tool name", skips
+  # it with a warning on every start, and so allowed nothing — every claudebase
+  # call outside a skip-permissions session asked for approval. Those two
+  # strings are removed on the way in.
+  local entry='Bash(~/.claude/tools/claudebase/claudebase *)'
+  local entry_bare='Bash(claudebase *)'
+  local legacy='~/.claude/tools/claudebase/claudebase *'
+  local legacy_bare='claudebase *'
 
   if [ ! -f "$settings" ]; then
     mkdir -p "$CLAUDE_DIR"
@@ -413,8 +421,8 @@ EOF
 
   if command -v jq >/dev/null 2>&1; then
     local tmp; tmp="$(mktemp)"
-    if jq --arg new "$entry" --arg bare "$entry_bare" \
-         '(.permissions //= {}) | (.permissions.allow //= []) | .permissions.allow = ((.permissions.allow + [$new, $bare]) | unique)' \
+    if jq --arg new "$entry" --arg bare "$entry_bare" --arg old "$legacy" --arg oldbare "$legacy_bare" \
+         '(.permissions //= {}) | (.permissions.allow //= []) | .permissions.allow = ((.permissions.allow - [$old, $oldbare] + [$new, $bare]) | unique)' \
          "$settings" > "$tmp" \
        && jq -e '.' "$tmp" >/dev/null 2>&1; then
       mv "$tmp" "$settings"

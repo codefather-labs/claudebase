@@ -371,7 +371,13 @@ function Register-BashAllowlist {
     # it) and the bare name (how an agent calls it after Register-Alias put a
     # wrapper on PATH - `claudebase telegram send ...`). Without the bare form
     # every reply to a Telegram message raises a permission prompt.
-    $entries = @('~/.claude/tools/claudebase/claudebase *', 'claudebase *')
+    #
+    # Each is a Bash(...) rule. Earlier installers wrote the bare command
+    # ('claudebase *'); Claude Code rejects that as a "wildcard tool name",
+    # skips it with a warning on every start, and so allowed nothing. Those two
+    # strings are removed on the way in.
+    $entries = @('Bash(~/.claude/tools/claudebase/claudebase *)', 'Bash(claudebase *)')
+    $legacy  = @('~/.claude/tools/claudebase/claudebase *', 'claudebase *')
 
     # Issue 003: Set-Content -Encoding UTF8 writes UTF-8 WITH BOM on
     # Windows PowerShell 5.1; some JSON parsers (notably Claude Code's
@@ -391,9 +397,11 @@ function Register-BashAllowlist {
         if ($null -eq $obj.permissions) { $obj | Add-Member -NotePropertyName permissions -NotePropertyValue @{ allow = @() } -Force }
         if ($null -eq $obj.permissions.allow) { $obj.permissions | Add-Member -NotePropertyName allow -NotePropertyValue @() -Force }
 
-        $missing = @($entries | Where-Object { $obj.permissions.allow -notcontains $_ })
-        if ($missing.Count -gt 0) {
-            $obj.permissions.allow = @($obj.permissions.allow) + $missing
+        $current = @($obj.permissions.allow)
+        $kept    = @($current | Where-Object { $legacy -notcontains $_ })
+        $missing = @($entries | Where-Object { $kept -notcontains $_ })
+        if ($missing.Count -gt 0 -or $kept.Count -ne $current.Count) {
+            $obj.permissions.allow = $kept + $missing
             $json = $obj | ConvertTo-Json -Depth 10
             [System.IO.File]::WriteAllText($settings, $json, [System.Text.UTF8Encoding]::new($false))
             Write-Ok "settings.json (claudebase allowlist merged)"
@@ -401,7 +409,7 @@ function Register-BashAllowlist {
             Write-Ok "settings.json already contains claudebase allowlist"
         }
     } catch {
-        Write-Warn "settings.json merge failed: $($_.Exception.Message); add manually: $entry"
+        Write-Warn "settings.json merge failed: $($_.Exception.Message); add manually: $($entries -join ', ')"
     }
 }
 

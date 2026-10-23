@@ -37,6 +37,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **`chat clone` streams instead of reading the transcript into memory**, and lines it does not
   change keep their exact bytes rather than being re-serialised.
 
+### Fixed
+
+- **The settings.json allowlist the installers write now actually allows something.** Both wrote
+  `claudebase *` and `~/.claude/tools/claudebase/claudebase *` as bare strings. Claude Code rejects
+  those as "wildcard tool names", skips them with a warning on every start, and so allowed nothing:
+  outside a `claudebase run` session (which skips permissions by default) every `claudebase` call —
+  `telegram send` included — stopped at an approval prompt. They are now `Bash(claudebase *)` and
+  `Bash(~/.claude/tools/claudebase/claudebase *)`, and re-running an installer removes the old two.
+  Checked with `claude -p --permission-mode default`: blocked before, runs after.
+
 ## [0.12.0] - 2026-10-07
 
 ### Added

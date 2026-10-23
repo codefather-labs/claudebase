@@ -158,6 +158,26 @@ fn an_explicit_version_request_is_not_overwritten() {
     );
 }
 
+/// An allow rule names its tool: `Bash(claudebase *)`, not `claudebase *`.
+///
+/// Both installers wrote the bare form for releases. Claude Code rejects it as a
+/// "wildcard tool name", skips it with a warning on every start, and allows
+/// nothing — so outside a skip-permissions session every `claudebase` call,
+/// `telegram send` included, stopped at an approval prompt. Checked against a
+/// live `claude -p --permission-mode default`: blocked with the bare rule, run
+/// with the `Bash(...)` one.
+#[test]
+fn the_installers_write_allow_rules_claude_code_accepts() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for installer in ["install.sh", "install.ps1"] {
+        let text = std::fs::read_to_string(root.join(installer))
+            .unwrap_or_else(|e| panic!("read {installer}: {e}"));
+        for rule in ["Bash(claudebase *)", "Bash(~/.claude/tools/claudebase/claudebase *)"] {
+            assert!(text.contains(rule), "{installer} does not install the allow rule {rule}");
+        }
+    }
+}
+
 /// Both installers announce what they installed, and both under-reported it.
 ///
 /// The closing summary listed the four `commands/` entries and CALLED them

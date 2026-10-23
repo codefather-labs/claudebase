@@ -232,10 +232,7 @@ pub fn ensure_model(path: &std::path::Path) -> Result<()> {
         "whisper: starting model download from huggingface"
     );
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(900)) // 15 min cap
-        .build()
-        .context("build reqwest client for model download")?;
+    let client = super::download::http_client()?;
 
     let mut req = client.get(HF_MODEL_URL);
     if part_size_existing > 0 {
@@ -266,8 +263,12 @@ pub fn ensure_model(path: &std::path::Path) -> Result<()> {
     let mut writer = open_mode
         .with_context(|| format!("open .part file {}", part_path.display()))?;
 
-    std::io::copy(&mut resp, &mut writer)
-        .with_context(|| format!("write to .part file {}", part_path.display()))?;
+    // A 206 resumes: the body is the rest, and the whole is what we had plus
+    // that. A 200 restarts from zero (the server ignored the Range).
+    let resumed = if resp.status().as_u16() == 206 { part_size_existing } else { 0 };
+    let total = resp.content_length().map(|rest| resumed + rest);
+    super::download::copy_with_progress("whisper model", &mut resp, &mut writer, resumed, total)
+        .with_context(|| format!("write to .part file {} (kept; the next run resumes)", part_path.display()))?;
     drop(writer);
 
     // Verify size sanity BEFORE rename — a truncated download leaves

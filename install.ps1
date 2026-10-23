@@ -831,8 +831,13 @@ function Install-AsrModel {
         $expected = $whisperModel
     }
     Write-Info "  skip with -SkipAsrModel; voice notes still work without it"
+    Write-Info "  interrupted? re-run: the download resumes where it stopped"
     try {
-        & $bin daemon warmup --asr 2>&1 | Out-Null
+        # Show the progress lines (stdout). This used to be `| Out-Null`, so a
+        # slow line meant many minutes of a silent installer that looked hung --
+        # and got interrupted. stdout only: under ErrorActionPreference=Stop a
+        # redirected stderr line would be raised as an error and abort the step.
+        & $bin daemon warmup --asr | ForEach-Object { Write-Host "    $_" }
         if (Test-Path $expected) { Write-Ok "speech model ready" }
         else { throw "warmup finished but the model is not there" }
     } catch {

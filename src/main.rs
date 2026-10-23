@@ -1412,6 +1412,10 @@ fn run_daemon_doctor(_args: &cli::DaemonDoctorArgs) -> std::process::ExitCode {
 fn run_daemon_warmup(_args: &cli::DaemonWarmupArgs) -> std::process::ExitCode {
     use claudebase::daemon::{asr, config};
 
+    // Someone is waiting on this — an operator, or an installer showing them
+    // its output — and a model download can take many minutes.
+    asr::download::REPORT_PROGRESS.store(true, std::sync::atomic::Ordering::Relaxed);
+
     // A missing daemon.toml means defaults, not failure: the file is optional
     // and the default backend is whisper. Refusing to run here removed the one
     // command that would have explained why voice notes were not transcribing

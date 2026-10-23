@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **The speech-model download no longer looks hung.** `daemon warmup --asr` printed nothing while it
+  fetched the ~1.5 GB whisper model, and both installers threw its output away, so on a slow line
+  the installer sat on `downloading the whisper model ...` for many minutes in silence — on one
+  Windows install it reached 580 MB in seven minutes at 1.4 MB/s and was interrupted as stuck.
+  `warmup` now prints progress every 10 s (done, total, rate, time left) and says when it resumes,
+  and both installers show those lines and say that a re-run resumes. A download that receives
+  nothing for 60 s now fails instead of waiting 15 minutes (whisper) or forever (parakeet); whisper's
+  `.part` is kept and the next run continues from it.
+
 ## [0.13.0] - 2026-10-23
 
 ### Added

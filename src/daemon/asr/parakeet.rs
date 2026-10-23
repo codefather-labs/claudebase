@@ -277,10 +277,7 @@ fn ensure_model(dir: &Path, files: &[PathBuf; 4]) -> Result<()> {
         "parakeet: downloading the model archive (~640 MB); the first voice note will wait for it"
     );
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(None)
-        .build()
-        .context("parakeet: build http client")?;
+    let client = super::download::http_client()?;
     let mut resp = client
         .get(MODEL_ARCHIVE_URL)
         .send()
@@ -293,7 +290,8 @@ fn ensure_model(dir: &Path, files: &[PathBuf; 4]) -> Result<()> {
     }
     let mut out = std::fs::File::create(&archive)
         .with_context(|| format!("create {}", archive.display()))?;
-    std::io::copy(&mut resp, &mut out)
+    let total = resp.content_length();
+    super::download::copy_with_progress("parakeet model", &mut resp, &mut out, 0, total)
         .with_context(|| format!("write {}", archive.display()))?;
     drop(out);
 

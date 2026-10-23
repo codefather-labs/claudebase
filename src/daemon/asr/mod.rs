@@ -44,6 +44,7 @@ use async_trait::async_trait;
 use crate::daemon::config::Config;
 
 pub mod decoder;
+pub mod download;
 
 #[cfg(feature = "asr-whisper")]
 pub mod whisper;

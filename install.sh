@@ -962,8 +962,15 @@ install_asr_model() {
       log_info "downloading the whisper model (~1.5 GB, one time) ..." ;;
   esac
   log_info "  skip with CLAUDEBASE_SKIP_ASR_MODEL=1; voice notes still work without it"
+  log_info "  interrupted? re-run: the download resumes where it stopped"
 
-  if "$bin" daemon warmup --asr >/dev/null 2>&1; then
+  # Show the command's progress lines. This used to go to /dev/null, so a slow
+  # line meant many minutes of a silent installer that looked hung — and got
+  # interrupted. `while read` rather than `sed -u`: BSD sed has no -u.
+  local rc
+  "$bin" daemon warmup --asr 2>&1 | while IFS= read -r line; do printf '    %s\n' "$line"; done
+  rc=${PIPESTATUS[0]}
+  if [ "$rc" -eq 0 ]; then
     log_ok "speech model ready"
   else
     log_warn "speech model download failed; it will be fetched on the first voice note"

@@ -405,6 +405,8 @@ pub enum Command {
     ///   `chat list --thread X` — list messages in a thread (chronological)
     ///   `chat threads`         — list all known threads with counts
     ///   `chat clone <id|name> <name>` — copy a Claude Code conversation for /resume
+    ///   `chat dump <id|name>`    — pack a conversation into a .zip for another machine
+    ///   `chat load <file.zip>`   — unpack one here, resumable from this directory
     Chat(ChatArgs),
     /// Launch `claude` with the Telegram plugin preset and any extra args
     /// forwarded verbatim. Equivalent to:
@@ -599,6 +601,38 @@ pub enum ChatSubcommand {
     /// context; the original is not touched. Run it from the directory the
     /// conversation was started in.
     Clone(ChatCloneArgs),
+    /// Pack a Claude Code conversation — transcript, subagent transcripts,
+    /// spilled tool results and /rewind backups — into one .zip, to carry it
+    /// to another machine and `chat load` it there.
+    Dump(ChatDumpArgs),
+    /// Unpack a `chat dump` archive into this directory's conversations, so
+    /// `/resume` run here lists it. Keeps the conversation's id; project paths
+    /// recorded on the source machine are moved to this directory.
+    Load(ChatLoadArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ChatDumpArgs {
+    /// The conversation to pack: its UUID or the name it is listed under in
+    /// `/resume`.
+    pub source: String,
+    /// Where to write the archive. Default: `<name>-<id8>.zip` in the current
+    /// directory. Never overwrites an existing file.
+    #[arg(long, short)]
+    pub out: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct ChatLoadArgs {
+    /// The archive `chat dump` produced.
+    pub archive: PathBuf,
+    /// Load under a fresh id, as a separate copy — for a conversation that is
+    /// already on this machine.
+    #[arg(long)]
+    pub new_id: bool,
+    /// List the loaded conversation in `/resume` under this name instead.
+    #[arg(long)]
+    pub name: Option<String>,
 }
 
 #[derive(Args, Debug)]

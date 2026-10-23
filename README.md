@@ -288,6 +288,10 @@ claudebase chat clone <id|name> <new-name>     copy a Claude Code conversation u
                                                id; the copy appears in /resume as <new-name>
                                                and continues from the same context, the
                                                original is untouched
+claudebase chat dump <id|name> [--out F.zip]   pack a conversation into one .zip to carry it
+                                               to another machine
+claudebase chat load <F.zip> [--new-id]        unpack it here, as a native conversation
+                             [--name N]        /resume run from this directory lists
 ```
 
 `<id|name>` is the conversation's UUID (the transcript file name under
@@ -297,6 +301,30 @@ started in: a name is looked up there first, and the copy is filed next to the o
 `/resume` from that directory shows it. A name that several conversations share is refused with
 their ids. The copy carries the subagent transcripts and the `/rewind` file backups; it does not
 carry the original's Remote Control binding.
+
+**Moving a conversation to another machine.** On the source machine, from the project directory:
+
+```bash
+claudebase chat dump "refactor-crypto-classifier-prompts"   # -> ./refactor-crypto-classifier-prompts-88d0e3e5.zip
+```
+
+Copy the archive to the other machine, into the project directory there, and:
+
+```bash
+claudebase chat load ./refactor-crypto-classifier-prompts-88d0e3e5.zip
+claude --resume 88d0e3e5-…                                  # or pick it in /resume
+```
+
+The archive holds the transcript, the subagent transcripts, spilled tool results and the `/rewind`
+backups, plus a `manifest.json` naming the conversation and the project path it came from. `load`
+keeps the conversation's id — it is the same conversation, moved — and refuses when that id is
+already on the machine; `--new-id` loads a separate copy instead, `--name` lists it under another
+name. `cwd` fields at or under the source project path are moved to the directory `load` runs in,
+since the project rarely sits at the same path on both machines; message text is left as written.
+The Remote Control binding stays behind. The archive is treated as untrusted on load: only the
+expected entries are extracted, by sanitised path, regular files only, and nothing existing is
+overwritten. Project-level memory (`~/.claude/projects/<dir>/memory/`) is not part of a
+conversation and does not travel.
 
 All subcommands accept `--project-root <dir>` (defaults to cwd) and `--json` for structured output. Insight bodies can come from positional arg, `-`, or piped stdin (TTY without a body is rejected — designed for non-interactive agent use).
 

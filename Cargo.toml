@@ -110,6 +110,12 @@ teloxide = { version = "0.17", default-features = false, features = [
     "rustls",
 ] }
 
+# `chat dump` / `chat load` — a conversation travels between machines as one
+# .zip. Deflate only, through flate2's pure-Rust backend (miniz_oxide, already
+# in the tree via `png`): no C codecs, no encryption, nothing the archive
+# format needs beyond the one method every unzip tool reads.
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+
 # Slice 4 — daemon.toml + secrets.toml loaders.
 toml = "0.8"
 
@@ -224,6 +230,8 @@ required-features = ["asr-whisper"]
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+# chat_transfer_test builds hostile archives by hand.
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 
 # Slice 1a TDD integration tests: UDS/named-pipe server + concurrent accept
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync", "process"] }

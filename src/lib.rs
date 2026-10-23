@@ -9,6 +9,7 @@ pub mod access_cli;
 pub mod agent_cli;
 pub mod callback_cli;
 pub mod chat_clone;
+pub mod chat_transfer;
 pub mod chunker;
 pub mod cli;
 pub mod daemon;

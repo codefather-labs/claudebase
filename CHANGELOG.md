@@ -6,12 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **`claudebase chat dump <id|name>` and `claudebase chat load <file.zip>` move a conversation
+  between machines.** `dump` packs the transcript, subagent transcripts, spilled tool results and
+  `/rewind` backups into one zip with a manifest; `load`, run from the project directory on the other
+  machine, unpacks it there as a native conversation that `/resume` lists. The id is kept (the same
+  conversation, moved) and an id already on the machine is refused — `--new-id` loads a separate
+  copy, `--name` renames it. Project paths recorded in `cwd` are moved to the new location; the
+  Remote Control binding stays behind. The archive is untrusted on load: expected entries only, by
+  sanitised path, regular files only, staged and put in place transcript-last, nothing overwritten.
+  Both directions stream, so a 370 MB transcript (818 MB with its side files) dumps to 242 MB in
+  26 s with under 20 MB of memory.
+
 ### Changed
 
 - **`chat clone` by a name several conversations share now says which is which.** A conversation
   continued after its context ran out is a new file that keeps the old title, so this is the normal
   case, not an edge one. The refusal lists the candidates newest first, each with its last activity
   and last prompt, and marks the most recent — the one usually wanted.
+- **`chat clone` streams instead of reading the transcript into memory**, and lines it does not
+  change keep their exact bytes rather than being re-serialised.
 
 ## [0.12.0] - 2026-10-07
 

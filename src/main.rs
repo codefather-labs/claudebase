@@ -174,6 +174,8 @@ fn main() -> std::process::ExitCode {
             cli::ChatSubcommand::List(a) => run_chat_list(a),
             cli::ChatSubcommand::Threads(a) => run_chat_threads(a),
             cli::ChatSubcommand::Clone(a) => simple(run_chat_clone(a), "chat clone"),
+            cli::ChatSubcommand::Dump(a) => simple(run_chat_dump(a), "chat dump"),
+            cli::ChatSubcommand::Load(a) => simple(run_chat_load(a), "chat load"),
         },
         Command::Run(args) => run_claude_with_preset(&args),
         Command::Telegram(args) => match &args.sub {
@@ -766,6 +768,61 @@ fn run_chat_clone(args: &cli::ChatCloneArgs) -> anyhow::Result<String> {
         report.new_id,
         args.name.trim(),
     ))
+}
+
+/// `claudebase chat dump <id|name>` — pack a conversation into a .zip.
+fn run_chat_dump(args: &cli::ChatDumpArgs) -> anyhow::Result<String> {
+    use claudebase::{chat_clone, chat_transfer};
+    let cwd = std::env::current_dir()?;
+    let r = chat_transfer::dump_conversation(
+        &chat_clone::claude_dir()?,
+        &cwd,
+        &args.source,
+        args.out.as_deref(),
+    )?;
+    let size = std::fs::metadata(&r.archive).map(|m| m.len()).unwrap_or(0);
+    Ok(format!(
+        "dumped {}{} ({} files, {:.1} MB -> {:.1} MB)\narchive: {}\non the other machine, from the project directory:\n  claudebase chat load {}",
+        r.session_id,
+        r.title.as_deref().map(|t| format!(" `{t}`")).unwrap_or_default(),
+        r.files,
+        r.bytes_in as f64 / 1e6,
+        size as f64 / 1e6,
+        r.archive.display(),
+        r.archive.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+    ))
+}
+
+/// `claudebase chat load <file.zip>` — unpack a dump into this directory.
+fn run_chat_load(args: &cli::ChatLoadArgs) -> anyhow::Result<String> {
+    use claudebase::{chat_clone, chat_transfer};
+    let cwd = std::env::current_dir()?;
+    let r = chat_transfer::load_conversation(
+        &chat_clone::claude_dir()?,
+        &cwd,
+        &args.archive,
+        args.new_id,
+        args.name.as_deref(),
+    )?;
+    let mut msg = format!(
+        "loaded {}{} ({} lines)",
+        r.session_id,
+        r.title.as_deref().map(|t| format!(" `{t}`")).unwrap_or_default(),
+        r.lines,
+    );
+    if r.session_id != r.source_id {
+        msg.push_str(&format!(" — a copy of {}", r.source_id));
+    }
+    if let Some(from) = &r.source_cwd {
+        msg.push_str(&format!("\nproject paths moved: {from} -> {}", cwd.display()));
+    }
+    msg.push_str(&format!(
+        "\nfile:   {}\nresume: claude --resume {}{}",
+        r.transcript.display(),
+        r.session_id,
+        r.title.as_deref().map(|t| format!("   (or pick `{t}` in /resume)")).unwrap_or_default(),
+    ));
+    Ok(msg)
 }
 
 /// `claudebase chat threads` — list all known chat threads.

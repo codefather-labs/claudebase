@@ -113,6 +113,37 @@ jobs:
           test -x "$HOME/.claude/tools/claudebase/claudebase"
           "$HOME/.claude/tools/claudebase/claudebase" --version
 
+      # --local builds from this checkout, so the installed binary has no excuse
+      # to be any version but the one in Cargo.toml.
+      - name: The installed version is this checkout's
+        shell: bash
+        run: |
+          set -eu
+          want=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          got=$("$HOME/.claude/tools/claudebase/claudebase" --version | awk '{print $2}')
+          echo "Cargo.toml: $want  installed: $got"
+          test "$got" = "$want"
+
+      # Claude Code skips an allow rule that is not `Tool(...)` with a warning,
+      # and a skipped rule allows nothing. The installers wrote the bare form
+      # for several releases and every check stayed green, because nothing
+      # looked at what landed in settings.json.
+      - name: settings.json allows claudebase in a form Claude Code accepts
+        shell: bash
+        run: |
+          set -eu
+          allow=$(jq -c '.permissions.allow' "$HOME/.claude/settings.json")
+          echo "$allow"
+          for rule in 'Bash(claudebase *)' 'Bash(~/.claude/tools/claudebase/claudebase *)'; do
+            jq -e --arg r "$rule" '.permissions.allow | index($r)' "$HOME/.claude/settings.json" >/dev/null \
+              || { echo "missing allow rule: $rule"; exit 1; }
+          done
+          for legacy in 'claudebase *' '~/.claude/tools/claudebase/claudebase *'; do
+            if jq -e --arg r "$legacy" '.permissions.allow | index($r)' "$HOME/.claude/settings.json" >/dev/null; then
+              echo "bare rule Claude Code rejects is still there: $legacy"; exit 1
+            fi
+          done
+
       - name: The binary links nothing exotic
         shell: bash
         run: |
@@ -292,6 +323,28 @@ jobs:
           }
           Write-Host "ASCII only"
 
+      # The installer downloads the newest RELEASE, not this checkout. Whether
+      # it can get the version in Cargo.toml depends on whether that release's
+      # Windows binary is published yet: on the commit that bumps the version,
+      # this job runs while the release is still building, and the installer
+      # correctly falls back to the previous one. So decide BEFORE installing
+      # whether the exact version is owed, and hold the installer to it then.
+      - name: Which version the installer owes
+        shell: powershell
+        run: |
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $want = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' |
+                   Select-Object -First 1).Matches[0].Groups[1].Value
+          $url = "https://github.com/codefather-labs/claudebase/releases/download/claudebase-v$want/claudebase-windows-x64.exe"
+          $published = $false
+          try {
+            $r = Invoke-WebRequest -Uri $url -Method Head -UseBasicParsing -MaximumRedirection 5
+            $published = ($r.StatusCode -eq 200)
+          } catch { }
+          Write-Host "Cargo.toml: $want  Windows release published: $published"
+          "CB_WANT=$want" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+          "CB_PUBLISHED=$published" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+
       - name: Run the installer
         shell: powershell
         run: .\install.ps1 -Yes
@@ -302,6 +355,30 @@ jobs:
           $exe = "$env:USERPROFILE\.claude\tools\claudebase\claudebase.exe"
           if (-not (Test-Path $exe)) { Write-Host "binary missing"; exit 1 }
           & $exe --version
+
+      - name: The installed version is the newest published
+        shell: powershell
+        run: |
+          $exe = "$env:USERPROFILE\.claude\tools\claudebase\claudebase.exe"
+          $got = ((& $exe --version) -replace '^claudebase ', '').Trim()
+          if ($env:CB_PUBLISHED -ne 'True') {
+            Write-Host "::warning::v$env:CB_WANT has no published Windows binary yet (release still building, or not tagged); installed $got from the previous release -- not checked"
+            exit 0
+          }
+          Write-Host "owed: $env:CB_WANT  installed: $got"
+          if ($got -ne $env:CB_WANT) { Write-Host "installer did not install the newest release"; exit 1 }
+
+      - name: settings.json allows claudebase in a form Claude Code accepts
+        shell: powershell
+        run: |
+          $allow = @((Get-Content "$env:USERPROFILE\.claude\settings.json" -Raw | ConvertFrom-Json).permissions.allow)
+          Write-Host ($allow -join ' | ')
+          foreach ($rule in @('Bash(claudebase *)', 'Bash(~/.claude/tools/claudebase/claudebase *)')) {
+            if ($allow -notcontains $rule) { Write-Host "missing allow rule: $rule"; exit 1 }
+          }
+          foreach ($legacy in @('claudebase *', '~/.claude/tools/claudebase/claudebase *')) {
+            if ($allow -contains $legacy) { Write-Host "bare rule Claude Code rejects is still there: $legacy"; exit 1 }
+          }
 
       - name: Every skill, command, rule and agent is installed
         shell: powershell
@@ -341,7 +418,11 @@ jobs:
         run: |
           .\install.ps1 -Yes
           $exe = "$env:USERPROFILE\.claude\tools\claudebase\claudebase.exe"
-          & $exe --version
+          $got = ((& $exe --version) -replace '^claudebase ', '').Trim()
+          Write-Host "after the second install: $got"
+          if ($env:CB_PUBLISHED -eq 'True' -and $got -ne $env:CB_WANT) {
+            Write-Host "the second install left $got, not $env:CB_WANT"; exit 1
+          }
 
   install-idempotent:
     name: installing twice changes nothing

@@ -72,7 +72,7 @@ fn ps1_hooks_are_ascii_only() {
         "claudebase-agent-routing-reminder.ps1",
         "claudebase-channel-contract.ps1",
         "claudebase-feature-describe.ps1",
-        "claudebase-read-insights-reminder.ps1",
+        "claudebase-journal-reminder.ps1",
         "claudebase-selfcheck-reminder.ps1",
     ] {
         assert_ascii_only(name);

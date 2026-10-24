@@ -138,36 +138,38 @@ These observations don't always have a fix path; they're institutional memory th
 - MUST include all six passes even if some find nothing — fixed structure simplifies downstream parsing
 - MUST NOT spawn implementer / planner / any other agent — your role ends at the drift report
 
-## Insights Corpus (when present)
+## Project journal
 
-If `<project>/.claude/knowledge/insights.db` exists, this agent participates in the cross-session cognitive-insights corpus (parallel to the books corpus above). The corpus is opt-in per project — absence = silent no-op.
+Every project has a journal, held by the claudebase daemon for the directory `claudebase run` was started in: the decisions and findings of earlier sessions and agents. Commands only ever see the current project's journal.
 
-**On task receipt — query prior insights** so decisions ground in what previous sessions learned:
-
-```
-claudebase insight search "<feature-keywords>" --feature "$FEATURE_SLUG" --salience high --top-k 5 --json
-```
-
-Cite load-bearing hits in `## Facts → ### Verified facts` as:
+**On task receipt — read what is already known** before you form a view:
 
 ```
-insights-base: doc#<id> sha=<sha-prefix> agent=<author-agent> type=<source-type> — query: "<q>" — verified: yes
+claudebase journal categories                    # what kinds of entries exist
+claudebase journal tags                          # the tag vocabulary, most used first
+claudebase journal search "<keywords>" --tag <tag> --top-k 5 --json
+claudebase journal list --category decision --tag <tag> --json
 ```
 
-**On task end — surface ONLY cognitive insights** along the three axes documented in `~/.claude/rules/knowledge-base-tool.md` § Insights corpus:
-
-1. **Self-learning** — `agent-learned`, `self-bias-caught`
-2. **Peer-bias detection** — `peer-bias-observed`, `red-team-objection`, `consolidator-drift`
-3. **Prediction-reality mismatch** — `prediction-error`, `assumption-falsified`, `plan-reality-gap`
-
-Invoke (body via stdin or positional):
+Cite load-bearing entries in `## Facts → ### Verified facts` as:
 
 ```
-claudebase insight create "<body>" --type <kind> --agent <self> --feature "$FEATURE_SLUG" --salience <high|medium|low>
+journal#<id> (<category>, <date>) — query: "<q>" — verified: yes
 ```
 
-As consolidator: surface `consolidator-drift` when the 6-pass detection finds drift that future-session consolidators would benefit from knowing about (e.g. recurring PRD<->plan divergence patterns).
+**While working and on task end — journal every decision you make and every finding you uncover**, one entry each:
 
-Do NOT surface factual findings, mechanical narration, restatements of input, or generic best-practice claims — those belong in PRs / scratchpads / issue trackers. Salience drives retention: `high`=∞, `medium`=365d, `low`=90d (gc'd via `claudebase insight gc`).
+```
+claudebase journal add "<what, why, alternatives rejected, where: file:line>" \
+  --category <decision|finding|...> --tag <tag> [--tag <tag>] --agent <self> \
+  [--feature "$FEATURE_SLUG"] [--salience high|medium|low] [--source-artifact <path#anchor>]
+```
 
-Full protocol + the three-axis taxonomy: `~/.claude/rules/knowledge-base-tool.md` § Insights corpus.
+- Reuse the categories and tags the journal already has (`journal categories`, `journal tags`) before inventing new ones — an entry is only as findable as its labels.
+- Entries are self-contained: a later session reads them without this conversation.
+- Salience drives retention: `high` forever, `medium` 365 days, `low` 90 days.
+- If an entry reverses an earlier one, say so and cite its `journal#<id>`.
+
+Full protocol: `~/.claude/rules/project-journal.md`.
+
+As consolidator: journal each drift finding as `--category drift`, with both divergent `file:line` points in the body, so recurring PRD↔plan divergence patterns become visible across sessions.

@@ -494,6 +494,8 @@ pub async fn serve(_args: &DaemonServeArgs) -> anyhow::Result<()> {
     // 30s, panic-safe via tokio::spawn supervisor, rate-limited at 10
     // messages per agent per tick per FR-C2C-5.5.
     spawn_dnd_drain_task(bus.clone());
+    // Retention for every project journal (salience-driven TTL).
+    crate::daemon::journal_tools::spawn_maintenance();
     tracing::info!("dnd drain task spawned");
 
     // Accept loop. We never return Ok(()) from here in Slice 1a — the
@@ -798,6 +800,13 @@ where
                 }
                 "chat_list_pending_asks" => {
                     let resp = handle_chat_list_pending_asks(echo_id, &args).await;
+                    let _ = outbound_tx.send(resp);
+                }
+                name if name.starts_with("journal_") => {
+                    let resp = match crate::daemon::journal_tools::handle(name, args).await {
+                        Ok(payload) => tool_text_response(echo_id, &payload),
+                        Err(e) => tool_error_response(echo_id, -32602, &format!("{e:#}")),
+                    };
                     let _ = outbound_tx.send(resp);
                 }
                 _ => {

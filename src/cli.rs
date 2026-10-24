@@ -40,28 +40,8 @@ impl Default for SearchMode {
     }
 }
 
-/// Corpus selector for the standalone `search` subcommand (Slice 6 of
-/// agent-insights-base). `books` opens `index.db`, `insights` opens
-/// `insights.db`, `all` opens BOTH and cross-corpus RRF-fuses ranked
-/// hits with a `source_corpus` JSON field on each hit.
-///
-/// When `--corpus` is set it overrides `--db-name`. When both are set
-/// the CLI emits a stderr warning and the `--corpus` selection wins —
-/// this is the deliberate forward-compat path (tests that hardcode
-/// `--db-name` continue to work; new agent prompts use `--corpus`).
-#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Corpus {
-    /// User-curated books / regulations / docs (the default — `index.db`).
-    Books,
-    /// Agent-written cognitive insights (`insights.db`).
-    Insights,
-    /// Cross-corpus RRF fusion of both — hits carry `source_corpus`.
-    All,
-}
-
-/// Salience tag per cognitive-self-check rule. Drives TTL on the insights
-/// corpus: `high` survives forever, `medium` 1 year, `low` 90 days. The
-/// tag is stored verbatim as TEXT in `documents.salience` (schema v4).
+/// Salience tag per cognitive-self-check rule. Drives retention in the
+/// journal: `high` survives forever, `medium` 1 year, `low` 90 days.
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Salience {
     /// Load-bearing for the whole artifact; retained indefinitely.
@@ -78,29 +58,6 @@ impl Salience {
             Salience::High => "high",
             Salience::Medium => "medium",
             Salience::Low => "low",
-        }
-    }
-}
-
-/// Corpus-scope category for the insights corpus (schema v5). `general`
-/// routes the insight to the cross-project GLOBAL db at
-/// `$HOME/.claude/knowledge/insights.db`; `project` routes it to the current
-/// project's LOCAL `insights.db`. The value is stored verbatim as TEXT in
-/// `documents.category` and is the SOLE selector of which db a write lands in
-/// — `--project <slug>` is data (a `project_slug` column value), never a path.
-#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InsightCategory {
-    /// Cross-project lesson → GLOBAL `$HOME/.claude/knowledge/insights.db`.
-    General,
-    /// Project-scoped lesson → the current project's LOCAL `insights.db`.
-    Project,
-}
-
-impl InsightCategory {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            InsightCategory::General => "general",
-            InsightCategory::Project => "project",
         }
     }
 }
@@ -163,7 +120,6 @@ pub struct IngestArgs {
 
 /// Which corpus file to open under `<project>/.claude/knowledge/`.
 /// `index.db` (default) is the user-curated books corpus.
-/// `insights.db` is the agent-written insights corpus (slice 1+).
 /// Anything else: must end in `.db` and contain no path separators.
 const DEFAULT_DB_NAME: &str = "index.db";
 
@@ -179,11 +135,10 @@ pub fn validate_db_name(name: &str) -> Result<&str, &'static str> {
     if !name.ends_with(".db") {
         return Err("db_name must end with `.db`");
     }
-    if name.contains('/') || name.contains('\\') || name.contains("..") || name.starts_with('.') && name != "index.db" && name != "insights.db" {
+    if name.contains('/') || name.contains('\\') || name.contains("..") || name.starts_with('.') {
         // Allow only well-formed *.db names; reject anything with separators,
-        // double-dots, or hidden-file prefixes (except the two canonical names).
-        // The `.db` suffix dot is fine; the leading-dot check is for paths
-        // like `.malicious.db`. Permit `index.db` and `insights.db` explicitly.
+        // double-dots, or hidden-file prefixes. The `.db` suffix dot is fine;
+        // the leading-dot check is for paths like `.malicious.db`.
         return Err("db_name must be a bare filename ending in `.db`");
     }
     Ok(name)
@@ -212,16 +167,9 @@ pub struct SearchArgs {
     pub mode: SearchMode,
     #[arg(long)]
     pub project_root: Option<PathBuf>,
-    /// Corpus file (under `<project>/.claude/knowledge/`). Default `index.db`
-    /// (user-curated books); `insights.db` for the agent-written insights corpus.
-    /// Overridden by `--corpus` when both are set.
+    /// Corpus file (under `<project>/.claude/knowledge/`). Default `index.db`.
     #[arg(long, default_value = DEFAULT_DB_NAME)]
     pub db_name: String,
-    /// Corpus selector (Slice 6): `books` (default), `insights`, or `all`.
-    /// `all` runs hybrid search against both corpora and RRF-fuses ranks
-    /// — each hit then carries a `source_corpus` field.
-    #[arg(long, value_enum)]
-    pub corpus: Option<Corpus>,
     #[arg(long)]
     pub json: bool,
 }
@@ -388,11 +336,9 @@ pub enum Command {
     /// schema. Re-parses each PDF via pdfium and populates pages without
     /// touching chunks_fts / chunks_vec — preserves embeddings.
     ReindexPages(ReindexPagesArgs),
-    /// Unified agent-insights subcommand tree (`create / search / list /
-    /// random / get`). Operates exclusively on `insights.db` — the books
-    /// corpus (`index.db`) is untouched. See
-    /// docs/design/agent-insights-base.md.
-    Insight(InsightArgs),
+    /// The project journal: decisions and findings, recorded by agents and
+    /// searched by tag and category. Held by the daemon, one per project.
+    Journal(JournalArgs),
     /// Run as a persistent daemon — owns the local IPC surface (UDS on
     /// Unix, named pipe on Windows) for MCP plugin bridges and
     /// agent-chat. Slice 1a wires the accept loop + echo; richer
@@ -845,8 +791,8 @@ pub enum DaemonSubcommand {
     Install(DaemonInstallArgs),
     /// Remove the installed service unit. Preserves user data unless
     /// `--keep-data` is omitted (in which case chat.db / secrets.toml /
-    /// daemon.toml are deleted; the books and insights corpora under
-    /// `~/.claude/knowledge/` and the runtime access.json under
+    /// daemon.toml are deleted; the books corpora, the project journals under
+    /// `~/.claude/claudebase/journals/` and the runtime access.json under
     /// `~/.claude/channels/claudebase/` are preserved regardless).
     Uninstall(DaemonUninstallArgs),
     /// Start the installed daemon service.
@@ -879,8 +825,7 @@ pub struct DaemonUninstallArgs {
     #[arg(long)]
     pub yes: bool,
     /// Preserve user data (chat.db, secrets.toml, daemon.toml).
-    /// The books corpus and insights corpus under
-    /// `~/.claude/knowledge/` are preserved regardless.
+    /// The books corpora and the project journals are preserved regardless.
     #[arg(long)]
     pub keep_data: bool,
 }
@@ -969,184 +914,151 @@ pub struct DaemonConfigShowArgs {
 
 
 #[derive(Args, Debug)]
-pub struct InsightArgs {
+pub struct JournalArgs {
     #[command(subcommand)]
-    pub sub: InsightSubcommand,
+    pub sub: JournalSubcommand,
 }
 
+/// The project journal. Every subcommand goes through the daemon, which owns
+/// the journals (`~/.claude/claudebase/journals/`) and decides which project a
+/// call belongs to: the directory `claudebase run` was started in. Nothing is
+/// ever read from or written to another project's journal.
 #[derive(Subcommand, Debug)]
-pub enum InsightSubcommand {
-    /// Persist a cognitive insight. Same body within (agent, sha256) over
-    /// the last 30 days is deduplicated.
-    Create(InsightCreateArgs),
-    /// Vector + lexical search against the insights corpus (hybrid by
-    /// default — BM25 ⊕ dense via RRF k=60, with auto-fallback to lexical
-    /// when the e5 encoder is unavailable).
-    Search(InsightSearchArgs),
-    /// List insights newest-first, 10 per page. `--offset 0` = latest 10,
-    /// `--offset 1` = next 10, and so on.
-    List(InsightListArgs),
-    /// Return one random insight uniformly sampled from the corpus.
-    Random(InsightRandomArgs),
-    /// Fetch one insight by integer `documents.id` or sha256 prefix
-    /// (≥4 hex chars matches the stored sha256 via LIKE 'prefix%').
-    Get(InsightGetArgs),
-    /// Garbage-collect insights past their salience-driven TTL.
-    /// salience=high retained indefinitely. medium retained 365 days.
-    /// low retained 90 days. Runs VACUUM after delete.
-    Gc(InsightGcArgs),
-    /// Delete one insight by integer `documents.id` (with chunks +
-    /// chunks_vec cascade). Refuses to delete non-insight rows.
-    Delete(InsightDeleteArgs),
-    /// Aggregate tag frequencies across the insights corpus. Default merges
-    /// the cwd-local project db with the global general db (summing counts for
-    /// tags present in both). `--category general` restricts to the global db,
-    /// `--category project` to the cwd-local db, `--project <slug>` to a
-    /// registered project's db (looked up in `~/.claude/knowledge/projects.json`)
-    /// merged with the global db.
-    Tags(InsightTagsArgs),
+pub enum JournalSubcommand {
+    /// Record a decision or a finding. Needs a session started with
+    /// `claudebase run`. The same text in the same category within 30 days is
+    /// stored once (its new tags are merged in).
+    Add(JournalAddArgs),
+    /// Find earlier entries: BM25 plus semantic search, fused. Filters by tag,
+    /// category and the rest are exact.
+    Search(JournalSearchArgs),
+    /// Entries newest first, a page at a time.
+    List(JournalListArgs),
+    /// One entry in full.
+    Get(JournalIdArgs),
+    /// Delete one entry. Needs a session started with `claudebase run`.
+    Delete(JournalIdArgs),
+    /// Tags used in this project's journal, most used first.
+    Tags(JournalTagsArgs),
+    /// Categories used in this project's journal, most used first.
+    Categories(JournalJsonArgs),
+    /// Apply retention now (the daemon also does it daily): salience `low`
+    /// entries live 90 days, `medium` 365, `high` forever.
+    Gc(JournalGcArgs),
+    /// Every project journal the daemon holds, with entry counts.
+    Projects(JournalJsonArgs),
 }
 
-/// `claudebase insight create "<body>"` — agent write surface for the
-/// insights corpus (schema v4). Persists one cognitive insight per call;
-/// same body within the same `(agent, sha256)` over the last 30 days is
-/// deduplicated by `find_recent_insight_by_sha`.
-///
-/// Body semantics:
-///   - positional `<body>` literal string
-///   - `-` as the positional → read stdin
-///   - omitted positional with piped stdin → read stdin
-///   - omitted positional on an interactive TTY → exits 2 with usage
-#[derive(Args, Debug)]
-pub struct InsightCreateArgs {
-    /// Insight body. Pass `-` or omit (with piped stdin) to read from stdin.
-    /// On an interactive TTY without a body, the command exits 2.
-    pub body: Option<String>,
-
-    /// Insight kind — open enum tied to docs/design/agent-insights-base.md.
-    /// Examples: agent-learned, self-bias-caught, peer-bias-observed,
-    /// red-team-objection, consolidator-drift, prediction-error,
-    /// assumption-falsified, plan-reality-gap, reflection-observation,
-    /// operator-correction.
-    #[arg(long = "type")]
-    pub kind: String,
-
-    /// Emitting agent name (planner, reflection, consolidator, red-team, ...).
+/// Filters shared by `search` and `list`.
+#[derive(Args, Debug, Default)]
+pub struct JournalFilterArgs {
+    /// Only entries carrying ANY of these tags (repeatable).
+    #[arg(long = "tag", alias = "tags")]
+    pub tags: Vec<String>,
+    /// Only this category.
     #[arg(long)]
-    pub agent: String,
-
-    /// Claude Code session id for trace linking. Optional but recommended;
-    /// when absent the field stays NULL.
+    pub category: Option<String>,
+    /// Only entries written by this agent.
     #[arg(long)]
-    pub session: Option<String>,
-
-    /// Feature slug this insight belongs to (matches .claude/plan.md feature).
+    pub agent: Option<String>,
+    #[arg(long, value_enum)]
+    pub salience: Option<Salience>,
+    /// Only entries for this feature slug.
     #[arg(long)]
     pub feature: Option<String>,
+    /// Only entries newer than this: `<N>` + `s|m|h|d|w`, e.g. `30d`, `12h`.
+    #[arg(long)]
+    pub since: Option<String>,
+}
 
-    /// Salience tag per cognitive-self-check rule; drives retention TTL.
+/// `claudebase journal add "<text>" --category <c> --tag <t>`.
+///
+/// The text is the positional argument, or stdin when it is `-` or omitted
+/// and stdin is not a terminal.
+#[derive(Args, Debug)]
+pub struct JournalAddArgs {
+    pub body: Option<String>,
+    /// What kind of entry: free text, normalized to lowercase-with-dashes.
+    /// Reuse what `claudebase journal categories` lists before inventing one —
+    /// typical: decision, finding, bug, lesson, assumption-falsified.
+    #[arg(long)]
+    pub category: String,
+    /// At least one (repeatable). Tags are how the entry is found again; reuse
+    /// what `claudebase journal tags` lists.
+    #[arg(long = "tag", alias = "tags")]
+    pub tags: Vec<String>,
+    /// Retention: `high` forever, `medium` 365 days, `low` 90 days.
     #[arg(long, value_enum, default_value_t = Salience::Medium)]
     pub salience: Salience,
-
-    /// Path or anchor of the artifact the insight was extracted from
-    /// (e.g. `.claude/plan.md#slice-3`, `docs/PRD.md#FR-7.2`).
+    /// The agent that wrote it (planner, reviewer, ...). Defaults to the
+    /// session's nick.
+    #[arg(long)]
+    pub agent: Option<String>,
+    /// Feature slug the entry belongs to.
+    #[arg(long)]
+    pub feature: Option<String>,
+    /// Where it came from: a file, `docs/PRD.md#FR-7`, a commit, a URL.
     #[arg(long = "source-artifact")]
     pub source_artifact: Option<String>,
-
-    /// Corpus-scope category — REQUIRED. `general` writes to the global
-    /// cross-project db; `project` writes to the current project's local db.
-    /// No default: clap exits 2 when absent (a category MUST be explicit so an
-    /// agent never silently lands a cross-project lesson in a single project).
-    #[arg(long, value_enum)]
-    pub category: InsightCategory,
-
-    /// Tag(s) for this insight — REPEATABLE, at least one required (the empty
-    /// check is business-logic in `run_insight_create`, not a clap-level
-    /// required-arg, so the operator-facing error names `--tag` explicitly).
-    /// Each tag is normalized: a single leading `#` stripped, lowercased,
-    /// trimmed; empties dropped, duplicates collapsed (stable order).
-    #[arg(long = "tags")]
-    pub tags: Vec<String>,
-
-    /// Explicit project slug stored in `documents.project_slug` (DATA, never a
-    /// path). For `--category project` it overrides the cwd-basename default;
-    /// for `--category general` it is silently ignored (project_slug stays
-    /// NULL). NEVER used to construct a filesystem path.
-    #[arg(long)]
-    pub project: Option<String>,
-
-    #[arg(long)]
-    pub project_root: Option<PathBuf>,
-
-    /// Corpus file — `insights.db` by default. Tests/admin may override.
-    #[arg(long, default_value = "insights.db")]
-    pub db_name: String,
-
     #[arg(long)]
     pub json: bool,
 }
 
-/// `claudebase insight search "<query>"` — hybrid retrieval against
-/// `insights.db`. Default mode is `hybrid` (BM25 ⊕ dense via RRF k=60);
-/// auto-falls-back to `lexical` when the e5 encoder model or the
-/// chunks_vec virtual table is unavailable.
-///
-/// Slice 4 filter args (`--type / --agent / --salience / --feature /
-/// --since`) post-filter the ranked hits against the document metadata.
-/// Implementation note: filters are applied AFTER ranking — `top_k` is
-/// over-fetched (×4 cap 100) so the filter doesn't starve thin pages.
 #[derive(Args, Debug)]
-pub struct InsightSearchArgs {
+pub struct JournalSearchArgs {
     pub query: String,
+    #[command(flatten)]
+    pub filter: JournalFilterArgs,
     #[arg(long, default_value_t = 5)]
     pub top_k: usize,
-    #[arg(long, default_value_t = 0)]
-    pub context: usize,
+    /// `hybrid` (default) falls back to `lexical` until the e5 model is installed.
     #[arg(long, value_enum, default_value_t = SearchMode::Hybrid)]
     pub mode: SearchMode,
-    /// Filter by `documents.source_type` (exact match).
-    #[arg(long = "type")]
-    pub kind: Option<String>,
-    /// Filter by `documents.agent_name` (exact match).
     #[arg(long)]
-    pub agent: Option<String>,
-    /// Filter by `documents.salience` (high|medium|low).
-    #[arg(long, value_enum)]
-    pub salience: Option<Salience>,
-    /// Filter by `documents.feature_slug` (exact match).
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct JournalListArgs {
+    #[command(flatten)]
+    pub filter: JournalFilterArgs,
+    /// Page number, 0 = newest.
+    #[arg(long, default_value_t = 0)]
+    pub page: usize,
+    /// Entries per page, at most 100.
+    #[arg(long, default_value_t = 10)]
+    pub page_size: usize,
     #[arg(long)]
-    pub feature: Option<String>,
-    /// Relative-time filter on `documents.ingested_at`. Format: `<N><unit>`
-    /// where unit is `s|m|h|d|w` (seconds / minutes / hours / days / weeks).
-    /// Examples: `30d`, `12h`, `90m`, `4w`. Rejected if no unit suffix.
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct JournalIdArgs {
+    pub id: i64,
     #[arg(long)]
-    pub since: Option<String>,
-    /// Tag filter (repeatable). OR / any-intersection semantics: an insight
-    /// is kept if it carries ANY of the listed tags. `--tag nginx --tag docker`
-    /// returns insights tagged nginx, docker, or both. Bound as parameters.
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct JournalTagsArgs {
+    /// Only tags used within this category.
     #[arg(long)]
-    pub tag: Vec<String>,
-    /// Corpus-scope filter: `general` reads only the global db, `project`
-    /// reads only the cwd-local db. Absent → both legs merged.
-    #[arg(long, value_enum)]
-    pub category: Option<InsightCategory>,
-    /// Registry slug of a project whose db replaces the cwd-local leg (merged
-    /// with the global db). Looked up in `~/.claude/knowledge/projects.json`;
-    /// unknown slug → exit 1. DATA, never a raw filesystem path.
+    pub category: Option<String>,
     #[arg(long)]
-    pub project: Option<String>,
-    /// Read only the global db (skip the local/project leg). Mutually
-    /// exclusive with `--project-only` (both set → exit 2).
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct JournalGcArgs {
+    /// Count what would go, delete nothing.
     #[arg(long)]
-    pub general_only: bool,
-    /// Read only the local/project db (skip the global leg). Mutually
-    /// exclusive with `--general-only` (both set → exit 2).
+    pub dry_run: bool,
     #[arg(long)]
-    pub project_only: bool,
-    #[arg(long)]
-    pub project_root: Option<PathBuf>,
-    #[arg(long, default_value = "insights.db")]
-    pub db_name: String,
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct JournalJsonArgs {
     #[arg(long)]
     pub json: bool,
 }
@@ -1187,170 +1099,6 @@ pub fn parse_since(value: &str) -> Result<i64, String> {
         .checked_mul(seconds_per_unit)
         .ok_or_else(|| format!("--since value overflows i64 seconds: {value}"))?;
     i64::try_from(total).map_err(|_| format!("--since value overflows i64 seconds: {value}"))
-}
-
-#[derive(Args, Debug)]
-pub struct InsightListArgs {
-    /// Page index (0-based). Page size is fixed at 10 by default but
-    /// overrideable via `--page-size` for batch-scripted exports.
-    #[arg(long, default_value_t = 0)]
-    pub offset: usize,
-    /// Page size — number of insights per page. Default 10. Capped at 100.
-    #[arg(long, default_value_t = 10)]
-    pub page_size: usize,
-    /// Optional filter on `documents.source_type` (exact match).
-    #[arg(long = "type")]
-    pub kind: Option<String>,
-    /// Optional filter on `documents.agent_name` (exact match).
-    #[arg(long)]
-    pub agent: Option<String>,
-    /// Optional filter on `documents.salience` (exact match: high|medium|low).
-    #[arg(long, value_enum)]
-    pub salience: Option<Salience>,
-    /// Optional filter on `documents.feature_slug` (exact match).
-    #[arg(long)]
-    pub feature: Option<String>,
-    /// Tag filter (repeatable, OR / any-intersection). See `InsightSearchArgs`.
-    #[arg(long)]
-    pub tag: Vec<String>,
-    /// Corpus-scope filter: `general` (global db) or `project` (cwd-local db).
-    #[arg(long, value_enum)]
-    pub category: Option<InsightCategory>,
-    /// Registry slug of a project whose db replaces the cwd-local leg.
-    #[arg(long)]
-    pub project: Option<String>,
-    /// Read only the global db. Mutually exclusive with `--project-only`.
-    #[arg(long)]
-    pub general_only: bool,
-    /// Read only the local/project db. Mutually exclusive with `--general-only`.
-    #[arg(long)]
-    pub project_only: bool,
-    #[arg(long)]
-    pub project_root: Option<PathBuf>,
-    #[arg(long, default_value = "insights.db")]
-    pub db_name: String,
-    #[arg(long)]
-    pub json: bool,
-}
-
-#[derive(Args, Debug)]
-pub struct InsightRandomArgs {
-    /// Optional filter on `documents.source_type` (exact match).
-    #[arg(long = "type")]
-    pub kind: Option<String>,
-    /// Optional filter on `documents.agent_name` (exact match).
-    #[arg(long)]
-    pub agent: Option<String>,
-    /// Optional filter on `documents.salience` (exact match: high|medium|low).
-    #[arg(long, value_enum)]
-    pub salience: Option<Salience>,
-    /// Optional filter on `documents.feature_slug` (exact match).
-    #[arg(long)]
-    pub feature: Option<String>,
-    /// Tag filter (repeatable, OR / any-intersection). See `InsightSearchArgs`.
-    #[arg(long)]
-    pub tag: Vec<String>,
-    /// Corpus-scope filter: `general` (global db) or `project` (cwd-local db).
-    #[arg(long, value_enum)]
-    pub category: Option<InsightCategory>,
-    /// Registry slug of a project whose db replaces the cwd-local leg.
-    #[arg(long)]
-    pub project: Option<String>,
-    /// Read only the global db. Mutually exclusive with `--project-only`.
-    #[arg(long)]
-    pub general_only: bool,
-    /// Read only the local/project db. Mutually exclusive with `--general-only`.
-    #[arg(long)]
-    pub project_only: bool,
-    #[arg(long)]
-    pub project_root: Option<PathBuf>,
-    #[arg(long, default_value = "insights.db")]
-    pub db_name: String,
-    #[arg(long)]
-    pub json: bool,
-}
-
-#[derive(Args, Debug)]
-pub struct InsightGcArgs {
-    /// Show what would be deleted without actually deleting. JSON output
-    /// surfaces `{would_delete_medium: N, would_delete_low: N}`.
-    #[arg(long)]
-    pub dry_run: bool,
-    /// Corpus scope: `general` gc's only the global db. Absent → gc BOTH the
-    /// cwd-local db and the global db sequentially, combining their reports.
-    #[arg(long, value_enum)]
-    pub category: Option<InsightCategory>,
-    #[arg(long)]
-    pub project_root: Option<PathBuf>,
-    #[arg(long, default_value = "insights.db")]
-    pub db_name: String,
-    #[arg(long)]
-    pub json: bool,
-}
-
-#[derive(Args, Debug)]
-pub struct InsightDeleteArgs {
-    /// Integer `documents.id` of the insight to delete. (Sha-prefix
-    /// targeting is not supported here — use `insight get <prefix>` to
-    /// confirm the id first, then `insight delete <id>`.)
-    pub id: i64,
-    /// Corpus scope: `general` resolves the id against the global db. Absent
-    /// (or `project`) → the cwd-local db (existing behavior).
-    #[arg(long, value_enum)]
-    pub category: Option<InsightCategory>,
-    #[arg(long)]
-    pub project_root: Option<PathBuf>,
-    #[arg(long, default_value = "insights.db")]
-    pub db_name: String,
-    #[arg(long)]
-    pub json: bool,
-}
-
-#[derive(Args, Debug)]
-pub struct InsightGetArgs {
-    /// Insight identifier — integer `documents.id` OR sha256 prefix
-    /// (≥4 hex chars, matched as `sha256 LIKE '<prefix>%'`).
-    pub ident: String,
-    #[arg(long)]
-    pub project_root: Option<PathBuf>,
-    #[arg(long, default_value = "insights.db")]
-    pub db_name: String,
-    #[arg(long)]
-    pub json: bool,
-}
-
-/// `claudebase insight tags` — tag-frequency aggregation over the insights
-/// corpus (schema v5 `insight_tags` table).
-///
-/// DB selection:
-///   - default (no flags)            → cwd-local db + global db (merged)
-///   - `--category general`          → global db only
-///   - `--category project`          → cwd-local db only
-///   - `--project <slug>`            → registered project's db + global db
-///
-/// `--category` and `--project` are not combined: when `--project` is set the
-/// registry lookup drives the local leg and `--category` is ignored. `--project`
-/// is a registry KEY (data), looked up against the trusted
-/// `~/.claude/knowledge/projects.json` file — its resolved path comes from that
-/// trusted file, never joined from raw CLI input.
-#[derive(Args, Debug)]
-pub struct InsightTagsArgs {
-    /// Restrict to one corpus scope: `general` (global db) or `project`
-    /// (cwd-local db). Absent → merge both. Ignored when `--project` is set.
-    #[arg(long, value_enum)]
-    pub category: Option<InsightCategory>,
-    /// Registry slug of a project whose db to query (merged with the global
-    /// db). Looked up in `~/.claude/knowledge/projects.json`; absent slug →
-    /// exit 1. DATA, never a raw filesystem path.
-    #[arg(long)]
-    pub project: Option<String>,
-    #[arg(long)]
-    pub project_root: Option<PathBuf>,
-    /// Corpus file — `insights.db` by default. Tests/admin may override.
-    #[arg(long, default_value = "insights.db")]
-    pub db_name: String,
-    #[arg(long)]
-    pub json: bool,
 }
 
 #[derive(clap::Parser, Debug)]

@@ -26,6 +26,7 @@ pub mod chat;
 pub mod client;
 pub mod config;
 pub mod ipc;
+pub mod journal_tools;
 pub mod pending_asks;
 pub mod server;
 pub mod subscribe_client;

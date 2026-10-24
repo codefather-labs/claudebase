@@ -59,6 +59,17 @@ fn model_cache_dir() -> Result<PathBuf, EncoderError> {
     Ok(PathBuf::from(home).join(".claude/tools/claudebase/models"))
 }
 
+/// Whether the model files are already on disk. Loading the encoder without
+/// them makes fastembed download ~450 MB, which a long-running process (the
+/// daemon) must never start on its own: the installers fetch the model with
+/// `claudebase warmup`, and until then callers stay lexical.
+pub fn model_cached() -> bool {
+    let Ok(dir) = model_cache_dir() else { return false };
+    std::fs::read_dir(dir.join("models--intfloat--multilingual-e5-small").join("snapshots"))
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false)
+}
+
 /// Compose the e5 passage-prefixed input. **Critical**: exactly ONE
 /// `"passage: "` prefix per call. Plan Risk R7 + architect AI-4: the
 /// encoder MUST add the prefix; double-prefix silently degrades quality.

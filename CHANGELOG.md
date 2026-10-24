@@ -6,6 +6,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **The project journal: `claudebase journal`.** Agents record every decision and finding
+  (`journal add "<text>" --category <c> --tag <t>`) and find them again by category and tag
+  (`journal search`, `journal list`); `journal categories` and `journal tags` list what this project
+  uses. The journal belongs to the directory `claudebase run` was started in — a command from `src/`
+  still lands in the project's journal — and no command ever sees another project's entries,
+  categories or tags.
+- **The daemon owns the journals.** Every `journal` command is a call to the daemon, the only
+  writer; it keeps one SQLite file per project under `~/.claude/claudebase/journals/` and nothing in
+  the project directory. `journal projects` lists every journal it holds — the base for
+  orchestrating across projects. It applies salience retention daily (`low` 90 days, `medium` a
+  year, `high` forever) and computes the vectors for semantic search after the write, only when the
+  e5 model is already installed.
+- The SessionStart hook `claudebase-journal-reminder` tells the agent to read the journal on a fresh
+  context and to journal decisions and findings as it works; the `cognitive-self-check` rule and the
+  reflection and consolidator agents say the same.
+
+### Changed
+
+- **BREAKING: `claudebase insight` is gone, replaced by `claudebase journal`.** Categories are now
+  free-form (`--category decision|finding|...`, what `--type` used to be); the `general` / `project`
+  split and the global corpus are gone — the journal is per project. Writing needs a session started
+  with `claudebase run`; reading works from any terminal inside the project. Search is lexical until
+  the e5 model is installed, and query punctuation (`codefather.dev`, `v0.13.0`) no longer breaks it.
+- **A project's `.claude/knowledge/insights.db` is imported** into its journal the first time a
+  session uses it (type → category, tags and salience kept); the old file is left as it was. The
+  global `~/.claude/knowledge/insights.db` is not imported.
+- `claudebase search --corpus` is removed (there is no insights corpus to fuse with), and so is the
+  project registry `~/.claude/knowledge/projects.json`, which only served `insight --project`.
+- The installers replace the `claudebase-read-insights-reminder` hook with
+  `claudebase-journal-reminder`, unwiring the old one from `settings.json`.
+
 ### Fixed
 
 - **The speech-model download no longer looks hung.** `daemon warmup --asr` printed nothing while it

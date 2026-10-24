@@ -104,6 +104,7 @@ WHAT GETS INSTALLED:
   ~/.claude/tools/claudebase/pdfium/        PDFium dynamic library for PDF extraction
   ~/.claude/tools/claudebase/models/        e5-multilingual-small encoder (pre-cached)
   ~/.claude/rules/cognitive-self-check.md   3-protocol discipline (Facts / Decisions / Inbound)
+  ~/.claude/rules/project-journal.md        how agents read and write the project journal
   ~/.claude/commands/                       /knowledge-ingest, /reflect, /consolidate, /update-claudebase
   ~/.claude/agents/                         reflection (Drift), consolidator (Mnem)
   ~/.claude/skills/                         /claudebase-daemon-change-nick,
@@ -111,7 +112,7 @@ WHAT GETS INSTALLED:
                                             /claudebase-daemon-callback-info,
                                             /claudebase-chat-dump, /claudebase-chat-load
   ~/.claude/hooks/claudebase-channel-contract.sh   SessionStart - how outside messages arrive
-  ~/.claude/hooks/claudebase-read-insights-reminder.sh  SessionStart - load prior insights
+  ~/.claude/hooks/claudebase-journal-reminder.sh   SessionStart - read and keep the project journal
   ~/.claude/hooks/claudebase-selfcheck-reminder.sh UserPromptSubmit - self-check reminder
   ~/.claude/hooks/claudebase-agent-routing-reminder.sh  PreToolUse:EnterPlanMode - peers exist
   ~/.claude/hooks/claudebase-feature-describe.sh   PostToolUse:ExitPlanMode - publish the plan
@@ -119,8 +120,9 @@ WHAT GETS INSTALLED:
   ~/.claude/settings.json                   Bash allowlist + the hooks above, merged
 
 WHAT IS *REMOVED* (reverse migration, idempotent):
-  the old Stop[insight-capture] hook, the claudebase patch inside the official
-  Anthropic Telegram plugin, and the retired claudebase@claudebase-dev marketplace.
+  the old Stop[insight-capture] and SessionStart[read-insights] hooks, the
+  claudebase patch inside the official Anthropic Telegram plugin, and the
+  retired claudebase@claudebase-dev marketplace.
 
 AFTER INSTALLING:
   claudebase run                            start a session the daemon can reach
@@ -451,8 +453,8 @@ EOF
 #     [agent-to-agent:<nick>]:, [callback]:) and that a reply only leaves
 #     through a CLI call. It has to be in context BEFORE the first such line
 #     appears, which is why it is a hook and not a skill.
-#   - SessionStart -> claudebase-read-insights-reminder.sh — load prior-session
-#     insights by tag rather than re-reading everything.
+#   - SessionStart -> claudebase-journal-reminder.sh — read the project journal
+#     by category and tag, and record every decision and finding while working.
 #   - PreToolUse:EnterPlanMode -> claudebase-agent-routing-reminder.sh — surface
 #     that peers exist before drafting a plan that collides with theirs.
 #   - PostToolUse:ExitPlanMode -> claudebase-feature-describe.sh — publish what
@@ -471,11 +473,13 @@ install_claudebase_hooks() {
 
   mkdir -p "$hooks_dir"
 
-  # Remove the retired Stop insight-capture hook files (superseded by the
-  # UserPromptSubmit reminder).
+  # Remove retired hook files: the Stop insight-capture hook (superseded by the
+  # UserPromptSubmit reminder) and the read-insights reminder (superseded by the
+  # journal reminder when insights became the journal).
   rm -f "$hooks_dir/claudebase-insight-capture.sh" "$hooks_dir/claudebase-insight-capture.ps1"
+  rm -f "$hooks_dir/claudebase-read-insights-reminder.sh" "$hooks_dir/claudebase-read-insights-reminder.ps1"
 
-  local hook_files=(claudebase-selfcheck-reminder.sh claudebase-selfcheck-reminder.ps1 claudebase-read-insights-reminder.sh claudebase-read-insights-reminder.ps1 claudebase-agent-routing-reminder.sh claudebase-agent-routing-reminder.ps1 claudebase-feature-describe.sh claudebase-feature-describe.ps1 claudebase-channel-contract.sh claudebase-channel-contract.ps1)
+  local hook_files=(claudebase-selfcheck-reminder.sh claudebase-selfcheck-reminder.ps1 claudebase-journal-reminder.sh claudebase-journal-reminder.ps1 claudebase-agent-routing-reminder.sh claudebase-agent-routing-reminder.ps1 claudebase-feature-describe.sh claudebase-feature-describe.ps1 claudebase-channel-contract.sh claudebase-channel-contract.ps1)
   for hook in "${hook_files[@]}"; do
     local src="$SCRIPT_DIR/hooks/$hook"
     local dst="$hooks_dir/$hook"
@@ -497,15 +501,16 @@ install_claudebase_hooks() {
   if ! command -v jq >/dev/null 2>&1; then
     log_warn "jq required for settings.json hook merge — add manually:"
     log_warn '  hooks.UserPromptSubmit[*].hooks[*].command = ~/.claude/hooks/claudebase-selfcheck-reminder.sh'
-    log_warn '  hooks.SessionStart[*].hooks[*].command = ~/.claude/hooks/claudebase-read-insights-reminder.sh'
+    log_warn '  hooks.SessionStart[*].hooks[*].command = ~/.claude/hooks/claudebase-journal-reminder.sh'
     log_warn '  hooks.SessionStart[*].hooks[*].command = ~/.claude/hooks/claudebase-channel-contract.sh'
-    log_warn '  (and remove any hooks.Stop entry pointing at claudebase-insight-capture.sh)'
+    log_warn '  (and remove any hook entry pointing at claudebase-insight-capture.sh or claudebase-read-insights-reminder.sh)'
     return 0
   fi
 
   local stop_cmd="$HOME/.claude/hooks/claudebase-insight-capture.sh"
   local selfcheck_cmd="$HOME/.claude/hooks/claudebase-selfcheck-reminder.sh"
   local readins_cmd="$HOME/.claude/hooks/claudebase-read-insights-reminder.sh"
+  local journal_cmd="$HOME/.claude/hooks/claudebase-journal-reminder.sh"
   local routing_cmd="$HOME/.claude/hooks/claudebase-agent-routing-reminder.sh"
   local describe_cmd="$HOME/.claude/hooks/claudebase-feature-describe.sh"
   # The transport contract. Without it a session receives `[telegram_message]:`
@@ -518,7 +523,8 @@ install_claudebase_hooks() {
   #     command. (2) Actively UNWIRE the retired Stop insight-capture hook:
   #     drop matcher blocks whose only command was claudebase-insight-capture,
   #     and remove that command from any shared block. Foreign matchers stay.
-  # (3) Idempotently wire the SessionStart read-insights reminder. Match by
+  # (3) Idempotently wire the SessionStart journal reminder, and unwire the
+  #     read-insights reminder it replaced. Match by
   #     command-string equality across ALL SessionStart blocks (foreign blocks
   #     and the SDLC onboarding block are preserved). The official SessionStart
   #     shape nests command under a matcher block: {matcher, hooks[{type,command}]}.
@@ -526,6 +532,7 @@ install_claudebase_hooks() {
       --arg stop_cmd "$stop_cmd" \
       --arg selfcheck_cmd "$selfcheck_cmd" \
       --arg readins_cmd "$readins_cmd" \
+      --arg journal_cmd "$journal_cmd" \
       --arg routing_cmd "$routing_cmd" \
       --arg describe_cmd "$describe_cmd" \
       --arg channel_cmd "$channel_cmd" \
@@ -545,9 +552,14 @@ install_claudebase_hooks() {
            end)
       | .hooks.SessionStart //= []
       | .hooks.SessionStart |=
-          (if any(.[]?; (.hooks // []) | any(.command == $readins_cmd))
+          (map(if (.hooks | type) == "array"
+               then (.hooks |= map(select(.command != $readins_cmd)))
+                    | select(.hooks | length > 0)
+               else . end))
+      | .hooks.SessionStart |=
+          (if any(.[]?; (.hooks // []) | any(.command == $journal_cmd))
            then .
-           else . + [{"matcher": "startup|resume|compact", "hooks": [{"type": "command", "command": $readins_cmd}]}]
+           else . + [{"matcher": "startup|resume|compact", "hooks": [{"type": "command", "command": $journal_cmd}]}]
            end)
       | .hooks.SessionStart |=
           (if any(.[]?; (.hooks // []) | any(.command == $channel_cmd))
@@ -578,7 +590,7 @@ install_claudebase_hooks() {
      && jq -e . "$tmp" >/dev/null 2>&1; then
     mv "$tmp" "$settings"
     chmod 0644 "$settings"
-    log_ok "settings.json (UserPromptSubmit[selfcheck] + SessionStart[read-insights,channel-contract] wired; retired Stop[insight-capture] unwired)"
+    log_ok "settings.json (UserPromptSubmit[selfcheck] + SessionStart[journal,channel-contract] wired; retired Stop[insight-capture] + SessionStart[read-insights] unwired)"
   else
     rm -f "$tmp"
     log_warn "settings.json hook merge failed; please add manually"
@@ -1029,7 +1041,7 @@ echo -e "${BOLD}============================================${NC}"
 echo ""
 echo "  This will install to $CLAUDE_DIR:"
 echo "    tools/claudebase/   (binary + pdfium + e5 model)"
-echo "    rules/              (1 file - cognitive-self-check)"
+echo "    rules/              (2 files - cognitive-self-check, project-journal)"
 echo "    commands/           (4 files — knowledge-ingest, reflect, consolidate, update-claudebase)"
 echo "    agents/             (2 files — reflection, consolidator)"
 echo "    skills/             (5 skills — change-nick, setup-auth-token, callback-info, chat-dump, chat-load)"
@@ -1115,8 +1127,9 @@ echo "  Quick start:"
 echo "    claudebase --version                  Confirm binary is on PATH"
 echo "    claudebase ingest <path>              Ingest PDF/MD/TXT into <cwd>/.claude/knowledge/"
 echo "    claudebase search '<query>' --json    Hybrid retrieval over the books corpus"
-echo "    claudebase insight create '...' \\     Persist a cognitive insight (insights corpus)"
-echo "        --type agent-learned --agent <name>"
+echo "    claudebase journal add '...' \\       Record a decision or finding in the project journal"
+echo "        --category decision --tag <tag>"
+echo "    claudebase journal search '<query>'   Find earlier entries (also: list, tags, categories)"
 echo "    claudebase compare '<query>'          A/B-test all 3 retrieval modes"
 echo ""
 echo "  Commands installed (~/.claude/commands/):"

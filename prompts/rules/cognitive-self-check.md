@@ -108,15 +108,15 @@ The `### External contracts` subsection is mandatory whenever the artifact refer
 
 Downstream agents (verifier, code-reviewer, security-auditor, consolidator) MUST sort by salience descending and audit **high** entries first when time-boxed. The salience tag mirrors how the brain's salience network gates attention — not all facts are equal; surface the ones that matter most. Default to `medium` when uncertain; explicit `low` is preferred over omission.
 
-**Salience also drives retention in the agent-insights corpus** (`claudebase insight create --salience <tag>`). When the file `<project>/.claude/knowledge/insights.db` exists, agents surface load-bearing cognitive insights into the corpus and the salience tag chosen here is the SAME tag that controls how long the insight survives:
+**Salience also drives retention in the project journal** (`claudebase journal add --salience <tag>`). Every decision in `### Decisions made` and every load-bearing finding is journaled (see `## Project journal` below and `~/.claude/rules/project-journal.md`), and the salience tag chosen here is the SAME tag that controls how long the entry survives:
 
-| Salience | Insights-corpus retention | When to use |
+| Salience | Journal retention | When to use |
 |---|---|---|
-| `high` | indefinite — never gc'd | Insight whose loss would degrade the entire pipeline. Use sparingly. |
-| `medium` | 365 days from ingestion | Insight affecting correctness of a slice or single decision. Default. |
-| `low` | 90 days from ingestion | Context-setting / ambient observation only. Cheap to lose. |
+| `high` | indefinite — never gc'd | Entry whose loss would degrade the whole project's decision trail. Use sparingly. |
+| `medium` | 365 days from writing | Entry affecting correctness of a slice or single decision. Default. |
+| `low` | 90 days from writing | Context-setting / ambient observation only. Cheap to lose. |
 
-`claudebase insight gc` purges rows past their salience-driven TTL. Marking everything `high` defeats the gc — be honest about which insights are truly load-bearing across sessions and which fade after a quarter. See `~/.claude/rules/knowledge-base-tool.md` § Insights corpus for the retrieval + surfacing protocol.
+The daemon applies retention daily (`claudebase journal gc` runs it on demand). Marking everything `high` defeats it — be honest about which entries stay load-bearing across sessions and which fade after a quarter.
 
 **Cognitive-load constraint:** list only facts that load-bear on the decision being made — not every file the agent read. The point is a navigable evidence trail for the load-bearing claims, not a comprehensive read-log. If a fact can be removed without changing the verdict, it does not belong in `### Verified facts`.
 
@@ -150,6 +150,14 @@ The `salience:` tag has the same three-value enum (`high` | `medium` | `low`) an
 - `### Symptom-only patches` — same shape but specifically for symptom-vs-cause trade-offs. The root cause MUST be tracked somewhere reachable; the entry MUST cite where.
 
 **Cognitive-load constraint:** same as `## Facts` — list only load-bearing decisions. A decision that's mechanical (passes all 5 questions trivially because the choice is forced by upstream constraints) doesn't need an entry. A decision where Q1, Q3, or Q4 had ambiguity that the agent resolved deliberately — that's load-bearing and goes in the block.
+
+## Project journal
+
+The `## Facts` and `## Decisions` blocks are per artifact; the project journal is what carries them across sessions. Its full protocol is `~/.claude/rules/project-journal.md`. In short:
+
+- **Before deciding**, search the journal for what the project already decided or found on the subject (`claudebase journal search "<keywords>" --tag <tag>`, `claudebase journal list --category decision --tag <tag>`). A hit you rely on is a fact: cite it as `journal#<id>` under `### Verified facts`.
+- **After deciding or finding**, journal it — every entry of `### Decisions made`, every load-bearing finding, every falsified assumption, one entry each (`claudebase journal add "<what, why, alternatives rejected, where>" --category <decision|finding|assumption-falsified|...> --tag <tag> --salience <tag>`).
+- The artifact explains this change; the journal is what the next session will search. Neither replaces the other.
 
 ## Protocol 3 — Inbound Task Validation
 

@@ -105,20 +105,21 @@ WHAT GETS INSTALLED:
   %USERPROFILE%\.claude\tools\claudebase\claudebase.exe   CLI binary
   %USERPROFILE%\.claude\tools\claudebase\pdfium\bin\pdfium.dll
   %USERPROFILE%\.claude\tools\claudebase\models\          e5 encoder cache
-  %USERPROFILE%\.claude\rules\        cognitive-self-check
+  %USERPROFILE%\.claude\rules\        cognitive-self-check, project-journal
   %USERPROFILE%\.claude\commands\     knowledge-ingest, reflect, consolidate, update-claudebase
   %USERPROFILE%\.claude\agents\       reflection (Drift), consolidator (Mnem)
   %USERPROFILE%\.claude\skills\       daemon-change-nick, daemon-setup-auth-token,
                                       daemon-callback-info, chat-dump (claudebase-chat-dump),
                                       chat-load (claudebase-chat-load)
-  %USERPROFILE%\.claude\hooks\        SessionStart x2 (channel contract, read-insights),
+  %USERPROFILE%\.claude\hooks\        SessionStart x2 (channel contract, journal),
                                       UserPromptSubmit (self-check),
                                       Pre/PostToolUse (peer routing, feature describe)
   %USERPROFILE%\.claude\bin\claudebase.cmd  Global wrapper (User PATH)
 
 WHAT IS *REMOVED* (reverse migration, idempotent):
-  the old Stop[insight-capture] hook, the claudebase patch inside the official
-  Anthropic Telegram plugin, and the retired claudebase@claudebase-dev marketplace.
+  the old Stop[insight-capture] and SessionStart[read-insights] hooks, the
+  claudebase patch inside the official Anthropic Telegram plugin, and the
+  retired claudebase@claudebase-dev marketplace.
 
 AFTER INSTALLING:
   claudebase run                        start a session the daemon can reach
@@ -417,12 +418,12 @@ function Register-BashAllowlist {
 # Install claudebase hooks into ~/.claude/hooks/ and wire into settings.json:
 #   - SessionStart -> claudebase-channel-contract.ps1 (how messages from outside
 #     the terminal arrive, and that a reply only leaves through a CLI call)
-#   - SessionStart -> claudebase-read-insights-reminder.ps1 (prior insights)
+#   - SessionStart -> claudebase-journal-reminder.ps1 (read and keep the journal)
 #   - UserPromptSubmit -> claudebase-selfcheck-reminder.ps1 (self-check nudge)
 #   - PreToolUse:EnterPlanMode -> claudebase-agent-routing-reminder.ps1
 #   - PostToolUse:ExitPlanMode -> claudebase-feature-describe.ps1
-# The retired Stop[insight-capture] hook is actively UNWIRED and its files
-# deleted -- see below.
+# The retired Stop[insight-capture] and SessionStart[read-insights] hooks are
+# actively UNWIRED and their files deleted -- see below.
 # Idempotent -- dedup by command-string equality so re-running never duplicates.
 # ============================================================================
 function Install-ClaudebaseHooks {
@@ -430,15 +431,16 @@ function Install-ClaudebaseHooks {
     $settings = Join-Path $Script:ClaudeDir 'settings.json'
     New-Item -ItemType Directory -Force -Path $hooksDir | Out-Null
 
-    # Remove the retired Stop insight-capture hook files (superseded).
-    foreach ($old in 'claudebase-insight-capture.sh', 'claudebase-insight-capture.ps1') {
+    # Remove retired hook files: Stop insight-capture, and the read-insights
+    # reminder the journal reminder replaced.
+    foreach ($old in 'claudebase-insight-capture.sh', 'claudebase-insight-capture.ps1', 'claudebase-read-insights-reminder.sh', 'claudebase-read-insights-reminder.ps1') {
         $p = Join-Path $hooksDir $old
         if (Test-Path $p) { Remove-Item -Force $p }
     }
 
-    # Deploy both variants of the self-check reminder + read-insights reminder;
+    # Deploy both variants of the self-check reminder + journal reminder;
     # Windows wires the .ps1 variants.
-    foreach ($hook in 'claudebase-selfcheck-reminder.sh', 'claudebase-selfcheck-reminder.ps1', 'claudebase-read-insights-reminder.sh', 'claudebase-read-insights-reminder.ps1', 'claudebase-agent-routing-reminder.sh', 'claudebase-agent-routing-reminder.ps1', 'claudebase-channel-contract.sh', 'claudebase-channel-contract.ps1', 'claudebase-feature-describe.sh', 'claudebase-feature-describe.ps1') {
+    foreach ($hook in 'claudebase-selfcheck-reminder.sh', 'claudebase-selfcheck-reminder.ps1', 'claudebase-journal-reminder.sh', 'claudebase-journal-reminder.ps1', 'claudebase-agent-routing-reminder.sh', 'claudebase-agent-routing-reminder.ps1', 'claudebase-channel-contract.sh', 'claudebase-channel-contract.ps1', 'claudebase-feature-describe.sh', 'claudebase-feature-describe.ps1') {
         $src = Join-Path $Script:ScriptDir "hooks\$hook"
         $dst = Join-Path $hooksDir $hook
         if (-not (Test-Path $src)) { Write-Warn "hooks/$hook missing in source -- skipping"; continue }
@@ -449,6 +451,7 @@ function Install-ClaudebaseHooks {
     $stopCmd = "powershell -NoProfile -File `"$(Join-Path $hooksDir 'claudebase-insight-capture.ps1')`""
     $selfcheckCmd = "powershell -NoProfile -File `"$(Join-Path $hooksDir 'claudebase-selfcheck-reminder.ps1')`""
     $readinsCmd = "powershell -NoProfile -File `"$(Join-Path $hooksDir 'claudebase-read-insights-reminder.ps1')`""
+    $journalCmd = "powershell -NoProfile -File `"$(Join-Path $hooksDir 'claudebase-journal-reminder.ps1')`""
     $routingCmd = "powershell -NoProfile -File `"$(Join-Path $hooksDir 'claudebase-agent-routing-reminder.ps1')`""
     # pty-transport v0.10 -- the external-channel contract must be in context
     # BEFORE the first [telegram_message]: line arrives, so it rides SessionStart.
@@ -488,19 +491,29 @@ function Install-ClaudebaseHooks {
 
         & $mergeEvent 'UserPromptSubmit' $selfcheckCmd
 
-        # Idempotent merge of SessionStart read-insights reminder by command-string
-        # equality. Official SessionStart shape: {matcher, hooks[{type,command}]}.
+        # Idempotent merge of the SessionStart journal reminder by command-string
+        # equality, after unwiring the read-insights reminder it replaced.
+        # Official SessionStart shape: {matcher, hooks[{type,command}]}.
         if (-not ($json.hooks.PSObject.Properties.Name -contains 'SessionStart')) {
             $json.hooks | Add-Member -NotePropertyName 'SessionStart' -NotePropertyValue @() -Force
         }
+        $ssKept = @()
+        foreach ($entry in @($json.hooks.SessionStart)) {
+            if ($entry.hooks) {
+                $entry.hooks = @($entry.hooks | Where-Object { $_.command -ne $readinsCmd })
+                if (@($entry.hooks).Count -eq 0) { continue }
+            }
+            $ssKept += $entry
+        }
+        $json.hooks.SessionStart = $ssKept
         $ssExisting = @($json.hooks.SessionStart)
         $ssAlready = $false
         foreach ($entry in $ssExisting) {
-            if ($entry.hooks) { foreach ($h in $entry.hooks) { if ($h.command -eq $readinsCmd) { $ssAlready = $true; break } } }
+            if ($entry.hooks) { foreach ($h in $entry.hooks) { if ($h.command -eq $journalCmd) { $ssAlready = $true; break } } }
             if ($ssAlready) { break }
         }
         if (-not $ssAlready) {
-            $ssNewEntry = [pscustomobject]@{ matcher = 'startup|resume|compact'; hooks = @([pscustomobject]@{ type = 'command'; command = $readinsCmd }) }
+            $ssNewEntry = [pscustomobject]@{ matcher = 'startup|resume|compact'; hooks = @([pscustomobject]@{ type = 'command'; command = $journalCmd }) }
             $json.hooks.SessionStart = @($ssExisting) + $ssNewEntry
         }
 
@@ -562,13 +575,13 @@ function Install-ClaudebaseHooks {
         }
 
         $json | ConvertTo-Json -Depth 12 | Set-Content -Path $settings -Encoding UTF8
-        Write-Ok "settings.json (UserPromptSubmit[selfcheck] + SessionStart[read-insights, channel-contract] wired; retired Stop[insight-capture] unwired)"
+        Write-Ok "settings.json (UserPromptSubmit[selfcheck] + SessionStart[journal, channel-contract] wired; retired Stop[insight-capture] + SessionStart[read-insights] unwired)"
     } catch {
         Write-Warn "settings.json hook merge failed ($($_.Exception.Message)); add manually:"
         Write-Warn "  hooks.Stop[*].hooks[*].command = $stopCmd"
         Write-Warn "  hooks.UserPromptSubmit[*].hooks[*].command = $selfcheckCmd"
-        Write-Warn "  hooks.SessionStart[*].hooks[*].command = $readinsCmd"
-        Write-Warn "  (and remove any hooks.Stop entry pointing at claudebase-insight-capture.ps1)"
+        Write-Warn "  hooks.SessionStart[*].hooks[*].command = $journalCmd"
+        Write-Warn "  (and remove any hook entry pointing at claudebase-insight-capture.ps1 or claudebase-read-insights-reminder.ps1)"
     }
 }
 
@@ -918,8 +931,8 @@ Write-Host "============================================" -ForegroundColor White
 Write-Host ""
 Write-Host "  This will install to $($Script:ClaudeDir):"
 Write-Host "    tools\claudebase\   (binary + pdfium + e5 model)"
-Write-Host "    rules\              (3 files)"
-Write-Host "    commands\           (3 files)"
+Write-Host "    rules\              (2 files)"
+Write-Host "    commands\           (4 files)"
 Write-Host "    agents\             (2 files)"
 Write-Host ""
 
@@ -1042,8 +1055,9 @@ Write-Host "  Quick start:"
 Write-Host "    claudebase --version                  Confirm binary is on PATH"
 Write-Host "    claudebase ingest <path>              Ingest PDF/MD/TXT into <cwd>\.claude\knowledge\"
 Write-Host "    claudebase search '<query>' --json    Hybrid retrieval over the books corpus"
-Write-Host "    claudebase insight create '...' \"
-Write-Host "        --type agent-learned --agent <name>      Persist a cognitive insight"
+Write-Host "    claudebase journal add '...' \"
+Write-Host "        --category decision --tag <tag>          Record a decision or finding"
+Write-Host "    claudebase journal search '<query>'   Find earlier entries (also: list, tags, categories)"
 Write-Host ""
 Write-Host "  Commands installed: /knowledge-ingest /reflect /consolidate /update-claudebase"
 Write-Host "  Skills installed:   /claudebase-daemon-change-nick"

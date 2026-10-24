@@ -288,8 +288,9 @@ pub fn launchd_plist_path() -> Result<PathBuf> {
         .join("dev.codefather.claudebase.plist"))
 }
 
-/// Items removed on a no-`--keep-data` uninstall. Insight DB and books
-/// corpus are deliberately NOT in this list (cross-feature data).
+/// Items removed on a no-`--keep-data` uninstall. The project journals
+/// (`~/.claude/claudebase/journals/`) and the books corpora are deliberately
+/// NOT in this list: they are the operator's records, not daemon state.
 fn data_paths_full_wipe() -> Result<Vec<PathBuf>> {
     let home = home_dir()?;
     Ok(vec![

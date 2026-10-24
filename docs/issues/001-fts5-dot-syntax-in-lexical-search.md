@@ -1,9 +1,9 @@
-# Issue #001 — `insight search` exits 1 on queries containing `.`
+# Issue #001 — lexical `search` exits 1 on queries containing `.`
 
-**Status:** OPEN — needs fix in v0.5.1
+**Status:** OPEN for `claudebase search --mode lexical` (and the lexical leg of hybrid). The journal is not affected: it quotes every query word (`src/journal.rs` `fts_query`) — the same fix applies here.
 **Filed:** 2026-05-16
 **Severity:** MAJOR
-**Surface:** `claudebase insight search` AND `claudebase search` (both lexical mode)
+**Surface:** `claudebase search` (lexical mode, and the lexical leg of hybrid). Originally also the since-removed `insight search`.
 **Discovered by:** DMN reflection pass on `codefather.dev` (persisted as agent-insights doc #—)
 **Reference:** [knowledge-base-tool.md § Insights corpus retrieval protocol]
 

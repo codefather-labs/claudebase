@@ -8,7 +8,7 @@
 #
 # Lives in claudebase (not SDLC): the cognitive-self-check protocol rule
 # (~/.claude/rules/cognitive-self-check.md) is shipped by claudebase as part of
-# its cognitive-infrastructure layer — the books/insights corpora and the
+# its cognitive-infrastructure layer — the books corpus, the project journal and the
 # Facts/Decisions evidence discipline all rest on it. The reminder hook ships
 # with the rule it reminds about.
 #

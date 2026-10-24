@@ -168,7 +168,7 @@ jobs:
           # Assert the files AND the settings.json wiring, since either half
           # alone was true at some point while the feature did not work.
           for h in claudebase-channel-contract.sh \
-                   claudebase-read-insights-reminder.sh \
+                   claudebase-journal-reminder.sh \
                    claudebase-selfcheck-reminder.sh \
                    claudebase-agent-routing-reminder.sh \
                    claudebase-feature-describe.sh; do
@@ -179,6 +179,15 @@ jobs:
             jq -e ".hooks.\"$ev\" | length > 0" "$HOME/.claude/settings.json" >/dev/null \
               || { echo "settings.json has no $ev hook wired"; exit 1; }
           done
+
+          # The journal reminder replaced the read-insights one: wired once, and
+          # the old one gone from both the hooks dir and settings.json.
+          jq -e '[.hooks.SessionStart[].hooks[].command | select(endswith("/claudebase-journal-reminder.sh"))] | length == 1' \
+            "$HOME/.claude/settings.json" >/dev/null || { echo "journal reminder not wired exactly once"; exit 1; }
+          if grep -q 'read-insights' "$HOME/.claude/settings.json"; then echo "read-insights hook still wired"; exit 1; fi
+          test ! -e "$HOME/.claude/hooks/claudebase-read-insights-reminder.sh" || { echo "read-insights hook file left behind"; exit 1; }
+          bash "$HOME/.claude/hooks/claudebase-journal-reminder.sh" | jq -r '.hookSpecificOutput.additionalContext' \
+            | grep -qF 'claudebase journal add' || { echo "journal reminder does not teach journal add"; exit 1; }
 
           # The contract has to teach every prefix the transport can produce; a
           # session meeting an unexplained one cannot recover on its own.
@@ -260,6 +269,17 @@ jobs:
           test -d "$(dirname "$sock")" 
           "$HOME/.claude/tools/claudebase/claudebase" daemon status
           "$HOME/.claude/tools/claudebase/claudebase" daemon callback status
+
+          # The journal is served by the daemon: a read from a plain terminal
+          # answers (empty), and a write without a `claudebase run` session is
+          # refused with the reason rather than failing on a missing tool.
+          cb="$HOME/.claude/tools/claudebase/claudebase"
+          "$cb" journal categories --json | jq -e '.categories == []' >/dev/null \
+            || { echo "journal categories did not answer"; exit 1; }
+          if out=$("$cb" journal add "x" --category decision --tag ci 2>&1); then
+            echo "journal add without a session should be refused"; exit 1
+          fi
+          echo "$out" | grep -qF 'claudebase run' || { echo "unexpected refusal: $out"; exit 1; }
 
       - name: The generated systemd unit is valid for a USER manager
         shell: bash
@@ -408,6 +428,9 @@ jobs:
           foreach ($ev in @("SessionStart","UserPromptSubmit","PreToolUse","PostToolUse")) {
             if (-not $s.hooks.$ev) { Write-Host "no $ev hook wired"; exit 1 }
           }
+          $ss = @($s.hooks.SessionStart | ForEach-Object { $_.hooks } | ForEach-Object { $_.command })
+          if (@($ss | Where-Object { $_ -like '*claudebase-journal-reminder.ps1*' }).Count -ne 1) { Write-Host "journal reminder not wired exactly once"; exit 1 }
+          if (@($ss | Where-Object { $_ -like '*read-insights*' }).Count -ne 0) { Write-Host "read-insights hook still wired"; exit 1 }
           Write-Host "hooks wired"
 
       # Windows refuses to overwrite a RUNNING .exe, and the daemon from the

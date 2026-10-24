@@ -28,7 +28,7 @@ Single Rust binary · no Python · no external APIs.
 ```
 Layer 4 · Multi-channel orchestration   ← planned (server foundation + transports)
 Layer 3 · Channel transport              ← shipping (Telegram in-daemon; Discord/Slack/Matrix next)
-Layer 2 · Cross-session agent memory     ← shipping (insights corpus)
+Layer 2 · Cross-session agent memory     ← shipping (project journal)
 Layer 1 · Hybrid retrieval over docs     ← shipping (books corpus)
 Layer 0 · Single static Rust binary, local-first
 ```
@@ -40,7 +40,7 @@ Stop at Layer 1 if all you want is RAG. Go to Layer 4 when you want an orchestra
 - 🔍 **Hybrid retrieval** — FTS5 BM25 + 384-dim e5-multilingual-small embeddings, fused via RRF (k=60)
 - 🌐 **Multilingual + cross-lingual** — query in English, recall chunks in Russian / Chinese / etc
 - 📄 **Per-page PDF navigation** — every hit carries `path:page:chunk_id` so the agent cites verifiable evidence
-- 🧠 **Cross-session agent memory** (insights corpus) — hippocampal-replay analogue; agents persist load-bearing observations across sessions
+- 🧠 **Cross-session agent memory** (project journal) — agents journal every decision and finding, and the next session finds them by category and tag
 - 💬 **Telegram built into the daemon** — no Claude Code plugin, no MCP channel, nothing a CLI update can break
 - 🚀 **`claudebase run`** — PTY supervisor: runs `claude` unmodified and injects inbound messages into its input
 - 🔌 **Agent toolkit out of the box** (rules, commands, agents, hooks)
@@ -108,14 +108,15 @@ $ claudebase search "dependency rule" --top-k 3 --mode hybrid
 2. clean-architecture.pdf:p89:1251  score=1.43  (BM25=0.81, dense=0.62)
    ...
 
-$ claudebase insight create "RRF k=60 outperforms k=40 on 17-PDF corpus" \
-    --type agent-learned --agent retrieval-tuning \
-    --category general --tags rrf,retrieval --salience high
-{"status":"stored","sha":"a1b2c3d4..."}
+$ claudebase journal add "RRF k=60 beats k=40 on the 17-PDF golden set; keeping 60" \
+    --category decision --tag rrf --tag retrieval --salience high
+journaled #42 (/home/me/projects/claudebase)
 
-$ claudebase insight search "RRF parameters" --salience high --top-k 5
-1. doc#42 sha=a1b2c3d4 agent=retrieval-tuning type=agent-learned
-   RRF k=60 outperforms k=40 on 17-PDF corpus
+$ claudebase journal search "RRF parameters" --category decision
+journal of /home/me/projects/claudebase — 1 hit(s), hybrid
+
+#42 2026-10-24 decision [rrf, retrieval] high
+  RRF k=60 beats k=40 on the 17-PDF golden set; keeping 60
 
 $ claudebase run                          # `claude` under a PTY supervisor; Telegram + peer messages arrive in its input
 $ claudebase run --no-telegram            # plain `claude`, no supervisor, no inbound messages
@@ -135,7 +136,8 @@ graph LR
     E --> G
     F --> G
     G --> H[Claude Code agent]
-    I[Agent observations] -->|claudebase insight create| J[(insights.db<br/>same FTS5+vec)]
+    I[Agent decisions + findings] -->|claudebase journal add| L
+    L -->|one journal per project| J[(journals/*.db<br/>FTS5 + sqlite-vec)]
     J -.cross-session recall.-> H
     K[Telegram messages] -->|daemon long-poll + ASR| L[claudebase daemon]
     L -.channel callbacks.-> H
@@ -150,7 +152,7 @@ graph LR
 | PDF extraction | `pdfium-render` v0.9 (CID fonts, Calibre-converted PDFs, multi-column layouts handled) |
 | OCR (image chunks) | `ocr-rs` v2 / PaddleOCR PP-OCRv4 via MNN runtime |
 | Books-corpus storage | Single `index.db` SQLite file per project — no co-located figure files; image bytes as BLOB |
-| Insights-corpus storage | Separate `insights.db` per project — same engine + an `insights` metadata table (type / agent / salience / feature / session / source-artifact); cascade-deletes through chunks and chunks_vec |
+| Project journal | Owned by the daemon: one SQLite file per project under `~/.claude/claudebase/journals/`, entries with category, tags, salience, agent, session; FTS5 + vec0 over the entry text, RRF-fused; the project is the directory `claudebase run` started in |
 | Telegram bridge | `src/daemon/telegram.rs` — long-poll, ASR and outbound queue inside the daemon; no external plugin |
 | Session transport | `src/supervisor/` — `claudebase run` owns the pty in which `claude` runs; inbound text is pasted through bracketed paste behind a gate (no modal, no half-typed operator line), and closing the terminal is propagated to the child so a session never outlives its window |
 | HTTP callbacks | `src/daemon/callback.rs` — per-nick token, `X-Api-Token`, off until enabled; hands the body to the same delivery path peer messages use |
@@ -162,7 +164,7 @@ Deep-dive (L2/cosine equivalence math, RRF derivation, e5 prefix asymmetry contr
 
 | You want… | claudebase gives you |
 |---|---|
-| LLM agents that remember what they learned across sessions | Insights corpus + `claudebase insight create / search` |
+| LLM agents that remember what they decided and found across sessions | The project journal — `claudebase journal add / search / tags / categories` |
 | Claude Code to cite the actual page of the book it's quoting from | Books corpus + per-page navigation via PDFium |
 | To chat with your long-running Claude Code session from your phone | `claudebase telegram addbot` + `claudebase run` |
 | A fleet of specialised agents on different machines coordinating | Planned: server foundation + agent registry — see [`docs/plans/`](docs/plans/) |
@@ -187,88 +189,53 @@ claudebase delete <source-path>          remove a source and its chunks
 claudebase warmup [--quiet]              pre-load encoder model (~30s first run)
 ```
 
-**Insights corpus** (`insights.db`) — agent-written cognitive observations, opt-in per project:
+**Project journal** — the decisions and findings of every session, one journal per project:
 
 ```text
-claudebase insight create <body>         persist an agent's cognitive observation
-                          --type <kind>  agent-learned | self-bias-caught |
-                                         peer-bias-observed | red-team-objection |
-                                         consolidator-drift | prediction-error |
-                                         assumption-falsified | plan-reality-gap |
-                                         reflection-observation | operator-correction
-                          --agent <name> emitting agent (planner, reflection, ...)
-                          --category <general|project>  REQUIRED (v0.7.0+): general
-                                         routes to the global $HOME/.claude/knowledge/
-                                         insights.db; project routes to the per-project
-                                         local insights.db. Missing -> exit 2.
-                          --tags <t,..>  REQUIRED (v0.7.0+, >=1): comma-separated
-                                         free-form tags (e.g. nginx, mistakes, feature
-                                         slug). Normalized (# stripped, lowercased,
-                                         deduped). Missing -> exit 2.
-                          [--feature SLUG] [--salience high|medium|low] [--session ID]
-                          [--source-artifact REF]
-claudebase insight tags                  list distinct tag vocabulary with counts
-                          [--category C] [--project SLUG] [--json]
-                                         default merges local + global; --category
-                                         narrows; --project does registry lookup
-claudebase insight search <query>        hybrid retrieval over the insights corpus
-                          [--mode M] [--top-k N] [--type T] [--agent A]
-                          [--salience S] [--feature F] [--since <Nd|Nh|Nm|Nw>]
-                          [--tag T ...]  OR/any-intersection filter (v0.7.0+):
-                                         repeatable; an insight is returned if its
-                                         tag set intersects the requested tags by
-                                         at least one
-                          [--category C] [--project SLUG]
-                          [--general-only|--project-only]
-                                         in-project default = merge(local, global);
-                                         narrowing flags exclude the other leg
-claudebase insight list                  newest-first, 10 per page
-                          [--offset N] [--page-size N] [filters]
-claudebase insight random [filters]      uniformly-sampled single insight
-claudebase insight get <id|sha-prefix>   fetch one by integer id or ≥4-hex sha prefix
-claudebase insight gc [--dry-run]        salience-driven TTL purge + VACUUM
-claudebase insight delete <id>           single-row delete with chunks + vec cascade
+claudebase journal add <text>            record one decision or finding (text, `-`, or stdin)
+                   --category <c>        REQUIRED, free-form: decision, finding, bug, lesson, ...
+                   --tag <t> [--tag ..]  REQUIRED, at least one; how the entry is found again
+                   [--salience high|medium|low] [--agent NAME] [--feature SLUG]
+                   [--source-artifact REF]
+claudebase journal search <query>        BM25 + semantic, RRF-fused (lexical until the e5
+                                         model is installed)
+claudebase journal list                  newest first, a page at a time (--page N --page-size N)
+       search/list filters:              [--tag T ...] (any of) [--category C] [--agent A]
+                                         [--salience S] [--feature F] [--since 30d|12h|..]
+claudebase journal categories            the categories this project uses, with counts
+claudebase journal tags [--category C]   the tags this project uses, with counts
+claudebase journal get <id>              one entry in full
+claudebase journal delete <id>           remove one entry
+claudebase journal gc [--dry-run]        apply retention now (the daemon does it daily)
+claudebase journal projects              every journal the daemon holds
 ```
 
-**Hybrid Insights Corpus** (v0.7.0+) — every insight is routed by a mandatory `--category`:
+**Who owns it.** The daemon. `claudebase journal …` never opens a file itself: it asks the daemon,
+which keeps one SQLite journal per project under `~/.claude/claudebase/journals/` — nothing is
+written into the project directory — and is the only writer. That makes the journals of all
+projects one place to orchestrate from (`journal projects`).
 
-- `--category project` writes to the **per-project local** `<project>/.claude/knowledge/insights.db` (this-project insights — feature work, project-specific lessons).
-- `--category general` writes to the **global** `~/.claude/knowledge/insights.db` (cross-project lessons — tools, patterns, anything reusable across projects).
+**Which project.** The directory `claudebase run` was started in, taken from the session's
+registration with the daemon (`CLAUDEBASE_AGENT_ID` / `CLAUDEBASE_SESSION_TOKEN`), not from where a
+command happens to run — `journal add` from `src/` lands in the project's journal. Every command
+sees only that project's entries, categories and tags. Writing (`add`, `delete`) needs such a
+session and is refused otherwise; reading from a plain terminal uses the nearest enclosing directory
+that has a journal.
 
-Every `insight create` also requires at least one `--tag` (free-form, e.g. `#nginx`, `#mistakes`, the feature slug). Tags are normalized (`#` stripped, lowercased, deduped) and stored one row per tag in `insight_tags`. Missing `--category` or `--tags` → exit 2. (BREAKING change from v0.6.0 — see CHANGELOG.)
+**Entries.** Category and tags are free-form and normalized (`#` stripped, lowercased, spaces to
+`-`); reuse what `journal categories` / `journal tags` already list. The same text in the same
+category within 30 days is stored once. Salience sets retention: `high` forever, `medium` 365 days,
+`low` 90 days. Vectors for semantic search are computed by the daemon after the write, and only
+when the e5 model is already installed — it never starts that download itself.
 
-```text
-# create — both flags required
-claudebase insight create "Tokio mutex held across await deadlocks" \
-  --type agent-learned --agent planner --category project --tags tokio,mutex \
-  --feature insights-hybrid-corpus --salience high
+**From insights.** The first time a session uses the journal, the project's old
+`.claude/knowledge/insights.db` is imported: the insight type becomes the category, tags and
+salience carry over, and the old file is left untouched (delete it when you are satisfied). The
+global `~/.claude/knowledge/insights.db` is not imported — the journal is per project by design.
 
-# create a general / cross-project lesson
-claudebase insight create "nginx reload signal is HUP not USR1" \
-  --type agent-learned --agent ops --category general --tags nginx,infrastructure --salience medium
-
-# discover the tag vocabulary (merges local + global by default)
-claudebase insight tags --json              # [{"tag":"tokio","count":3},...]
-claudebase insight tags --category general  # only global db
-claudebase insight tags --project some-name # registry lookup + global
-
-# read with tag/category/project filters (OR / any-intersection semantics for multi-tag)
-claudebase insight search "race" --tag tokio --tag mutex     # ANY of tokio/mutex
-claudebase insight search "deploy" --category general        # global only
-claudebase insight list --general-only                       # exclude project insights
-claudebase insight list --project-only                       # exclude global insights
-```
-
-**Default in-project reads merge local + global** so the agent sees both this-project insights and general lessons. `--general-only` / `--project-only` narrow when needed. Other projects are walled off; cross-project access requires explicit `--project <slug>` which resolves the path via the **project registry** (`~/.claude/knowledge/projects.json`, atomically populated at `claudebase run` startup).
-
-**SessionStart read-on-new-context hook** — when an agent enters a fresh context window, `claudebase-read-insights-reminder.{sh,ps1}` reminds it to discover tags via `insight tags` and pull only relevant insights via `insight search --tag <t>` (not re-read everything).
-
-**Cross-corpus search:**
-
-```text
-claudebase search <query> --corpus all   RRF-fuse hits from books and insights
-                                         (each hit tagged with source_corpus)
-```
+**The hook.** `claudebase-journal-reminder.{sh,ps1}` (SessionStart) tells the agent the journal
+exists, to read the entries that bear on its task by category and tag on a fresh context, and to
+journal every decision and finding as it works.
 
 **Launcher:**
 
@@ -332,50 +299,36 @@ directory. Both only run the commands above; the load skill asks before importin
 operator did not make, since a loaded conversation's transcript becomes a model's context when it is
 resumed.
 
-All subcommands accept `--project-root <dir>` (defaults to cwd) and `--json` for structured output. Insight bodies can come from positional arg, `-`, or piped stdin (TTY without a body is rejected — designed for non-interactive agent use).
+The corpus subcommands accept `--project-root <dir>` (defaults to cwd), and nearly everything takes `--json` for structured output. Journal entries can come from the positional argument, `-`, or piped stdin (a terminal without a body is rejected — designed for non-interactive agent use).
 
-## 🧠 Two corpora — books and insights
+## 🧠 Books and the journal
 
-| | Books corpus (`index.db`) | Insights corpus (`insights.db`) |
+| | Books corpus (`index.db`) | Project journal |
 |---|---|---|
-| **Direction** | Read-side. User feeds it; agents query it. | Write-side. Agents feed it; agents query it (user audits). |
-| **Content** | Curated PDFs / Markdown / plain text — books, regulatory docs, internal style guides. | Cognitive observations from agents — drift findings, prediction-errors, peer-bias catches, self-corrections, DMN observations. |
-| **Lifecycle** | Stable; changes only when user re-ingests. | Dynamic; grows across every session. `gc` prunes by TTL. |
-| **Activation** | Present when `index.db` exists (`claudebase ingest …`). | Opt-in; created on first `insight create`. A project that never adopts it stays byte-identical to one that never heard of it. |
-| **Why** | Extend agent expertise with project-specific domain content not in training data. | Persist load-bearing cognitive insights across sessions — without it, every CC session re-discovers what previous sessions already learned. |
-
-### Three-axis taxonomy for insights
-
-The `--type` field is a small open enum, organized along three cognitive axes:
-
-| Axis | `--type` values | When to emit |
-|---|---|---|
-| **Self-learning** | `agent-learned`, `self-bias-caught` | The agent noticed it learned something new, or caught a blind spot in its own prior reasoning. |
-| **Peer-bias / drift detection** | `peer-bias-observed`, `red-team-objection`, `consolidator-drift` | The agent observed a cognitive bias or drift in another agent's output or in upstream artifacts. |
-| **Prediction-reality mismatch** | `prediction-error`, `assumption-falsified`, `plan-reality-gap` | Planned / expected / predicted did not match what actually happened (Friston-style prediction error). |
-| Special | `reflection-observation`, `operator-correction` | DMN observations from the reflection agent; insights from operator corrections worth carrying forward. |
-
-Factual findings, mechanical execution narration, and generic best-practice claims do **not** belong in the corpus — they go to PRs, scratchpads, or stay silent.
+| **Direction** | Read-side. You feed it; agents query it. | Write-side. Agents feed it; agents query it (you audit). |
+| **Content** | Curated PDFs / Markdown / plain text — books, regulatory docs, internal style guides. | What was decided and what was found: decisions with their reasons and rejected alternatives, findings, bugs, falsified assumptions, lessons. |
+| **Where** | `<project>/.claude/knowledge/index.db` | With the daemon, `~/.claude/claudebase/journals/`, one per project |
+| **Lifecycle** | Stable; changes only when you re-ingest. | Grows every session; retention by salience, applied daily. |
+| **Why** | Domain knowledge the model was not trained on. | So a session does not re-decide, or re-discover, what an earlier one already did. |
 
 ### Salience drives retention
 
 | Salience | Retention | Use for |
 |---|---|---|
-| `high` | indefinite (never gc'd) | Insights whose loss would degrade the entire pipeline. Use sparingly. |
-| `medium` | 365 days | Slice-level or single-decision insights. Default. |
+| `high` | indefinite (never gc'd) | Entries whose loss would degrade the whole decision trail. Use sparingly. |
+| `medium` | 365 days | Slice-level or single-decision entries. Default. |
 | `low` | 90 days | Ambient / context-setting observations. Cheap to lose. |
 
-Be honest with the tag — marking everything `high` defeats the purge and turns the corpus into a write-only log.
+Be honest with the tag — marking everything `high` turns the journal into a write-only log.
 
-### Books vs insights — which to query for what
+### Which to query for what
 
-| Question | Right corpus |
+| Question | Where |
 |---|---|
 | "What does the SQL spec say about FTS5?" | books (`claudebase search`) |
-| "What did reflection notice last session about the consent flow?" | insights (`claudebase insight search`) |
+| "Why did we choose WAL mode for this database?" | journal (`claudebase journal search "WAL" --category decision`) |
 | "How does Kafka's exactly-once delivery work?" | books |
-| "Did a prior planner flag this scope as oversized?" | insights |
-| Genuinely spans both | `claudebase search --corpus all` (RRF-fused; each hit tagged with `source_corpus`) |
+| "What did we already find out about the deploy pipeline?" | journal (`claudebase journal list --tag deploy`) |
 
 ## 💬 Telegram — setup and the message contract
 
@@ -797,7 +750,7 @@ Discuss in [GH Discussions](https://github.com/codefather-labs/claudebase/discus
 | Single static binary | ✅ | ❌ (Python) | ❌ (Python) | ❌ (Go + Python) | n/a |
 | Hybrid retrieval (BM25 + dense + RRF) | ✅ | partial | partial | partial | ✅ |
 | Per-page PDF citations | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Cross-session agent memory | ✅ (insights corpus) | ❌ | ❌ | ❌ | ❌ |
+| Cross-session agent memory | ✅ (project journal) | ❌ | ❌ | ❌ | ❌ |
 | Claude Code MCP server | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Telegram bridge (no plugin required) | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Multilingual / cross-lingual recall | ✅ (e5) | depends on chosen embedder | depends on chosen embedder | depends on chosen embedder | ✅ |

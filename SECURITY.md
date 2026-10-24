@@ -50,7 +50,7 @@ Out of scope (file separately upstream):
 
 ## What we consider a vulnerability
 
-- Unauthorized read / write / modification of the SQLite knowledge / insights DB
+- Unauthorized read / write / modification of the SQLite knowledge DB or the project journals
 - Path traversal allowing read / write outside the project root
 - Code execution via crafted PDF / Markdown ingestion
 - Bypass of the `assert_allowed_chat` security gate (Telegram outbound)

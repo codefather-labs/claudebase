@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-24
+
 ### Added
 
 - **`chat dump` / `chat load` carry the journal and the nick.** The archive now holds the project's

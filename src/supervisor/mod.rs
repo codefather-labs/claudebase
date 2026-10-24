@@ -713,6 +713,25 @@ pub mod identity {
     /// while silently binding to whichever registered last. A suffix is added
     /// only when a LIVE session already holds the name; restarting a session
     /// reuses the plain nick because the old row is superseded at register.
+    /// A directory name is a label, not a nick: `tacticstrade.ai` has a dot,
+    /// which `validate_agent_name` refuses, and a refused name left the session
+    /// off the map entirely — no journal, no messages. Map everything outside
+    /// `[a-zA-Z0-9_-]` to `-`, leaving room for `disambiguate`'s `-NN`.
+    pub(crate) fn nick_from_label(label: &str) -> String {
+        let mapped: String = label
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '-' })
+            .collect();
+        let mut nick = String::new();
+        for c in mapped.chars() {
+            if !(c == '-' && nick.ends_with('-')) {
+                nick.push(c);
+            }
+        }
+        let nick: String = nick.trim_matches('-').chars().take(60).collect();
+        if nick.is_empty() { "claude".to_string() } else { nick }
+    }
+
     fn disambiguate(base: String) -> String {
         let Ok(conn) = crate::daemon::chat::open_chat_db() else {
             return base;
@@ -796,7 +815,7 @@ pub mod identity {
                         })
                 })
                 .unwrap_or_else(|| "claude".to_string());
-            disambiguate(derived)
+            disambiguate(nick_from_label(&derived))
         });
 
         AgentIdentity {
@@ -1094,5 +1113,29 @@ mod topic_ownership_tests {
         assert!(!other4, "topic 4 is not transport's, whoever pinged last");
         assert!(!other3, "topic 3 is not cutover's");
         assert!(!unbound, "an unassigned topic belongs to nobody, so withhold");
+    }
+}
+
+#[cfg(test)]
+mod default_nick_tests {
+    use super::identity::nick_from_label;
+    use crate::daemon::agent_registry::validate_agent_name;
+
+    /// A directory named `tacticstrade.ai` produced the nick `tacticstrade.ai`,
+    /// the daemon refused it, and the session never got on the map.
+    #[test]
+    fn a_directory_name_always_becomes_a_valid_nick() {
+        for (label, nick) in [
+            ("tacticstrade.ai", "tacticstrade-ai"),
+            ("my project", "my-project"),
+            ("claudebase", "claudebase"),
+            ("..", "claude"),
+            ("проект", "claude"),
+            ("a..b", "a-b"),
+        ] {
+            assert_eq!(nick_from_label(label), nick);
+            validate_agent_name(&nick_from_label(label)).unwrap();
+        }
+        assert!(nick_from_label(&"x".repeat(200)).len() <= 60);
     }
 }

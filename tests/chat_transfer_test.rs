@@ -1,6 +1,9 @@
 //! `claudebase chat dump` / `chat load` — a conversation carried from one
 //! machine to another. Each "machine" is its own CLAUDE_CONFIG_DIR and its own
-//! project directory, at different paths.
+//! project directory, at different paths — and its own HOME, so a test never
+//! reaches this machine's daemon or `chat.db`.
+
+mod common;
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -11,16 +14,23 @@ use std::path::{Path, PathBuf};
 const ID: &str = "33333333-3333-4333-8333-333333333333";
 
 struct Machine {
+    home: PathBuf,
     claude: PathBuf,
     project: PathBuf,
 }
 
 impl Machine {
     fn new(root: &Path, name: &str) -> Machine {
+        Machine::with_project(root, name, "proj")
+    }
+
+    fn with_project(root: &Path, name: &str, project: &str) -> Machine {
+        let home = root.join(name).join("home");
         let claude = root.join(name).join("claude");
-        let project = root.join(name).join("work").join("proj");
+        let project = root.join(name).join("work").join(project);
         fs::create_dir_all(&project).unwrap();
-        Machine { claude, project: project.canonicalize().unwrap() }
+        fs::create_dir_all(home.join("run")).unwrap();
+        Machine { home: home.canonicalize().unwrap(), claude, project: project.canonicalize().unwrap() }
     }
 
     fn folder(&self) -> PathBuf {
@@ -32,6 +42,11 @@ impl Machine {
             .unwrap()
             .current_dir(&self.project)
             .env("CLAUDE_CONFIG_DIR", &self.claude)
+            .env("HOME", &self.home)
+            .env("XDG_RUNTIME_DIR", self.home.join("run"))
+            .env_remove("CLAUDEBASE_AGENT_ID")
+            .env_remove("CLAUDEBASE_SESSION_TOKEN")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
             .args(args)
             .assert()
     }
@@ -267,4 +282,120 @@ fn hostile_or_foreign_archives_are_refused_and_leave_nothing() {
     b.run(&["chat", "load", "future.zip"])
         .failure()
         .stderr(predicates::str::contains("update it first"));
+}
+
+struct Daemon(std::process::Child);
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        common::stop(&mut self.0);
+    }
+}
+
+async fn daemon_for(m: &Machine) -> Daemon {
+    let d = Daemon(common::spawn_daemon_with_home(&m.home).expect("daemon spawned"));
+    common::wait_for_socket(&common::socket_under(&m.home), std::time::Duration::from_secs(10))
+        .await
+        .expect("socket");
+    d
+}
+
+/// The journal and the nick travel with the conversation — into a directory
+/// with another name, at another path, on a machine with its own daemon.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_journal_and_the_nick_travel_with_the_conversation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = Machine::new(tmp.path(), "a");
+    let b = Machine::with_project(tmp.path(), "b", "renamed.on-b");
+    seed(&a);
+
+    let _da = daemon_for(&a).await;
+    let a_dir = a.project.to_str().unwrap().to_owned();
+    let mut client = common::Client::connect(&common::socket_under(&a.home)).await.unwrap();
+    let entries = serde_json::json!([
+        {"body": "Chose WAL for the journal", "category": "decision", "tags": ["sqlite"], "salience": "high",
+         "created_at": 1_700_000_000, "agent": "planner", "session_id": ID,
+         "source_artifact": format!("{a_dir}/src/journal.rs#L160")},
+        {"body": "bumped zip to 2.x", "category": "update", "tags": ["deps"], "created_at": 1_700_000_100,
+         "source_artifact": "cd3f1a1"},
+    ]);
+    let r = client
+        .call("journal_import", serde_json::json!({"cwd": a_dir, "entries": entries}), 1)
+        .await
+        .unwrap();
+    assert_eq!(common::payload(&r).unwrap()["written"], 2, "{r}");
+    let chat = rusqlite::Connection::open(a.home.join(".claude/knowledge/chat.db")).unwrap();
+    claudebase::daemon::agent_registry::remember_conversation_nick(&chat, ID, "tt-backend", 1).unwrap();
+    drop(chat);
+
+    let (a2, b2) = (a, b);
+    let (a, b, archive) = tokio::task::spawn_blocking(move || {
+        let out = a2.run(&["chat", "dump", ID]).success().get_output().stdout.clone();
+        let text = String::from_utf8_lossy(&out).into_owned();
+        assert!(text.contains("journal: 2 entries") && text.contains("nick: tt-backend"), "{text}");
+        let archive = archive_path(&out);
+        (a2, b2, archive)
+    })
+    .await
+    .unwrap();
+
+    let _db = daemon_for(&b).await;
+    let carried = b.project.join("carried.zip");
+    fs::copy(&archive, &carried).unwrap();
+    tokio::task::spawn_blocking(move || {
+        let out = b.run(&["chat", "load", "carried.zip"]).success().get_output().stdout.clone();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("journal: 2 entries written, 0 already there"), "{text}");
+        assert!(text.contains("nick: `tt-backend`"), "{text}");
+
+        // b's journal is the journal of b's directory, whatever it is called.
+        let out = b.run(&["journal", "list", "--json"]).success().get_output().stdout.clone();
+        let listed: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(listed["project"], b.project.to_str().unwrap());
+        assert_eq!(listed["total"], 2);
+        let wal = listed["entries"].as_array().unwrap().iter().find(|e| e["category"] == "decision").unwrap();
+        assert_eq!(wal["created_at"], 1_700_000_000, "the original creation time is kept");
+        assert_eq!((wal["agent"].as_str(), wal["salience"].as_str()), (Some("planner"), Some("high")));
+        assert_eq!(wal["session_id"], ID);
+        assert_eq!(wal["source_artifact"], format!("{}/src/journal.rs#L160", b.project.display()));
+        assert!(wal.get("agent_id").is_none());
+        let bump = listed["entries"].as_array().unwrap().iter().find(|e| e["category"] == "update").unwrap();
+        assert_eq!(bump["source_artifact"], "cd3f1a1", "not a path: left alone");
+
+        let chat = rusqlite::Connection::open(b.home.join(".claude/knowledge/chat.db")).unwrap();
+        assert_eq!(
+            claudebase::daemon::agent_registry::recall_conversation_nick(&chat, ID).unwrap().as_deref(),
+            Some("tt-backend")
+        );
+
+        // Importing the same archive again writes nothing new.
+        let out = b.run(&["journal", "import", "carried.zip"]).success().get_output().stdout.clone();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("0 entries written, 2 already there"), "{text}");
+    })
+    .await
+    .unwrap();
+}
+
+/// Without a daemon the conversation still moves, and the operator is told
+/// how to bring the journal in afterwards.
+#[test]
+fn without_a_daemon_the_conversation_loads_and_the_journal_waits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let b = Machine::new(tmp.path(), "b");
+    let archive = b.project.join("dump.zip");
+    let manifest = serde_json::to_vec(&serde_json::json!({
+        "format":"claudebase-chat-dump","version":2,"session_id":ID,"title":null,
+        "source_cwd":"/x","created_at":"2026-01-01T00:00:00Z","claudebase_version":"0",
+        "journal_entries":1
+    }))
+    .unwrap();
+    let line = format!("{{\"type\":\"user\",\"sessionId\":\"{ID}\"}}\n");
+    let journal = br#"{"body":"x","category":"decision","tags":["t"],"created_at":5}
+"#;
+    hostile_zip(&archive, &[("manifest.json", &manifest), ("transcript.jsonl", line.as_bytes()), ("journal.jsonl", journal)]);
+    let out = b.run(&["chat", "load", "dump.zip"]).success().get_output().stdout.clone();
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("the journal was NOT imported") && text.contains("claudebase journal import"), "{text}");
+    assert!(b.folder().join(format!("{ID}.jsonl")).is_file());
 }

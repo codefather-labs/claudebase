@@ -9,7 +9,14 @@
 //! transcript.jsonl     <claude-dir>/projects/<slug>/<id>.jsonl
 //! session/...          <claude-dir>/projects/<slug>/<id>/      subagents, tool results
 //! file-history/...     <claude-dir>/file-history/<id>/         /rewind backups
+//! journal.jsonl        the project's journal, one entry per line (from the daemon)
 //! ```
+//!
+//! The manifest also carries the nick the conversation answers to. Both are
+//! what claudebase itself keeps about a conversation and its directory; what it
+//! keeps about the MACHINE stays behind — which terminal had which nick, the
+//! Telegram topic bindings (another machine has its own bot and chats), and the
+//! callback tokens (secrets).
 //!
 //! `load` unpacks it under the working directory's project folder, so `/resume`
 //! run from there lists it as a native conversation. On the way in:
@@ -22,7 +29,10 @@
 //!   the other machine;
 //! - `bridge-session` lines are dropped: they bind the conversation to the
 //!   source machine's Remote Control session;
-//! - free text (messages, tool calls) is left as written — it is history.
+//! - free text (messages, tool calls) is left as written — it is history;
+//! - the journal and the nick are not written here: the daemon owns the
+//!   journals and `chat.db`, so the caller hands them over (see
+//!   [`read_journal`] and [`LoadReport::nick`]).
 //!
 //! The archive comes from another machine and is treated as untrusted: only
 //! the entries above are extracted, by their sanitised name, regular files
@@ -50,12 +60,18 @@ pub const SESSION_ID_ENV: &str = "CLAUDE_CODE_SESSION_ID";
 /// `manifest.json`'s `format` — what tells a conversation dump from any zip.
 const FORMAT: &str = "claudebase-chat-dump";
 /// Bumped when a reader of the previous version could misread the archive.
-const VERSION: u32 = 1;
+/// 2: `journal.jsonl` and the manifest's `nick` — a version-1 reader refuses
+/// the unknown entry, and should say "update" rather than "unexpected entry".
+const VERSION: u32 = 2;
 
 const MANIFEST: &str = "manifest.json";
 const TRANSCRIPT: &str = "transcript.jsonl";
 const SESSION_DIR: &str = "session";
 const FILE_HISTORY_DIR: &str = "file-history";
+const JOURNAL: &str = "journal.jsonl";
+/// Bounds on what is read from an untrusted `journal.jsonl`.
+const MAX_JOURNAL_BYTES: u64 = 256 << 20;
+const MAX_JOURNAL_ENTRIES: usize = 200_000;
 
 /// Lines that belong to the machine the conversation came from.
 const DROPPED_ON_LOAD: &[&str] = &["bridge-session"];
@@ -71,6 +87,21 @@ struct Manifest {
     source_cwd: Option<String>,
     created_at: String,
     claudebase_version: String,
+    /// The nick this conversation answers to (`conversation_nick`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nick: Option<String>,
+    /// Entries in `journal.jsonl`; absent when the archive has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    journal_entries: Option<usize>,
+}
+
+/// What claudebase keeps about the conversation and its directory, fetched by
+/// the caller from the daemon and packed beside the transcript.
+#[derive(Debug, Default)]
+pub struct DumpExtras {
+    /// The project journal, oldest first; `None` when none is to be packed.
+    pub journal: Option<Vec<Value>>,
+    pub nick: Option<String>,
 }
 
 /// What [`dump_conversation`] produced.
@@ -81,6 +112,7 @@ pub struct DumpReport {
     pub archive: PathBuf,
     pub files: usize,
     pub bytes_in: u64,
+    pub journal_entries: Option<usize>,
 }
 
 /// What [`load_conversation`] produced.
@@ -92,11 +124,24 @@ pub struct LoadReport {
     pub transcript: PathBuf,
     pub source_cwd: Option<String>,
     pub lines: usize,
+    /// The nick the conversation had, for the caller to remember — `None`
+    /// for a `--new-id` copy, which is a different conversation.
+    pub nick: Option<String>,
+    /// Entries waiting in the archive's `journal.jsonl` (see [`read_journal`]).
+    pub journal_entries: usize,
 }
 
 // ---------------------------------------------------------------------------
 // dump
 // ---------------------------------------------------------------------------
+
+/// Conversation `key`'s id and the project directory it is filed under — what
+/// the caller needs to fetch the [`DumpExtras`] before dumping.
+pub fn conversation_source(claude_dir: &Path, cwd: &Path, key: &str) -> Result<(String, Option<String>)> {
+    let (id, transcript) = resolve_conversation(claude_dir, cwd, key)?;
+    let folder = transcript.parent().context("transcript has no parent folder")?;
+    Ok((id.clone(), project_root_of(&transcript, folder)))
+}
 
 /// Pack conversation `key` (its id, or the name `/resume` lists it under) into
 /// a zip at `out`, or at `<cwd>/<name>.zip` when `out` is `None`.
@@ -105,6 +150,7 @@ pub fn dump_conversation(
     cwd: &Path,
     key: &str,
     out: Option<&Path>,
+    extras: &DumpExtras,
 ) -> Result<DumpReport> {
     let (id, transcript) = resolve_conversation(claude_dir, cwd, key)?;
     let folder = transcript.parent().context("transcript has no parent folder")?;
@@ -127,6 +173,8 @@ pub fn dump_conversation(
             source_cwd: source_cwd.clone(),
             created_at: chrono::Utc::now().to_rfc3339(),
             claudebase_version: env!("CARGO_PKG_VERSION").to_owned(),
+            nick: extras.nick.clone(),
+            journal_entries: extras.journal.as_ref().map(Vec::len),
         };
         zip.start_file(MANIFEST, options(0))?;
         zip.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
@@ -156,11 +204,26 @@ pub fn dump_conversation(
                 bytes += b;
             }
         }
+        if let Some(entries) = &extras.journal {
+            zip.start_file(JOURNAL, options(0))?;
+            for e in entries {
+                serde_json::to_writer(&mut zip, e)?;
+                zip.write_all(b"\n")?;
+            }
+            files += 1;
+        }
         zip.finish()?.flush()?;
         Ok((files, bytes))
     })();
     match result {
-        Ok((files, bytes_in)) => Ok(DumpReport { session_id: id, title, archive, files, bytes_in }),
+        Ok((files, bytes_in)) => Ok(DumpReport {
+            session_id: id,
+            title,
+            archive,
+            files,
+            bytes_in,
+            journal_entries: extras.journal.as_ref().map(Vec::len),
+        }),
         Err(e) => {
             let _ = fs::remove_file(&archive);
             Err(e)
@@ -349,6 +412,8 @@ pub fn load_conversation(
             };
             let dest_root = match top.as_deref() {
                 Some(MANIFEST) if rest.is_empty() => continue,
+                // Read by `read_journal` and handed to the daemon.
+                Some(JOURNAL) if rest.is_empty() => continue,
                 Some(TRANSCRIPT) if rest.is_empty() => None,
                 Some(SESSION_DIR) if !rest.is_empty() => Some(&stage_session),
                 Some(FILE_HISTORY_DIR) if !rest.is_empty() => Some(&stage_history),
@@ -400,6 +465,8 @@ pub fn load_conversation(
             transcript,
             source_cwd: manifest.source_cwd,
             lines,
+            nick: if new_id { None } else { manifest.nick },
+            journal_entries: manifest.journal_entries.unwrap_or(0),
         }),
         Err(e) => {
             for dir in [&stage_session, &stage_history] {
@@ -415,6 +482,48 @@ pub fn load_conversation(
             Err(e)
         }
     }
+}
+
+/// The project directory the archive's conversation came from.
+pub fn archive_source_project(archive_path: &Path) -> Result<Option<String>> {
+    let file = fs::File::open(archive_path).with_context(|| format!("open {}", archive_path.display()))?;
+    let mut zip = zip::ZipArchive::new(BufReader::new(file))
+        .with_context(|| format!("{} is not a zip archive", archive_path.display()))?;
+    let mut entry = zip.by_name(MANIFEST).context("not a claudebase conversation dump (no manifest.json)")?;
+    let mut buf = Vec::new();
+    entry.by_ref().take(1 << 20).read_to_end(&mut buf)?;
+    let manifest: Manifest = serde_json::from_slice(&buf).context("manifest.json is not valid")?;
+    Ok(manifest.source_cwd)
+}
+
+/// The journal entries packed in `archive`, as the objects `journal list
+/// --json` prints; empty when it has none. Each is validated again when the
+/// daemon writes it — this only bounds how much is read.
+pub fn read_journal(archive_path: &Path) -> Result<Vec<Value>> {
+    let file = fs::File::open(archive_path).with_context(|| format!("open {}", archive_path.display()))?;
+    let mut zip = zip::ZipArchive::new(BufReader::new(file))
+        .with_context(|| format!("{} is not a zip archive", archive_path.display()))?;
+    let entry = match zip.by_name(JOURNAL) {
+        Ok(e) => e,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut out = Vec::new();
+    for (n, line) in std::io::BufRead::lines(BufReader::new(entry.take(MAX_JOURNAL_BYTES))).enumerate() {
+        let line = line.with_context(|| format!("{JOURNAL} line {}", n + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: Value = serde_json::from_str(&line).with_context(|| format!("{JOURNAL} line {} is not JSON", n + 1))?;
+        if !v.is_object() {
+            bail!("{JOURNAL} line {} is not an entry", n + 1);
+        }
+        out.push(v);
+        if out.len() > MAX_JOURNAL_ENTRIES {
+            bail!("{JOURNAL} has more than {MAX_JOURNAL_ENTRIES} entries");
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

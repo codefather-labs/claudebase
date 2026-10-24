@@ -41,7 +41,7 @@ pub async fn handle(tool: &str, args: Value) -> Result<Value> {
     // Vectors are computed after the answer, so a write never waits for the
     // encoder; a search that just ran also tops up anything still missing
     // (entries imported from old insights, or written before the model).
-    if matches!(tool.as_str(), "journal_add" | "journal_search") {
+    if matches!(tool.as_str(), "journal_add" | "journal_search" | "journal_import") {
         if let Some(project) = value.get("project").and_then(Value::as_str) {
             spawn_embedding(PathBuf::from(project));
         }
@@ -70,6 +70,7 @@ fn dispatch(tool: &str, args: &Value) -> Result<Value> {
         "journal_categories" => categories(&dir, args),
         "journal_gc" => gc(&dir, args),
         "journal_projects" => Ok(json!({ "journals": journal::list_journals(&dir)? })),
+        "journal_import" => import(&dir, args),
         other => bail!("unknown journal tool `{other}`"),
     }
 }
@@ -155,6 +156,57 @@ fn add(dir: &Path, args: &Value) -> Result<Value> {
     };
     let (status, id) = journal::add(&mut conn, &entry, journal::now_secs())?;
     Ok(json!({ "status": status, "id": id, "project": project_json(&caller) }))
+}
+
+/// Most entries one `journal_import` call takes; the client sends batches.
+pub const MAX_IMPORT_BATCH: usize = 100;
+
+/// Entries carried over from another machine (`chat load`, `journal import`),
+/// written into the journal of the directory the command ran in.
+///
+/// The one write that needs no session: the target is not "the project this
+/// session belongs to" but the directory the operator loaded a conversation
+/// into — the one it will be resumed from. Each entry still goes through
+/// `journal::add`, so the archive (untrusted, from elsewhere) gets the same
+/// validation as an agent's `add`, and its own creation time is kept. Loading
+/// the same archive twice writes nothing the second time: `add` folds an
+/// identical note in the same category into the existing entry.
+fn import(dir: &Path, args: &Value) -> Result<Value> {
+    let cwd = str_arg(args, "cwd").ok_or_else(|| anyhow!("cwd required: the directory to import into"))?;
+    let project = PathBuf::from(cwd);
+    if !project.is_absolute() {
+        bail!("cwd must be an absolute path");
+    }
+    let entries = args.get("entries").and_then(Value::as_array).ok_or_else(|| anyhow!("entries required (array)"))?;
+    if entries.len() > MAX_IMPORT_BATCH {
+        bail!("at most {MAX_IMPORT_BATCH} entries per call, got {}", entries.len());
+    }
+    let caller = Caller { project, agent_id: None, nick: None };
+    let mut conn = journal::open(dir, &caller.project, true)?.expect("created on demand");
+    let now = journal::now_secs();
+    let (mut written, mut merged, mut refused) = (0, 0, Vec::new());
+    for (i, e) in entries.iter().enumerate() {
+        let entry = NewEntry {
+            body: str_arg(e, "body").unwrap_or_default(),
+            category: str_arg(e, "category").unwrap_or_default(),
+            tags: str_list(e, "tags"),
+            salience: str_arg(e, "salience").unwrap_or_else(|| "medium".into()),
+            agent: str_arg(e, "agent"),
+            // The source machine's session ids mean nothing here.
+            agent_id: None,
+            session_id: str_arg(e, "session_id"),
+            feature: str_arg(e, "feature"),
+            source_artifact: str_arg(e, "source_artifact"),
+        };
+        // A creation time from the future would outlive its retention.
+        let created = e.get("created_at").and_then(Value::as_i64).filter(|t| *t > 0).unwrap_or(now).min(now);
+        match journal::add(&mut conn, &entry, created) {
+            Ok((journal::AddStatus::Written, _)) => written += 1,
+            Ok((_, _)) => merged += 1,
+            Err(err) => refused.push(json!({ "index": i, "error": format!("{err:#}") })),
+        }
+    }
+    Ok(json!({ "written": written, "merged": merged, "refused": refused, "project": project_json(&caller) }))
 }
 
 fn filter(args: &Value) -> Result<Filter> {

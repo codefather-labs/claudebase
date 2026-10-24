@@ -283,7 +283,14 @@ claude --resume 88d0e3e5-…                                  # or pick it in /r
 ```
 
 The archive holds the transcript, the subagent transcripts, spilled tool results and the `/rewind`
-backups, plus a `manifest.json` naming the conversation and the project path it came from. `load`
+backups, plus a `manifest.json` naming the conversation, its nick and the project path it came from,
+and the project's journal (`journal.jsonl`, fetched from the daemon). `load` hands the journal to
+this machine's daemon, which writes it into the journal of the directory `load` runs in — its name and
+path need not match the source — keeping each entry's creation time and moving `source_artifact`
+paths under the source project; entries already there are not written twice. If the daemon is down
+then, `claudebase journal import <F.zip>` brings the journal in later. The conversation's nick
+comes back with it (not for a `--new-id` copy). Machine-bound state stays behind: per-terminal nicks,
+Telegram bindings, callback tokens. `load`
 keeps the conversation's id — it is the same conversation, moved — and refuses when that id is
 already on the machine; `--new-id` loads a separate copy instead, `--name` lists it under another
 name. `cwd` fields at or under the source project path are moved to the directory `load` runs in,

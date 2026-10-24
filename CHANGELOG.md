@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **`chat dump` / `chat load` carry the journal and the nick.** The archive now holds the project's
+  journal (`journal.jsonl`, fetched from the daemon) and the nick the conversation answers to. `load`
+  hands the journal to this machine's daemon, which writes it into the journal of the directory
+  `load` runs in — that directory's name and path need not match the source. Each entry keeps its
+  creation time, category, tags, salience and author; `source_artifact` paths under the source
+  project move with it; entries already there are not written twice. The nick comes back unless the
+  machine already has one for the conversation or it was loaded `--new-id`. Machine-bound state —
+  per-terminal nicks, Telegram bindings, callback tokens — stays behind.
+- **`claudebase journal import <F.zip>`** brings in an archive's journal when the daemon was not
+  running at `chat load` time. Running it twice writes nothing new.
+
+### Changed
+
+- **Dump format version 2.** claudebase 0.14 refuses a version-2 archive with "update it first";
+  this version still loads version-1 archives (which have no journal).
+
 ## [0.14.0] - 2026-10-24
 
 ### Added

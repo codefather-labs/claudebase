@@ -549,12 +549,14 @@ pub enum ChatSubcommand {
     /// conversation was started in.
     Clone(ChatCloneArgs),
     /// Pack a Claude Code conversation — transcript, subagent transcripts,
-    /// spilled tool results and /rewind backups — into one .zip, to carry it
-    /// to another machine and `chat load` it there.
+    /// spilled tool results and /rewind backups — with its nick and the
+    /// project's journal into one .zip, to carry it to another machine and
+    /// `chat load` it there.
     Dump(ChatDumpArgs),
     /// Unpack a `chat dump` archive into this directory's conversations, so
     /// `/resume` run here lists it. Keeps the conversation's id; project paths
-    /// recorded on the source machine are moved to this directory.
+    /// recorded on the source machine are moved to this directory, and the
+    /// journal goes into this directory's journal, whatever it is called.
     Load(ChatLoadArgs),
 }
 
@@ -948,6 +950,18 @@ pub enum JournalSubcommand {
     Gc(JournalGcArgs),
     /// Every project journal the daemon holds, with entry counts.
     Projects(JournalJsonArgs),
+    /// Bring in the journal packed in a `chat dump` archive, into the journal
+    /// of the current directory. `chat load` does this itself; this is for when
+    /// the daemon was not running then. Loading twice writes nothing new.
+    Import(JournalImportArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct JournalImportArgs {
+    /// The archive `chat dump` produced.
+    pub archive: PathBuf,
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Filters shared by `search` and `list`.

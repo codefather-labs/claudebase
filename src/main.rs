@@ -763,23 +763,48 @@ fn run_chat_dump(args: &cli::ChatDumpArgs) -> anyhow::Result<String> {
                 )
             })?,
     };
-    let r = chat_transfer::dump_conversation(
-        &chat_clone::claude_dir()?,
-        &cwd,
-        &source,
-        args.out.as_deref(),
-    )?;
+    let claude_dir = chat_clone::claude_dir()?;
+    // What claudebase keeps about this conversation and its directory. The
+    // daemon owns the journal, so it is asked; a dump without it is still a
+    // dump, but the operator is told, since the journal is half the point.
+    let (id, source_cwd) = chat_transfer::conversation_source(&claude_dir, &cwd, &source)?;
+    let project = source_cwd.as_deref().map(std::path::PathBuf::from).unwrap_or_else(|| cwd.clone());
+    let mut notes = Vec::new();
+    let journal = match claudebase::daemon::run_tokio(claudebase::journal_cli::export_entries(&project)) {
+        Ok(j) => j,
+        Err(e) => {
+            notes.push(format!(
+                "WARNING: the journal is NOT in this archive — the daemon did not answer ({e:#}). \
+                 Start it (`claudebase daemon start`) and dump again."
+            ));
+            None
+        }
+    };
+    let nick = claudebase::daemon::chat::open_chat_db_readonly()
+        .ok()
+        .and_then(|c| claudebase::daemon::agent_registry::recall_conversation_nick(&c, &id).ok().flatten());
+    let extras = chat_transfer::DumpExtras { journal, nick };
+    let r = chat_transfer::dump_conversation(&claude_dir, &cwd, &id, args.out.as_deref(), &extras)?;
     let size = std::fs::metadata(&r.archive).map(|m| m.len()).unwrap_or(0);
-    Ok(format!(
-        "dumped {}{} ({} files, {:.1} MB -> {:.1} MB)\narchive: {}\non the other machine, from the project directory:\n  claudebase chat load {}",
+    let mut msg = format!(
+        "dumped {}{} ({} files, {:.1} MB -> {:.1} MB)\njournal: {}\nnick: {}\narchive: {}\non the other machine, from the project directory:\n  claudebase chat load {}",
         r.session_id,
         r.title.as_deref().map(|t| format!(" `{t}`")).unwrap_or_default(),
         r.files,
         r.bytes_in as f64 / 1e6,
         size as f64 / 1e6,
+        match r.journal_entries {
+            Some(n) => format!("{n} entries of {}", project.display()),
+            None => format!("none for {}", project.display()),
+        },
+        extras.nick.as_deref().unwrap_or("(none remembered)"),
         r.archive.display(),
         r.archive.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-    ))
+    );
+    for n in notes {
+        msg.push_str(&format!("\n{n}"));
+    }
+    Ok(msg)
 }
 
 /// `claudebase chat load <file.zip>` — unpack a dump into this directory.
@@ -805,6 +830,22 @@ fn run_chat_load(args: &cli::ChatLoadArgs) -> anyhow::Result<String> {
     if let Some(from) = &r.source_cwd {
         msg.push_str(&format!("\nproject paths moved: {from} -> {}", cwd.display()));
     }
+    msg.push_str(&format!("\n{}", load_nick(&r)));
+    if r.journal_entries > 0 {
+        let entries = chat_transfer::read_journal(&args.archive)?;
+        let moved = claudebase::journal_cli::Moved {
+            session: (r.session_id != r.source_id).then_some((r.source_id.as_str(), r.session_id.as_str())),
+            source_project: r.source_cwd.as_deref(),
+        };
+        match claudebase::daemon::run_tokio(claudebase::journal_cli::import_entries(&cwd, entries, moved)) {
+            Ok(report) => msg.push_str(&format!("\n{}", report.describe())),
+            Err(e) => msg.push_str(&format!(
+                "\nWARNING: the journal was NOT imported — the daemon did not answer ({e:#}).\n\
+                 Start it (`claudebase daemon start`), then from this directory:\n  claudebase journal import {}",
+                args.archive.display()
+            )),
+        }
+    }
     msg.push_str(&format!(
         "\nfile:   {}\nresume: claude --resume {}{}",
         r.transcript.display(),
@@ -812,6 +853,31 @@ fn run_chat_load(args: &cli::ChatLoadArgs) -> anyhow::Result<String> {
         r.title.as_deref().map(|t| format!("   (or pick `{t}` in /resume)")).unwrap_or_default(),
     ));
     Ok(msg)
+}
+
+/// Give the loaded conversation back the nick it had, unless this machine
+/// already remembers one for it.
+fn load_nick(r: &claudebase::chat_transfer::LoadReport) -> String {
+    use claudebase::daemon::{agent_registry, chat};
+    let Some(nick) = r.nick.as_deref() else {
+        return "nick: none carried".into();
+    };
+    // From another machine: only a name the daemon would accept.
+    if agent_registry::validate_agent_name(nick).is_err() {
+        return format!("nick: `{nick}` is not a valid nick here, not kept");
+    }
+    let result = chat::open_chat_db().map_err(anyhow::Error::from).and_then(|c| {
+        if agent_registry::recall_conversation_nick(&c, &r.session_id)?.is_some() {
+            return Ok(false);
+        }
+        agent_registry::remember_conversation_nick(&c, &r.session_id, nick, chrono::Utc::now().timestamp_millis())?;
+        Ok(true)
+    });
+    match result {
+        Ok(true) => format!("nick: `{nick}` — the session resuming it will take that name"),
+        Ok(false) => "nick: this machine already has one for this conversation, kept it".into(),
+        Err(e) => format!("nick: `{nick}` not kept ({e:#})"),
+    }
 }
 
 /// `claudebase chat threads` — list all known chat threads.

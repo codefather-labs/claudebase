@@ -188,7 +188,7 @@ fn render(tool: &str, p: &Value) -> String {
     }
 }
 
-/// `#12 2026-10-24 decision [sqlite, locking] high`
+/// `#12 2026-10-24 14:05Z decision [sqlite, locking] high`
 fn headline(e: &Value) -> String {
     let tags: Vec<&str> = e["tags"].as_array().map(|t| t.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
     format!(
@@ -201,8 +201,10 @@ fn headline(e: &Value) -> String {
     )
 }
 
+/// Minutes matter: several updates land on the same day, and the journal is
+/// read as a changelog.
 fn date(secs: i64) -> String {
-    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0).map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default()
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0).map(|d| d.format("%Y-%m-%d %H:%MZ").to_string()).unwrap_or_default()
 }
 
 fn one_line(text: &str, max: usize) -> String {

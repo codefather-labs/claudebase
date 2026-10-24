@@ -153,10 +153,10 @@ The `salience:` tag has the same three-value enum (`high` | `medium` | `low`) an
 
 ## Project journal
 
-The `## Facts` and `## Decisions` blocks are per artifact; the project journal is what carries them across sessions. Its full protocol is `~/.claude/rules/project-journal.md`. In short:
+The `## Facts` and `## Decisions` blocks are per artifact; the project journal is what carries them across sessions — and, through its `update` entries, it is also the project's changelog. Its full protocol is `~/.claude/rules/project-journal.md`. In short:
 
 - **Before deciding**, search the journal for what the project already decided or found on the subject (`claudebase journal search "<keywords>" --tag <tag>`, `claudebase journal list --category decision --tag <tag>`). A hit you rely on is a fact: cite it as `journal#<id>` under `### Verified facts`.
-- **After deciding or finding**, journal it — every entry of `### Decisions made`, every load-bearing finding, every falsified assumption, one entry each (`claudebase journal add "<what, why, alternatives rejected, where>" --category <decision|finding|assumption-falsified|...> --tag <tag> --salience <tag>`).
+- **After deciding or finding**, journal it — every entry of `### Decisions made`, every load-bearing finding, every falsified assumption, one entry each; and every change you make as an `update` entry (what changed, where, why, the decision's `journal#<id>`) (`claudebase journal add "<what, why, alternatives rejected, where>" --category <decision|finding|assumption-falsified|...> --tag <tag> --salience <tag>`).
 - The artifact explains this change; the journal is what the next session will search. Neither replaces the other.
 
 ## Protocol 3 — Inbound Task Validation

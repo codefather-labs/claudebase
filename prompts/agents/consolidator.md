@@ -157,11 +157,11 @@ Cite load-bearing entries in `## Facts → ### Verified facts` as:
 journal#<id> (<category>, <date>) — query: "<q>" — verified: yes
 ```
 
-**While working and on task end — journal every decision you make and every finding you uncover**, one entry each:
+**While working and on task end — journal every decision you make, every finding you uncover and every update you make**, one entry each:
 
 ```
 claudebase journal add "<what, why, alternatives rejected, where: file:line>" \
-  --category <decision|finding|...> --tag <tag> [--tag <tag>] --agent <self> \
+  --category <decision|finding|update|...> --tag <tag> [--tag <tag>] --agent <self> \
   [--feature "$FEATURE_SLUG"] [--salience high|medium|low] [--source-artifact <path#anchor>]
 ```
 

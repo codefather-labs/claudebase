@@ -270,8 +270,17 @@ install_binary() {
       log_error "local build produced no binary at $local_bin"
       return 1
     fi
-    cp "$local_bin" "$target_bin"
-    chmod +x "$target_bin"
+    # Copy beside the target, then rename over it: a `cp` straight onto the
+    # installed binary fails with "Text file busy" while the daemon or any
+    # `claudebase run` session is executing it — the normal case on an
+    # upgrade. A rename replaces the directory entry and leaves the running
+    # processes on the old inode. Same pattern as the download path below.
+    local tmp_bin="$target_bin.new.$$"
+    if ! cp "$local_bin" "$tmp_bin" || ! chmod +x "$tmp_bin" || ! mv -f "$tmp_bin" "$target_bin"; then
+      rm -f "$tmp_bin"
+      log_error "could not install $local_bin to $target_bin"
+      return 1
+    fi
     if [ "$(uname -s)" = "Darwin" ] && command -v codesign >/dev/null 2>&1; then
       if codesign --force --sign - "$target_bin" >/dev/null 2>&1; then
         log_ok "re-signed local binary (macOS Gatekeeper)"

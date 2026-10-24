@@ -336,8 +336,9 @@ pub enum Command {
     /// schema. Re-parses each PDF via pdfium and populates pages without
     /// touching chunks_fts / chunks_vec — preserves embeddings.
     ReindexPages(ReindexPagesArgs),
-    /// The project journal: decisions and findings, recorded by agents and
-    /// searched by tag and category. Held by the daemon, one per project.
+    /// The project journal: decisions, findings and updates (the changelog),
+    /// recorded by agents and searched by tag and category. Held by the
+    /// daemon, one per project.
     Journal(JournalArgs),
     /// Run as a persistent daemon — owns the local IPC surface (UDS on
     /// Unix, named pipe on Windows) for MCP plugin bridges and

@@ -8,12 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- **The project journal: `claudebase journal`.** Agents record every decision and finding
+- **The project journal: `claudebase journal`.** Agents record every decision, finding and update
+  — the journal is both the record of why and the project's changelog (`--category update`)
   (`journal add "<text>" --category <c> --tag <t>`) and find them again by category and tag
   (`journal search`, `journal list`); `journal categories` and `journal tags` list what this project
   uses. The journal belongs to the directory `claudebase run` was started in — a command from `src/`
   still lands in the project's journal — and no command ever sees another project's entries,
-  categories or tags.
+  categories or tags. Every entry carries its creation time: `created_at` (unix seconds) and
+  `created` (RFC 3339 UTC) in `--json`, date and minute in the text output.
 - **The daemon owns the journals.** Every `journal` command is a call to the daemon, the only
   writer; it keeps one SQLite file per project under `~/.claude/claudebase/journals/` and nothing in
   the project directory. `journal projects` lists every journal it holds — the base for

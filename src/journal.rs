@@ -358,7 +358,11 @@ impl Filter {
 #[derive(Debug, Clone, Serialize)]
 pub struct Entry {
     pub id: i64,
+    /// When the entry was written, unix seconds; for an imported insight,
+    /// when the insight was.
     pub created_at: i64,
+    /// `created_at` as RFC 3339 UTC, for readers that should not convert.
+    pub created: String,
     pub category: String,
     pub tags: Vec<String>,
     pub salience: String,
@@ -382,6 +386,7 @@ fn entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
     Ok(Entry {
         id: r.get(0)?,
         created_at: r.get(1)?,
+        created: rfc3339(r.get(1)?),
         category: r.get(2)?,
         salience: r.get(3)?,
         body: r.get(4)?,
@@ -392,6 +397,12 @@ fn entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
         source_artifact: r.get(9)?,
         tags: Vec::new(),
     })
+}
+
+pub fn rfc3339(secs: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
+        .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_default()
 }
 
 fn attach_tags(conn: &Connection, entries: &mut [Entry]) -> Result<()> {
@@ -921,6 +932,16 @@ mod tests {
         assert_eq!(list(&c, &f, 0, 10).unwrap().0, 2);
         let f = Filter { category: Some("Finding".into()), since: Some(3), ..Default::default() };
         assert_eq!(list(&c, &f, 0, 10).unwrap().0, 1);
+    }
+
+    #[test]
+    fn every_entry_carries_its_creation_time() {
+        let (_d, mut c) = journal();
+        add(&mut c, &entry("bumped rusqlite to 0.32", "update", &["deps"]), 1_761_300_300).unwrap();
+        let (_, page) = list(&c, &Filter::default(), 0, 10).unwrap();
+        assert_eq!((page[0].created_at, page[0].created.as_str()), (1_761_300_300, "2025-10-24T10:05:00Z"));
+        let json = serde_json::to_value(&page[0]).unwrap();
+        assert_eq!((json["created_at"].as_i64(), json["created"].as_str()), (Some(1_761_300_300), Some("2025-10-24T10:05:00Z")));
     }
 
     #[test]

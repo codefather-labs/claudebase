@@ -3,7 +3,7 @@
 #
 # Fires on session startup|resume|compact. Injects an agent-only reminder that
 # this project has a journal: read the entries that bear on the task (by
-# category and tag), and record every decision and finding while working. The
+# category and tag), and record every decision, finding and update while working. The
 # journal lives with the claudebase daemon, one per project directory.
 #
 # Emits TEXT ONLY - does NOT itself invoke claudebase.
@@ -30,9 +30,10 @@ On a fresh context window (session start, resume, post-compact), read before you
      claudebase journal list --category decision --tag <tag>
 Mid-task with the context already in hand, skip this.
 
-While you work, journal every decision you make and every finding you uncover, one entry each, as you go:
+While you work, journal every decision you make, every finding you uncover and every update you make, one entry each, as you go. The journal is both the record of decisions and the project changelog:
      claudebase journal add "<what, why, alternatives rejected, where: file:line>" --category decision --tag <tag> --tag <tag>
-- Category: reuse one the journal already has (decision, finding, bug, lesson, ...) before inventing one.
+- Category: reuse one the journal already has (decision, finding, bug, lesson, update, ...) before inventing one.
+- update = a change you made: what changed, where (files, commit), why; cite the #id of the decision behind it.
 - Tags: 1-4 specific nouns (component, technology, feature); reuse existing tags so the entry is found again.
 - Self-contained: a later session reads the entry without this conversation.
 - --salience high for load-bearing entries (kept forever), low for ambient context (90 days); medium is the default (a year).

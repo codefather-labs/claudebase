@@ -36,7 +36,7 @@ $ErrorActionPreference = 'Stop'
 # this constant sat at 0.9.2 through four releases because nothing checked it,
 # and every fresh install in that window silently got a binary two minor
 # versions old.
-$Script:ClaudebaseVersionFallback = '0.13.0'
+$Script:ClaudebaseVersionFallback = '0.14.0'
 $Script:ClaudebasePdfiumVersion = 'chromium/7802'
 
 # Which version to install: an explicit request, else the newest published tag,

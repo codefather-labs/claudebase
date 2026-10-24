@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-24
+
 ### Added
 
 - **The project journal: `claudebase journal`.** Agents record every decision, finding and update
@@ -51,6 +53,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   and both installers show those lines and say that a re-run resumes. A download that receives
   nothing for 60 s now fails instead of waiting 15 minutes (whisper) or forever (parakeet); whisper's
   `.part` is kept and the next run continues from it.
+- **A session in a directory whose name is not a valid nick now registers.** The default nick was
+  the directory name verbatim; `tacticstrade.ai` has a dot, the daemon refused it, and the session
+  was never on the map — no journal, no messages, only an error in the daemon log. Characters
+  outside `[a-zA-Z0-9_-]` now become `-` (`tacticstrade-ai`).
+- **`journal add` no longer fails with "database is locked" under a burst of writes.** Writes were
+  deferred transactions; in WAL mode such a writer gets SQLITE_BUSY at once when the daemon is
+  storing vectors, without the busy timeout ever waiting. Writes now take the lock up front and
+  wait for it. A storage error answers -32603 instead of -32602 (invalid params).
+- **`install.sh --local` really replaces the binary on an upgrade.** It copied straight onto the
+  installed binary, which fails with "Text file busy" while the daemon runs it, then reported OK and
+  left the old binary in place. It now copies beside it and renames over it.
 
 ## [0.13.0] - 2026-10-23
 

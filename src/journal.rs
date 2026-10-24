@@ -36,7 +36,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -255,7 +255,10 @@ pub fn add(conn: &mut Connection, entry: &NewEntry, now: i64) -> Result<(AddStat
     let salience = normalize_salience(Some(&entry.salience))?;
     let sha = hex(&Sha256::digest(body.as_bytes()));
 
-    let existing: Option<i64> = conn
+    // The duplicate check runs inside the write transaction, so two identical
+    // adds arriving together cannot both miss it.
+    let tx = write_tx(conn)?;
+    let existing: Option<i64> = tx
         .query_row(
             "SELECT id FROM entries WHERE sha256 = ?1 AND category = ?2 AND created_at >= ?3 \
              ORDER BY id DESC LIMIT 1",
@@ -265,13 +268,11 @@ pub fn add(conn: &mut Connection, entry: &NewEntry, now: i64) -> Result<(AddStat
         .optional()?;
     if let Some(id) = existing {
         // The same note again still teaches us its tags.
-        let tx = conn.transaction()?;
         insert_tags(&tx, id, &tags)?;
         tx.commit()?;
         return Ok((AddStatus::Deduped, id));
     }
 
-    let tx = conn.transaction()?;
     tx.execute(
         "INSERT INTO entries (created_at, category, body, sha256, salience, agent, agent_id, \
                               session_id, feature, source_artifact) \
@@ -293,6 +294,16 @@ pub fn add(conn: &mut Connection, entry: &NewEntry, now: i64) -> Result<(AddStat
     insert_tags(&tx, id, &tags)?;
     tx.commit()?;
     Ok((AddStatus::Written, id))
+}
+
+/// Every multi-statement write starts as `BEGIN IMMEDIATE`. A deferred
+/// transaction takes the write lock only at its first write, and in WAL mode
+/// a writer that finds the lock held by another connection gets SQLITE_BUSY
+/// at once, without `busy_timeout` ever waiting: a burst of `journal add`
+/// while the daemon stored vectors answered "database is locked". Taking the
+/// lock up front is what lets the busy timeout queue the writers.
+fn write_tx(conn: &mut Connection) -> Result<Transaction<'_>> {
+    Ok(conn.transaction_with_behavior(TransactionBehavior::Immediate)?)
 }
 
 fn clean(v: &Option<String>) -> Option<&str> {
@@ -623,15 +634,19 @@ pub fn missing_vectors(conn: &Connection, limit: usize) -> Result<Vec<(i64, Stri
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-pub fn store_vector(conn: &Connection, id: i64, embedding: &[f32]) -> Result<()> {
+pub fn store_vector(conn: &mut Connection, id: i64, embedding: &[f32]) -> Result<()> {
     let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-    // vec0 has no upsert; the entry may have been deleted in between, in which
-    // case there is nothing to attach the vector to.
-    if conn.query_row("SELECT 1 FROM entries WHERE id = ?1", params![id], |_| Ok(())).optional()?.is_none() {
+    // vec0 has no upsert, so the replace is a delete and an insert — in one
+    // transaction, or two embedding passes over the same entry collide on the
+    // rowid. The entry may also have been deleted in between, in which case
+    // there is nothing to attach the vector to.
+    let tx = write_tx(conn)?;
+    if tx.query_row("SELECT 1 FROM entries WHERE id = ?1", params![id], |_| Ok(())).optional()?.is_none() {
         return Ok(());
     }
-    conn.execute("DELETE FROM entries_vec WHERE rowid = ?1", params![id])?;
-    conn.execute("INSERT INTO entries_vec(rowid, embedding) VALUES (?1, ?2)", params![id, bytes])?;
+    tx.execute("DELETE FROM entries_vec WHERE rowid = ?1", params![id])?;
+    tx.execute("INSERT INTO entries_vec(rowid, embedding) VALUES (?1, ?2)", params![id, bytes])?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -934,6 +949,56 @@ mod tests {
         assert_eq!(list(&c, &f, 0, 10).unwrap().0, 1);
     }
 
+    /// A burst of adds from several connections while others store vectors and
+    /// search — what the daemon does after every add — must never answer
+    /// "database is locked". With deferred transactions it did, at once.
+    #[test]
+    fn concurrent_writers_wait_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_path_buf();
+        open(&d, Path::new("/w/p"), true).unwrap();
+        let errors = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let mut threads = Vec::new();
+        for t in 0..3 {
+            let (d, errors) = (d.clone(), errors.clone());
+            threads.push(std::thread::spawn(move || {
+                for i in 0..40 {
+                    let r = open(&d, Path::new("/w/p"), true).and_then(|c| {
+                        add(&mut c.unwrap(), &entry(&format!("entry {t} {i}"), "update", &["x"]), now_secs())
+                    });
+                    if let Err(e) = r {
+                        errors.lock().unwrap().push(format!("add: {e:#}"));
+                    }
+                }
+            }));
+        }
+        for _ in 0..2 {
+            let (d, errors) = (d.clone(), errors.clone());
+            threads.push(std::thread::spawn(move || {
+                for _ in 0..100 {
+                    let r = (|| -> Result<()> {
+                        let mut c = open(&d, Path::new("/w/p"), false)?.unwrap();
+                        for (id, _) in missing_vectors(&c, 32)? {
+                            store_vector(&mut c, id, &[0.1f32; 384])?;
+                        }
+                        let _ = search(&c, "entry", None, SearchMode::Lexical, &Filter::default(), 10)?;
+                        Ok(())
+                    })();
+                    if let Err(e) = r {
+                        errors.lock().unwrap().push(format!("vectors/search: {e:#}"));
+                    }
+                }
+            }));
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+        let errors = errors.lock().unwrap();
+        assert!(errors.is_empty(), "{} errors, e.g. {:?}", errors.len(), errors.first());
+        let c = open(&d, Path::new("/w/p"), false).unwrap().unwrap();
+        assert_eq!(list(&c, &Filter::default(), 0, 1).unwrap().0, 120);
+    }
+
     #[test]
     fn every_entry_carries_its_creation_time() {
         let (_d, mut c) = journal();
@@ -970,8 +1035,8 @@ mod tests {
         va[0] = 1.0;
         let mut vb = vec![0.0f32; 384];
         vb[1] = 1.0;
-        store_vector(&c, a, &va).unwrap();
-        store_vector(&c, b, &vb).unwrap();
+        store_vector(&mut c, a, &va).unwrap();
+        store_vector(&mut c, b, &vb).unwrap();
         assert!(missing_vectors(&c, 10).unwrap().is_empty());
         let (mode, hits) = search(&c, "zzz", Some(&vb), SearchMode::Dense, &Filter::default(), 1).unwrap();
         assert_eq!(mode, SearchMode::Dense);

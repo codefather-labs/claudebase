@@ -805,7 +805,11 @@ where
                 name if name.starts_with("journal_") => {
                     let resp = match crate::daemon::journal_tools::handle(name, args).await {
                         Ok(payload) => tool_text_response(echo_id, &payload),
-                        Err(e) => tool_error_response(echo_id, -32602, &format!("{e:#}")),
+                        Err(e) => tool_error_response(
+                            echo_id,
+                            crate::daemon::journal_tools::error_code(&e),
+                            &format!("{e:#}"),
+                        ),
                     };
                     let _ = outbound_tx.send(resp);
                 }

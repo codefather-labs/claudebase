@@ -49,6 +49,15 @@ pub async fn handle(tool: &str, args: Value) -> Result<Value> {
     Ok(value)
 }
 
+/// JSON-RPC code for a failed tool call. A refused request (no session, bad
+/// arguments, unknown entry) is the caller's to fix: -32602. A database that
+/// stayed locked past the busy timeout, or any other storage failure, is the
+/// daemon's: -32603, so the caller can tell "retry" from "change the call".
+pub fn error_code(e: &anyhow::Error) -> i64 {
+    let storage = e.chain().any(|c| c.downcast_ref::<rusqlite::Error>().is_some());
+    if storage { -32603 } else { -32602 }
+}
+
 fn dispatch(tool: &str, args: &Value) -> Result<Value> {
     let dir = journal::journals_dir();
     match tool {
@@ -272,7 +281,7 @@ fn spawn_embedding(project: PathBuf) {
 }
 
 fn embed_missing(dir: &Path, project: &Path) -> Result<()> {
-    let Some(conn) = journal::open(dir, project, false)? else { return Ok(()) };
+    let Some(mut conn) = journal::open(dir, project, false)? else { return Ok(()) };
     loop {
         let batch = journal::missing_vectors(&conn, 32)?;
         if batch.is_empty() {
@@ -281,7 +290,7 @@ fn embed_missing(dir: &Path, project: &Path) -> Result<()> {
         let texts: Vec<&str> = batch.iter().map(|(_, body)| body.as_str()).collect();
         let vectors = crate::encoder::encode_passages(&texts)?;
         for ((id, _), v) in batch.iter().zip(vectors) {
-            journal::store_vector(&conn, *id, &v)?;
+            journal::store_vector(&mut conn, *id, &v)?;
         }
         if batch.len() < 32 {
             return Ok(());
@@ -344,6 +353,13 @@ mod tests {
         assert_eq!(nearest_journal(dir.path(), Path::new("/w/other")), PathBuf::from("/w/other"));
         // A sibling whose name merely starts the same is a different project.
         assert_eq!(nearest_journal(dir.path(), Path::new("/w/proj2")), PathBuf::from("/w/proj2"));
+    }
+
+    #[test]
+    fn a_lock_is_the_daemons_error_a_bad_call_is_the_callers() {
+        let busy = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY), None);
+        assert_eq!(error_code(&anyhow::Error::new(busy).context("journal add")), -32603);
+        assert_eq!(error_code(&anyhow!("at least one --tag is required")), -32602);
     }
 
     #[test]

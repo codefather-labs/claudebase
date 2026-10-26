@@ -152,6 +152,11 @@ async fn a_gateway_dispatches_to_free_workers_and_gets_their_answers() {
             .assert()
             .failure()
             .stderr(predicates::str::contains("another session"));
+        // Loose JSON in `content` is refused where the worker can still fix it.
+        cli(&h, Some((&s1.0, &s1.1)), &["pool", "reply", "r-1", "--content", "{color:red}"])
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains("not valid JSON"));
         // As PowerShell writes a file: UTF-16 LE with a BOM.
         let answer = r#"{"content": "{\"fields\":[]}"}"#;
         let utf16: Vec<u8> = [0xFF, 0xFE].into_iter().chain(answer.encode_utf16().flat_map(u16::to_le_bytes)).collect();

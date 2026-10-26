@@ -29,6 +29,9 @@ pub async fn run(sub: PoolSubcommand) -> Result<String> {
                 (None, None, Some(r)) if r != "-" => parse_result(r)?,
                 (None, None, _) => parse_result(&crate::input::read_stdin()?)?,
             };
+            if !a.raw {
+                check_content(&result)?;
+            }
             let v = call("pool_reply", json!({ "req_id": a.req_id, "result": result })).await?;
             Ok(if v["accepted"].as_bool() == Some(true) {
                 format!("pool job {} answered", a.req_id)
@@ -47,6 +50,26 @@ pub async fn run(sub: PoolSubcommand) -> Result<String> {
         PoolSubcommand::Token(t) => token(t.sub),
         PoolSubcommand::Workers(a) => workers(&a.pool),
     }
+}
+
+/// The caller parses `content` strictly, so a `content` that is meant to be
+/// JSON — it opens with `{` or `[` — and is not, is refused here, where the
+/// worker can still fix it, instead of failing downstream. Workers produced
+/// `{color:red}` on the first LAN run (2026-10-26).
+fn check_content(result: &Value) -> Result<()> {
+    let Some(content) = result.get("content").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let t = content.trim();
+    if (t.starts_with('{') || t.starts_with('[')) && serde_json::from_str::<Value>(t).is_err() {
+        let err = serde_json::from_str::<Value>(t).unwrap_err();
+        bail!(
+            "\"content\" looks like JSON but is not valid JSON ({err}) — the caller parses it strictly. \
+             Quote every key and string: {{\"color\": \"red\"}}, not {{color: red}}. \
+             If it really is meant as text, add --raw."
+        );
+    }
+    Ok(())
 }
 
 /// A result is any JSON value — `{content}`, `{tool_calls: […]}`, whatever the

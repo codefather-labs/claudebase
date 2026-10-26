@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- **`pool reply` refuses a `content` that looks like JSON but is not.** Workers answered `{color:red}`;
+  the gateway's caller parses `content` strictly. A `content` opening with `{` or `[` must now parse,
+  else the reply is refused with the reason, so the worker fixes it in place (`--raw` sends it as is).
+  The contract hook tells workers that `content` must be strict JSON when JSON is asked for.
+
 ## [0.18.2] - 2026-10-26
 
 ### Fixed

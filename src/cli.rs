@@ -992,6 +992,11 @@ pub struct PoolReplyArgs {
     /// whose pipes can add a BOM or re-encode.
     #[arg(long, conflicts_with_all = ["result", "content"])]
     pub file: Option<PathBuf>,
+    /// Send a `content` that looks like JSON but does not parse, as it is.
+    /// Without this, `{color: red}` is refused: the gateway's caller runs a
+    /// strict JSON.parse on `content`.
+    #[arg(long)]
+    pub raw: bool,
 }
 
 #[derive(Args, Debug)]

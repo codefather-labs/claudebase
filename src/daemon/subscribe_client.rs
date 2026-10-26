@@ -355,6 +355,7 @@ impl SubscribeClient {
         identity: &crate::supervisor::AgentIdentity,
         extra_threads: &[String],
         tx: &Sender<InboundMessage>,
+        clears: &Sender<crate::supervisor::ClearRequest>,
         done: &Arc<AtomicBool>,
     ) -> Result<()> {
         let self_agent_id = identity.agent_id.as_str();
@@ -416,6 +417,17 @@ impl SubscribeClient {
                 continue;
             }
 
+            // A pool gateway asked for this worker's context to be cleared:
+            // a command for the supervisor, never text for the session.
+            if value.get("method").and_then(|m| m.as_str()) == Some(crate::daemon::pool::CLEAR_METHOD) {
+                let meta = value.pointer("/params/meta").cloned().unwrap_or(Value::Null);
+                if meta.get("target_agent_id").and_then(|v| v.as_str()) == Some(self_agent_id) {
+                    if let Some(clear_id) = meta.get("clear_id").and_then(|v| v.as_str()) {
+                        let _ = clears.send(crate::supervisor::ClearRequest { clear_id: clear_id.to_owned() });
+                    }
+                }
+                continue;
+            }
             if value.get("method").and_then(|m| m.as_str())
                 != Some("notifications/claude/channel")
             {

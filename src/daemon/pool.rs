@@ -43,6 +43,10 @@ const OFFLINE_SHOWN_MS: i64 = 3_600_000;
 /// — backpressure, not a loop. Operator decision 2026-10-26: 8 minutes.
 /// `CLAUDEBASE_POOL_SUSPECT_COOLDOWN_MS` overrides it on the daemon.
 const SUSPECT_COOLDOWN_MS: i64 = 480_000;
+/// How long a `/clear` of one worker may take before the gateway is told
+/// `clear_timeout`. Measured live: the screen shows the empty session within
+/// half a second of the Enter; the rest is margin for a busy machine.
+const CLEAR_TIMEOUT_MS: i64 = 60_000;
 
 fn suspect_cooldown_ms() -> i64 {
     std::env::var("CLAUDEBASE_POOL_SUSPECT_COOLDOWN_MS")
@@ -110,6 +114,14 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     if !has_attempts {
         conn.execute_batch("ALTER TABLE pool_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1")?;
     }
+    let has_clearing: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('pool_members') WHERE name = 'clearing_until')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_clearing {
+        conn.execute_batch("ALTER TABLE pool_members ADD COLUMN clearing_until INTEGER")?;
+    }
     Ok(())
 }
 
@@ -159,6 +171,8 @@ struct Worker {
     alive: bool,
     capacity: i64,
     suspect: bool,
+    /// A `/clear` is in progress until then (ms); no job may land meanwhile.
+    clearing_until: i64,
     last_seen: i64,
     last_assigned: i64,
     leased: Vec<String>,
@@ -170,6 +184,8 @@ impl Worker {
             "offline"
         } else if self.suspect {
             "suspect"
+        } else if self.clearing_until > now_ms() {
+            "clearing"
         } else if self.leased.len() as i64 >= self.capacity {
             "busy"
         } else {
@@ -181,7 +197,7 @@ impl Worker {
 fn workers(conn: &Connection, pool: &str) -> Result<Vec<Worker>> {
     let mut stmt = conn.prepare(
         "SELECT m.agent_id, COALESCE(r.agent_name, m.agent_id), COALESCE(r.state, 'dead'), m.capacity, m.suspect, \
-                COALESCE(r.last_pinged_at, 0), COALESCE(m.last_assigned_at, 0) \
+                COALESCE(r.last_pinged_at, 0), COALESCE(m.last_assigned_at, 0), COALESCE(m.clearing_until, 0) \
          FROM pool_members m LEFT JOIN agent_registry r ON r.agent_id = m.agent_id \
          WHERE m.pool = ?1",
     )?;
@@ -195,6 +211,7 @@ fn workers(conn: &Connection, pool: &str) -> Result<Vec<Worker>> {
                 suspect: r.get::<_, i64>(4)? != 0,
                 last_seen: r.get(5)?,
                 last_assigned: r.get(6)?,
+                clearing_until: r.get(7)?,
                 leased: Vec::new(),
             })
         })?
@@ -237,7 +254,7 @@ pub fn workers_json(conn: &Connection, pool: &str) -> Result<Option<Value>> {
 fn job_json(conn: &Connection, req_id: &str) -> Result<Option<Value>> {
     conn.query_row(
         "SELECT j.req_id, j.state, COALESCE(r.agent_name, j.worker), j.created_at, j.expires_at, j.finished_at, \
-                j.result, j.error, j.message, j.call_type, COALESCE(j.attempts, 1) \
+                j.result, j.error, j.message, j.call_type, COALESCE(j.attempts, 1), j.worker \
          FROM pool_jobs j LEFT JOIN agent_registry r ON r.agent_id = j.worker WHERE j.req_id = ?1",
         [req_id],
         |r| {
@@ -249,6 +266,9 @@ fn job_json(conn: &Connection, req_id: &str) -> Result<Option<Value>> {
                 "req_id": r.get::<_, String>(0)?,
                 "state": state,
                 "worker": r.get::<_, String>(2)?,
+                // The worker's agent_id: stable for the life of the session,
+                // unlike the nick — what a gateway pins a conversation to.
+                "worker_id": r.get::<_, String>(11)?,
                 "expires_at_ms": r.get::<_, i64>(4)?,
                 "call_type": r.get::<_, Option<String>>(9)?,
                 "attempts": r.get::<_, i64>(10)?,
@@ -348,6 +368,11 @@ pub enum Dispatch {
     /// `req_id` was dispatched before; its current state.
     Existing(Value),
     NoFreeWorker { free: usize, busy: usize },
+    /// The worker named by `worker_id` holds a job or is being cleared.
+    WorkerBusy { state: &'static str, req_ids: Vec<String> },
+    /// The worker named by `worker_id` cannot take a job: offline, suspect,
+    /// or not a member of this pool.
+    WorkerUnavailable { state: &'static str },
     NoSuchPool,
 }
 
@@ -384,13 +409,31 @@ pub fn dispatch(conn: &Connection, pool: &str, body: &Value) -> Result<Dispatch>
     if all.is_empty() {
         return Ok(Dispatch::NoSuchPool);
     }
-    let Some(worker) = all
-        .iter()
-        .filter(|w| w.state() == "free")
-        .min_by_key(|w| (w.leased.len(), w.last_assigned))
-    else {
-        let busy = all.iter().filter(|w| matches!(w.state(), "busy" | "suspect")).count();
-        return Ok(Dispatch::NoFreeWorker { free: 0, busy });
+    // A pinned job goes to that worker or nowhere: the gateway keeps the
+    // conversation's context on it, so another worker is not a substitute.
+    // No queue here either — a busy pin means the gateway sent two steps of
+    // one conversation at once, and it holds the second.
+    let target = body.get("worker_id").and_then(Value::as_str).filter(|s| !s.is_empty());
+    let worker = match target {
+        Some(id) => match all.iter().find(|w| w.agent_id == id) {
+            None => return Ok(Dispatch::WorkerUnavailable { state: "unknown" }),
+            Some(w) => match w.state() {
+                "free" => w,
+                s @ ("busy" | "clearing") => return Ok(Dispatch::WorkerBusy { state: s, req_ids: w.leased.clone() }),
+                s => return Ok(Dispatch::WorkerUnavailable { state: s }),
+            },
+        },
+        None => {
+            let Some(w) = all
+                .iter()
+                .filter(|w| w.state() == "free")
+                .min_by_key(|w| (w.leased.len(), w.last_assigned))
+            else {
+                let busy = all.iter().filter(|w| matches!(w.state(), "busy" | "suspect" | "clearing")).count();
+                return Ok(Dispatch::NoFreeWorker { free: 0, busy });
+            };
+            w
+        }
     };
 
     // The job's files first; the row that makes it visible last.
@@ -548,6 +591,137 @@ pub fn worker_ready(conn: &Connection, agent_id: &str) -> Result<Value> {
     changed();
     Ok(json!({ "ready": true }))
 }
+
+// ---------------------------------------------------------------------------
+// Clearing one worker's context (`POST /pool/<pool>/workers/<id>/clear`)
+// ---------------------------------------------------------------------------
+
+pub enum ClearStart {
+    /// The worker is marked `clearing`; ask its supervisor with `clear_id`.
+    Begin { clear_id: String },
+    Busy { state: &'static str, req_ids: Vec<String> },
+    Unavailable { state: &'static str },
+    NoSuchPool,
+}
+
+/// Clears in flight: `clear_id` -> (the worker, who to tell it finished).
+type ClearWaiter = (String, tokio::sync::oneshot::Sender<Result<(), String>>);
+static CLEARS: LazyLock<std::sync::Mutex<std::collections::HashMap<String, ClearWaiter>>> =
+    LazyLock::new(Default::default);
+
+/// Mark an idle worker `clearing`, so neither an untargeted nor a pinned
+/// dispatch lands on it while its context is being thrown away.
+pub fn begin_clear(conn: &Connection, pool: &str, worker_id: &str) -> Result<ClearStart> {
+    check_pool(pool)?;
+    ensure_schema(conn)?;
+    let all = workers(conn, pool)?;
+    if all.is_empty() {
+        return Ok(ClearStart::NoSuchPool);
+    }
+    let Some(w) = all.iter().find(|w| w.agent_id == worker_id) else {
+        return Ok(ClearStart::Unavailable { state: "unknown" });
+    };
+    match w.state() {
+        // A worker with spare capacity is "free" yet may hold a job: clearing
+        // would throw that job's context away under it.
+        "free" if w.leased.is_empty() => {}
+        "free" | "busy" => return Ok(ClearStart::Busy { state: "busy", req_ids: w.leased.clone() }),
+        "clearing" => return Ok(ClearStart::Busy { state: "clearing", req_ids: Vec::new() }),
+        s => return Ok(ClearStart::Unavailable { state: s }),
+    }
+    let now = now_ms();
+    conn.execute(
+        "UPDATE pool_members SET clearing_until = ?1 WHERE agent_id = ?2",
+        params![now + CLEAR_TIMEOUT_MS + 5_000, worker_id],
+    )?;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(ClearStart::Begin { clear_id: format!("clr_{now}_{seq}") })
+}
+
+/// The worker takes jobs again.
+pub fn end_clear(conn: &Connection, worker_id: &str) -> Result<()> {
+    conn.execute("UPDATE pool_members SET clearing_until = NULL WHERE agent_id = ?1", [worker_id])?;
+    changed();
+    Ok(())
+}
+
+/// The supervisor of `agent_id` reports the clear `clear_id` finished.
+fn worker_cleared(agent_id: &str, clear_id: &str, outcome: Result<(), String>) -> Result<Value> {
+    let mut clears = CLEARS.lock().map_err(|_| anyhow!("pool: clear table poisoned"))?;
+    match clears.get(clear_id) {
+        Some((worker, _)) if worker == agent_id => {
+            let (_, tx) = clears.remove(clear_id).expect("present");
+            let _ = tx.send(outcome);
+            Ok(json!({ "ok": true }))
+        }
+        Some(_) => bail!("clear {clear_id} is not this session's"),
+        // The gateway gave up on it (clear_timeout); nothing waits any more.
+        None => Ok(json!({ "ok": true, "note": "nobody is waiting for this clear any more" })),
+    }
+}
+
+async fn clear_worker(bus: &SharedBus, pool: &str, worker_id: &str) -> (&'static str, Value) {
+    let err = |status: &'static str, code: &str, extra: Value| {
+        let mut v = json!({ "error": code, "worker_id": worker_id });
+        if let (Some(o), Some(e)) = (v.as_object_mut(), extra.as_object()) {
+            o.extend(e.clone());
+        }
+        (status, v)
+    };
+    let (p, w) = (pool.to_owned(), worker_id.to_owned());
+    let start = tokio::task::spawn_blocking(move || crate::daemon::chat::with_writer(|c| begin_clear(c, &p, &w))).await;
+    let clear_id = match start {
+        Ok(Ok(ClearStart::Begin { clear_id })) => clear_id,
+        Ok(Ok(ClearStart::Busy { state, req_ids })) => {
+            return err("409 Conflict", "worker_busy", json!({ "state": state, "req_ids": req_ids }))
+        }
+        Ok(Ok(ClearStart::Unavailable { state })) => return err("503 Service Unavailable", "worker_unavailable", json!({ "state": state })),
+        Ok(Ok(ClearStart::NoSuchPool)) => {
+            return err("404 Not Found", "no_such_pool", json!({ "message": format!("no session has joined pool `{pool}`") }))
+        }
+        Ok(Err(e)) => return err("400 Bad Request", "bad_request", json!({ "message": format!("{e:#}") })),
+        Err(_) => return err("500 Internal Server Error", "internal", json!({})),
+    };
+    let finish = |w: String| async move {
+        let _ = tokio::task::spawn_blocking(move || crate::daemon::chat::with_writer(|c| end_clear(c, &w))).await;
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if let Ok(mut clears) = CLEARS.lock() {
+        clears.insert(clear_id.clone(), (worker_id.to_owned(), tx));
+    }
+    let started = now_ms();
+    let frame = json!({
+        "jsonrpc": "2.0",
+        "method": CLEAR_METHOD,
+        "params": { "meta": { "target_agent_id": worker_id, "clear_id": clear_id, "pool": pool } }
+    });
+    if bus.publish(&format!("agent:{worker_id}"), frame).await == 0 {
+        if let Ok(mut clears) = CLEARS.lock() {
+            clears.remove(&clear_id);
+        }
+        finish(worker_id.to_owned()).await;
+        return err("503 Service Unavailable", "worker_unavailable", json!({ "state": "unreachable" }));
+    }
+    tracing::info!(pool = %pool, worker = %worker_id, %clear_id, "pool: clearing a worker's context");
+    let outcome = tokio::time::timeout(std::time::Duration::from_millis(CLEAR_TIMEOUT_MS as u64), rx).await;
+    if let Ok(mut clears) = CLEARS.lock() {
+        clears.remove(&clear_id);
+    }
+    finish(worker_id.to_owned()).await;
+    match outcome {
+        Ok(Ok(Ok(()))) => (
+            "200 OK",
+            json!({ "worker_id": worker_id, "state": "free", "duration_ms": now_ms() - started }),
+        ),
+        Ok(Ok(Err(why))) => err("502 Bad Gateway", "clear_failed", json!({ "message": why })),
+        Ok(Err(_)) => err("500 Internal Server Error", "internal", json!({})),
+        Err(_) => err("504 Gateway Timeout", "clear_timeout", json!({ "timeout_ms": CLEAR_TIMEOUT_MS })),
+    }
+}
+
+/// The frame that asks a worker's supervisor to `/clear` its session.
+pub const CLEAR_METHOD: &str = "notifications/claudebase/pool_clear";
 
 // ---------------------------------------------------------------------------
 // Sweep: expiry, lost workers, retention
@@ -736,6 +910,12 @@ pub async fn http(method: &str, target: &str, token: Option<&str>, body: &[u8], 
                 Err(_) => err("500 Internal Server Error", "internal", "workers failed".into()),
             }
         }
+        ("POST", ["pool", pool, "workers", worker_id, "clear"]) => {
+            if let Err(e) = check_pool(pool) {
+                return err("400 Bad Request", "bad_request", format!("{e:#}"));
+            }
+            clear_worker(bus, pool, worker_id).await
+        }
         ("POST", ["pool", pool, "dispatch"]) => {
             if body.len() > MAX_BODY {
                 return err("413 Payload Too Large", "too_large", format!("over {MAX_BODY} bytes"));
@@ -765,6 +945,14 @@ pub async fn http(method: &str, target: &str, token: Option<&str>, body: &[u8], 
                 Ok(Ok(Dispatch::NoFreeWorker { free, busy })) => (
                     "503 Service Unavailable",
                     json!({ "error": "no_free_worker", "free": free, "busy": busy }),
+                ),
+                Ok(Ok(Dispatch::WorkerBusy { state, req_ids })) => (
+                    "409 Conflict",
+                    json!({ "error": "worker_busy", "worker_id": parsed["worker_id"], "state": state, "req_ids": req_ids }),
+                ),
+                Ok(Ok(Dispatch::WorkerUnavailable { state })) => (
+                    "503 Service Unavailable",
+                    json!({ "error": "worker_unavailable", "worker_id": parsed["worker_id"], "state": state }),
                 ),
                 Ok(Ok(Dispatch::NoSuchPool)) => err("404 Not Found", "no_such_pool", format!("no session has joined pool `{pool}`")),
                 Ok(Err(e)) => err("400 Bad Request", "bad_request", format!("{e:#}")),
@@ -836,6 +1024,16 @@ pub async fn handle_tool(tool: &str, args: Value) -> Result<Value> {
                 crate::daemon::chat::with_writer(|c| worker_fail(c, &agent_id, &r, &reason))
             }
             "pool_ready" => crate::daemon::chat::with_writer(|c| worker_ready(c, &agent_id)),
+            // From the worker's supervisor, not the model: the `/clear` it was
+            // asked for is done (or could not be done).
+            "pool_cleared" => {
+                let clear_id = args.get("clear_id").and_then(Value::as_str).unwrap_or("");
+                let outcome = match args.get("error").and_then(Value::as_str) {
+                    Some(e) => Err(e.to_owned()),
+                    None => Ok(()),
+                };
+                worker_cleared(&agent_id, clear_id, outcome)
+            }
             other => bail!("unknown pool tool `{other}`"),
         }
     })

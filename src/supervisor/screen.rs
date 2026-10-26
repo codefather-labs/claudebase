@@ -123,6 +123,70 @@ impl ModalDetector {
     }
 }
 
+/// A horizontal rule of the input box: a row of nothing but box-drawing dashes.
+fn is_rule(row: &str) -> bool {
+    let t = row.trim();
+    t.chars().count() >= 8 && t.chars().all(|c| matches!(c, '─' | '━' | '-'))
+}
+
+/// The text of a prompt row (`❯ text` or `> text`), if it is one.
+fn prompt_text(row: &str) -> Option<String> {
+    let t = row.trim_start();
+    let rest = t.strip_prefix('❯').or_else(|| t.strip_prefix('>'))?;
+    Some(rest.trim().to_owned())
+}
+
+/// The input box: the rows between the last two rules. Returns the index of
+/// its top rule and the text typed into it.
+fn input_box(rows: &[String]) -> Option<(usize, String)> {
+    let rules: Vec<usize> = rows.iter().enumerate().filter(|(_, r)| is_rule(r)).map(|(i, _)| i).collect();
+    let [.., top, bottom] = rules.as_slice() else { return None };
+    let inside: Vec<String> = rows[top + 1..*bottom].iter().filter(|r| !r.trim().is_empty()).cloned().collect();
+    let text = match inside.first() {
+        None => String::new(),
+        Some(first) => {
+            let mut t = prompt_text(first).unwrap_or_else(|| first.trim().to_owned());
+            for more in &inside[1..] {
+                t.push(' ');
+                t.push_str(more.trim());
+            }
+            t
+        }
+    };
+    Some((*top, text))
+}
+
+impl ModalDetector {
+    fn rows(&self) -> Vec<String> {
+        let Ok(p) = self.screen.lock() else { return Vec::new() };
+        let (_, cols) = p.screen().size();
+        p.screen().rows(0, cols).collect()
+    }
+
+    /// What is typed in Claude Code's input box now; `None` when no input box
+    /// is on screen (a dialog, startup).
+    pub fn input_text(&self) -> Option<String> {
+        input_box(&self.rows()).map(|(_, t)| t)
+    }
+
+    /// The screen of a session that `/clear` has just emptied: an empty input
+    /// box, and above it nothing of a conversation but the `/clear` itself
+    /// (Claude Code 2.1.310 redraws its banner, then `❯ /clear`). Measured
+    /// with `examples/clear_probe.rs`.
+    pub fn shows_cleared_session(&self) -> bool {
+        let rows = self.rows();
+        let Some((top, text)) = input_box(&rows) else { return false };
+        if !text.is_empty() {
+            return false;
+        }
+        let above: Vec<&String> = rows[..top].iter().filter(|r| !r.trim().is_empty()).collect();
+        let prompts: Vec<String> = above.iter().filter_map(|r| prompt_text(r)).collect();
+        prompts == ["/clear"]
+            && above.last().and_then(|r| prompt_text(r)).as_deref() == Some("/clear")
+            && !above.iter().any(|r| r.contains('●'))
+    }
+}
+
 impl Default for ModalDetector {
     fn default() -> Self {
         Self::new(24, 80)
@@ -248,6 +312,41 @@ mod tests {
         assert_eq!(d.known_dialog(), Some(KnownDialog::FolderTrust { yes_selected: true }));
         d.feed(b"\x1b[2J\x1b[H> ");
         assert_eq!(d.known_dialog(), None);
+    }
+
+    /// Screens from `examples/clear_probe.rs` against claude 2.1.310.
+    const RULE: &str = "──────────────────────────────────────────────────";
+    fn screen(rows: &[&str]) -> Vec<u8> {
+        format!("\x1b[2J\x1b[H{}", rows.join("\r\n")).into_bytes()
+    }
+
+    #[test]
+    fn tells_a_cleared_session_from_the_moments_around_it() {
+        let banner = [" ▐▛███▜▌   Claude Code v2.1.310", "▝▜█████▛▘  Opus 5.5 · Claude Max", "  ▘▘ ▝▝    ~/project"];
+        let d = ModalDetector::new(30, 110);
+        let mut conversation = banner.to_vec();
+        conversation.extend(["❯ say only the word PROBE-ONE", "● PROBE-ONE", "✻ Churned for 1s", RULE, "❯ ", RULE, "  ⏵⏵ auto mode on (shift+tab to cycle)"]);
+        d.feed(&screen(&conversation));
+        assert_eq!(d.input_text().as_deref(), Some(""));
+        assert!(!d.shows_cleared_session(), "a conversation is on screen");
+
+        let mut typed = banner.to_vec();
+        typed.extend(["❯ say only the word PROBE-ONE", "● PROBE-ONE", "  ❯ /clear        Start a new session with empty context", RULE, "❯ /clear", RULE]);
+        d.feed(&screen(&typed));
+        assert_eq!(d.input_text().as_deref(), Some("/clear"));
+        assert!(!d.shows_cleared_session(), "typed, not yet run");
+        assert!(!d.modal_is_up(), "the command menu is not a dialog");
+
+        let mut cleared = banner.to_vec();
+        cleared.extend(["❯ /clear", RULE, "❯ ", RULE, "  ⏵⏵ auto mode on (shift+tab to cycle)"]);
+        d.feed(&screen(&cleared));
+        assert!(d.shows_cleared_session());
+
+        // The next conversation after an earlier clear is not a fresh clear.
+        let mut later = banner.to_vec();
+        later.extend(["❯ /clear", "❯ next question", "● an answer", RULE, "❯ ", RULE]);
+        d.feed(&screen(&later));
+        assert!(!d.shows_cleared_session());
     }
 
     #[test]

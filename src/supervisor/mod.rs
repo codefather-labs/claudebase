@@ -45,7 +45,7 @@ use serde_json::json;
 use crate::cli::RunArgs;
 
 pub use draft::DraftTracker;
-pub use inject::{InboundMessage, Injector};
+pub use inject::{ClearRequest, InboundMessage, Injector};
 pub use identity::AgentIdentity;
 pub use screen::{KnownDialog, ModalDetector};
 
@@ -395,7 +395,26 @@ pub fn run(args: &RunArgs) -> Result<std::process::ExitCode> {
 
     // ---- injector: the only writer of inbound messages ----
     let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>();
-    let injector = Injector::new(writer.clone(), draft.clone(), modal.clone(), done.clone());
+    let (clear_tx, clear_rx) = mpsc::channel::<ClearRequest>();
+    let (agent_id, session_token) = (identity.agent_id.clone(), identity.session_token.clone());
+    let injector = Injector::new(writer.clone(), draft.clone(), modal.clone(), done.clone()).with_clears(
+        clear_rx,
+        // A short connection of its own: the daemon leg's is busy pumping.
+        Box::new(move |clear_id: &str, outcome: Result<(), String>| {
+            let mut args = json!({ "agent_id": agent_id, "session_token": session_token, "clear_id": clear_id });
+            if let Err(e) = outcome {
+                args["error"] = json!(e);
+            }
+            std::thread::spawn(move || {
+                let r = crate::daemon::run_tokio(async move {
+                    crate::daemon::client::DaemonClient::connect().await?.call_tool("pool_cleared", args).await
+                });
+                if let Err(e) = r {
+                    tracing::warn!(error = %format!("{e:#}"), "pool: could not report the clear to the daemon");
+                }
+            });
+        }),
+    );
     let inject_thread = std::thread::spawn(move || injector.run(inbound_rx));
 
     // ---- daemon leg: register, subscribe, forward notifications ----
@@ -412,6 +431,7 @@ pub fn run(args: &RunArgs) -> Result<std::process::ExitCode> {
             subscribe_extra,
             pool_for_daemon,
             inbound_tx,
+            clear_tx,
             done_daemon,
         ));
     });
@@ -469,6 +489,7 @@ async fn daemon_leg(
     extra_threads: Vec<String>,
     (pool, pool_capacity): (Option<String>, i64),
     tx: mpsc::Sender<InboundMessage>,
+    clears: mpsc::Sender<ClearRequest>,
     done: Arc<AtomicBool>,
 ) {
     use crate::daemon::subscribe_client::SubscribeClient;
@@ -554,7 +575,7 @@ async fn daemon_leg(
         // re-subscribe — a daemon restart must not silently end delivery
         // (the failure mode documented in docs/issues/006).
         if let Err(e) = client
-            .pump(&identity, &extra_threads, &tx, &done)
+            .pump(&identity, &extra_threads, &tx, &clears, &done)
             .await
         {
             tracing::warn!(error = %e, "daemon connection ended; will reconnect");

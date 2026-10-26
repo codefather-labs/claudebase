@@ -313,7 +313,7 @@ pub fn remote_may_call(tool: &str) -> bool {
         // the point of `auth setup-token`; a remote token is already full trust.
         || matches!(tool, "auth_set_token" | "auth_status" | "auth_clear_token")
         // A pool worker joined from another machine answers its jobs.
-        || matches!(tool, "pool_job" | "pool_reply" | "pool_fail" | "pool_ready")
+        || matches!(tool, "pool_job" | "pool_reply" | "pool_fail" | "pool_ready" | "pool_cleared")
 }
 
 // ---------------------------------------------------------------------------

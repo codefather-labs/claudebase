@@ -45,11 +45,31 @@ pub struct InboundMessage {
     pub body: String,
 }
 
+/// A gateway asked for this pool worker's context to be thrown away
+/// (`POST /pool/<pool>/workers/<id>/clear`).
+#[derive(Debug, Clone)]
+pub struct ClearRequest {
+    pub clear_id: String,
+}
+
+/// Tells the daemon how a clear went: `Ok` once the empty session is on screen.
+pub type ClearReport = Box<dyn Fn(&str, Result<(), String>) + Send>;
+
+/// Typing `/clear` must show up in the input box within this long.
+const CLEAR_TYPED_WITHIN: Duration = Duration::from_secs(3);
+/// And the emptied session must be on screen within this long after Enter.
+/// Measured live: under half a second.
+const CLEAR_DONE_WITHIN: Duration = Duration::from_secs(45);
+/// After the screen shows it: the SessionStart hooks of the new session (the
+/// channel contract among them) run before the next job is typed in.
+const CLEAR_SETTLE: Duration = Duration::from_millis(1500);
+
 pub struct Injector {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     draft: Arc<DraftTracker>,
     modal: Arc<ModalDetector>,
     done: Arc<AtomicBool>,
+    clears: Option<(Receiver<ClearRequest>, ClearReport)>,
 }
 
 impl Injector {
@@ -64,7 +84,15 @@ impl Injector {
             draft,
             modal,
             done,
+            clears: None,
         }
+    }
+
+    /// Also run `/clear` when asked. Behind the same gate as a message, and
+    /// only once every waiting message is delivered.
+    pub fn with_clears(mut self, rx: Receiver<ClearRequest>, report: ClearReport) -> Self {
+        self.clears = Some((rx, report));
+        self
     }
 
     /// Consume inbound messages until the channel closes or the session ends.
@@ -73,6 +101,7 @@ impl Injector {
         let mut seen: Vec<String> = Vec::new();
         let mut queued_since: Option<Instant> = None;
         let mut warned = false;
+        let mut clears: std::collections::VecDeque<ClearRequest> = Default::default();
 
         loop {
             if self.done.load(Ordering::SeqCst) {
@@ -107,9 +136,24 @@ impl Injector {
                 }
             }
 
+            if let Some((rx, _)) = &self.clears {
+                clears.extend(rx.try_iter());
+            }
+
             if queue.is_empty() {
                 queued_since = None;
                 warned = false;
+                if !clears.is_empty() && self.gate_open() {
+                    let req = clears.pop_front().expect("not empty");
+                    let outcome = self.clear_session();
+                    match &outcome {
+                        Ok(()) => tracing::info!(clear_id = %req.clear_id, "pool: session cleared"),
+                        Err(e) => tracing::warn!(clear_id = %req.clear_id, error = %e, "pool: clear failed"),
+                    }
+                    if let Some((_, report)) = &self.clears {
+                        report(&req.clear_id, outcome);
+                    }
+                }
                 continue;
             }
 
@@ -149,6 +193,53 @@ impl Injector {
                 }
             }
         }
+    }
+
+    /// Type `/clear` as a person would and wait for the screen to show the
+    /// emptied session. Typed, not pasted: the command menu takes it the same
+    /// way it takes keystrokes, which is what was measured.
+    fn clear_session(&self) -> Result<(), String> {
+        let write = |bytes: &[u8]| -> Result<(), String> {
+            let mut w = self.writer.lock().map_err(|_| "pty writer mutex poisoned".to_string())?;
+            w.write_all(bytes).and_then(|_| w.flush()).map_err(|e| format!("pty write: {e}"))
+        };
+        // Whatever we typed must not stay behind for the next message to be
+        // appended to.
+        let erase = || write(&[0x7f; 6]);
+        let wait = |within: Duration, done: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + within;
+            while Instant::now() < deadline {
+                if done() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            false
+        };
+
+        write(b"/clear")?;
+        if !wait(CLEAR_TYPED_WITHIN, &|| self.modal.input_text().as_deref() == Some("/clear")) {
+            erase()?;
+            return Err(format!(
+                "the input box did not show /clear (screen: {})",
+                self.modal.bottom_text()
+            ));
+        }
+        std::thread::sleep(SUBMIT_DELAY);
+        if self.modal.modal_is_up() {
+            erase()?;
+            return Err("a dialog came up before Enter".into());
+        }
+        write(b"\r")?;
+        self.draft.clear();
+        if !wait(CLEAR_DONE_WITHIN, &|| self.modal.shows_cleared_session()) {
+            return Err(format!(
+                "the screen never showed the cleared session (screen: {})",
+                self.modal.bottom_text()
+            ));
+        }
+        std::thread::sleep(CLEAR_SETTLE);
+        Ok(())
     }
 
     /// Both conditions must hold: no modal (F-3) and an empty operator line (F-6).

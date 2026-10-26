@@ -113,11 +113,16 @@ impl Client {
     /// Wait for the next `notifications/claude/channel` frame, ignoring
     /// responses to earlier requests.
     pub async fn next_notification(&mut self, within: Duration) -> Result<Value> {
+        self.next_method("notifications/claude/channel", within).await
+    }
+
+    /// The next frame carrying `method`; frames of other methods are skipped.
+    pub async fn next_method(&mut self, method: &str, within: Duration) -> Result<Value> {
         let deadline = tokio::time::Instant::now() + within;
         loop {
             let frame = tokio::time::timeout_at(deadline, read_frame(&mut self.read)).await??;
             let value: Value = serde_json::from_slice(&frame)?;
-            if value.get("method").and_then(|m| m.as_str()) == Some("notifications/claude/channel") {
+            if value.get("method").and_then(|m| m.as_str()) == Some(method) {
                 return Ok(value);
             }
         }

@@ -57,6 +57,153 @@ impl Drop for Daemon {
     }
 }
 
+/// A daemon with the callback listener on, a pool token, and the workers
+/// `(agent_id, nick)` registered in pool `funnel` — each subscribed to its own
+/// inbox unless its nick ends in `-deaf` (a session the daemon cannot reach).
+struct Setup {
+    _tmp: tempfile::TempDir,
+    home: PathBuf,
+    port: u16,
+    token: String,
+    _daemon: Daemon,
+    clients: std::collections::HashMap<String, common::Client>,
+}
+
+async fn setup(workers: &[(&str, &str)]) -> Setup {
+    let tmp = tempfile::tempdir().unwrap();
+    let home: PathBuf = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(home.join("run")).unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let h = home.clone();
+    let token = tokio::task::spawn_blocking(move || {
+        out(cli(&h, None, &["daemon", "callback", "enable", "--bind", &format!("127.0.0.1:{port}")]));
+        let issued = out(cli(&h, None, &["pool", "token", "issue", "gateway"]));
+        issued.lines().find(|l| l.starts_with("cbp_")).expect("token").trim().to_owned()
+    })
+    .await
+    .unwrap();
+    let daemon = Daemon(common::spawn_daemon_with_home(&home).unwrap());
+    common::wait_for_socket(&common::socket_under(&home), Duration::from_secs(10)).await.unwrap();
+    for _ in 0..50 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut clients = std::collections::HashMap::new();
+    for (n, (id, nick)) in workers.iter().enumerate() {
+        let mut c = common::Client::connect(&common::socket_under(&home)).await.unwrap();
+        let r = c
+            .call("agent_register", json!({"agent_id": id, "name": nick, "session_token": format!("tok-{nick}"), "pool": "funnel"}), 1)
+            .await
+            .unwrap();
+        assert!(common::payload(&r).is_some(), "{r}");
+        if !nick.ends_with("-deaf") {
+            c.call("chat_subscribe", json!({"thread": format!("agent:{id}")}), 2 + n as u32).await.unwrap();
+        }
+        clients.insert(nick.to_string(), c);
+    }
+    Setup { _tmp: tmp, home, port, token, _daemon: daemon, clients }
+}
+
+/// The gateway's affinity primitives: a job pinned to one worker, and that
+/// worker's context cleared (the gateway keeps funnel -> worker itself).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gateway_pins_jobs_to_a_worker_and_clears_its_context() {
+    let mut s = setup(&[("w-a-id", "w-a"), ("w-b-id", "w-b"), ("w-c-id", "w-c-deaf")]).await;
+    let (port, tk) = (s.port, s.token.clone());
+    let g = move |method: &'static str, path: String, body: Option<Value>| {
+        let tk = tk.clone();
+        async move { tokio::task::spawn_blocking(move || http(port, method, &path, &tk, body.as_ref())).await.unwrap() }
+    };
+    let job = |id: &str, worker: Option<&str>| {
+        let mut j = json!({"req_id": id, "payload": {"messages": [{"role": "user", "content": "step"}]}});
+        if let Some(w) = worker {
+            j["worker_id"] = json!(w);
+        }
+        j
+    };
+
+    // Pinned: that worker, and the job names it by its stable id.
+    let (st, p1) = g("POST", "/pool/funnel/dispatch".into(), Some(job("p-1", Some("w-a-id")))).await;
+    assert_eq!((st, p1["worker"].as_str(), p1["worker_id"].as_str()), (202, Some("w-a"), Some("w-a-id")), "{p1}");
+    let (_, read) = g("GET", "/pool/jobs/p-1".into(), None).await;
+    assert_eq!(read["worker_id"], "w-a-id", "{read}");
+    // A busy pin is refused, not queued and not given to the free worker.
+    let (st, busy) = g("POST", "/pool/funnel/dispatch".into(), Some(job("p-2", Some("w-a-id")))).await;
+    assert_eq!((st, busy["error"].as_str(), busy["req_ids"][0].as_str()), (409, Some("worker_busy"), Some("p-1")), "{busy}");
+    let (st, none) = g("GET", "/pool/jobs/p-2".into(), None).await;
+    assert_eq!(st, 404, "a refused pin leaves no job behind: {none}");
+    let (st, unknown) = g("POST", "/pool/funnel/dispatch".into(), Some(job("p-3", Some("w-zz-id")))).await;
+    assert_eq!((st, unknown["error"].as_str(), unknown["state"].as_str()), (503, Some("worker_unavailable"), Some("unknown")), "{unknown}");
+
+    // A worker holding a job is not cleared under it.
+    let (st, c) = g("POST", "/pool/funnel/workers/w-a-id/clear".into(), None).await;
+    assert_eq!((st, c["error"].as_str()), (409, Some("worker_busy")), "{c}");
+    let h = s.home.clone();
+    tokio::task::spawn_blocking(move || out(cli(&h, Some(("w-a-id", "tok-w-a")), &["pool", "reply", "p-1", "--content", "ok"])))
+        .await
+        .unwrap();
+    s.clients.get_mut("w-a").unwrap().next_notification(Duration::from_secs(5)).await.unwrap(); // the p-1 job line
+
+    // Clear: the supervisor is asked, the worker is `clearing` meanwhile, and
+    // the gateway's call returns once the supervisor says it is done.
+    let clearing = tokio::spawn(g("POST", "/pool/funnel/workers/w-a-id/clear".into(), None));
+    let ask = s
+        .clients
+        .get_mut("w-a")
+        .unwrap()
+        .next_method("notifications/claudebase/pool_clear", Duration::from_secs(5))
+        .await
+        .unwrap();
+    let clear_id = ask["params"]["meta"]["clear_id"].as_str().unwrap().to_owned();
+    assert_eq!(ask["params"]["meta"]["target_agent_id"], "w-a-id");
+    let (_, w) = g("GET", "/pool/funnel/workers".into(), None).await;
+    let a = w["workers"].as_array().unwrap().iter().find(|x| x["agent_id"] == "w-a-id").unwrap().clone();
+    assert_eq!(a["state"], "clearing", "{w}");
+    let (st, pinned) = g("POST", "/pool/funnel/dispatch".into(), Some(job("p-4", Some("w-a-id")))).await;
+    assert_eq!((st, pinned["state"].as_str()), (409, Some("clearing")), "{pinned}");
+    let (st, any) = g("POST", "/pool/funnel/dispatch".into(), Some(job("p-5", None))).await;
+    assert_eq!((st, any["worker"].as_str()), (202, Some("w-b")), "an untargeted job skips a clearing worker: {any}");
+    let other = json!({"agent_id": "w-b-id", "session_token": "tok-w-b", "clear_id": clear_id});
+    let r = s.clients.get_mut("w-b").unwrap().call("pool_cleared", other, 50).await.unwrap();
+    assert!(r.get("error").is_some(), "another session cannot finish this clear: {r}");
+    let done = json!({"agent_id": "w-a-id", "session_token": "tok-w-a", "clear_id": clear_id});
+    let r = s.clients.get_mut("w-a").unwrap().call("pool_cleared", done, 51).await.unwrap();
+    assert!(common::payload(&r).is_some(), "{r}");
+    let (st, cleared) = clearing.await.unwrap();
+    assert_eq!((st, cleared["state"].as_str()), (200, Some("free")), "{cleared}");
+    let (st, p4) = g("POST", "/pool/funnel/dispatch".into(), Some(job("p-4", Some("w-a-id")))).await;
+    assert_eq!((st, p4["worker_id"].as_str()), (202, Some("w-a-id")), "free again after the clear: {p4}");
+
+    // A clear the supervisor could not do is reported, and frees the worker.
+    let h = s.home.clone();
+    tokio::task::spawn_blocking(move || out(cli(&h, Some(("w-b-id", "tok-w-b")), &["pool", "reply", "p-5", "--content", "ok"])))
+        .await
+        .unwrap();
+    let failing = tokio::spawn(g("POST", "/pool/funnel/workers/w-b-id/clear".into(), None));
+    let ask = s
+        .clients
+        .get_mut("w-b")
+        .unwrap()
+        .next_method("notifications/claudebase/pool_clear", Duration::from_secs(5))
+        .await
+        .unwrap();
+    let bad = json!({"agent_id": "w-b-id", "session_token": "tok-w-b", "clear_id": ask["params"]["meta"]["clear_id"], "error": "the screen never showed the cleared session"});
+    s.clients.get_mut("w-b").unwrap().call("pool_cleared", bad, 52).await.unwrap();
+    let (st, failed) = failing.await.unwrap();
+    assert_eq!((st, failed["error"].as_str()), (502, Some("clear_failed")), "{failed}");
+    let (_, w) = g("GET", "/pool/funnel/workers".into(), None).await;
+    let b = w["workers"].as_array().unwrap().iter().find(|x| x["agent_id"] == "w-b-id").unwrap().clone();
+    assert_eq!(b["state"], "free", "{w}");
+
+    // A session the daemon cannot reach is unavailable at once, not a timeout.
+    let (st, deaf) = g("POST", "/pool/funnel/workers/w-c-id/clear".into(), None).await;
+    assert_eq!((st, deaf["error"].as_str(), deaf["state"].as_str()), (503, Some("worker_unavailable"), Some("unreachable")), "{deaf}");
+    let (st, unknown) = g("POST", "/pool/funnel/workers/w-zz-id/clear".into(), None).await;
+    assert_eq!((st, unknown["state"].as_str()), (503, Some("unknown")), "{unknown}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_gateway_dispatches_to_free_workers_and_gets_their_answers() {
     let tmp = tempfile::tempdir().unwrap();

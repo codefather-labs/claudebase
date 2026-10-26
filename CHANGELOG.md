@@ -20,6 +20,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **Pinned pool jobs and clearing a worker's context** (prod-deploy's affinity). `worker_id` in
+  `POST /pool/<pool>/dispatch` sends the job to that worker only: busy is `409 worker_busy`,
+  offline/suspect/unknown is `503 worker_unavailable`, never another worker. `POST
+  /pool/<pool>/workers/<worker_id>/clear` runs `/clear` in that worker and answers once the empty
+  session is on screen; the worker is `clearing` meanwhile and takes no job. Every job answer now
+  carries `worker_id` (the stable agent id; `worker` stays the nick).
 - **`claudebase run --no-input`: no startup questions.** The supervisor answers Claude Code's
   folder-trust question by itself — it moves the cursor to "Yes, I trust this folder" (the default is
   "No, exit"), checks the screen shows it selected, then confirms; the directory becomes trusted.

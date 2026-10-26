@@ -72,8 +72,10 @@ pool's machine. The listener: `claudebase daemon callback enable [--bind …]` +
                    { "nick": "funnel-3", "state": "suspect" } ],
       "free": 1 }
 ```
-`state`: `free` | `busy` (leased to capacity) | `suspect` (a job expired on it; it gets no
-new job until it replies late or runs `claudebase pool ready`) | `offline`.
+`state`: `free` | `busy` (leased to capacity) | `clearing` (a `/clear` is running on it,
+below) | `suspect` (a job expired on it; it gets no new job until it replies late, runs
+`claudebase pool ready`, or the 8-minute cooldown passes) | `offline`. `agent_id` is the
+worker's stable id for the life of its session; the nick is not stable.
 
 ### `POST /pool/<pool>/dispatch`
 ```json
@@ -83,13 +85,17 @@ new job until it replies late or runs `claudebase pool ready`) | `offline`.
   "images": [ { "path": "/srv/fbscout/logs/claudebase-llm/r-42-1.jpg" },  // read by the DAEMON's host, or
               { "base64": "/9j/4AAQ…", "mime": "image/jpeg" } ],          // when the gateway is elsewhere
   "timeout_ms": 480000,                   // lease; default 480000 = the brain's HARNESS_STEP_TIMEOUT_MS
-  "wait_ms": 0 }                          // optional: hold the response up to this long for the result
+  "wait_ms": 0,                           // optional: hold the response up to this long for the result
+  "worker_id": "…" }                      // optional: this worker (agent_id from /workers) or none
 ```
-- `202 { "req_id": "r-42", "state": "leased", "worker": "funnel-2", "expires_at_ms": … }`
+- `202 { "req_id": "r-42", "state": "leased", "worker": "funnel-2", "worker_id": "…", "expires_at_ms": … }`
 - `200 { …, "state": "done", "result": … }` when `wait_ms` covered the answer
 - `200` the current state, when `req_id` was already dispatched (idempotent — no second worker)
 - `503 { "error": "no_free_worker", "free": 0, "busy": 3 }` — keep it queued, retry
 - `404 { "error": "no_such_pool" }` — no live worker has ever joined it
+- with `worker_id`: `409 { "error": "worker_busy", "state": "busy|clearing", "req_ids": […] }`
+  — hold it and retry; `503 { "error": "worker_unavailable", "state": "offline|suspect|unknown" }`
+  — pin the conversation to another worker
 - `413` payload over 12 MB (images included); `400` malformed
 
 Notes (from `prod-deploy`, 2026-10-26):
@@ -149,6 +155,33 @@ on `failed` re-posted ~490 times in seconds (the daemon logged one dispatch).
 ### `POST /pool/jobs/<req_id>/cancel`
 `200 { "state": "cancelled" }`; the worker is told and freed.
 
+### Pinned conversations (added 2026-10-26, prod-deploy's affinity)
+
+A funnel walk keeps its context on one worker. The mapping `funnel_id -> worker_id` is the
+gateway's (stateful orchestration); the daemon gives it two primitives and keeps no table:
+
+- **Pinned dispatch** — `worker_id` in `/dispatch`: that worker or nobody. Busy is `409`,
+  never a queue and never another worker: the steps of one conversation are sequential, so a
+  busy pin means the gateway sent two at once and holds the second. Replaces the
+  daemon-side affinity table proposed earlier (journal#17).
+- **`POST /pool/<pool>/workers/<worker_id>/clear`** — throw that worker's context away,
+  before a new conversation is pinned to it. Synchronous, up to 60 s:
+  - `200 { "worker_id": "…", "state": "free", "duration_ms": 2640 }` — ready for the first job;
+  - `409 worker_busy` — it holds a lease (cancel it first) or is already clearing;
+  - `503 worker_unavailable` — `offline` / `suspect` / `unknown`, or `unreachable` (its
+    session is not connected to the daemon);
+  - `502 clear_failed` (`message` says why) / `504 clear_timeout`.
+
+  The worker is `clearing` meanwhile, so neither a pinned nor an unpinned job lands on it.
+  The daemon sends the worker's supervisor a `notifications/claudebase/pool_clear` frame;
+  the supervisor types `/clear` behind the same gate as a message (no dialog, no operator
+  draft), waits for the screen to show the emptied session, lets the SessionStart hooks of
+  the new session run, and reports back with the `pool_cleared` tool. The channel contract
+  comes back through those hooks — they are wired for the `clear` source since 0.18.5, so a
+  worker installed earlier must be reinstalled before a gateway clears it. Measured live:
+  2.6 s, and the next job neither remembered the previous one nor missed the `[pool-job:]`
+  contract.
+
 ## Worker side (CLI, inside a `--pool` session)
 
 The job arrives as one input line:
@@ -184,4 +217,5 @@ Capacity per worker: `claudebase run --pool funnel --pool-capacity N` (default 1
 
 - Spawning and supervising the N sessions — the gateway's orchestrator (its §5).
 - Priorities and lanes — the registry's queue.
-- A daemon-side queue — deliberately absent (above).
+- A daemon-side queue — deliberately absent (above), pinned jobs included.
+- Which conversation sits on which worker — the gateway's map (above).

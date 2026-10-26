@@ -615,6 +615,30 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, bus: &SharedBus) -
         }
     }
 
+    // The pool API (docs/design/pool-dispatch.md) shares this listener: its own
+    // routes, methods, token kind and a larger body (a dispatch carries images).
+    if target.starts_with("/pool/") {
+        if content_length > super::pool::MAX_BODY {
+            respond(&mut stream, "413 Payload Too Large", &serde_json::json!({
+                "error": "too_large", "message": format!("over {} bytes", super::pool::MAX_BODY)
+            })).await?;
+            return Ok(());
+        }
+        let mut body = buf[head_end + 4..].to_vec();
+        let mut big = vec![0u8; 64 * 1024];
+        while body.len() < content_length {
+            let n = stream.read(&mut big).await?;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&big[..n]);
+        }
+        body.truncate(content_length);
+        let (status, reply) = super::pool::http(&method.to_ascii_uppercase(), &target, token.as_deref(), &body, bus).await;
+        respond(&mut stream, status, &reply).await?;
+        return Ok(());
+    }
+
     if !method.eq_ignore_ascii_case("POST") {
         respond(&mut stream, "405 Method Not Allowed", &serde_json::json!({
             "ok": false, "error": "use POST"

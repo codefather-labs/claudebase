@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **Pool dispatch: a gateway routes model calls to a pool of Claude sessions.** `claudebase run --pool
+  <name> [--pool-capacity N]` makes a session a worker. On the daemon's HTTP listener, with a gateway
+  token (`claudebase pool token issue|revoke|list`): `GET /pool/<pool>/workers`, `POST
+  /pool/<pool>/dispatch` (leases a free worker, idempotent by `req_id`, `503 no_free_worker` when none,
+  images as a daemon-host path or base64), `GET /pool/jobs/<req_id>?wait_ms=` (long-poll), `POST
+  /pool/jobs/<req_id>/cancel`. The worker sees `[pool-job:<pool> <req_id> <role>]`, fetches the job
+  with `claudebase pool job` (files written on its own machine, so remote workers work) and answers
+  with `claudebase pool reply` (any JSON: `{content}` or `{tool_calls}`), `pool fail`, `pool ready`.
+  Expired leases mark the worker suspect; a vanished worker fails its job as `worker_lost`. `claudebase
+  pool workers <pool>` shows the pool. docs/design/pool-dispatch.md.
+
+### Fixed
+
+- **A session that disconnected with messages unread stayed `alive` forever.** The daemon marked a
+  session orphaned only on a clean EOF; a peer closing with frames still in its socket reaches it as
+  `ConnectionReset`, and the row stayed alive — listed, addressed, holding its pool jobs. Every way a
+  connection ends now orphans its sessions.
+
 ## [0.17.0] - 2026-10-26
 
 ### Added

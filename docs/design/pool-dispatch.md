@@ -1,6 +1,6 @@
 # Pool dispatch — the daemon routes jobs to a pool of Claude sessions
 
-Status: proposed, 2026-10-26. Requested by `prod-deploy` (fbscout gateway,
+Status: implemented, 2026-10-26 (`src/daemon/pool.rs`, `src/pool_cli.rs`, tests/pool_dispatch_e2e_test.rs). Requested by `prod-deploy` (fbscout gateway,
 `fbscout-cutover/docs/plans/claudebase-gateway/DESIGN.md` §10); direction confirmed
 by the operator: a gateway queues model calls and hands them to N claudebase
 sessions instead of Ollama, and the daemon is the router.
@@ -60,6 +60,9 @@ Transport: the existing HTTP listener (`claudebase daemon callback enable`, defa
 from `claudebase pool token issue <gateway-name>` (shown once, stored hashed, revocable).
 Errors: `{ "error": "<code>", "message": "…" }` with the HTTP status below.
 
+Gateway token: `claudebase pool token issue <gateway>` (and `revoke`, `list`) on the
+pool's machine. The listener: `claudebase daemon callback enable [--bind …]` + restart.
+
 ### `GET /pool/<pool>/workers`
 ```json
 200 { "pool": "funnel",
@@ -102,6 +105,10 @@ Notes (from `prod-deploy`, 2026-10-26):
   Max 900000 for other callers.
 - `meta.callType` (`FORM_FILL`, `BUTTON_FIND`, `CONTENT_AGENT`, …) names the role in the
   `[pool-job:…]` line.
+- `result` is `{content}` or `{content, tool_calls}` / `{tool_calls: [{function: {name,
+  arguments}}]}` when the payload carries tools — the gateway's runner executes the tool
+  and sends the next turn as a new job with the whole history, so any free worker takes
+  any turn (no session affinity). The daemon relays `result` untouched.
 
 ### `GET /pool/jobs/<req_id>?wait_ms=25000`
 Long-poll; returns as soon as the state is final or `wait_ms` passes (max 30000).

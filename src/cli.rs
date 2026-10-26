@@ -343,6 +343,10 @@ pub enum Command {
     /// The Claude subscription token of the machine whose daemon is in use:
     /// hand it over once, and every Claude started there is signed in.
     Auth(AuthArgs),
+    /// A pool of sessions that answer jobs from a gateway
+    /// (docs/design/pool-dispatch.md): the worker's commands, and the tokens and
+    /// view for the machine whose daemon routes them.
+    Pool(PoolArgs),
     /// Run as a persistent daemon — owns the local IPC surface (UDS on
     /// Unix, named pipe on Windows) for MCP plugin bridges and
     /// agent-chat. Slice 1a wires the accept loop + echo; richer
@@ -500,6 +504,16 @@ pub struct RunArgs {
     /// profile, else local. Every claudebase command the session runs follows.
     #[arg(long)]
     pub daemon: Option<String>,
+
+    /// Make this session a worker of a pool: the daemon may hand it jobs
+    /// (`[pool-job:<pool> <req_id> <role>]`) from a gateway, and it answers with
+    /// `claudebase pool reply` (docs/design/pool-dispatch.md).
+    #[arg(long)]
+    pub pool: Option<String>,
+
+    /// How many pool jobs this session takes at once.
+    #[arg(long, default_value_t = 1)]
+    pub pool_capacity: i64,
 
     /// Extra thread to subscribe to for this session, repeatable
     /// (`--subscribe telegram:123 --subscribe agent:foo`). Paired Telegram
@@ -932,6 +946,75 @@ pub struct DaemonConfigShowArgs {
 pub struct JournalArgs {
     #[command(subcommand)]
     pub sub: JournalSubcommand,
+}
+
+#[derive(Args, Debug)]
+pub struct PoolArgs {
+    #[command(subcommand)]
+    pub sub: PoolSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PoolSubcommand {
+    /// Worker: fetch job <req_id> — writes payload.json and the images into a
+    /// job directory on this machine and prints their paths.
+    Job(PoolJobArgs),
+    /// Worker: answer job <req_id>. The result JSON comes as an argument, on
+    /// stdin (`-` or omitted), or as `--content <text>` meaning {"content": text}.
+    Reply(PoolReplyArgs),
+    /// Worker: give job <req_id> back with a reason.
+    Fail(PoolFailArgs),
+    /// Worker: take jobs again after a job expired on this session.
+    Ready,
+    /// Gateway tokens for `/pool/*` (this machine's daemon only).
+    Token(PoolTokenArgs),
+    /// The workers of a pool and their state (this machine's daemon only).
+    Workers(PoolWorkersArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct PoolJobArgs {
+    pub req_id: String,
+    /// Where to write the job's files. Default: ~/.claude/claudebase/pool-jobs/<req_id>/
+    #[arg(long)]
+    pub dir: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct PoolReplyArgs {
+    pub req_id: String,
+    /// The result as JSON; omitted or `-` reads stdin.
+    pub result: Option<String>,
+    /// Shorthand for the result {"content": "<text>"} — what a model call returns.
+    #[arg(long, conflicts_with = "result")]
+    pub content: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct PoolFailArgs {
+    pub req_id: String,
+    pub reason: String,
+}
+
+#[derive(Args, Debug)]
+pub struct PoolTokenArgs {
+    #[command(subcommand)]
+    pub sub: PoolTokenSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PoolTokenSubcommand {
+    /// Issue a token for a gateway (shown once; re-issuing retires the old one).
+    Issue(RemoteClientArgs),
+    /// Revoke a gateway's token.
+    Revoke(RemoteClientArgs),
+    /// Gateways with a token, and their last use.
+    List,
+}
+
+#[derive(Args, Debug)]
+pub struct PoolWorkersArgs {
+    pub pool: String,
 }
 
 #[derive(Args, Debug)]

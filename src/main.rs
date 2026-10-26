@@ -69,6 +69,7 @@ fn main() -> std::process::ExitCode {
         // The journal lives with the daemon, not under a project root.
         Command::Journal(_) => None,
         Command::Auth(_) => None,
+        Command::Pool(_) => None,
         // Daemon / Plugin do NOT operate on a project filesystem — they
         // own a runtime-dir-scoped socket and chat.db under ~/.claude/.
         // The path-canonicalization gate still runs (project_root will
@@ -114,6 +115,7 @@ fn main() -> std::process::ExitCode {
             simple_async(claudebase::journal_cli::run(args.sub), "journal")
         }
         Command::Auth(args) => simple_async(claudebase::remote_cli::auth(args.sub), "auth"),
+        Command::Pool(args) => simple_async(claudebase::pool_cli::run(args.sub), "pool"),
         Command::Daemon(args) => match args.sub {
             cli::DaemonSubcommand::Serve(serve_args) => run_daemon_serve(&serve_args),
             cli::DaemonSubcommand::Config(config_args) => match config_args.sub {

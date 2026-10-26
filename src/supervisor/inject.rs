@@ -232,6 +232,16 @@ pub fn render(source: Source, content: &str) -> String {
         // the only way to tell them apart in the input.
         Source::Callback { label: None } => "[callback]".to_string(),
         Source::Callback { label: Some(ref l) } => format!("[callback:{}]", sanitize_nick(l)),
+        // Every part sanitised: the request id and role come from a gateway.
+        Source::PoolJob { ref pool, ref req_id, ref call_type } => {
+            let mut p = format!("[pool-job:{} {}", sanitize_nick(pool), sanitize_nick(req_id));
+            if let Some(ct) = call_type {
+                p.push(' ');
+                p.push_str(&sanitize_nick(ct));
+            }
+            p.push(']');
+            p
+        }
     };
     format!("{prefix}: {content}")
 }
@@ -245,6 +255,8 @@ pub enum Source {
     Agent { nick: String },
     /// An external system over the HTTP callback endpoint.
     Callback { label: Option<String> },
+    /// A job from a pool gateway (docs/design/pool-dispatch.md).
+    PoolJob { pool: String, req_id: String, call_type: Option<String> },
 }
 
 /// Keep a nick to one token so it cannot forge a second prefix or split the

@@ -519,6 +519,8 @@ pub async fn serve(_args: &DaemonServeArgs) -> anyhow::Result<()> {
     spawn_dnd_drain_task(bus.clone());
     // Retention for every project journal (salience-driven TTL).
     crate::daemon::journal_tools::spawn_maintenance();
+    // Pool leases: expiry, lost workers, retention (docs/design/pool-dispatch.md).
+    crate::daemon::pool::spawn_sweeper();
     tracing::info!("dnd drain task spawned");
 
     // Accept loop. We never return Ok(()) from here in Slice 1a — the
@@ -649,42 +651,36 @@ where
         let body = match read_frame(read_half).await {
             Ok(b) => b,
             Err(e) => {
-                // Distinguish clean EOF from a real I/O error. Clean
-                // EOF surfaces as `UnexpectedEof` from `read_exact` on
-                // the length prefix — that's an expected client
-                // disconnect, log at "info" not "error".
-                if let Some(io_err) = e.downcast_ref::<io::Error>() {
-                    if io_err.kind() == io::ErrorKind::UnexpectedEof {
-                        // Slice 5: bulk-UPDATE agent_registry rows for this
-                        // connection_id from 'alive' to 'orphaned' before
-                        // tearing down. rusqlite is !Send across .await
-                        // (ASYNC_INVARIANTS Rule 2) — wrap in spawn_blocking.
-                        let cid_str = connection_id.to_string();
-                        let orphan_result = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
-                            let conn = crate::daemon::chat::open_chat_db()?;
-                            crate::daemon::agent_registry::mark_connection_orphaned(&conn, &cid_str)
-                        }).await;
-                        match orphan_result {
-                            Ok(Ok(n)) if n > 0 => tracing::info!(
-                                %connection_id,
-                                orphaned = n,
-                                "connection EOF — marked alive agents orphaned"
-                            ),
-                            Ok(Ok(_)) => {}  // no rows — silent
-                            Ok(Err(e)) => tracing::warn!(
-                                %connection_id,
-                                error = %e,
-                                "agent_registry orphan-on-EOF UPDATE failed (non-fatal)"
-                            ),
-                            Err(e) => tracing::warn!(
-                                %connection_id,
-                                error = %e,
-                                "agent_registry orphan-on-EOF spawn_blocking panicked"
-                            ),
-                        }
-                        tracing::info!(%connection_id, "connection EOF");
-                        return Ok(());
-                    }
+                // The connection is over, however it ended. A clean close is
+                // `UnexpectedEof` on the length prefix; a peer that closes with
+                // frames still unread in its socket (a supervisor that crashed
+                // with messages waiting — the normal case for a busy session)
+                // surfaces as `ConnectionReset` instead. Marking only the clean
+                // case left every such session `alive` forever: still listed,
+                // still addressed, still holding its pool jobs.
+                let clean = e
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|io_err| io_err.kind() == io::ErrorKind::UnexpectedEof);
+                // rusqlite is !Send across .await (ASYNC_INVARIANTS Rule 2).
+                let cid_str = connection_id.to_string();
+                let orphan_result = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+                    let conn = crate::daemon::chat::open_chat_db()?;
+                    crate::daemon::agent_registry::mark_connection_orphaned(&conn, &cid_str)
+                })
+                .await;
+                match orphan_result {
+                    Ok(Ok(n)) if n > 0 => tracing::info!(
+                        %connection_id,
+                        orphaned = n,
+                        "connection closed — marked alive agents orphaned"
+                    ),
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => tracing::warn!(%connection_id, error = %e, "agent_registry orphan-on-close UPDATE failed (non-fatal)"),
+                    Err(e) => tracing::warn!(%connection_id, error = %e, "agent_registry orphan-on-close spawn_blocking panicked"),
+                }
+                if clean {
+                    tracing::info!(%connection_id, "connection EOF");
+                    return Ok(());
                 }
                 return Err(e);
             }
@@ -837,6 +833,13 @@ where
                 }
                 "chat_list_pending_asks" => {
                     let resp = handle_chat_list_pending_asks(echo_id, &args).await;
+                    let _ = outbound_tx.send(resp);
+                }
+                name if name.starts_with("pool_") => {
+                    let resp = match crate::daemon::pool::handle_tool(name, args).await {
+                        Ok(payload) => tool_text_response(echo_id, &payload),
+                        Err(e) => tool_error_response(echo_id, -32602, &format!("{e:#}")),
+                    };
                     let _ = outbound_tx.send(resp);
                 }
                 name if name.starts_with("auth_") => {
@@ -1507,6 +1510,9 @@ async fn handle_agent_register(
         .get("cwd")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    // `claudebase run --pool <name>`: this session is a worker of that pool.
+    let pool_arg = args.get("pool").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_owned);
+    let pool_capacity = args.get("pool_capacity").and_then(|v| v.as_i64()).unwrap_or(1);
     let project_id_arg = args.get("project_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_owned);
     let branch_arg = args.get("branch").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_owned);
     // pty-transport Slice 1 — optional per-session token. Minted by the PTY
@@ -1628,6 +1634,11 @@ async fn handle_agent_register(
                 ) {
                     tracing::warn!(error = %e, "could not remember the chosen nick");
                 }
+            }
+        }
+        if let Some(pool) = &pool_arg {
+            if let Err(e) = crate::daemon::pool::join(&conn, &agent_id_for_capture, pool, pool_capacity) {
+                tracing::warn!(error = %format!("{e:#}"), %pool, "could not join the pool");
             }
         }
         if let Some(cwd_str) = cwd_arg {

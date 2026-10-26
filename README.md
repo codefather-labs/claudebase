@@ -668,6 +668,41 @@ Design: [`docs/design/remote-daemon.md`](docs/design/remote-daemon.md).
 
 ---
 
+## 🏭 Pool dispatch — a gateway hands model calls to a pool of sessions
+
+A gateway (a queue of model calls, in place of an Ollama gateway) dispatches each call to a FREE
+session of a pool and gets its answer back by id. The daemon is the router: it knows which workers
+are free, leases one per job, and frees it when it answers.
+
+On the pool's machine:
+
+```bash
+claudebase daemon callback enable --bind 0.0.0.0:8585 --i-know-this-is-remote   # the HTTP listener
+claudebase daemon restart
+claudebase pool token issue gateway          # X-Api-Token for /pool/*, shown once
+claudebase run --pool funnel                 # each worker session (N of them)
+claudebase pool workers funnel               # who is free, busy, suspect, offline
+```
+
+The gateway:
+
+```
+GET  /pool/funnel/workers                    free / busy / suspect / offline
+POST /pool/funnel/dispatch {req_id, payload, images[{path}|{base64,mime}], timeout_ms, wait_ms}
+       202 leased | 200 existing (idempotent by req_id) | 503 no_free_worker (keep it queued)
+GET  /pool/jobs/<req_id>?wait_ms=25000       long-poll: done {result} | failed | expired | leased
+POST /pool/jobs/<req_id>/cancel
+```
+
+A worker gets `[pool-job:funnel <req_id> <role>]` in its input, fetches the job with
+`claudebase pool job <req_id>` (payload and images land on its own machine, so workers may be joined
+to a remote daemon), and answers with `claudebase pool reply <req_id>` — `{content}` or `{tool_calls}`,
+relayed untouched. A lease that runs out expires the job and keeps the worker out until it answers or
+runs `claudebase pool ready`; a worker whose session vanishes fails its job as `worker_lost` after 15 s.
+The daemon keeps no queue of its own. Design: [`docs/design/pool-dispatch.md`](docs/design/pool-dispatch.md).
+
+---
+
 ## 🪝 HTTP callbacks — something outside pings a session
 
 A CI job, a webhook or a script can write directly into a session's terminal input:

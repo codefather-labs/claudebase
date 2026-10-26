@@ -622,6 +622,21 @@ fn classify_with(meta: &Value, sender_hint: Option<String>, resolve_nick: bool) 
         );
     }
 
+    if field("source").as_deref() == Some("pool") {
+        let thread = thread_field
+            .clone()
+            .or_else(|| chat_field.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        return (
+            thread,
+            Source::PoolJob {
+                pool: field("pool").unwrap_or_default(),
+                req_id: field("req_id").unwrap_or_default(),
+                call_type: field("call_type").filter(|c| !c.is_empty()),
+            },
+        );
+    }
+
     if field("source").as_deref() == Some("callback") {
         let label = field("label").filter(|l| !l.is_empty());
         let thread = thread_field

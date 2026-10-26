@@ -802,6 +802,7 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "fastembed",

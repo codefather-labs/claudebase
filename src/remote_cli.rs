@@ -57,7 +57,7 @@ pub fn status() -> Result<String> {
         Err(_) => out.push_str("certificate: none yet\n"),
     }
     drop(conn);
-    let tokens = remote::list_tokens(&chat::open_chat_db().context("open chat.db")?)?;
+    let tokens = remote::list_tokens(&chat::open_chat_db().context("open chat.db")?, remote::TokenKind::Remote)?;
     if tokens.is_empty() {
         out.push_str("clients: none (claudebase daemon remote issue <client-name>)\n");
     } else {
@@ -81,7 +81,7 @@ pub fn issue(client: &str, host: Option<&str>) -> Result<String> {
         .rsplit_once(':')
         .and_then(|(_, p)| p.parse::<u16>().ok())
         .unwrap_or(remote::DEFAULT_PORT);
-    let token = remote::issue_token(&conn, client)?;
+    let token = remote::issue_token(&conn, remote::TokenKind::Remote, client)?;
     let host = host.map(str::to_owned).unwrap_or_else(remote::hostname);
     let url = Remote { host, port, pin, token }.url();
     Ok(format!(
@@ -95,7 +95,7 @@ pub fn issue(client: &str, host: Option<&str>) -> Result<String> {
 /// `daemon remote revoke <client>`
 pub fn revoke(client: &str) -> Result<String> {
     let conn = chat::open_chat_db().context("open chat.db")?;
-    if remote::revoke_token(&conn, client)? {
+    if remote::revoke_token(&conn, remote::TokenKind::Remote, client)? {
         Ok(format!(
             "`{client}` revoked: new connections with its token are refused; one already open \
              stays until it drops or the daemon restarts (claudebase daemon restart)"

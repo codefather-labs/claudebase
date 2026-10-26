@@ -189,6 +189,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
+# Pool dispatch: images travel between gateway, daemon and worker as base64.
+base64 = "0.22"
 # Parakeet ASR, behind `asr-sherpa`.
 #
 # `default-features = false` + `shared` on purpose: the crate's default is a

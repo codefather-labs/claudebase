@@ -143,16 +143,43 @@ pub fn hostname() -> String {
 // Server: configuration and tokens (chat.db, like the callback endpoint)
 // ---------------------------------------------------------------------------
 
-fn ensure_tokens_table(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS remote_tokens (
+/// Two kinds of client token, the same rules: one per named client, stored as
+/// a SHA-256, shown once, revocable. `Remote` is a machine joining this daemon
+/// over TLS; `Pool` is a gateway calling `/pool/*` (docs/design/pool-dispatch.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenKind {
+    Remote,
+    Pool,
+}
+
+impl TokenKind {
+    /// A fixed table name per kind — never built from input.
+    fn table(self) -> &'static str {
+        match self {
+            TokenKind::Remote => "remote_tokens",
+            TokenKind::Pool => "pool_tokens",
+        }
+    }
+
+    fn prefix(self) -> &'static str {
+        match self {
+            TokenKind::Remote => "cbr_",
+            TokenKind::Pool => "cbp_",
+        }
+    }
+}
+
+fn ensure_tokens_table(conn: &Connection, kind: TokenKind) -> Result<()> {
+    conn.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS {} (
            name         TEXT PRIMARY KEY,
            sha256       TEXT NOT NULL UNIQUE,
            created_at   INTEGER NOT NULL,
            last_used_at INTEGER
          );",
-    )
-    .context("remote: ensure remote_tokens")?;
+        kind.table()
+    ))
+    .with_context(|| format!("ensure {}", kind.table()))?;
     Ok(())
 }
 
@@ -180,26 +207,25 @@ pub fn clear_bind(conn: &Connection) -> Result<()> {
 
 /// Issue a token for client `name`, replacing any earlier one of that name.
 /// Only the hash is stored: the token is shown once.
-pub fn issue_token(conn: &Connection, name: &str) -> Result<String> {
+pub fn issue_token(conn: &Connection, kind: TokenKind, name: &str) -> Result<String> {
     check_client_name(name)?;
-    ensure_tokens_table(conn)?;
-    let token = format!(
-        "cbr_{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    );
+    ensure_tokens_table(conn, kind)?;
+    let token = format!("{}{}{}", kind.prefix(), uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
     conn.execute(
-        "INSERT INTO remote_tokens (name, sha256, created_at) VALUES (?1, ?2, ?3) \
-         ON CONFLICT(name) DO UPDATE SET sha256 = excluded.sha256, created_at = excluded.created_at, \
-         last_used_at = NULL",
+        &format!(
+            "INSERT INTO {} (name, sha256, created_at) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(name) DO UPDATE SET sha256 = excluded.sha256, created_at = excluded.created_at, \
+             last_used_at = NULL",
+            kind.table()
+        ),
         params![name, sha256_hex(token.as_bytes()), chrono::Utc::now().timestamp()],
     )?;
     Ok(token)
 }
 
-pub fn revoke_token(conn: &Connection, name: &str) -> Result<bool> {
-    ensure_tokens_table(conn)?;
-    Ok(conn.execute("DELETE FROM remote_tokens WHERE name = ?1", params![name])? > 0)
+pub fn revoke_token(conn: &Connection, kind: TokenKind, name: &str) -> Result<bool> {
+    ensure_tokens_table(conn, kind)?;
+    Ok(conn.execute(&format!("DELETE FROM {} WHERE name = ?1", kind.table()), params![name])? > 0)
 }
 
 #[derive(Debug, Serialize)]
@@ -209,26 +235,27 @@ pub struct TokenInfo {
     pub last_used_at: Option<i64>,
 }
 
-pub fn list_tokens(conn: &Connection) -> Result<Vec<TokenInfo>> {
-    ensure_tokens_table(conn)?;
-    let mut stmt = conn.prepare("SELECT name, created_at, last_used_at FROM remote_tokens ORDER BY name")?;
+pub fn list_tokens(conn: &Connection, kind: TokenKind) -> Result<Vec<TokenInfo>> {
+    ensure_tokens_table(conn, kind)?;
+    let mut stmt =
+        conn.prepare(&format!("SELECT name, created_at, last_used_at FROM {} ORDER BY name", kind.table()))?;
     let rows = stmt.query_map([], |r| Ok(TokenInfo { name: r.get(0)?, created_at: r.get(1)?, last_used_at: r.get(2)? }))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// The client a token belongs to, recording the use.
-fn authenticate(conn: &Connection, token: &str) -> Result<Option<String>> {
-    ensure_tokens_table(conn)?;
+pub fn authenticate(conn: &Connection, kind: TokenKind, token: &str) -> Result<Option<String>> {
+    ensure_tokens_table(conn, kind)?;
     let name: Option<String> = conn
         .query_row(
-            "SELECT name FROM remote_tokens WHERE sha256 = ?1",
+            &format!("SELECT name FROM {} WHERE sha256 = ?1", kind.table()),
             params![sha256_hex(token.as_bytes())],
             |r| r.get(0),
         )
         .optional()?;
     if let Some(n) = &name {
         conn.execute(
-            "UPDATE remote_tokens SET last_used_at = ?1 WHERE name = ?2",
+            &format!("UPDATE {} SET last_used_at = ?1 WHERE name = ?2", kind.table()),
             params![chrono::Utc::now().timestamp(), n],
         )?;
     }
@@ -285,6 +312,8 @@ pub fn remote_may_call(tool: &str) -> bool {
         // Setting this machine's Claude token from the operator's own machine is
         // the point of `auth setup-token`; a remote token is already full trust.
         || matches!(tool, "auth_set_token" | "auth_status" | "auth_clear_token")
+        // A pool worker joined from another machine answers its jobs.
+        || matches!(tool, "pool_job" | "pool_reply" | "pool_fail" | "pool_ready")
 }
 
 // ---------------------------------------------------------------------------
@@ -362,7 +391,7 @@ where
         .to_owned();
     let client = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
         let conn = crate::daemon::chat::open_chat_db()?;
-        authenticate(&conn, &token)
+        authenticate(&conn, TokenKind::Remote, &token)
     })
     .await??;
     let Some(client) = client else {
@@ -669,17 +698,18 @@ mod tests {
     #[test]
     fn tokens_are_stored_hashed_revocable_and_named() {
         let conn = Connection::open_in_memory().unwrap();
-        let t = issue_token(&conn, "laptop").unwrap();
+        let t = issue_token(&conn, TokenKind::Remote, "laptop").unwrap();
         assert!(t.starts_with("cbr_") && t.len() > 60);
         let stored: String = conn.query_row("SELECT sha256 FROM remote_tokens", [], |r| r.get(0)).unwrap();
         assert_ne!(stored, t);
-        assert_eq!(authenticate(&conn, &t).unwrap().as_deref(), Some("laptop"));
-        assert_eq!(authenticate(&conn, "cbr_wrong").unwrap(), None);
+        assert_eq!(authenticate(&conn, TokenKind::Remote, &t).unwrap().as_deref(), Some("laptop"));
+        assert_eq!(authenticate(&conn, TokenKind::Pool, &t).unwrap(), None, "kinds do not mix");
+        assert_eq!(authenticate(&conn, TokenKind::Remote, "cbr_wrong").unwrap(), None);
         // Re-issuing under the same name retires the old token.
-        let t2 = issue_token(&conn, "laptop").unwrap();
-        assert_eq!(authenticate(&conn, &t).unwrap(), None);
-        assert!(revoke_token(&conn, "laptop").unwrap());
-        assert_eq!(authenticate(&conn, &t2).unwrap(), None);
-        assert!(issue_token(&conn, "bad name").is_err());
+        let t2 = issue_token(&conn, TokenKind::Remote, "laptop").unwrap();
+        assert_eq!(authenticate(&conn, TokenKind::Remote, &t).unwrap(), None);
+        assert!(revoke_token(&conn, TokenKind::Remote, "laptop").unwrap());
+        assert_eq!(authenticate(&conn, TokenKind::Remote, &t2).unwrap(), None);
+        assert!(issue_token(&conn, TokenKind::Remote, "bad name").is_err());
     }
 }

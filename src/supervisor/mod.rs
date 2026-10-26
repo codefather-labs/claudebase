@@ -355,11 +355,13 @@ pub fn run(args: &RunArgs) -> Result<std::process::ExitCode> {
     // terminal pumps above never share a scheduler with the socket.
     let subscribe_extra = args.subscribe.clone();
     let identity_for_daemon = identity.clone();
+    let pool_for_daemon = (args.pool.clone(), args.pool_capacity);
     let done_daemon = done.clone();
     let daemon_thread = std::thread::spawn(move || {
         crate::daemon::run_tokio(daemon_leg(
             identity_for_daemon,
             subscribe_extra,
+            pool_for_daemon,
             inbound_tx,
             done_daemon,
         ));
@@ -416,6 +418,7 @@ pub fn run(args: &RunArgs) -> Result<std::process::ExitCode> {
 async fn daemon_leg(
     identity: identity::AgentIdentity,
     extra_threads: Vec<String>,
+    (pool, pool_capacity): (Option<String>, i64),
     tx: mpsc::Sender<InboundMessage>,
     done: Arc<AtomicBool>,
 ) {
@@ -441,11 +444,14 @@ async fn daemon_leg(
         // Resolved HERE, where the checkout is: a daemon on another machine has
         // no such directory to run `git` in, and the project id is what lets a
         // session on a laptop share prod's journal for the same repository.
+        let (pool, pool_capacity) = (pool.clone(), pool_capacity);
         let here = std::env::current_dir().ok();
         let project_id = here.as_deref().map(crate::project_id::resolve_project_id);
         let branch = here.as_deref().and_then(crate::project_id::current_branch);
         let register_payload = || {
             json!({
+                "pool": pool,
+                "pool_capacity": pool_capacity,
                 "project_id": project_id,
                 "branch": branch,
                 "agent_id": identity.agent_id,

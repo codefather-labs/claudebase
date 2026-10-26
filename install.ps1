@@ -110,7 +110,7 @@ WHAT GETS INSTALLED:
   %USERPROFILE%\.claude\agents\       reflection (Drift), consolidator (Mnem)
   %USERPROFILE%\.claude\skills\       daemon-change-nick, daemon-setup-auth-token,
                                       daemon-callback-info, chat-dump (claudebase-chat-dump),
-                                      chat-load (claudebase-chat-load)
+                                      chat-load (claudebase-chat-load), setup-remote-daemon
   %USERPROFILE%\.claude\hooks\        SessionStart x2 (channel contract, journal),
                                       UserPromptSubmit (self-check),
                                       Pre/PostToolUse (peer routing, feature describe)
@@ -993,9 +993,15 @@ if ($env:CLAUDEBASE_SKIP_DAEMON -eq "1") {
         # binary. Failures are NORMAL on a fresh box.
         $prevErrPref = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
-        Get-Process claudebase -ErrorAction SilentlyContinue | ForEach-Object {
-            try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch {}
-        }
+        # Only the DAEMON. `Get-Process claudebase` also matched every
+        # `claudebase run` supervisor -- the parent of each open Claude
+        # session -- so an upgrade closed all of them. The binary itself is
+        # replaced by renaming (Install-Binary), which does not need them gone.
+        Get-CimInstance Win32_Process -Filter "Name = 'claudebase.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -match '\bdaemon\s+serve\b' } |
+            ForEach-Object {
+                try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
+            }
         Start-Sleep -Milliseconds 500
         $ErrorActionPreference = $prevErrPref
 
@@ -1065,5 +1071,6 @@ Write-Host "                      /claudebase-daemon-callback-info"
 Write-Host "                      /claudebase-chat-dump"
 Write-Host "                      /claudebase-chat-load"
 Write-Host "                      /claudebase-daemon-setup-auth-token"
+Write-Host "                      /claudebase-setup-remote-daemon"
 Write-Host "  Agents installed:   reflection (Drift), consolidator (Mnem)"
 Write-Host ""

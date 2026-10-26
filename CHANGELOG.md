@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-10-26
+
+### Fixed
+
+- **v0.18.0 shipped without its Windows binary.** The windows-x64 build passed but its size check
+  failed (40.01 MB against a 40 MB budget), and because that platform was still marked best-effort the
+  release went out without `claudebase-windows-x64.exe` — `install.ps1` takes the newest release, so
+  every Windows install failed. The size budget is now 48 MB, and a failed Windows build now stops the
+  release instead of publishing without it. Same code as 0.18.0 otherwise.
+
 ## [0.18.0] - 2026-10-26
 
 ### Added

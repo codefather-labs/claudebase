@@ -76,9 +76,12 @@ jobs:
     #     deferred to iter-2.1
     # darwin-x64 dropped from the matrix (ort-sys 2.0.0-rc.12 has no
     # x86_64-apple-darwin prebuilt — Intel Mac is legacy; arm64 is covered).
-    # windows-x64 + linux-arm64 stay best-effort as a safety net while the
-    # runner/size fixes below settle; flip to false once they build green.
-    continue-on-error: ${{ matrix.platform == 'windows-x64' || matrix.platform == 'linux-arm64' }}
+    # windows-x64 is REQUIRED (2026-10-26): it builds green since 0.13, the
+    # operator installs on Windows, and install.ps1 takes the newest release —
+    # v0.18.0 went out without its .exe after a size check failed, and every
+    # Windows install broke until the next release. linux-arm64 stays
+    # best-effort as a safety net.
+    continue-on-error: ${{ matrix.platform == 'linux-arm64' }}
     permissions:
       contents: read
     strategy:
@@ -153,7 +156,7 @@ jobs:
             --manifest-path Cargo.toml \
             --target ${{ matrix.target }}
 
-      - name: Assert binary size <= 40 MB (iter-2 NFR-1.1)
+      - name: Assert binary size <= 48 MB (iter-2 NFR-1.1)
         shell: bash
         run: |
           # Windows Cargo emits `claudebase.exe`; unix targets emit `claudebase`.
@@ -170,11 +173,13 @@ jobs:
           # Windows Git Bash has neither — fall back to `wc -c`.
           size=$(stat -f%z "$BIN" 2>/dev/null || stat -c%s "$BIN" 2>/dev/null || wc -c < "$BIN")
           echo "Binary size: $size bytes"
-          # 41943040 = 40 * 1024 * 1024. Raised from 35 MB: the multi-agent
-          # build's windows-x64 binary is ~37 MB (fastembed-rs + ort +
-          # sqlite-vec + ocr-rs PaddleOCR runtime + bundled-sqlite + the
-          # multi-agent additions). Typical: linux-x64 ~29 MB, darwin-arm64 ~24 MB.
-          test "$size" -le 41943040
+          # 50331648 = 48 * 1024 * 1024. Raised from 40 MB at v0.18.0, when the
+          # windows-x64 binary reached 40.01 MB (remote daemon TLS + pool
+          # dispatch on top of fastembed-rs + ort + sqlite-vec + ocr-rs +
+          # bundled-sqlite). 0.17.0 was 39.8 MB. Typical: linux-x64 ~37 MB,
+          # darwin-arm64 ~30 MB. The check guards against a sudden jump (a
+          # dependency pulled in by accident), not against steady growth.
+          test "$size" -le 50331648
 
       - name: Smoke test (--version exits 0)
         shell: bash
@@ -302,9 +307,7 @@ jobs:
             dist/claudebase-linux-arm64/claudebase-linux-arm64
             dist/claudebase-windows-x64/claudebase-windows-x64.exe
             claude-code-sdlc-${{ steps.source-tarball.outputs.version }}-source.tar.gz
-          # Windows-x64 build is best-effort (continue-on-error in matrix).
-          # When that build fails, the .exe artifact is missing — we still
-          # publish the release with the 4 GA platforms + source tarball.
-          # Maintainer attaches the local mingw-built Windows binary
-          # manually after the release is created.
+          # windows-x64 is required: a failed Windows build stops the release
+          # (the job needs `build`). Only linux-arm64 is best-effort, so its
+          # binary can be missing here.
           fail_on_unmatched_files: false

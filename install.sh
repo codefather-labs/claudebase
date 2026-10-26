@@ -570,13 +570,18 @@ install_claudebase_hooks() {
       | .hooks.SessionStart |=
           (if any(.[]?; (.hooks // []) | any(.command == $journal_cmd))
            then .
-           else . + [{"matcher": "startup|resume|compact", "hooks": [{"type": "command", "command": $journal_cmd}]}]
+           else . + [{"matcher": "startup|resume|clear|compact", "hooks": [{"type": "command", "command": $journal_cmd}]}]
            end)
       | .hooks.SessionStart |=
           (if any(.[]?; (.hooks // []) | any(.command == $channel_cmd))
            then .
-           else . + [{"matcher": "startup|resume|compact", "hooks": [{"type": "command", "command": $channel_cmd}]}]
+           else . + [{"matcher": "startup|resume|clear|compact", "hooks": [{"type": "command", "command": $channel_cmd}]}]
            end)
+      | .hooks.SessionStart |=
+          (map(if .matcher == "startup|resume|compact"
+                  and ((.hooks // []) | any(.command == $journal_cmd or .command == $channel_cmd))
+               then .matcher = "startup|resume|clear|compact"
+               else . end))
       | .hooks.PreToolUse //= []
       | .hooks.PreToolUse |=
           (if any(.[]?; (.hooks // []) | any(.command == $routing_cmd))

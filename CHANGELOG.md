@@ -13,6 +13,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   get a second worker. Now they get a new lease (`attempts + 1`); `done`, `cancelled` and a worker's
   refusal (`failed` / `worker_failed`, e.g. a content-policy decline) stay final. Every job answer
   carries `retryable`, so a gateway can tell "retry" from "give up" instead of looping.
+- **After `/clear` a session forgot how outside messages arrive.** The channel-contract and journal
+  SessionStart hooks were wired with `startup|resume|compact`; Claude Code also starts a session
+  with source `clear`, so a cleared pool worker no longer knew what a `[pool-job:…]` line was. Both
+  installers now wire `startup|resume|clear|compact` and update blocks they wired earlier.
 
 ### Added
 

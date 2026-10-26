@@ -526,7 +526,7 @@ function Install-ClaudebaseHooks {
             if ($ssAlready) { break }
         }
         if (-not $ssAlready) {
-            $ssNewEntry = [pscustomobject]@{ matcher = 'startup|resume|compact'; hooks = @([pscustomobject]@{ type = 'command'; command = $journalCmd }) }
+            $ssNewEntry = [pscustomobject]@{ matcher = 'startup|resume|clear|compact'; hooks = @([pscustomobject]@{ type = 'command'; command = $journalCmd }) }
             $json.hooks.SessionStart = @($ssExisting) + $ssNewEntry
         }
 
@@ -539,8 +539,17 @@ function Install-ClaudebaseHooks {
             if ($ccAlready) { break }
         }
         if (-not $ccAlready) {
-            $ccNewEntry = [pscustomobject]@{ matcher = 'startup|resume|compact'; hooks = @([pscustomobject]@{ type = 'command'; command = $channelCmd }) }
+            $ccNewEntry = [pscustomobject]@{ matcher = 'startup|resume|clear|compact'; hooks = @([pscustomobject]@{ type = 'command'; command = $channelCmd }) }
             $json.hooks.SessionStart = @($ccExisting) + $ccNewEntry
+        }
+
+        # Blocks wired before /clear was a matcher get it: a cleared session
+        # starts with an empty context and needs both reminders again.
+        foreach ($entry in @($json.hooks.SessionStart)) {
+            if ($entry.matcher -eq 'startup|resume|compact' -and $entry.hooks -and
+                @($entry.hooks | Where-Object { $_.command -eq $journalCmd -or $_.command -eq $channelCmd }).Count -gt 0) {
+                $entry.matcher = 'startup|resume|clear|compact'
+            }
         }
 
         # PreToolUse:EnterPlanMode -> agent-routing-reminder (peer read side).

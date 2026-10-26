@@ -91,6 +91,38 @@ impl ModalDetector {
     }
 }
 
+/// A startup question `claudebase run --no-input` answers by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnownDialog {
+    /// "Quick safety check: Is this a project you created or one you trust?"
+    /// The cursor starts on "No, exit" — Enter alone would close Claude Code.
+    FolderTrust { yes_selected: bool },
+}
+
+impl ModalDetector {
+    /// The known dialog on screen now, if any, and where its cursor is.
+    pub fn known_dialog(&self) -> Option<KnownDialog> {
+        let p = self.screen.lock().ok()?;
+        let (_, cols) = p.screen().size();
+        let rows: Vec<String> = p.screen().rows(0, cols).map(|r| normalize(r.as_bytes())).collect();
+        let all = rows.join("\n");
+        if all.contains("quick safety check") && all.contains("yes, i trust this folder") {
+            let yes_selected = rows.iter().any(|r| r.contains('❯') && r.contains("yes, i trust this folder"));
+            return Some(KnownDialog::FolderTrust { yes_selected });
+        }
+        None
+    }
+
+    /// The bottom of the screen as text, for a log line about a dialog nobody answers.
+    pub fn bottom_text(&self) -> String {
+        let Ok(p) = self.screen.lock() else { return String::new() };
+        let (_, cols) = p.screen().size();
+        let rows: Vec<String> = p.screen().rows(0, cols).collect();
+        let bottom: Vec<&String> = rows.iter().rev().filter(|r| !r.trim().is_empty()).take(BOTTOM_ROWS).collect();
+        normalize(bottom.iter().rev().map(|r| r.as_str()).collect::<Vec<_>>().join(" | ").as_bytes())
+    }
+}
+
 impl Default for ModalDetector {
     fn default() -> Self {
         Self::new(24, 80)
@@ -201,6 +233,21 @@ mod tests {
         d.feed(b"> \r\n  shift+tab to cycle\r\n");
         d.feed(b"Do you want to proceed?\r\n Enter to confirm");
         assert!(d.modal_is_up());
+    }
+
+    /// Verbatim from claude 2.1.310 in an untrusted directory.
+    const TRUST: &[u8] = "Accessing workspace:\r\n /tmp/x\r\n Quick safety check: Is this a project you created or one you trust?\r\n Claude Code'll be able to read, edit, and execute files here.\r\n \u{276f} 1. No, exit\r\n   2. Yes, I trust this folder\r\n Enter to confirm \u{b7} Esc to cancel".as_bytes();
+
+    #[test]
+    fn recognises_the_trust_question_and_where_its_cursor_is() {
+        let d = detector();
+        d.feed(TRUST);
+        assert_eq!(d.known_dialog(), Some(KnownDialog::FolderTrust { yes_selected: false }));
+        assert!(d.modal_is_up());
+        d.feed("\x1b[2J\x1b[HQuick safety check:\r\n   1. No, exit\r\n \u{276f} 2. Yes, I trust this folder\r\n Enter to confirm".as_bytes());
+        assert_eq!(d.known_dialog(), Some(KnownDialog::FolderTrust { yes_selected: true }));
+        d.feed(b"\x1b[2J\x1b[H> ");
+        assert_eq!(d.known_dialog(), None);
     }
 
     #[test]

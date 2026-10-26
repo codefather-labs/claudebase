@@ -505,6 +505,12 @@ pub struct RunArgs {
     #[arg(long)]
     pub daemon: Option<String>,
 
+    /// Answer Claude Code's startup questions without an operator: today the
+    /// folder-trust question ("Yes, I trust this folder" — the directory is
+    /// trusted). Other dialogs are left alone and logged. Implied by --pool.
+    #[arg(long)]
+    pub no_input: bool,
+
     /// Make this session a worker of a pool: the daemon may hand it jobs
     /// (`[pool-job:<pool> <req_id> <role>]`) from a gateway, and it answers with
     /// `claudebase pool reply` (docs/design/pool-dispatch.md).

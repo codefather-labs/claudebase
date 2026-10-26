@@ -47,7 +47,7 @@ use crate::cli::RunArgs;
 pub use draft::DraftTracker;
 pub use inject::{InboundMessage, Injector};
 pub use identity::AgentIdentity;
-pub use screen::ModalDetector;
+pub use screen::{KnownDialog, ModalDetector};
 
 /// Env vars exported into the `claude` child so any Bash call made from inside
 /// that session can attribute itself without arguments (`telegram send`).
@@ -186,6 +186,40 @@ mod shutdown {
     pub fn spawn_watcher(_child_pid: Option<u32>, _done: Arc<AtomicBool>) {}
 }
 
+/// The `--no-input` loop. Runs for the first minutes of the session, where
+/// startup questions appear; a dialog later on is the operator's.
+fn answer_startup_questions(
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    modal: Arc<ModalDetector>,
+    done: Arc<AtomicBool>,
+) {
+    const DOWN: &[u8] = b"\x1b[B";
+    let deadline = std::time::Instant::now() + Duration::from_secs(180);
+    let (mut presses, mut reported) = (0u32, false);
+    while !done.load(Ordering::SeqCst) && std::time::Instant::now() < deadline && presses < 12 {
+        std::thread::sleep(Duration::from_millis(400));
+        let keys: &[u8] = match modal.known_dialog() {
+            Some(KnownDialog::FolderTrust { yes_selected: false }) => DOWN,
+            Some(KnownDialog::FolderTrust { yes_selected: true }) => b"\r",
+            None => {
+                if modal.modal_is_up() && !reported {
+                    reported = true;
+                    tracing::warn!(screen = %modal.bottom_text(), "--no-input: a dialog it does not know is up; left for the operator");
+                }
+                continue;
+            }
+        };
+        tracing::info!(keys = if keys == DOWN { "down" } else { "enter" }, "--no-input: answering the folder-trust question (trust this folder)");
+        let Ok(mut w) = writer.lock() else { return };
+        if w.write_all(keys).is_err() || w.flush().is_err() {
+            return;
+        }
+        presses += 1;
+        // Let the TUI repaint before reading the screen again.
+        std::thread::sleep(Duration::from_millis(400));
+    }
+}
+
 /// Entry point for `claudebase run`.
 pub fn run(args: &RunArgs) -> Result<std::process::ExitCode> {
     let identity = identity::derive(args.nick.as_deref(), args.pool.as_deref());
@@ -279,6 +313,19 @@ pub fn run(args: &RunArgs) -> Result<std::process::ExitCode> {
         done_out.store(true, Ordering::SeqCst);
         let _ = drained_tx.send(());
     });
+
+    // ---- --no-input: answer the known startup questions ----
+    //
+    // An unattended session (a pool worker) must not sit at "do you trust this
+    // folder?" until someone walks by. Only questions recognised by their full
+    // text are answered, and only after the screen shows the right option
+    // selected: on the trust question the cursor starts on "No, exit", so a
+    // bare Enter would close Claude Code. Anything else is left alone and
+    // logged, so a stuck window says why.
+    if args.no_input || args.pool.is_some() {
+        let (writer_ans, modal_ans, done_ans) = (writer.clone(), modal.clone(), done.clone());
+        std::thread::spawn(move || answer_startup_questions(writer_ans, modal_ans, done_ans));
+    }
 
     // ---- operator's stdin -> pty, feeding the draft tracker on the way ----
     //

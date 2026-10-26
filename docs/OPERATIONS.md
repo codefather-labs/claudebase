@@ -62,10 +62,14 @@ LAN bind:
 
 ```bash
 claudebase pool token issue gateway       # X-Api-Token for /pool/*, shown once
-claudebase run --pool funnel              # one per worker, N windows
+claudebase run --pool funnel              # one per worker, N windows (implies --no-input)
 claudebase pool workers funnel            # free / busy / suspect / offline, and their jobs
 claudebase pool token list | revoke gateway
 ```
+
+`--pool` implies `--no-input`: the supervisor answers Claude Code's folder-trust question by
+itself ("Yes, I trust this folder" — the directory becomes trusted) and logs any other dialog it
+finds instead of answering it. `claudebase run --no-input` does the same for any session.
 
 The gateway then calls `http://<pool-machine>:8585/pool/funnel/…` with that token.
 Workers run like every `claudebase run` session (permissions skipped).

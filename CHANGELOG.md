@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **`claudebase run --no-input`: no startup questions.** The supervisor answers Claude Code's
+  folder-trust question by itself — it moves the cursor to "Yes, I trust this folder" (the default is
+  "No, exit"), checks the screen shows it selected, then confirms; the directory becomes trusted.
+  Any other dialog is left for the operator and logged with its text. `--pool` implies it: a pool
+  worker opened in a new directory no longer sits at the trust question.
+
 ## [0.18.4] - 2026-10-26
 
 ### Fixed

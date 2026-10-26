@@ -7,7 +7,7 @@ resolver = "2"
 
 [package]
 name = "claudebase"
-version = "0.18.3"
+version = "0.18.4"
 edition = "2021"
 description = "Local hybrid retrieval CLI for LLM agents — BM25 + dense embeddings + RRF, multimodal OCR, per-page navigation"
 license = "MIT"
@@ -191,6 +191,10 @@ rustls-pki-types = { version = "1", features = ["std"] }
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
 # Pool dispatch: images travel between gateway, daemon and worker as base64.
 base64 = "0.22"
+# The supervisor's modal detector reads the CURRENT screen, not the output
+# history: a dialog closed without a footer repaint left the old verdict stuck
+# (pool workers on Windows withheld every job, 2026-10-26).
+vt100 = "0.15"
 # Parakeet ASR, behind `asr-sherpa`.
 #
 # `default-features = false` + `shared` on purpose: the crate's default is a

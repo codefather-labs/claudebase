@@ -6,7 +6,7 @@ fn main() {
         "docs/qa/evidence/pty-transport-e2e/agent-to-agent-transcript.txt",
     ] {
         let Ok(body) = std::fs::read(path) else { continue };
-        let d = ModalDetector::new();
+        let d = ModalDetector::new(24, 80);
         // feed in chunks, like the real pump
         for chunk in body.chunks(4096) { d.feed(chunk); }
         println!("{:60} modal_is_up = {}", path, d.modal_is_up());

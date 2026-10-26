@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.18.4] - 2026-10-26
+
+### Fixed
+
+- **A session could stop accepting inbound messages for good after a dialog.** The supervisor holds a
+  message while Claude Code shows a dialog (typing into one answers it). It decided that from the
+  output history: a dialog line seen, and no prompt line ("shift+tab to cycle") printed after it.
+  Claude Code erases a dialog without repainting that line — the folder-trust question, asked at every
+  start in the home directory — so the verdict stuck: on the Windows pool machine three of four
+  workers withheld every job they were given while the daemon showed them leased. The detector now
+  keeps a terminal emulator (`vt100`) and looks at the screen as it is now, the bottom rows only.
+
 ## [0.18.3] - 2026-10-26
 
 ### Changed

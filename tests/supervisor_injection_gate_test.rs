@@ -52,7 +52,7 @@ impl Harness {
         let writer: Arc<Mutex<Box<dyn Write + Send>>> =
             Arc::new(Mutex::new(Box::new(SharedBuf(buf.clone()))));
         let draft = Arc::new(DraftTracker::new());
-        let modal = Arc::new(ModalDetector::new());
+        let modal = Arc::new(ModalDetector::new(24, 80));
         let done = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel::<InboundMessage>();
         let injector = Injector::new(writer, draft.clone(), modal.clone(), done.clone());
@@ -163,8 +163,8 @@ fn holds_the_message_while_a_modal_is_up_then_releases_it() {
         "F-3: a modal swallows the message and the submit key answers the dialog"
     );
 
-    // Operator dismisses the dialog; the TUI repaints its normal prompt.
-    h.modal.feed(b"\r\n auto mode on (shift+tab to cycle)\r\n");
+    // Operator dismisses the dialog: the TUI erases it and draws its prompt.
+    h.modal.feed(b"\x1b[2J\x1b[H> \r\n auto mode on (shift+tab to cycle)\r\n");
     assert!(
         h.wait_for(Duration::from_secs(3), |w| w.contains("INBOUND-DURING-MODAL")),
         "message must survive the modal and land afterwards"

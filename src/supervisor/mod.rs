@@ -241,7 +241,7 @@ pub fn run(args: &RunArgs) -> Result<std::process::ExitCode> {
     shutdown::spawn_watcher(child_pid, done.clone());
 
     let draft = Arc::new(DraftTracker::new());
-    let modal = Arc::new(ModalDetector::new());
+    let modal = Arc::new(ModalDetector::new(rows, cols));
 
     // Raw mode last: any failure above still prints on a sane terminal. The
     // guard restores termios on every exit path, including panics.
@@ -324,6 +324,7 @@ pub fn run(args: &RunArgs) -> Result<std::process::ExitCode> {
     // ---- window-size follower ----
     let master_rs = master.clone();
     let done_rs = done.clone();
+    let modal_rs = modal.clone();
     std::thread::spawn(move || {
         let mut last = (rows, cols);
         while !done_rs.load(Ordering::SeqCst) {
@@ -338,6 +339,7 @@ pub fn run(args: &RunArgs) -> Result<std::process::ExitCode> {
                             pixel_height: 0,
                         });
                     }
+                    modal_rs.resize(cur.0, cur.1);
                     last = cur;
                 }
             }

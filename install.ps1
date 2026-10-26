@@ -116,6 +116,7 @@ WHAT GETS INSTALLED:
                                       UserPromptSubmit (self-check),
                                       Pre/PostToolUse (peer routing, feature describe)
   %USERPROFILE%\.claude\bin\claudebase.cmd  Global wrapper (User PATH)
+  %USERPROFILE%\.claude\bin\claudebase      Same, for Git Bash (where agents run commands)
 
 WHAT IS *REMOVED* (reverse migration, idempotent):
   the old Stop[insight-capture] and SessionStart[read-insights] hooks, the
@@ -352,6 +353,17 @@ function Register-Alias {
 "@ | Set-Content -Path $wrapperPath -Encoding ASCII
 
     Write-Ok "wrapper: $wrapperPath"
+
+    # The same for Git Bash, which is where Claude Code runs an agent's commands
+    # on Windows: bash does not run a .cmd by its bare name, so agents got
+    # `claudebase: command not found` while PowerShell found the wrapper. An
+    # extensionless sh script with a shebang is what bash runs. LF endings, no
+    # BOM -- bash reads the first line literally.
+    $shPath = Join-Path $binDir 'claudebase'
+    $sh = "#!/bin/sh`n# Git Bash (Claude Code on Windows) does not run .cmd files by name.`n" +
+          'exec "$(cygpath -u "$USERPROFILE")/.claude/tools/claudebase/claudebase.exe" "$@"' + "`n"
+    [IO.File]::WriteAllText($shPath, $sh, (New-Object Text.UTF8Encoding $false))
+    Write-Ok "wrapper: $shPath (Git Bash)"
 
     # Append $binDir to User PATH if not already present.
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')

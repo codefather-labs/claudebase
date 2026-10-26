@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **Agents on Windows: `claudebase: command not found`.** Claude Code runs an agent's commands in Git
+  Bash, and bash does not run the installer's `claudebase.cmd` by its bare name — PowerShell found it,
+  agents did not. `install.ps1` now also writes an extensionless sh wrapper next to it; the
+  install-smoke Windows job checks that Git Bash finds `claudebase` by name.
+
 ### Changed
 
 - **A suspect pool worker is trusted again after 8 minutes.** A worker whose job expired (typically

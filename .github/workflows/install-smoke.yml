@@ -376,6 +376,18 @@ jobs:
           if (-not (Test-Path $exe)) { Write-Host "binary missing"; exit 1 }
           & $exe --version
 
+      # Claude Code runs an agent's commands in Git Bash, which does not run
+      # claudebase.cmd by name: agents on Windows got "command not found" while
+      # PowerShell worked. The installer adds an extensionless sh wrapper; bash
+      # must find and run it by the bare name.
+      - name: Git Bash finds claudebase by name
+        shell: bash
+        run: |
+          set -eu
+          export PATH="$(cygpath -u "$USERPROFILE")/.claude/bin:$PATH"
+          command -v claudebase
+          claudebase --version
+
       - name: The installed version is the newest published
         shell: powershell
         run: |

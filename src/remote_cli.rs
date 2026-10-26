@@ -120,7 +120,7 @@ pub fn add(name: &str, url: Option<&str>) -> Result<String> {
             s
         }
     };
-    let r = Remote::parse(&url)?;
+    let r = Remote::parse(crate::input::strip_bom(&url))?;
     let mut p = Profiles::load()?;
     let replaced = p.remotes.insert(name.to_owned(), r.clone()).is_some();
     p.save()?;
@@ -217,7 +217,7 @@ pub async fn auth(sub: crate::cli::AuthSubcommand) -> Result<String> {
                     s
                 }
             };
-            ("auth_set_token", serde_json::json!({ "token": token.trim() }))
+            ("auth_set_token", serde_json::json!({ "token": crate::input::strip_bom(token.trim()) }))
         }
         AuthSubcommand::Status => ("auth_status", serde_json::json!({})),
         AuthSubcommand::ClearToken => ("auth_clear_token", serde_json::json!({})),

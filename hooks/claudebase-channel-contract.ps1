@@ -64,6 +64,8 @@ a model call for you to answer, as the model would. Do it, in order:
   {"content": "..."}                     parses: {"content": ...} or, when the payload
   EOF                                    offers tools, {"tool_calls": [...]}
   claudebase pool fail <req_id> "why"   when you cannot answer it
+  claudebase pool reply <req_id> --file answer.json   from PowerShell: write the JSON
+                                        to a file first; its pipes can mangle stdin
 
 Images come as files, numbered in the order the gateway sent them:
 image-01.*, image-02.*, ... and a marker "[image #N ...]" in the messages

@@ -12,6 +12,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Bash, and bash does not run the installer's `claudebase.cmd` by its bare name — PowerShell found it,
   agents did not. `install.ps1` now also writes an extensionless sh wrapper next to it; the
   install-smoke Windows job checks that Git Bash finds `claudebase` by name.
+- **A pool worker on Windows could not reply through PowerShell.** Its pipe put a byte-order mark in
+  front of the JSON and `claudebase pool reply` answered "the result is not JSON … line 1 column 1".
+  Every command that reads stdin (`pool reply`, `journal add -`, `agent send --stdin`, `telegram send
+  --stdin`, `remote add`, `auth setup-token`) now accepts UTF-8 with or without a BOM and UTF-16, and
+  `pool reply --file <path>` reads the answer from a file — the dependable route from PowerShell. The
+  error now shows how the input started.
 
 ### Changed
 

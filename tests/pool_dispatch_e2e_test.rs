@@ -152,7 +152,12 @@ async fn a_gateway_dispatches_to_free_workers_and_gets_their_answers() {
             .assert()
             .failure()
             .stderr(predicates::str::contains("another session"));
-        out(cli(&h, Some((&s1.0, &s1.1)), &["pool", "reply", "r-1", "--content", "{\"fields\":[]}"]));
+        // As PowerShell writes a file: UTF-16 LE with a BOM.
+        let answer = r#"{"content": "{\"fields\":[]}"}"#;
+        let utf16: Vec<u8> = [0xFF, 0xFE].into_iter().chain(answer.encode_utf16().flat_map(u16::to_le_bytes)).collect();
+        let file = h.join("answer.json");
+        std::fs::write(&file, utf16).unwrap();
+        out(cli(&h, Some((&s1.0, &s1.1)), &["pool", "reply", "r-1", "--file", file.to_str().unwrap()]));
     })
     .await
     .unwrap();
@@ -166,7 +171,10 @@ async fn a_gateway_dispatches_to_free_workers_and_gets_their_answers() {
     let (h, s2) = (home.clone(), sess(&w2));
     tokio::task::spawn_blocking(move || {
         let mut reply = cli(&h, Some((&s2.0, &s2.1)), &["pool", "reply", "r-2"]);
-        reply.write_stdin(r#"{"tool_calls":[{"function":{"name":"click","arguments":"{\"x\":1}"}}]}"#);
+        // As PowerShell pipes it: a UTF-8 BOM first.
+        let mut piped = vec![0xEF, 0xBB, 0xBF];
+        piped.extend_from_slice(br#"{"tool_calls":[{"function":{"name":"click","arguments":"{\"x\":1}"}}]}"#);
+        reply.write_stdin(piped);
         reply.assert().success();
     })
     .await

@@ -138,9 +138,7 @@ pub async fn bind_session(session_id: Option<String>, from_stdin: bool) -> Resul
     let session_id = match (session_id, from_stdin) {
         (Some(s), _) => s.trim().to_string(),
         (None, true) => {
-            use std::io::Read as _;
-            let mut buf = String::new();
-            std::io::stdin().read_to_string(&mut buf)?;
+            let buf = crate::input::read_stdin()?;
             match serde_json::from_str::<serde_json::Value>(&buf) {
                 Ok(v) => {
                     // A conversation is a thing with a transcript.

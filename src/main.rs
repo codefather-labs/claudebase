@@ -1188,15 +1188,15 @@ fn run_daemon_serve(args: &cli::DaemonServeArgs) -> std::process::ExitCode {
 /// `claudebase plugin serve` — entry point. Slice 1a stub.
 /// `claudebase agent send` — agent-to-agent messaging over the CLI.
 fn run_agent_send(args: &cli::AgentSendArgs) -> std::process::ExitCode {
-    use std::io::Read;
 
     let text = if args.stdin {
-        let mut buf = String::new();
-        if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
-            eprintln!("claudebase agent chat: reading stdin failed: {e}");
-            return std::process::ExitCode::FAILURE;
+        match claudebase::input::read_stdin() {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!("claudebase agent chat: reading stdin failed: {e:#}");
+                return std::process::ExitCode::FAILURE;
+            }
         }
-        buf
     } else {
         match args.text.as_deref() {
             Some(t) => t.to_string(),
@@ -1238,15 +1238,15 @@ fn run_agent_send(args: &cli::AgentSendArgs) -> std::process::ExitCode {
 /// the tokio runtime is built only for the duration of the daemon round-trip
 /// (invariant 1 in the module header: no `#[tokio::main]`).
 fn run_telegram_send(args: &cli::TelegramSendArgs) -> std::process::ExitCode {
-    use std::io::Read;
 
     let text = if args.stdin {
-        let mut buf = String::new();
-        if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
-            eprintln!("claudebase telegram send: reading stdin failed: {e}");
-            return std::process::ExitCode::FAILURE;
+        match claudebase::input::read_stdin() {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!("claudebase telegram send: reading stdin failed: {e:#}");
+                return std::process::ExitCode::FAILURE;
+            }
         }
-        buf
     } else {
         match args.text.as_deref() {
             Some(t) => t.to_string(),

@@ -988,6 +988,10 @@ pub struct PoolReplyArgs {
     /// Shorthand for the result {"content": "<text>"} — what a model call returns.
     #[arg(long, conflicts_with = "result")]
     pub content: Option<String>,
+    /// Read the result JSON from a file — the dependable route from PowerShell,
+    /// whose pipes can add a BOM or re-encode.
+    #[arg(long, conflicts_with_all = ["result", "content"])]
+    pub file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]

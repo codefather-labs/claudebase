@@ -6,9 +6,7 @@
 //! `CLAUDEBASE_SESSION_TOKEN`) when there is one, and the working directory for
 //! reads from a plain terminal. The daemon turns that into a project.
 
-use std::io::Read;
-
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
 use crate::agent_cli::{AGENT_ID_ENV, SESSION_TOKEN_ENV};
@@ -253,9 +251,7 @@ fn read_body(arg: Option<&str>) -> Result<String> {
             if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
                 bail!("the entry text is missing: pass it as an argument, or pipe it on stdin");
             }
-            let mut buf = String::new();
-            std::io::stdin().read_to_string(&mut buf).context("read stdin")?;
-            Ok(buf)
+            crate::input::read_stdin()
         }
         Some(text) => Ok(text.to_string()),
     }

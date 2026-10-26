@@ -8,7 +8,6 @@
 //! its `chat.db` directly, like `daemon callback …` and `daemon remote issue`;
 //! they are never reachable over a connection.
 
-use std::io::Read;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
@@ -24,14 +23,11 @@ pub async fn run(sub: PoolSubcommand) -> Result<String> {
     match sub {
         PoolSubcommand::Job(a) => job(&a.req_id, a.dir).await,
         PoolSubcommand::Reply(a) => {
-            let result = match (a.content, a.result.as_deref()) {
-                (Some(text), _) => json!({ "content": text }),
-                (None, Some(r)) if r != "-" => parse_result(r)?,
-                (None, _) => {
-                    let mut s = String::new();
-                    std::io::stdin().read_to_string(&mut s).context("read the result from stdin")?;
-                    parse_result(&s)?
-                }
+            let result = match (a.content, a.file, a.result.as_deref()) {
+                (Some(text), _, _) => json!({ "content": text }),
+                (None, Some(path), _) => parse_result(&crate::input::read_file(&path)?)?,
+                (None, None, Some(r)) if r != "-" => parse_result(r)?,
+                (None, None, _) => parse_result(&crate::input::read_stdin()?)?,
             };
             let v = call("pool_reply", json!({ "req_id": a.req_id, "result": result })).await?;
             Ok(if v["accepted"].as_bool() == Some(true) {
@@ -56,7 +52,13 @@ pub async fn run(sub: PoolSubcommand) -> Result<String> {
 /// A result is any JSON value — `{content}`, `{tool_calls: […]}`, whatever the
 /// gateway's caller expects; the daemon relays it untouched.
 fn parse_result(text: &str) -> Result<Value> {
-    serde_json::from_str(text.trim()).context("the result is not JSON (use --content \"<text>\" for plain text)")
+    serde_json::from_str(crate::input::strip_bom(text).trim()).with_context(|| {
+        let start: String = text.chars().take(24).flat_map(char::escape_debug).collect();
+        format!(
+            "the result is not JSON (it starts with \"{start}\"); use --file <path> from PowerShell, \
+             or --content \"<text>\" for plain text"
+        )
+    })
 }
 
 async fn call(tool: &str, mut args: Value) -> Result<Value> {

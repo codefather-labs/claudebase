@@ -205,6 +205,26 @@ async fn a_gateway_dispatches_to_free_workers_and_gets_their_answers() {
     let (_, w) = g("GET", "/pool/funnel/workers".into(), None).await;
     assert_eq!(w["free"], 2, "{w}");
 
+    // Retry semantics. An answered job is final: dispatching it again is its state.
+    let (st, again) = g("POST", "/pool/funnel/dispatch".into(), Some(job("r-1", 60_000))).await;
+    assert_eq!((st, again["state"].as_str(), again["retryable"].as_bool()), (200, Some("done"), Some(false)), "{again}");
+    // An expired job goes to a worker again, as attempt 2.
+    assert_eq!(r5["retryable"], true, "{r5}");
+    let (st, retry) = g("POST", "/pool/funnel/dispatch".into(), Some(job("r-5", 60_000))).await;
+    assert_eq!((st, retry["state"].as_str(), retry["attempts"].as_i64()), (202, Some("leased"), Some(2)), "{retry}");
+    // A refusal by a worker is final too: it would repeat on any worker.
+    let w5r = retry["worker"].as_str().unwrap().to_owned();
+    let (h, s5r) = (home.clone(), sess(&w5r));
+    tokio::task::spawn_blocking(move || {
+        out(cli(&h, Some((&s5r.0, &s5r.1)), &["pool", "fail", "r-5", "Declined: content policy"]))
+    })
+    .await
+    .unwrap();
+    let (_, f5) = g("GET", "/pool/jobs/r-5?wait_ms=2000".into(), None).await;
+    assert_eq!((f5["state"].as_str(), f5["error"].as_str(), f5["retryable"].as_bool()), (Some("failed"), Some("worker_failed"), Some(false)), "{f5}");
+    let (st, f5again) = g("POST", "/pool/funnel/dispatch".into(), Some(job("r-5", 60_000))).await;
+    assert_eq!((st, f5again["state"].as_str(), f5again["attempts"].as_i64()), (200, Some("failed"), Some(2)), "no new lease: {f5again}");
+
     // Without `pool ready`, a suspect worker is trusted again after the cooldown.
     let (_, d5b) = g("POST", "/pool/funnel/dispatch".into(), Some(job("r-5b", 1_000))).await;
     assert_eq!(d5b["state"], "leased", "{d5b}");
@@ -242,5 +262,10 @@ async fn a_gateway_dispatches_to_free_workers_and_gets_their_answers() {
         }
     }
     assert_eq!((lost["state"].as_str(), lost["error"].as_str()), (Some("failed"), Some("worker_lost")), "{lost}");
+    assert_eq!(lost["retryable"], true);
+    // A lost job goes to the worker still there.
+    let (st, re7) = g("POST", "/pool/funnel/dispatch".into(), Some(job("r-7", 60_000))).await;
+    assert_eq!((st, re7["attempts"].as_i64()), (202, Some(2)), "{re7}");
+    assert_ne!(re7["worker"].as_str(), Some(w7.as_str()));
     let _ = w6;
 }

@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **A lost or expired pool job could not be retried.** Dispatching the same `req_id` again returned
+  its old state, so `worker_lost` / `expired` — which the contract says to re-dispatch — could never
+  get a second worker. Now they get a new lease (`attempts + 1`); `done`, `cancelled` and a worker's
+  refusal (`failed` / `worker_failed`, e.g. a content-policy decline) stay final. Every job answer
+  carries `retryable`, so a gateway can tell "retry" from "give up" instead of looping.
+
 ### Added
 
 - **`claudebase run --no-input`: no startup questions.** The supervisor answers Claude Code's

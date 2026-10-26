@@ -128,6 +128,24 @@ Long-poll; returns as soon as the state is final or `wait_ms` passes (max 30000)
 A final state is kept 10 minutes after it is first read, then dropped. `result` is opaque
 to the daemon: exactly the JSON the worker submitted (for the registry: `{content}`).
 
+### Retrying (added 2026-10-26)
+
+Every job answer carries `retryable` and `attempts`. The gateway retries a job by dispatching
+the SAME `req_id` again:
+
+| State | `retryable` | Dispatch with that `req_id` again |
+|---|---|---|
+| `leased` | false | its state (in flight) |
+| `done` | false | its state |
+| `cancelled` | false | its state |
+| `failed` / `worker_failed` (a `pool fail`, e.g. a content-policy refusal) | false | its state — it would repeat on any worker |
+| `failed` / `worker_lost` | **true** | a new lease to a free worker, `attempts + 1` |
+| `expired` | **true** | a new lease to a free worker, `attempts + 1` |
+
+A gateway retries only on `retryable: true`, with a cap of its own. Before this, a re-dispatch
+of a lost job returned its old state, so a lost job could never be retried — and a bridge looping
+on `failed` re-posted ~490 times in seconds (the daemon logged one dispatch).
+
 ### `POST /pool/jobs/<req_id>/cancel`
 `200 { "state": "cancelled" }`; the worker is told and freed.
 

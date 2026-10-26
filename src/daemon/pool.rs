@@ -102,6 +102,14 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     if !has {
         conn.execute_batch("ALTER TABLE pool_members ADD COLUMN suspect_since INTEGER")?;
     }
+    let has_attempts: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('pool_jobs') WHERE name = 'attempts')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_attempts {
+        conn.execute_batch("ALTER TABLE pool_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1")?;
+    }
     Ok(())
 }
 
@@ -229,7 +237,7 @@ pub fn workers_json(conn: &Connection, pool: &str) -> Result<Option<Value>> {
 fn job_json(conn: &Connection, req_id: &str) -> Result<Option<Value>> {
     conn.query_row(
         "SELECT j.req_id, j.state, COALESCE(r.agent_name, j.worker), j.created_at, j.expires_at, j.finished_at, \
-                j.result, j.error, j.message, j.call_type \
+                j.result, j.error, j.message, j.call_type, COALESCE(j.attempts, 1) \
          FROM pool_jobs j LEFT JOIN agent_registry r ON r.agent_id = j.worker WHERE j.req_id = ?1",
         [req_id],
         |r| {
@@ -243,7 +251,14 @@ fn job_json(conn: &Connection, req_id: &str) -> Result<Option<Value>> {
                 "worker": r.get::<_, String>(2)?,
                 "expires_at_ms": r.get::<_, i64>(4)?,
                 "call_type": r.get::<_, Option<String>>(9)?,
+                "attempts": r.get::<_, i64>(10)?,
             });
+            // Whether dispatching the same req_id again gives it another
+            // worker: only when the job was lost, never when it was answered,
+            // cancelled or refused by a worker — a refusal (`pool fail`, e.g. a
+            // content-policy decline) repeats on any worker.
+            let error: Option<String> = r.get(7)?;
+            v["retryable"] = json!(retryable(&v["state"].as_str().unwrap_or(""), error.as_deref()));
             if let Some(f) = finished {
                 v["duration_ms"] = json!(f - created);
             }
@@ -261,6 +276,10 @@ fn job_json(conn: &Connection, req_id: &str) -> Result<Option<Value>> {
     )
     .optional()
     .map_err(Into::into)
+}
+
+fn retryable(state: &str, error: Option<&str>) -> bool {
+    state == "expired" || (state == "failed" && error == Some("worker_lost"))
 }
 
 fn is_final(state: &str) -> bool {
@@ -339,8 +358,15 @@ pub fn dispatch(conn: &Connection, pool: &str, body: &Value) -> Result<Dispatch>
     ensure_schema(conn)?;
     let req_id = body.get("req_id").and_then(Value::as_str).ok_or_else(|| anyhow!("req_id required"))?;
     check_req_id(req_id)?;
+    // The same req_id again: in flight or final → its state, nothing new.
+    // Lost or expired → it goes to a worker again (the gateway's retry), as
+    // the next attempt of the same job.
+    let mut attempts = 1;
     if let Some(existing) = job_json(conn, req_id)? {
-        return Ok(Dispatch::Existing(existing));
+        if existing["retryable"].as_bool() != Some(true) {
+            return Ok(Dispatch::Existing(existing));
+        }
+        attempts = existing["attempts"].as_i64().unwrap_or(1) + 1;
     }
     let payload = body.get("payload").cloned().ok_or_else(|| anyhow!("payload required"))?;
     let timeout = body.get("timeout_ms").and_then(Value::as_i64).unwrap_or(DEFAULT_TIMEOUT_MS);
@@ -382,9 +408,9 @@ pub fn dispatch(conn: &Connection, pool: &str, body: &Value) -> Result<Dispatch>
 
     let now = now_ms();
     conn.execute(
-        "INSERT INTO pool_jobs (req_id, pool, worker, call_type, state, dir, created_at, expires_at) \
-         VALUES (?1, ?2, ?3, ?4, 'leased', ?5, ?6, ?7)",
-        params![req_id, pool, worker.agent_id, call_type, dir.to_string_lossy(), now, now + timeout],
+        "INSERT OR REPLACE INTO pool_jobs (req_id, pool, worker, call_type, state, dir, created_at, expires_at, attempts) \
+         VALUES (?1, ?2, ?3, ?4, 'leased', ?5, ?6, ?7, ?8)",
+        params![req_id, pool, worker.agent_id, call_type, dir.to_string_lossy(), now, now + timeout, attempts],
     )?;
     conn.execute("UPDATE pool_members SET last_assigned_at = ?1 WHERE agent_id = ?2", params![now, worker.agent_id])?;
     let job = job_json(conn, req_id)?.expect("just inserted");

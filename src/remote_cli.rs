@@ -201,3 +201,53 @@ fn stamp(secs: i64) -> String {
         .map(|d| d.format("%Y-%m-%d %H:%MZ").to_string())
         .unwrap_or_default()
 }
+
+/// `claudebase auth …` — sent to the daemon in use, applied on its machine.
+pub async fn auth(sub: crate::cli::AuthSubcommand) -> Result<String> {
+    use crate::cli::AuthSubcommand;
+    let endpoint = Endpoint::resolve()?;
+    let (tool, args) = match sub {
+        AuthSubcommand::SetupToken(a) => {
+            let token = match a.token.as_deref() {
+                Some(t) if t != "-" => t.to_owned(),
+                _ => {
+                    eprintln!("paste the token from `claude setup-token`, then Enter:");
+                    let mut s = String::new();
+                    std::io::stdin().read_line(&mut s).context("read stdin")?;
+                    s
+                }
+            };
+            ("auth_set_token", serde_json::json!({ "token": token.trim() }))
+        }
+        AuthSubcommand::Status => ("auth_status", serde_json::json!({})),
+        AuthSubcommand::ClearToken => ("auth_clear_token", serde_json::json!({})),
+    };
+    let mut client = crate::daemon::client::DaemonClient::connect_to(&endpoint).await?;
+    let v = client.call_tool(tool, args).await?;
+    let host = v["host"].as_str().unwrap_or("?");
+    let list = |key: &str| -> String {
+        v[key].as_array().into_iter().flatten().filter_map(|x| x.as_str()).map(|x| format!("\n  {x}")).collect()
+    };
+    Ok(match tool {
+        "auth_set_token" => format!(
+            "Claude token {} set on {host} (daemon {}). Applied to:{}\n\
+             New `claudebase run` sessions there are signed in now; a bare `claude` after the next login.",
+            v["tail"].as_str().unwrap_or("?"),
+            endpoint.describe(),
+            list("applied")
+        ),
+        "auth_status" if v["set"].as_bool() == Some(true) => format!(
+            "{host}: Claude token {} set {} by {}. Applied to:{}",
+            v["tail"].as_str().unwrap_or("?"),
+            v["set_at"].as_i64().map(stamp).unwrap_or_default(),
+            v["set_by"].as_str().unwrap_or("?"),
+            list("applied")
+        ),
+        "auth_status" => format!("{host}: no Claude token set (claudebase auth setup-token)"),
+        _ => format!(
+            "{host}: Claude token {}. Removed:{}\nSessions already running keep theirs until they end.",
+            if v["cleared"].as_bool() == Some(true) { "removed" } else { "was not set" },
+            list("removed")
+        ),
+    })
+}

@@ -46,7 +46,7 @@ pub type BoxWrite = Box<dyn AsyncWrite + Send + Unpin>;
 // Files
 // ---------------------------------------------------------------------------
 
-fn claudebase_dir() -> PathBuf {
+pub(crate) fn claudebase_dir() -> PathBuf {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .unwrap_or_else(|| std::ffi::OsString::from("."));
@@ -63,7 +63,7 @@ pub fn profiles_path() -> PathBuf {
     claudebase_dir().join("remotes.toml")
 }
 
-fn write_private(path: &Path, body: &[u8]) -> Result<()> {
+pub(crate) fn write_private(path: &Path, body: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         #[cfg(unix)]
@@ -282,6 +282,9 @@ pub fn remote_may_call(tool: &str) -> bool {
             | "agent_list_alive"
     ) || tool.starts_with("journal_")
         || tool.starts_with("session_")
+        // Setting this machine's Claude token from the operator's own machine is
+        // the point of `auth setup-token`; a remote token is already full trust.
+        || matches!(tool, "auth_set_token" | "auth_status" | "auth_clear_token")
 }
 
 // ---------------------------------------------------------------------------

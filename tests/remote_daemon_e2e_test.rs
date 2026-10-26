@@ -202,6 +202,38 @@ async fn a_laptop_session_joins_the_prod_daemon_and_talks_to_its_agents() {
     let got = laptop_session.next_notification(Duration::from_secs(5)).await;
     assert!(got.to_string().contains("hello from prod"), "{got}");
 
+    // The laptop hands prod a Claude token; prod applies it, never gives it back.
+    let (l, p) = (laptop.clone(), prod.clone());
+    tokio::task::spawn_blocking(move || {
+        let token = "sk-ant-oat01-TESTTOKENabcdefghijklmnopqrstuvwxyz0123456789";
+        let mut set = cli(&l, Some("prod"), None, &["auth", "setuptoken"]);
+        set.write_stdin(format!("{token}\n"));
+        let out = stdout(set);
+        assert!(out.contains("…6789") && !out.contains(token), "{out}");
+        let stored = std::fs::read_to_string(p.join(".claude/claudebase/auth.toml")).unwrap();
+        assert!(stored.contains(token), "stored on prod");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(p.join(".claude/claudebase/auth.toml")).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+            let profile = std::fs::read_to_string(p.join(".profile")).unwrap();
+            assert!(profile.contains("claudebase auth") && !profile.contains(token), "{profile}");
+            let env = std::fs::read_to_string(p.join(".claude/claudebase/auth.env")).unwrap();
+            assert!(env.contains("CLAUDE_CODE_OAUTH_TOKEN='sk-ant-oat01-TESTTOKEN"), "{env}");
+        }
+        assert!(!l.join(".claude/claudebase/auth.toml").exists(), "nothing stored on the laptop");
+        let st = stdout(cli(&l, Some("prod"), None, &["auth", "status"]));
+        assert!(st.contains("…6789") && st.contains("remote client `laptop`") && !st.contains(token), "{st}");
+        let cleared = stdout(cli(&l, Some("prod"), None, &["auth", "clear-token"]));
+        assert!(cleared.contains("removed"), "{cleared}");
+        assert!(!p.join(".claude/claudebase/auth.toml").exists());
+        #[cfg(unix)]
+        assert!(!std::fs::read_to_string(p.join(".profile")).unwrap().contains("claudebase auth"));
+    })
+    .await
+    .unwrap();
+
     // Revoking the laptop: a new connection is refused.
     let (l, p) = (laptop.clone(), prod.clone());
     tokio::task::spawn_blocking(move || {

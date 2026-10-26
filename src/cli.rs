@@ -340,6 +340,9 @@ pub enum Command {
     /// recorded by agents and searched by tag and category. Held by the
     /// daemon, one per project.
     Journal(JournalArgs),
+    /// The Claude subscription token of the machine whose daemon is in use:
+    /// hand it over once, and every Claude started there is signed in.
+    Auth(AuthArgs),
     /// Run as a persistent daemon — owns the local IPC surface (UDS on
     /// Unix, named pipe on Windows) for MCP plugin bridges and
     /// agent-chat. Slice 1a wires the accept loop + echo; richer
@@ -929,6 +932,36 @@ pub struct DaemonConfigShowArgs {
 pub struct JournalArgs {
     #[command(subcommand)]
     pub sub: JournalSubcommand,
+}
+
+#[derive(Args, Debug)]
+pub struct AuthArgs {
+    #[command(subcommand)]
+    pub sub: AuthSubcommand,
+}
+
+/// Goes to the daemon in use — this machine's, or the one `--daemon` /
+/// `CLAUDEBASE_DAEMON` names — and is applied on THAT machine.
+#[derive(Subcommand, Debug)]
+pub enum AuthSubcommand {
+    /// Give that machine a token from `claude setup-token`. Read from stdin
+    /// when omitted or `-`, so it stays out of the shell history. Stored with
+    /// the daemon's secrets, passed to every `claudebase run` there, and set in
+    /// the user's environment (Windows: HKCU\Environment; Linux/macOS: login
+    /// shells and systemd user sessions) for a bare `claude`.
+    #[command(name = "setup-token", alias = "setuptoken")]
+    SetupToken(AuthSetupTokenArgs),
+    /// Whether that machine has a token: its last four characters, when and by
+    /// whom it was set, where it was applied. Never the token itself.
+    Status,
+    /// Remove the token from that machine: secrets, environment, profiles.
+    #[command(name = "clear-token")]
+    ClearToken,
+}
+
+#[derive(Args, Debug)]
+pub struct AuthSetupTokenArgs {
+    pub token: Option<String>,
 }
 
 /// The project journal. Every subcommand goes through the daemon, which owns

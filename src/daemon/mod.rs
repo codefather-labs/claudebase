@@ -18,6 +18,7 @@
 
 pub mod agent_registry;
 pub mod asr;
+pub mod auth;
 pub mod channel_state;
 pub mod bots;
 pub mod agent_socket;

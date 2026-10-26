@@ -212,6 +212,14 @@ pub fn run(args: &RunArgs) -> Result<std::process::ExitCode> {
     cmd.env(ENV_AGENT_ID, &identity.agent_id);
     cmd.env(ENV_SESSION, &identity.name);
     cmd.env(ENV_SESSION_TOKEN, &identity.session_token);
+    // The Claude token handed to this machine with `claudebase auth setup-token`
+    // (docs/design/auth-token.md) — unless the operator's environment already
+    // carries one, which wins.
+    if std::env::var_os(crate::daemon::auth::TOKEN_ENV).is_none() {
+        if let Some(token) = crate::daemon::auth::stored_token() {
+            cmd.env(crate::daemon::auth::TOKEN_ENV, token);
+        }
+    }
 
     let mut child = pair
         .slave

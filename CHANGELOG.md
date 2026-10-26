@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **`claudebase auth setup-token`: one Claude token signs in every Claude on a machine.** The token
+  from `claude setup-token` goes to the daemon in use — this machine's or a remote one, over TLS — and
+  that daemon stores it with its secrets (0600), passes it as `CLAUDE_CODE_OAUTH_TOKEN` to every
+  `claudebase run` there, and sets it in the user's environment for a bare `claude` (Windows
+  `HKCU\Environment`; Linux/macOS login shells via a sourced 0600 file, and systemd user sessions).
+  Never readable back: `auth status` shows the last four characters. `auth clear-token` removes it
+  everywhere. `setuptoken` is accepted as a spelling.
+- **Skills `/claudebase-setup-remote-daemon` and `/claudebase-setup-claude-token`** walk the operator
+  through joining another machine's daemon and signing its Claude instances in; the agent never
+  handles a token or connection string itself.
+
+### Fixed
+
+- **`install.ps1` no longer closes every open session on upgrade.** It stopped all `claudebase.exe`
+  processes, `claudebase run` supervisors included; it now stops only `daemon serve`.
+
 ## [0.16.0] - 2026-10-26
 
 ### Added

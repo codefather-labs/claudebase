@@ -839,6 +839,13 @@ where
                     let resp = handle_chat_list_pending_asks(echo_id, &args).await;
                     let _ = outbound_tx.send(resp);
                 }
+                name if name.starts_with("auth_") => {
+                    let resp = match crate::daemon::auth::handle(name, args, &peer).await {
+                        Ok(payload) => tool_text_response(echo_id, &payload),
+                        Err(e) => tool_error_response(echo_id, -32602, &format!("{e:#}")),
+                    };
+                    let _ = outbound_tx.send(resp);
+                }
                 name if name.starts_with("session_") => {
                     let resp = match crate::daemon::session_tools::handle(name, args).await {
                         Ok(payload) => tool_text_response(echo_id, &payload),

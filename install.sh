@@ -29,7 +29,7 @@ set -u
 # this constant sat at 0.9.2 through four releases because nothing checked it,
 # and every fresh install in that window silently got a binary two minor
 # versions old.
-CLAUDEBASE_VERSION_FALLBACK="0.18.5"
+CLAUDEBASE_VERSION_FALLBACK="0.18.6"
 CLAUDEBASE_PDFIUM_VERSION="chromium/7802"
 REPO_URL="https://github.com/codefather-labs/claudebase.git"
 RELEASE_BASE="https://github.com/codefather-labs/claudebase/releases/download"
@@ -179,6 +179,18 @@ get_source_dir() {
 # ============================================================================
 install_prompts() {
   mkdir -p "$CLAUDE_DIR/rules" "$CLAUDE_DIR/commands" "$CLAUDE_DIR/agents"
+
+  # Retire rules claudebase stopped shipping in v0.8 (70e06f9): they document
+  # the long-gone `claudebase insight` tool, and Claude Code loads every file in
+  # rules/ into each session, counting against its 120k-char instruction limit.
+  # Moved aside, not deleted, in case the operator had edited one.
+  local retired_dir="$CLAUDE_DIR/claudebase/retired-rules"
+  for name in knowledge-base.md knowledge-base-tool.md tool-limitations.md; do
+    [ -f "$CLAUDE_DIR/rules/$name" ] || continue
+    mkdir -p "$retired_dir"
+    mv -f "$CLAUDE_DIR/rules/$name" "$retired_dir/$name"
+    log_ok "rules/$name retired (moved to $retired_dir)"
+  done
 
   for f in "$SCRIPT_DIR"/prompts/rules/*.md; do
     [ -f "$f" ] || continue

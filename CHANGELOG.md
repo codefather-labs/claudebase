@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.18.6] - 2026-10-27
+
+### Fixed
+
+- **Claude Code warned "All instruction files add up to … over the 120.0k-char total limit".** Two
+  causes on the claudebase side. `cognitive-self-check.md` is compacted from 36.5k to 9k characters,
+  with the same three protocols, block headings, salience and scope. The installers also retire
+  `knowledge-base.md`, `knowledge-base-tool.md` and `tool-limitations.md`, rules that claudebase
+  stopped shipping in 0.8 but never removed from `~/.claude/rules/`. They documented the long-gone
+  `claudebase insight` tool and added 61k characters to every session. They are moved to
+  `~/.claude/claudebase/retired-rules/`, not deleted.
+
 ## [0.18.5] - 2026-10-26
 
 ### Fixed

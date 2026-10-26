@@ -36,7 +36,7 @@ $ErrorActionPreference = 'Stop'
 # this constant sat at 0.9.2 through four releases because nothing checked it,
 # and every fresh install in that window silently got a binary two minor
 # versions old.
-$Script:ClaudebaseVersionFallback = '0.18.5'
+$Script:ClaudebaseVersionFallback = '0.18.6'
 $Script:ClaudebasePdfiumVersion = 'chromium/7802'
 
 # Which version to install: an explicit request, else the newest published tag,
@@ -169,6 +169,18 @@ function Get-SourceDir {
 # Copy prompts (rules + commands + agents) into ~/.claude/
 # ============================================================================
 function Install-Prompts {
+    # Retire rules claudebase stopped shipping in v0.8: they document the
+    # long-gone `claudebase insight` tool and count against Claude Code's
+    # 120k-char instruction limit. Moved aside, not deleted. See the sh twin.
+    $retiredDir = Join-Path $Script:ClaudeDir 'claudebase\retired-rules'
+    foreach ($name in 'knowledge-base.md', 'knowledge-base-tool.md', 'tool-limitations.md') {
+        $old = Join-Path $Script:ClaudeDir "rules\$name"
+        if (-not (Test-Path $old)) { continue }
+        New-Item -ItemType Directory -Force -Path $retiredDir | Out-Null
+        Move-Item -Force $old (Join-Path $retiredDir $name)
+        Write-Ok "rules\$name retired (moved to $retiredDir)"
+    }
+
     foreach ($sub in 'rules', 'commands', 'agents') {
         $dest = Join-Path $Script:ClaudeDir $sub
         New-Item -ItemType Directory -Force -Path $dest | Out-Null

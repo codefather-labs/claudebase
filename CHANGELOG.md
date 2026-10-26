@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.18.3] - 2026-10-26
+
 ### Changed
 
 - **`pool reply` refuses a `content` that looks like JSON but is not.** Workers answered `{color:red}`;

@@ -29,7 +29,7 @@ set -u
 # this constant sat at 0.9.2 through four releases because nothing checked it,
 # and every fresh install in that window silently got a binary two minor
 # versions old.
-CLAUDEBASE_VERSION_FALLBACK="0.18.1"
+CLAUDEBASE_VERSION_FALLBACK="0.18.2"
 CLAUDEBASE_PDFIUM_VERSION="chromium/7802"
 REPO_URL="https://github.com/codefather-labs/claudebase.git"
 RELEASE_BASE="https://github.com/codefather-labs/claudebase/releases/download"

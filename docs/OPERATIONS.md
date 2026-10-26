@@ -24,6 +24,10 @@ claudebase daemon install|uninstall # the service unit; the installers do this
   again by the first `claudebase run` after a reboot.
 - `uninstall --keep-data` keeps `chat.db`, secrets and config; the installers always
   pass it.
+- Windows over SSH: processes started in an SSH session die with it (OpenSSH for Windows
+  puts the session in a job object), so a daemon started by `install.ps1` or `daemon start`
+  through SSH stops when you disconnect (seen 2026-10-26 on the pool machine). The next
+  `claudebase run` started in a desktop window brings it back; run that first.
 - Upgrading (`install.sh` / `install.ps1`) restarts the daemon. Open `claudebase run`
   sessions re-register by themselves; they need no restart.
 

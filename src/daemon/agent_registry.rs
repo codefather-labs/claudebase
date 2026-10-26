@@ -889,20 +889,24 @@ pub fn startup_nick(conn: &Connection, host: &str, cwd: &str, terminal: &str, ba
             return (nick, true);
         }
     }
+    (unique_nick(conn, host, base), false)
+}
+
+/// `base`, or `base-2`, `base-3`, … — the first one no live session holds.
+pub fn unique_nick(conn: &Connection, host: &str, base: &str) -> String {
     let Ok(online) = list_online(conn, host) else {
-        return (base.to_owned(), false);
+        return base.to_owned();
     };
     let taken: std::collections::HashSet<String> = online.into_iter().map(|a| a.agent_name).collect();
     if !taken.contains(base) {
-        return (base.to_owned(), false);
+        return base.to_owned();
     }
     // `planner-2`, `planner-3`, … — bounded so a pathological registry
     // cannot spin here.
-    let nick = (2..100)
+    (2..100)
         .map(|n| format!("{base}-{n}"))
         .find(|candidate| !taken.contains(candidate))
-        .unwrap_or_else(|| base.to_owned());
-    (nick, false)
+        .unwrap_or_else(|| base.to_owned())
 }
 
 pub fn this_host() -> String {
@@ -1763,6 +1767,20 @@ mod tests {
             params![agent_id, nick, this_host(), pid],
         )
         .expect("seed");
+    }
+
+    /// Pool workers are named after the pool, numbered past live ones, and
+    /// never take a nick remembered for their directory.
+    #[test]
+    fn a_pool_worker_takes_the_pool_name_not_the_remembered_one() {
+        let conn = open_test_conn();
+        remember_nick(&conn, &this_host(), "/home/u", "", "zonekit", 1).expect("remember");
+        assert_eq!(unique_nick(&conn, &this_host(), "funnel"), "funnel");
+        seed_alive(&conn, "w1", "funnel", None);
+        seed_alive(&conn, "w2", "funnel-2", None);
+        assert_eq!(unique_nick(&conn, &this_host(), "funnel"), "funnel-3");
+        // The ordinary startup path still recalls the remembered choice.
+        assert_eq!(startup_nick(&conn, &this_host(), "/home/u", "", "u"), ("zonekit".to_string(), true));
     }
 
     /// A rename must take the operator's conversation with it. Bindings are

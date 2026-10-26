@@ -13,6 +13,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `claudebase pool ready` — under rate limits a whole pool could stop for good. It now returns to
   `free` after a cooldown (8 min; `CLAUDEBASE_POOL_SUSPECT_COOLDOWN_MS` on the daemon); if the limit
   still holds it expires the next job and is suspect again.
+- **Pool workers are named after their pool** (`funnel`, `funnel-2`, …). A worker used to take the
+  nick remembered for its directory, so on the pool machine a worker window came up as `zonekit` — the
+  name of an unrelated conversation — and looked like that conversation had joined the pool.
 
 ## [0.18.1] - 2026-10-26
 

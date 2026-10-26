@@ -28,6 +28,7 @@ fn dispatch(tool: &str, args: &Value) -> Result<Value> {
         }
         "session_chat_bound" => Ok(json!({ "owner": reg::chat_bound_to(&conn, i(args, "chat_id")?, &s(args, "agent_id")?)? })),
         "session_nick_of" => Ok(json!({ "nick": reg::nick_of(&conn, &s(args, "agent_id")?)? })),
+        "session_unique_nick" => Ok(json!({ "nick": reg::unique_nick(&conn, &s(args, "host")?, &s(args, "base")?) })),
         "session_startup_nick" => {
             let (nick, chosen) = reg::startup_nick(
                 &conn,

@@ -188,7 +188,7 @@ mod shutdown {
 
 /// Entry point for `claudebase run`.
 pub fn run(args: &RunArgs) -> Result<std::process::ExitCode> {
-    let identity = identity::derive(args.nick.as_deref());
+    let identity = identity::derive(args.nick.as_deref(), args.pool.as_deref());
     tracing::info!(agent_id = %identity.agent_id, name = %identity.name, "supervisor identity");
 
     let (rows, cols) = term::win_size().unwrap_or((24, 80));
@@ -752,7 +752,30 @@ pub mod identity {
         }
     }
 
-    pub fn derive(explicit: Option<&str>) -> AgentIdentity {
+    /// A pool worker is named after its pool — `funnel`, `funnel-2`, … — and
+    /// never takes the nick remembered for its directory. That memory belongs to
+    /// whatever work was done there before: on the pool machine a worker window
+    /// opened in the home directory came up as `zonekit`, the name of an
+    /// unrelated conversation, and looked like that conversation had joined
+    /// the pool (2026-10-26).
+    fn pool_nick(endpoint: &crate::daemon::remote::Endpoint, pool: &str) -> String {
+        let (host, base) = (crate::daemon::agent_registry::this_host(), nick_from_label(pool));
+        if endpoint.is_local() {
+            return match crate::daemon::chat::open_chat_db_readonly() {
+                Ok(conn) => crate::daemon::agent_registry::unique_nick(&conn, &host, &base),
+                Err(_) => base,
+            };
+        }
+        crate::daemon::run_tokio(async {
+            let mut c = crate::daemon::client::DaemonClient::connect_to(endpoint).await?;
+            c.call_tool("session_unique_nick", serde_json::json!({ "host": host, "base": base })).await
+        })
+        .ok()
+        .and_then(|v| v["nick"].as_str().map(str::to_owned))
+        .unwrap_or(base)
+    }
+
+    pub fn derive(explicit: Option<&str>, pool: Option<&str>) -> AgentIdentity {
         if let Some(nick) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
             return AgentIdentity {
                 agent_id: uuid::Uuid::new_v4().to_string(),
@@ -784,7 +807,10 @@ pub mod identity {
             .unwrap_or_else(|| "claude".to_string());
         // `claudebase run` resolved and exported the daemon before we got here.
         let endpoint = crate::daemon::remote::Endpoint::resolve().unwrap_or(crate::daemon::remote::Endpoint::Local);
-        let (name, chosen) = startup_nick(&endpoint, cwd.as_deref(), &nick_from_label(&derived));
+        let (name, chosen) = match pool.map(str::trim).filter(|p| !p.is_empty()) {
+            Some(p) => (pool_nick(&endpoint, p), false),
+            None => startup_nick(&endpoint, cwd.as_deref(), &nick_from_label(&derived)),
+        };
 
         AgentIdentity {
             agent_id: uuid::Uuid::new_v4().to_string(),

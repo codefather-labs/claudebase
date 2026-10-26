@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-10-26
+
 ### Added
 
 - **Pool dispatch: a gateway routes model calls to a pool of Claude sessions.** `claudebase run --pool

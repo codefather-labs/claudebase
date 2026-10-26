@@ -103,6 +103,10 @@ Notes (from `prod-deploy`, 2026-10-26):
 - `timeout_ms` must not exceed the brain's own budget (`HARNESS_STEP_TIMEOUT_MS`, 8 min,
   `gpt-util.js:237`): a lease that outlives the caller delivers its answer to nobody.
   Max 900000 for other callers.
+- Image order: `images[i]` is delivered as `image-0{i+1}.<ext>` and `pool job` prints them
+  in that order. The gateway moves `data:` images out of `messages` into `images[]` and leaves
+  a marker `[image #N …]` in their place (prod-deploy's bridge); marker N is `image-0N`. The
+  contract hook tells workers to open every image with Read.
 - `meta.callType` (`FORM_FILL`, `BUTTON_FIND`, `CONTENT_AGENT`, …) names the role in the
   `[pool-job:…]` line.
 - `result` is `{content}` or `{content, tool_calls}` / `{tool_calls: [{function: {name,

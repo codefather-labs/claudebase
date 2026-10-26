@@ -138,6 +138,11 @@ $who = $null
 if (Get-Command claudebase -ErrorAction SilentlyContinue) {
     $who = & claudebase agent whoami 2>$null
 }
+# A pool worker's nick is `claudebase run --pool`'s to give and the daemon
+# refuses its rename: leave the nick section out, see the bash counterpart.
+if ($who -and ($who -match '(?m)^origin: pool$')) {
+    $reminder = [regex]::Replace($reminder, '(?s)This session has a NICK.*?(?=Only sessions started)', '')
+}
 if ($who -and ($who -match '(?m)^origin: auto$')) {
     $current = ([regex]::Match($who, '(?m)^nick: (.+)$')).Groups[1].Value
     $reminder = $reminder + @"

@@ -165,6 +165,13 @@ pub fn join(conn: &Connection, agent_id: &str, pool: &str, capacity: i64) -> Res
     Ok(())
 }
 
+/// The pool `agent_id` is a worker of, if any. Read-only safe: a database
+/// that never saw a pool has no table, which is "not a worker".
+pub fn pool_of(conn: &Connection, agent_id: &str) -> Option<String> {
+    conn.query_row("SELECT pool FROM pool_members WHERE agent_id = ?1", [agent_id], |r| r.get(0))
+        .ok()
+}
+
 struct Worker {
     agent_id: String,
     nick: String,

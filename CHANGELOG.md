@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.18.7] - 2026-10-27
+
+### Fixed
+
+- **Pool workers renamed themselves after `/clear`** (`funnel-3` turned into `mira-sdlc`). The
+  SessionStart hook asks a session whose nick is still the default to pick one "before doing
+  anything else", and since 0.18.5 that hook also runs on `/clear`. A worker cleared between jobs
+  therefore renamed itself instead of taking the job, choosing a name from whatever persona its
+  instructions carried. Now `agent whoami` reports `origin: pool` for a worker, and the
+  channel-contract hook leaves out every nick instruction for it, on startup and on `/clear` alike.
+  The daemon also refuses `agent rename` from a pool member. To give a worker a name of your
+  choosing, start it with `--nick`.
+
 ## [0.18.6] - 2026-10-27
 
 ### Fixed

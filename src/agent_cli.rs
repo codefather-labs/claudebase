@@ -418,6 +418,18 @@ mod tests {
     }
 
     #[test]
+    fn a_pool_worker_is_never_asked_to_choose_a_nick() {
+        let c = fixture();
+        add_agent(&c, "id-1", "funnel-2", 10, "alive");
+        add_agent(&c, "id-2", "notes", 10, "alive");
+        crate::daemon::pool::join(&c, "id-1", "funnel", 1).unwrap();
+        let worker = crate::agent_cli::whoami_with(&c, "id-1", "box", "/w").unwrap();
+        assert!(worker.contains("\norigin: pool\n"), "{worker}");
+        let other = crate::agent_cli::whoami_with(&c, "id-2", "box", "/w").unwrap();
+        assert!(other.contains("\norigin: auto\n"), "{other}");
+    }
+
+    #[test]
     fn resolves_exact_id() {
         let c = fixture();
         add_agent(&c, "id-1", "alpha", 10, "alive");
@@ -536,8 +548,12 @@ pub fn whoami_with(conn: &rusqlite::Connection, id: &str, host: &str, cwd: &str)
         crate::daemon::agent_registry::recall_nick(conn, host, cwd, "").unwrap_or(None);
 
     // Chosen only if the memory names THIS nick: a stale memory pointing at a
-    // name the session no longer carries must not silence the hook.
+    // name the session no longer carries must not silence the hook. A pool
+    // worker's nick is `run --pool`'s to give: the SessionStart hook asks
+    // `auto` sessions to rename themselves, and a worker doing that after every
+    // `/clear` drifted away from its pool name.
     let origin = match remembered.as_deref() {
+        _ if crate::daemon::pool::pool_of(conn, id).is_some() => "pool",
         Some(r) if r == nick => "chosen",
         _ => "auto",
     };

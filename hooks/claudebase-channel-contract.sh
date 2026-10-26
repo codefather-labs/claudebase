@@ -155,15 +155,26 @@ Delivery you can rely on: messages arriving while you generate are queued, not
 dropped; messages arriving while the operator is mid-keystroke wait until their
 input line is clear; your own outbound messages are never echoed back to you.'
 
+who=""
+command -v claudebase >/dev/null 2>&1 && who=$(claudebase agent whoami 2>/dev/null)
+
+# A pool worker's nick is `claudebase run --pool`'s to give (`origin: pool`)
+# and the daemon refuses its `agent rename`. Leave the nick section out
+# entirely: a worker cleared between jobs that read it renamed itself after
+# whatever its instructions suggested (`mira`).
+if printf '%s\n' "$who" | grep -q '^origin: pool$'; then
+    reminder="${reminder%%This session has a NICK*}Only sessions${reminder#*
+Only sessions}"
+fi
+
 # Ask for a name ONCE. `origin: auto` means the nick merely fell out of the
 # directory name, so every window opened in this repository answers to it and
 # the operator cannot tell them apart in the Telegram /switch menu. Once a name
 # is chosen it is remembered for this directory, `origin` reads `chosen`, and
 # this paragraph disappears -- renaming on every start would break the
 # `/switch` binding, which is keyed by nick.
-if command -v claudebase >/dev/null 2>&1 \
-   && claudebase agent whoami 2>/dev/null | grep -q '^origin: auto$'; then
-    current=$(claudebase agent whoami 2>/dev/null | sed -n 's/^nick: //p')
+if printf '%s\n' "$who" | grep -q '^origin: auto$'; then
+    current=$(printf '%s\n' "$who" | sed -n 's/^nick: //p')
     reminder="$reminder
 
 YOUR NICK IS STILL THE DIRECTORY DEFAULT (\`${current}\`). Give yourself a

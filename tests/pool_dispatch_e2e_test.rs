@@ -416,3 +416,30 @@ async fn a_gateway_dispatches_to_free_workers_and_gets_their_answers() {
     assert_ne!(re7["worker"].as_str(), Some(w7.as_str()));
     let _ = w6;
 }
+
+/// A worker keeps the nick `run --pool` gave it; any other session still
+/// renames itself as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_a_pool_worker_is_refused_a_rename() {
+    let mut s = setup(&[("w-a-id", "w-a")]).await;
+    let mut other = common::Client::connect(&common::socket_under(&s.home)).await.unwrap();
+    let r = other
+        .call("agent_register", json!({"agent_id": "notes-id", "name": "notes", "session_token": "tok-notes"}), 1)
+        .await
+        .unwrap();
+    assert!(common::payload(&r).is_some(), "{r}");
+
+    let worker = s.clients.get_mut("w-a").unwrap();
+    let r = worker
+        .call("agent_rename", json!({"name": "mira", "from_agent_id": "w-a-id", "session_token": "tok-w-a"}), 50)
+        .await
+        .unwrap();
+    let refusal = r["error"]["message"].as_str().unwrap_or_default();
+    assert!(refusal.contains("pool `funnel`"), "{r}");
+
+    let r = other
+        .call("agent_rename", json!({"name": "notes-2", "from_agent_id": "notes-id", "session_token": "tok-notes"}), 2)
+        .await
+        .unwrap();
+    assert_eq!(common::payload(&r).unwrap()["name"], "notes-2", "{r}");
+}

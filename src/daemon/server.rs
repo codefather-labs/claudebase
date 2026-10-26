@@ -1717,6 +1717,12 @@ async fn handle_agent_rename(
         if !crate::daemon::agent_registry::resolve_session_token(&conn, &claimed, &token)? {
             anyhow::bail!("session_token does not match an alive agent");
         }
+        if let Some(pool) = crate::daemon::pool::pool_of(&conn, &claimed) {
+            anyhow::bail!(
+                "a worker of pool `{pool}` keeps the nick `claudebase run --pool` gave it; \
+                 to choose one, start the worker with --nick"
+            );
+        }
         rename_in_place(&conn, &claimed, &new_name, wants_new_token)
     })
     .await;

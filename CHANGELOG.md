@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- **A suspect pool worker is trusted again after 8 minutes.** A worker whose job expired (typically
+  the subscription's rate limit) used to stay out of the pool until it answered late or someone ran
+  `claudebase pool ready` — under rate limits a whole pool could stop for good. It now returns to
+  `free` after a cooldown (8 min; `CLAUDEBASE_POOL_SUSPECT_COOLDOWN_MS` on the daemon); if the limit
+  still holds it expires the next job and is suspect again.
+
 ## [0.18.1] - 2026-10-26
 
 ### Fixed

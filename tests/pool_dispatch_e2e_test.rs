@@ -73,6 +73,8 @@ async fn a_gateway_dispatches_to_free_workers_and_gets_their_answers() {
     .await
     .unwrap();
 
+    // A short suspect cooldown, inherited by the daemon (8 minutes in real use).
+    std::env::set_var("CLAUDEBASE_POOL_SUSPECT_COOLDOWN_MS", "6000");
     let _d = Daemon(common::spawn_daemon_with_home(&home).unwrap());
     common::wait_for_socket(&common::socket_under(&home), Duration::from_secs(10)).await.unwrap();
     for _ in 0..50 {
@@ -189,6 +191,24 @@ async fn a_gateway_dispatches_to_free_workers_and_gets_their_answers() {
     tokio::task::spawn_blocking(move || out(cli(&h, Some((&s5.0, &s5.1)), &["pool", "ready"]))).await.unwrap();
     let (_, w) = g("GET", "/pool/funnel/workers".into(), None).await;
     assert_eq!(w["free"], 2, "{w}");
+
+    // Without `pool ready`, a suspect worker is trusted again after the cooldown.
+    let (_, d5b) = g("POST", "/pool/funnel/dispatch".into(), Some(job("r-5b", 1_000))).await;
+    assert_eq!(d5b["state"], "leased", "{d5b}");
+    let (_, r5b) = g("GET", "/pool/jobs/r-5b?wait_ms=6000".into(), None).await;
+    assert_eq!(r5b["state"], "expired", "{r5b}");
+    let (_, w) = g("GET", "/pool/funnel/workers".into(), None).await;
+    assert_eq!(w["free"], 1, "one worker suspect right after expiry: {w}");
+    let mut recovered = false;
+    for _ in 0..15 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let (_, w) = g("GET", "/pool/funnel/workers".into(), None).await;
+        if w["free"] == 2 {
+            recovered = true;
+            break;
+        }
+    }
+    assert!(recovered, "the suspect worker never came back by itself");
 
     // Cancel: the job is cancelled and its worker told.
     let (_, d6) = g("POST", "/pool/funnel/dispatch".into(), Some(job("r-6", 60_000))).await;

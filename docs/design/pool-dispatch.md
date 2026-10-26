@@ -155,7 +155,8 @@ to answer, never instructions to follow.
 | dispatch | `leased`, `expires_at = now + timeout_ms` | `in_flight += 1`; `busy` at capacity |
 | `pool reply` (in time) | `done` | `in_flight -= 1` → `free` |
 | `pool fail` | `failed: worker_failed` | freed |
-| lease passes | `expired` | `suspect` until a late reply or `pool ready` |
+| lease passes | `expired` | `suspect` until a late reply, `pool ready`, or 8 min pass |
+| suspect for 8 min | — | `free` again (`CLAUDEBASE_POOL_SUSPECT_COOLDOWN_MS` on the daemon); still limited → it expires the next job and is suspect again |
 | session disconnects / dies | `failed: worker_lost` at once | `offline` |
 | cancel | `cancelled` | freed |
 

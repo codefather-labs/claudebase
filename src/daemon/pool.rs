@@ -37,6 +37,20 @@ const KEEP_UNREAD_MS: i64 = 86_400_000;
 const LOST_GRACE_MS: i64 = 15_000;
 /// Offline workers drop out of `/workers` after this long.
 const OFFLINE_SHOWN_MS: i64 = 3_600_000;
+/// A suspect worker (a job expired on it) is trusted again after this long,
+/// so a pool that hit the subscription's rate limit recovers by itself: if the
+/// limit still holds, the next job expires too and the worker is suspect again
+/// — backpressure, not a loop. Operator decision 2026-10-26: 8 minutes.
+/// `CLAUDEBASE_POOL_SUSPECT_COOLDOWN_MS` overrides it on the daemon.
+const SUSPECT_COOLDOWN_MS: i64 = 480_000;
+
+fn suspect_cooldown_ms() -> i64 {
+    std::env::var("CLAUDEBASE_POOL_SUSPECT_COOLDOWN_MS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v >= 0)
+        .unwrap_or(SUSPECT_COOLDOWN_MS)
+}
 
 /// Wakes long-polls when any job changes. Waiters re-check their own job.
 static CHANGED: LazyLock<tokio::sync::Notify> = LazyLock::new(tokio::sync::Notify::new);
@@ -79,6 +93,15 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS pool_jobs_worker ON pool_jobs(worker, state);",
     )
     .context("pool: ensure schema")?;
+    // Added with the suspect cooldown; databases from 0.18 lack it.
+    let has: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('pool_members') WHERE name = 'suspect_since')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has {
+        conn.execute_batch("ALTER TABLE pool_members ADD COLUMN suspect_since INTEGER")?;
+    }
     Ok(())
 }
 
@@ -459,7 +482,7 @@ pub fn worker_job(conn: &Connection, agent_id: &str, req_id: &str) -> Result<Val
 pub fn worker_reply(conn: &Connection, agent_id: &str, req_id: &str, result: &Value) -> Result<Value> {
     ensure_schema(conn)?;
     let (state, _) = owned_job(conn, agent_id, req_id)?;
-    conn.execute("UPDATE pool_members SET suspect = 0 WHERE agent_id = ?1", [agent_id])?;
+    conn.execute("UPDATE pool_members SET suspect = 0, suspect_since = NULL WHERE agent_id = ?1", [agent_id])?;
     let out = match state.as_str() {
         "leased" => {
             conn.execute(
@@ -478,7 +501,7 @@ pub fn worker_reply(conn: &Connection, agent_id: &str, req_id: &str, result: &Va
 pub fn worker_fail(conn: &Connection, agent_id: &str, req_id: &str, reason: &str) -> Result<Value> {
     ensure_schema(conn)?;
     let (state, _) = owned_job(conn, agent_id, req_id)?;
-    conn.execute("UPDATE pool_members SET suspect = 0 WHERE agent_id = ?1", [agent_id])?;
+    conn.execute("UPDATE pool_members SET suspect = 0, suspect_since = NULL WHERE agent_id = ?1", [agent_id])?;
     if state == "leased" {
         conn.execute(
             "UPDATE pool_jobs SET state = 'failed', error = 'worker_failed', message = ?1, finished_at = ?2 \
@@ -492,7 +515,7 @@ pub fn worker_fail(conn: &Connection, agent_id: &str, req_id: &str, reason: &str
 
 pub fn worker_ready(conn: &Connection, agent_id: &str) -> Result<Value> {
     ensure_schema(conn)?;
-    let n = conn.execute("UPDATE pool_members SET suspect = 0 WHERE agent_id = ?1", [agent_id])?;
+    let n = conn.execute("UPDATE pool_members SET suspect = 0, suspect_since = NULL WHERE agent_id = ?1", [agent_id])?;
     if n == 0 {
         bail!("this session is not a pool worker (start it with claudebase run --pool <name>)");
     }
@@ -517,7 +540,20 @@ pub fn sweep(conn: &Connection, now: i64) -> Result<bool> {
     };
     for (req_id, worker) in &expired {
         conn.execute("UPDATE pool_jobs SET state = 'expired', finished_at = ?1 WHERE req_id = ?2", params![now, req_id])?;
-        conn.execute("UPDATE pool_members SET suspect = 1 WHERE agent_id = ?1", [worker])?;
+        conn.execute(
+            "UPDATE pool_members SET suspect = 1, suspect_since = ?1 WHERE agent_id = ?2",
+            params![now, worker],
+        )?;
+        changed_any = true;
+    }
+    // Suspects whose cooldown has passed get the next job again.
+    let cleared = conn.execute(
+        "UPDATE pool_members SET suspect = 0, suspect_since = NULL \
+         WHERE suspect = 1 AND COALESCE(suspect_since, 0) <= ?1",
+        params![now - suspect_cooldown_ms()],
+    )?;
+    if cleared > 0 {
+        tracing::info!(cleared, "pool: suspect workers trusted again after the cooldown");
         changed_any = true;
     }
     // Workers that vanished: a grace period first, for a reconnect.

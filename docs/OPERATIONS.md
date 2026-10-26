@@ -74,7 +74,7 @@ Workers run like every `claudebase run` session (permissions skipped).
 |---|---|---|
 | `free` | takes the next job | — |
 | `busy` | holds jobs up to its capacity | — |
-| `suspect` | a job expired on it | the worker answers late or runs `claudebase pool ready`; restart the session if it hangs |
+| `suspect` | a job expired on it (usually the subscription's rate limit) | back to `free` by itself after 8 min (`CLAUDEBASE_POOL_SUSPECT_COOLDOWN_MS` in the daemon's environment), or sooner on a late answer / `claudebase pool ready`. A worker that keeps cycling `busy` → `suspect` is hung: restart its session |
 | `offline` | session gone | its jobs fail as `worker_lost` after 15 s; start a new `claudebase run --pool funnel` |
 
 ## 4. Remote daemon (a session here, its daemon elsewhere)

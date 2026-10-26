@@ -492,6 +492,12 @@ pub struct RunArgs {
     #[arg(long)]
     pub nick: Option<String>,
 
+    /// Join the daemon of another machine instead of this one's: a profile
+    /// from `claudebase daemon remote add`, or `local`. Default: the default
+    /// profile, else local. Every claudebase command the session runs follows.
+    #[arg(long)]
+    pub daemon: Option<String>,
+
     /// Extra thread to subscribe to for this session, repeatable
     /// (`--subscribe telegram:123 --subscribe agent:foo`). Paired Telegram
     /// chats and known telegram threads are subscribed automatically; this is
@@ -780,6 +786,9 @@ pub enum DaemonSubcommand {
     /// `daemon callback …` — the HTTP endpoint external systems use to write
     /// into a session's terminal input.
     Callback(DaemonCallbackArgs),
+    /// `daemon remote …` — sessions on other machines joining this daemon,
+    /// and this machine's sessions joining another's (named profiles).
+    Remote(DaemonRemoteArgs),
     /// `daemon doctor [--asr]` — health-check runtime backends without
     /// performing actual work. Exit 0 = healthy, 1 = unhealthy. The
     /// `--asr` flag scopes to the ASR backend (the only doctor target
@@ -1195,6 +1204,83 @@ pub enum DaemonCallbackSubcommand {
     Token(CallbackTokenArgs),
     /// Issue a new token for a nick; the previous one stops working at once.
     Rotate(CallbackTokenArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct DaemonRemoteArgs {
+    #[command(subcommand)]
+    pub sub: DaemonRemoteSubcommand,
+}
+
+/// Two sides. On the machine whose daemon is shared: `enable`, `issue`,
+/// `revoke`, `tokens`. On a machine joining it: `add`, `list`, `remove`,
+/// `default`, `test`, then `claudebase run --daemon <name>`.
+#[derive(Subcommand, Debug)]
+pub enum DaemonRemoteSubcommand {
+    /// Listen for other machines (TLS; a self-signed certificate is generated,
+    /// clients pin it). Takes effect on the daemon's next start.
+    Enable(RemoteEnableArgs),
+    /// Stop listening (tokens are kept). Takes effect on the daemon's next start.
+    Disable,
+    /// Whether this daemon listens, its certificate pin, and its client tokens.
+    Status,
+    /// Issue a token for a client machine and print the connection string to
+    /// give it. Re-issuing for the same name retires the old token.
+    Issue(RemoteIssueArgs),
+    /// Revoke a client's token; its connections are refused from then on.
+    Revoke(RemoteClientArgs),
+    /// Add a daemon of another machine under a name, from the connection
+    /// string `issue` printed there. Reads it from stdin when omitted or `-`,
+    /// so the token stays out of the shell history.
+    Add(RemoteAddArgs),
+    /// The daemons this machine can join, and the default.
+    List,
+    /// Forget a daemon profile.
+    Remove(RemoteNameArgs),
+    /// The daemon `claudebase run` and every claudebase command use when none
+    /// is named: a profile, or `local` for this machine's own.
+    Default(RemoteNameArgs),
+    /// Connect to a daemon profile (default: the default one) and report.
+    Test(RemoteTestArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct RemoteEnableArgs {
+    /// `host:port` to listen on.
+    #[arg(long, default_value = "0.0.0.0:8586")]
+    pub bind: String,
+}
+
+#[derive(Args, Debug)]
+pub struct RemoteIssueArgs {
+    /// A name for the client machine, e.g. `laptop`.
+    pub client: String,
+    /// The host clients reach this machine by. Default: this machine's name.
+    #[arg(long)]
+    pub host: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct RemoteClientArgs {
+    pub client: String,
+}
+
+#[derive(Args, Debug)]
+pub struct RemoteAddArgs {
+    /// Profile name, e.g. `prod`.
+    pub name: String,
+    /// `claudebase://host:port?pin=sha256:…&token=…`; omitted or `-` reads stdin.
+    pub url: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct RemoteNameArgs {
+    pub name: String,
+}
+
+#[derive(Args, Debug)]
+pub struct RemoteTestArgs {
+    pub name: Option<String>,
 }
 
 #[derive(Args, Debug)]

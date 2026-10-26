@@ -29,14 +29,13 @@
 //! frames), so `call_tool` skips any frame whose `id` does not match the
 //! request instead of assuming strict request/response alternation.
 
-use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 use crate::daemon::ipc::{read_frame, write_frame};
-use crate::daemon::server::socket_path;
+use crate::daemon::remote::{BoxRead, BoxWrite, Endpoint};
 
 /// Connect attempts before giving up. The daemon is a user service that may
 /// be mid-restart when a CLI call lands; three quick tries costs 500 ms in
@@ -51,8 +50,8 @@ const CONNECT_RETRY_DELAY_MS: u64 = 250;
 const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub struct DaemonClient {
-    read: tokio::io::ReadHalf<interprocess::local_socket::tokio::Stream>,
-    write: tokio::io::WriteHalf<interprocess::local_socket::tokio::Stream>,
+    read: BoxRead,
+    write: BoxWrite,
     next_id: u64,
 }
 
@@ -63,21 +62,27 @@ impl DaemonClient {
     /// always means the daemon is not running, and the message says so
     /// instead of leaking a bare ENOENT.
     pub async fn connect() -> Result<Self> {
-        let socket = socket_path().context("compute daemon socket path")?;
+        // The daemon this process belongs to: the one `claudebase run --daemon`
+        // put the session on, else the default profile, else this machine's.
+        let endpoint = Endpoint::resolve()?;
+        Self::connect_to(&endpoint).await
+    }
+
+    pub async fn connect_to(endpoint: &Endpoint) -> Result<Self> {
+        if !endpoint.is_local() {
+            // A remote refusal (bad token, pin mismatch) is not transient;
+            // retrying it only delays the message.
+            let (read, write) = crate::daemon::remote::connect(endpoint).await?;
+            return Ok(Self { read, write, next_id: 1 });
+        }
+        let socket = crate::daemon::server::socket_path().context("compute daemon socket path")?;
         for attempt in 0..CONNECT_RETRIES {
-            match try_connect(&socket).await {
-                Some(stream) => {
-                    let (read, write) = tokio::io::split(stream);
-                    return Ok(Self {
-                        read,
-                        write,
-                        next_id: 1,
-                    });
-                }
-                None if attempt + 1 < CONNECT_RETRIES => {
+            match crate::daemon::remote::connect(endpoint).await {
+                Ok((read, write)) => return Ok(Self { read, write, next_id: 1 }),
+                Err(_) if attempt + 1 < CONNECT_RETRIES => {
                     tokio::time::sleep(Duration::from_millis(CONNECT_RETRY_DELAY_MS)).await;
                 }
-                None => {}
+                Err(_) => {}
             }
         }
         bail!(
@@ -145,11 +150,3 @@ impl DaemonClient {
     }
 }
 
-async fn try_connect(socket: &Path) -> Option<interprocess::local_socket::tokio::Stream> {
-    use interprocess::local_socket::tokio::prelude::*;
-    use interprocess::local_socket::tokio::Stream;
-    use interprocess::local_socket::{GenericFilePath, ToFsName};
-
-    let name = socket.to_path_buf().to_fs_name::<GenericFilePath>().ok()?;
-    Stream::connect(name).await.ok()
-}

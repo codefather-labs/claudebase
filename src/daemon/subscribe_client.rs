@@ -19,7 +19,6 @@ use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 
 use crate::daemon::ipc::{read_frame, write_frame};
-use crate::daemon::server::socket_path;
 use crate::supervisor::{
     inject::{render, Source},
     InboundMessage,
@@ -39,8 +38,8 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const RESCAN_INTERVAL: Duration = Duration::from_secs(15);
 
 pub struct SubscribeClient {
-    read: tokio::io::ReadHalf<interprocess::local_socket::tokio::Stream>,
-    write: tokio::io::WriteHalf<interprocess::local_socket::tokio::Stream>,
+    read: crate::daemon::remote::BoxRead,
+    write: crate::daemon::remote::BoxWrite,
     next_id: u64,
     subscribed: std::collections::HashSet<String>,
     /// Request-id -> thread for subscribes issued by the re-scan, so their
@@ -50,19 +49,8 @@ pub struct SubscribeClient {
 
 impl SubscribeClient {
     pub async fn connect() -> Result<Self> {
-        use interprocess::local_socket::tokio::prelude::*;
-        use interprocess::local_socket::tokio::Stream;
-        use interprocess::local_socket::{GenericFilePath, ToFsName};
-
-        let socket = socket_path().context("compute daemon socket path")?;
-        let name = socket
-            .clone()
-            .to_fs_name::<GenericFilePath>()
-            .context("socket name")?;
-        let stream = Stream::connect(name)
-            .await
-            .with_context(|| format!("connect {}", socket.display()))?;
-        let (read, write) = tokio::io::split(stream);
+        let endpoint = crate::daemon::remote::Endpoint::resolve()?;
+        let (read, write) = crate::daemon::remote::connect(&endpoint).await?;
         Ok(Self {
             read,
             write,

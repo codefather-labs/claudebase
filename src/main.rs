@@ -125,6 +125,37 @@ fn main() -> std::process::ExitCode {
                     std::process::ExitCode::SUCCESS
                 }
             },
+            cli::DaemonSubcommand::Remote(a) => match a.sub {
+                cli::DaemonRemoteSubcommand::Enable(a) => {
+                    simple(claudebase::remote_cli::enable(&a.bind), "daemon remote enable")
+                }
+                cli::DaemonRemoteSubcommand::Disable => {
+                    simple(claudebase::remote_cli::disable(), "daemon remote disable")
+                }
+                cli::DaemonRemoteSubcommand::Status => {
+                    simple(claudebase::remote_cli::status(), "daemon remote status")
+                }
+                cli::DaemonRemoteSubcommand::Issue(a) => simple(
+                    claudebase::remote_cli::issue(&a.client, a.host.as_deref()),
+                    "daemon remote issue",
+                ),
+                cli::DaemonRemoteSubcommand::Revoke(a) => {
+                    simple(claudebase::remote_cli::revoke(&a.client), "daemon remote revoke")
+                }
+                cli::DaemonRemoteSubcommand::Add(a) => {
+                    simple(claudebase::remote_cli::add(&a.name, a.url.as_deref()), "daemon remote add")
+                }
+                cli::DaemonRemoteSubcommand::List => simple(claudebase::remote_cli::list(), "daemon remote list"),
+                cli::DaemonRemoteSubcommand::Remove(a) => {
+                    simple(claudebase::remote_cli::remove(&a.name), "daemon remote remove")
+                }
+                cli::DaemonRemoteSubcommand::Default(a) => {
+                    simple(claudebase::remote_cli::set_default(&a.name), "daemon remote default")
+                }
+                cli::DaemonRemoteSubcommand::Test(a) => {
+                    simple_async(claudebase::remote_cli::test(a.name.as_deref()), "daemon remote test")
+                }
+            },
             cli::DaemonSubcommand::Callback(a) => match a.sub {
                 cli::DaemonCallbackSubcommand::Enable(a) => simple(
                     claudebase::callback_cli::enable(&a.bind, a.allow_remote),
@@ -501,8 +532,33 @@ fn run_claude_with_preset(args: &cli::RunArgs) -> std::process::ExitCode {
     //
     // Pipe-probe (not SCM query) so we are immune to the v0.6 Windows
     // service::status() lying-success bug — see ensure_daemon_running.
+    // Which daemon this session joins. Exported to `claude` so every
+    // claudebase command the session runs — `agent send`, `journal add`,
+    // `telegram send` — reaches the same daemon the session is registered on.
+    let endpoint = match claudebase::daemon::remote::Endpoint::named(args.daemon.as_deref()) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("claudebase run: {e:#}");
+            return std::process::ExitCode::from(2);
+        }
+    };
+    std::env::set_var(claudebase::daemon::remote::DAEMON_ENV, endpoint.env_value());
+    if !endpoint.is_local() {
+        // Never fall back to the local daemon: a session that silently lands
+        // on another daemon would talk to the wrong agents.
+        match claudebase::daemon::run_tokio(claudebase::remote_cli::test(Some(&endpoint.env_value()))) {
+            Ok(report) => eprintln!("claudebase run: {report}"),
+            Err(e) => {
+                eprintln!("claudebase run: cannot join daemon {}: {e:#}", endpoint.describe());
+                return std::process::ExitCode::from(2);
+            }
+        }
+    }
+
     if !args.no_telegram {
-        ensure_daemon_running();
+        if endpoint.is_local() {
+            ensure_daemon_running();
+        }
         // Ensure <cwd>/.claudebase/config.json exists so the plugin
         // bridge (spawned later by CC) finds a stable per-project
         // session_id when it auto-registers. The bridge READS this

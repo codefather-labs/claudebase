@@ -17,6 +17,7 @@ pub mod encoder;
 pub mod ingest;
 pub mod journal;
 pub mod journal_cli;
+pub mod remote_cli;
 pub mod migrations;
 pub mod ocr;
 pub mod output;

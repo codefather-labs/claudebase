@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
-use interprocess::local_socket::tokio::{prelude::*, Stream};
+use interprocess::local_socket::tokio::prelude::*;
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, ToFsName};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
@@ -439,6 +439,29 @@ pub async fn serve(_args: &DaemonServeArgs) -> anyhow::Result<()> {
         Err(e) => tracing::warn!(error = %e, "could not read the callback bind setting"),
     }
 
+    // The remote listener (docs/design/remote-daemon.md), likewise only when
+    // the operator enabled it. Remote connections share the accept limit and
+    // the dispatcher with local ones, marked so the dispatcher can refuse
+    // what is not session surface.
+    match crate::daemon::chat::open_chat_db().and_then(|c| crate::daemon::remote::configured_bind(&c)) {
+        Ok(Some(bind)) => {
+            let (bus_r, sem_r) = (bus.clone(), semaphore.clone());
+            tokio::spawn(crate::daemon::remote::serve(bind, move |read, write, peer| {
+                let (bus, sem) = (bus_r.clone(), sem_r.clone());
+                async move {
+                    let Ok(permit) = sem.acquire_owned().await else { return };
+                    let connection_id = Uuid::new_v4();
+                    tracing::info!(%connection_id, ?peer, "accepted remote connection");
+                    if let Err(e) = handle_connection(read, write, connection_id, permit, bus, peer).await {
+                        tracing::error!(%connection_id, error = %e, "remote connection handler error");
+                    }
+                }
+            }));
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(error = %e, "could not read the remote listener setting"),
+    }
+
     // Slice 4 — spawn the Telegram long-poll task IFF a perm-checked
     // secrets.toml is present. The spawn is fire-and-forget: ASYNC_INVARIANTS
     // Rule 3 wraps the long-poll body so a fatal Telegram error logs
@@ -530,7 +553,9 @@ pub async fn serve(_args: &DaemonServeArgs) -> anyhow::Result<()> {
         tokio::spawn(async move {
             // Rule 3 / Rule 5 from ASYNC_INVARIANTS.md: panic-safe spawned
             // task body — propagate via Result, surface via tracing::error.
-            if let Err(e) = handle_connection(stream, connection_id, permit, bus_clone).await {
+            let (read, write) = tokio::io::split(stream);
+            let peer = crate::daemon::remote::Peer::Local;
+            if let Err(e) = handle_connection(Box::new(read), Box::new(write), connection_id, permit, bus_clone, peer).await {
                 tracing::error!(%connection_id, error = %e, "connection handler error");
             }
         });
@@ -554,14 +579,13 @@ type OutboundRx = mpsc::UnboundedReceiver<serde_json::Value>;
 /// for the entire task lifetime and released on Drop, freeing the slot
 /// for the next accept.
 async fn handle_connection(
-    stream: Stream,
+    mut read_half: crate::daemon::remote::BoxRead,
+    mut write_half: crate::daemon::remote::BoxWrite,
     connection_id: Uuid,
     _permit: OwnedSemaphorePermit,
     bus: SharedBus,
+    peer: crate::daemon::remote::Peer,
 ) -> anyhow::Result<()> {
-    // Split read / write halves so the writer task can run independently.
-    let (mut read_half, mut write_half) = tokio::io::split(stream);
-
     // Outbound mpsc — unbounded because all senders are local processes
     // we own (the read loop + per-thread forwarder tasks). Bounded
     // semantics would risk deadlock if the writer task lags briefly.
@@ -599,7 +623,7 @@ async fn handle_connection(
         }
     });
 
-    let outcome = run_request_loop(&mut read_half, outbound_tx, bus, connection_id).await;
+    let outcome = run_request_loop(&mut read_half, outbound_tx, bus, connection_id, peer).await;
     // Dropping outbound_tx (and every clone held by forwarder tasks
     // is owned by tokio::spawned bodies that wake up on bus closure or
     // EOF; in practice they exit when this function returns) closes the
@@ -616,6 +640,7 @@ async fn run_request_loop<R>(
     outbound_tx: OutboundTx,
     bus: SharedBus,
     connection_id: Uuid,
+    peer: crate::daemon::remote::Peer,
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncReadExt + Unpin,
@@ -708,6 +733,18 @@ where
                 .get("arguments")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
+
+            if let crate::daemon::remote::Peer::Remote { client } = &peer {
+                if !crate::daemon::remote::remote_may_call(&tool_name) {
+                    tracing::warn!(%connection_id, %client, tool = %tool_name, "remote: tool refused");
+                    let _ = outbound_tx.send(tool_error_response(
+                        echo_id,
+                        -32601,
+                        &format!("`{tool_name}` is not available over a remote connection; run it on the daemon's machine"),
+                    ));
+                    continue;
+                }
+            }
 
             match tool_name.as_str() {
                 "claudebase_daemon_status" => {

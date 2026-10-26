@@ -28,6 +28,7 @@ pub mod config;
 pub mod ipc;
 pub mod journal_tools;
 pub mod pending_asks;
+pub mod remote;
 pub mod server;
 pub mod subscribe_client;
 pub mod service;

@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.18.5] - 2026-10-26
+
 ### Fixed
 
 - **A lost or expired pool job could not be retried.** Dispatching the same `req_id` again returned

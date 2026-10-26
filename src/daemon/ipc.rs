@@ -56,9 +56,12 @@ pub async fn write_frame<W: AsyncWriteExt + Unpin>(
             body.len()
         );
     }
-    let len = body.len() as u32;
-    writer.write_all(&len.to_be_bytes()).await?;
-    writer.write_all(body).await?;
+    // One write: over TLS two writes become two records, and a reader that
+    // gives up between them would be left holding half a frame.
+    let mut buf = Vec::with_capacity(4 + body.len());
+    buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    buf.extend_from_slice(body);
+    writer.write_all(&buf).await?;
     writer.flush().await?;
     Ok(())
 }

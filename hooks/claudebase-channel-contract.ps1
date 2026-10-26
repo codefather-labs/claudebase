@@ -45,6 +45,12 @@ Connect, write the message, close -- the close is the end of the message. There
 is no token: the socket sits in your own runtime directory at mode 0600, so
 opening it already requires being that user.
 
+That socket is on the machine the DAEMON runs on. A session started with
+`claudebase run --daemon <name>` belongs to the daemon of another machine (its
+agents, its journal, its Telegram bot) -- `claudebase agent whoami` then shows
+a `daemon:` line -- and is reached there over HTTP, or by the socket on THAT
+machine; there is none here.
+
 To wire something up, or to find out why a callback never arrived, use
 /claudebase-daemon-callback-info; for the HTTP token use
 /claudebase-daemon-setup-auth-token.

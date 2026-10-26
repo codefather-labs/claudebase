@@ -36,13 +36,17 @@ pub async fn send(text: &str, target: &str, target_is_id: bool) -> Result<String
         .ok()
         .filter(|s| !s.is_empty());
 
-    let to_agent_id = {
+    let endpoint = crate::daemon::remote::Endpoint::resolve()?;
+    let to_agent_id = if target_is_id {
+        target.to_string()
+    } else if endpoint.is_local() {
         let conn = chat::open_chat_db().context("open chat.db")?;
-        if target_is_id {
-            target.to_string()
-        } else {
-            agent_registry::resolve_target(&conn, target)?
-        }
+        agent_registry::resolve_target(&conn, target)?
+    } else {
+        // The registry is the remote daemon's: resolve there.
+        let mut c = DaemonClient::connect_to(&endpoint).await?;
+        let v = c.call_tool("session_resolve_agent", json!({ "target": target })).await?;
+        v["agent_id"].as_str().map(str::to_owned).context("daemon resolved no agent_id")?
     };
 
 
@@ -285,7 +289,31 @@ pub struct SessionRow {
 /// list an accurate answer to "who can receive a message right now", which is
 /// the only question it needs to answer.
 pub fn list(include_offline: bool, as_json: bool) -> Result<String> {
+    let endpoint = crate::daemon::remote::Endpoint::resolve()?;
+    if !endpoint.is_local() {
+        return remote_text(&endpoint, "session_list", json!({ "include_offline": include_offline, "json": as_json }));
+    }
     let conn = chat::open_chat_db().context("open chat.db")?;
+    list_with(&conn, include_offline, as_json)
+}
+
+/// Ask a remote daemon for a command's whole answer, computed there by the
+/// same function the local path runs (`daemon::session_tools`).
+pub(crate) fn remote_text(
+    endpoint: &crate::daemon::remote::Endpoint,
+    tool: &str,
+    args: serde_json::Value,
+) -> Result<String> {
+    let v = crate::daemon::run_tokio(async {
+        let mut c = DaemonClient::connect_to(endpoint).await?;
+        c.call_tool(tool, args).await
+    })?;
+    v["text"].as_str().map(str::to_owned).context("daemon answered without text")
+}
+
+/// `agent list` against the registry in `conn` — this machine's, or, when
+/// called by the daemon for a remote session, the daemon's.
+pub fn list_with(conn: &rusqlite::Connection, include_offline: bool, as_json: bool) -> Result<String> {
     let mut stmt = conn
         .prepare(
             "SELECT agent_id, agent_name, state, project_id, branch, working_dir, \
@@ -476,9 +504,24 @@ pub fn whoami() -> Result<String> {
         );
     };
 
+    let cwd = std::env::current_dir()
+        .map(|c| c.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let host = crate::daemon::agent_registry::this_host();
+    let endpoint = crate::daemon::remote::Endpoint::resolve()?;
+    if !endpoint.is_local() {
+        let text = remote_text(&endpoint, "session_whoami", json!({ "agent_id": id, "host": host, "cwd": cwd }))?;
+        return Ok(format!("{text}
+daemon: {}", endpoint.describe()));
+    }
     let conn = crate::daemon::chat::open_chat_db_readonly()
         .context("open chat.db (read-only) for whoami")?;
+    whoami_with(&conn, &id, &host, &cwd)
+}
 
+/// `agent whoami` against the registry in `conn`; `host` and `cwd` are the
+/// session's own, which for a remote session are not the daemon's.
+pub fn whoami_with(conn: &rusqlite::Connection, id: &str, host: &str, cwd: &str) -> Result<String> {
     let nick: Option<String> = conn
         .query_row(
             "SELECT agent_name FROM agent_registry WHERE agent_id = ?1",
@@ -491,12 +534,8 @@ pub fn whoami() -> Result<String> {
         bail!("no registry row for {id} — is the daemon running?");
     };
 
-    let cwd = std::env::current_dir()
-        .map(|c| c.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let host = crate::daemon::agent_registry::this_host();
     let remembered =
-        crate::daemon::agent_registry::recall_nick(&conn, &host, &cwd, "").unwrap_or(None);
+        crate::daemon::agent_registry::recall_nick(conn, host, cwd, "").unwrap_or(None);
 
     // Chosen only if the memory names THIS nick: a stale memory pointing at a
     // name the session no longer carries must not silence the hook.

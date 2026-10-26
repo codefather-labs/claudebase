@@ -122,6 +122,55 @@ pub fn journal_path(dir: &Path, project: &Path) -> PathBuf {
     dir.join(journal_file_name(project))
 }
 
+/// What a project's journal is filed under: its repository, when it has one
+/// (`git:host/owner/repo`, from `project_id::resolve_project_id`), so every
+/// checkout of it — on this machine or a laptop joined to this daemon — shares
+/// one journal; otherwise its directory, as before.
+pub fn project_key(project_id: Option<&str>, path: &Path) -> PathBuf {
+    match project_id {
+        Some(id) if !id.is_empty() && !id.starts_with("local:") => PathBuf::from(format!("git:{id}")),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// A journal kept under the directory `path` before journals were filed by
+/// repository becomes the journal of `key`: same entries, renamed. Nothing
+/// happens when `key` already has a journal, or `path` has none.
+pub fn adopt_path_journal(dir: &Path, key: &Path, path: &Path) -> Result<bool> {
+    if key == path {
+        return Ok(false);
+    }
+    let (from, to) = (journal_path(dir, path), journal_path(dir, key));
+    if to.exists() || !from.exists() {
+        return Ok(false);
+    }
+    {
+        let conn = open_file(&from)?;
+        let recorded: Option<String> = conn
+            .query_row("SELECT value FROM journal_meta WHERE key = 'project_path'", [], |r| r.get(0))
+            .optional()?;
+        if recorded.as_deref() != Some(&*path.to_string_lossy()) {
+            return Ok(false);
+        }
+        // Everything into the main file, so the rename carries it all.
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        conn.execute(
+            "UPDATE journal_meta SET value = ?1 WHERE key = 'project_path'",
+            params![key.to_string_lossy()],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO journal_meta(key, value) VALUES ('adopted_from', ?1)",
+            params![path.to_string_lossy()],
+        )?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    }
+    std::fs::rename(&from, &to).with_context(|| format!("rename {} -> {}", from.display(), to.display()))?;
+    for ext in ["db-wal", "db-shm"] {
+        let _ = std::fs::remove_file(from.with_extension(ext));
+    }
+    Ok(true)
+}
+
 /// Open a project's journal. `create = false` returns `None` when it has never
 /// been written, so a read from an unrelated directory does not leave an empty
 /// file behind.
@@ -997,6 +1046,32 @@ mod tests {
         assert!(errors.is_empty(), "{} errors, e.g. {:?}", errors.len(), errors.first());
         let c = open(&d, Path::new("/w/p"), false).unwrap().unwrap();
         assert_eq!(list(&c, &Filter::default(), 0, 1).unwrap().0, 120);
+    }
+
+    #[test]
+    fn a_repository_journal_adopts_the_directory_journal_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Path::new("/home/me/proj");
+        let key = project_key(Some("github.com/me/proj"), path);
+        assert_eq!(key, PathBuf::from("git:github.com/me/proj"));
+        assert_eq!(project_key(Some("local:abc"), path), path);
+        assert_eq!(project_key(None, path), path);
+
+        let mut c = open(dir.path(), path, true).unwrap().unwrap();
+        add(&mut c, &entry("chose WAL", "decision", &["sqlite"]), 1).unwrap();
+        drop(c);
+        assert!(adopt_path_journal(dir.path(), &key, path).unwrap());
+        assert!(!journal_path(dir.path(), path).exists());
+        let c = open(dir.path(), &key, false).unwrap().expect("adopted");
+        assert_eq!(list(&c, &Filter::default(), 0, 10).unwrap().0, 1);
+        drop(c);
+        // A second checkout of the same repository does not adopt over it.
+        let other = Path::new("/srv/proj");
+        let mut o = open(dir.path(), other, true).unwrap().unwrap();
+        add(&mut o, &entry("prod note", "finding", &["x"]), 2).unwrap();
+        drop(o);
+        assert!(!adopt_path_journal(dir.path(), &key, other).unwrap());
+        assert_eq!(project_key(Some("github.com/me/proj"), other), key, "both checkouts share the key");
     }
 
     #[test]

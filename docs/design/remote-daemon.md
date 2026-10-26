@@ -1,6 +1,6 @@
 # Remote daemon — a session on one machine, its daemon on another
 
-Status: proposed, 2026-10-26.
+Status: implemented, 2026-10-26 (slices 1-6).
 
 ## Goal
 
@@ -103,6 +103,19 @@ refuse `--daemon`.
   the journal of the session's path and records the id in it, so nothing is lost.
 - `chat dump/load` keep working; on a shared project the import is mostly "already
   there".
+
+### Notes from implementation
+
+- Rather than one code path for local and remote, each registry question has ONE query
+  (`agent_registry`) and two ways to reach it: the local supervisor and CLI open `chat.db` as
+  before; a remote session asks the `session_*` tools, which call the same functions. Commands
+  that print a whole answer (`agent list`, `whoami`, `telegram status`) run their `*_with(conn)`
+  body on the daemon and print its text.
+- The supervisor's read loop waited on `read_frame` under a timeout, which drops a partly read
+  frame; harmless locally, a corrupted stream over TCP. Frames are now read by their own task.
+- Inspection commands that read a local `chat.db` (`chat list|threads`, `agent inspect|list-alive`)
+  refuse while a remote daemon is selected rather than show local data under the remote's name.
+- `nick` of a loaded conversation (`chat load`) is recorded only on a local daemon.
 
 ### 5. What does not travel
 

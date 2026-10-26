@@ -158,3 +158,28 @@ fn sha_local_id(cwd: &Path) -> String {
     let hex: String = digest.iter().take(8).map(|b| format!("{:02x}", b)).collect();
     format!("local:{hex}")
 }
+
+/// The checked-out branch: shells out to `git -C <cwd>
+/// rev-parse --abbrev-ref HEAD`. Returns `Some("feat/foo")` on a
+/// branch, `None` if the cwd isn't a git repo OR is at detached HEAD
+/// OR git is missing. Defensive: never panics, never blocks the
+/// caller's task long enough to matter (git config-only operations
+/// complete in <10ms on a local repo).
+pub fn current_branch(cwd: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?;
+    let trimmed = s.trim();
+    if trimmed.is_empty() || trimmed == "HEAD" {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}

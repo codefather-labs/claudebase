@@ -430,8 +430,16 @@ async fn daemon_leg(
         // lose a session to one transient `database is locked` during the
         // daemon's own startup burst, and it then stayed lost for the whole
         // life of the connection, because nothing ever tried again.
+        // Resolved HERE, where the checkout is: a daemon on another machine has
+        // no such directory to run `git` in, and the project id is what lets a
+        // session on a laptop share prod's journal for the same repository.
+        let here = std::env::current_dir().ok();
+        let project_id = here.as_deref().map(crate::project_id::resolve_project_id);
+        let branch = here.as_deref().and_then(crate::project_id::current_branch);
         let register_payload = || {
             json!({
+                "project_id": project_id,
+                "branch": branch,
                 "agent_id": identity.agent_id,
                 "name": identity.name,
                 // `--nick` was never remembered: only a rename wrote the
@@ -524,7 +532,7 @@ pub(crate) fn threads_to_subscribe(identity: &identity::AgentIdentity, extra: &[
     threads.push(format!("agent:{}", identity.agent_id));
 
     if let Ok(conn) = crate::daemon::chat::open_chat_db() {
-        threads.extend(bound_telegram_threads(&conn, &identity.agent_id));
+        threads.extend(crate::daemon::agent_registry::bound_telegram_threads(&conn, &identity.agent_id).unwrap_or_default());
     }
 
     threads.extend(extra.iter().cloned());
@@ -533,24 +541,6 @@ pub(crate) fn threads_to_subscribe(identity: &identity::AgentIdentity, extra: &[
     threads
 }
 
-/// Telegram chats whose routing key points at `agent_id` — i.e. the chats the
-/// operator `/switch`-ed to this session.
-fn bound_telegram_threads(conn: &rusqlite::Connection, agent_id: &str) -> Vec<String> {
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT routing_chat_id FROM agent_registry \
-         WHERE agent_id = ?1 AND routing_chat_id IS NOT NULL",
-    ) else {
-        return Vec::new();
-    };
-    let rows = stmt.query_map([agent_id], |row| row.get::<_, i64>(0));
-    match rows {
-        Ok(rows) => rows
-            .filter_map(|r| r.ok())
-            .map(|chat_id| format!("telegram:{chat_id}"))
-            .collect(),
-        Err(_) => Vec::new(),
-    }
-}
 
 /// Is `thread` still addressed to this session?
 ///
@@ -576,19 +566,7 @@ pub(crate) fn routing_belongs_to(agent_id: &str, chat_id: i64, topic: Option<i64
             return false;
         }
     };
-    use rusqlite::OptionalExtension;
-    let bound: Option<String> = conn
-        .query_row(
-            "SELECT agent_id FROM agent_registry \
-             WHERE routing_chat_id = ?1 \
-               AND COALESCE(routing_thread_id, -1) = COALESCE(?2, -1) \
-               AND state = 'alive' \
-             ORDER BY last_pinged_at DESC LIMIT 1",
-            rusqlite::params![chat_id, topic],
-            |row| row.get(0),
-        )
-        .optional()
-        .unwrap_or(None);
+    let bound = crate::daemon::agent_registry::topic_owner(&conn, chat_id, topic).unwrap_or(None);
     match bound {
         Some(owner) => owner == agent_id,
         // Nobody holds this exact topic. Withhold rather than broadcast: an
@@ -624,22 +602,11 @@ pub(crate) fn thread_belongs_to(agent_id: &str, thread: &str) -> bool {
         }
     };
 
-    use rusqlite::OptionalExtension;
-    let bound: Option<String> = match conn
-        .query_row(
-            // Any topic in this chat counts. The per-MESSAGE check decides
-            // which topic is actually ours; this one only answers "is this
-            // chat any of our business at all", and answering it with a single
-            // chat-wide owner is what discarded a second session's backlog.
-            "SELECT agent_id FROM agent_registry \
-             WHERE routing_chat_id = ?1 AND state = 'alive' \
-               AND agent_id = ?2 \
-             LIMIT 1",
-            rusqlite::params![chat_id, agent_id],
-            |row| row.get(0),
-        )
-        .optional()
-    {
+    // Any topic in this chat counts. The per-MESSAGE check decides which
+    // topic is actually ours; this one only answers "is this chat any of our
+    // business at all", and answering it with a single chat-wide owner is what
+    // discarded a second session's backlog.
+    let bound: Option<String> = match crate::daemon::agent_registry::chat_bound_to(&conn, chat_id, agent_id) {
         Ok(v) => v,
         Err(e) => {
             // Same reasoning, and this is the path that actually fired: `.ok()`
@@ -732,52 +699,42 @@ pub mod identity {
         if nick.is_empty() { "claude".to_string() } else { nick }
     }
 
-    fn disambiguate(base: String) -> String {
-        let Ok(conn) = crate::daemon::chat::open_chat_db() else {
-            return base;
-        };
-        let host = crate::daemon::agent_registry::this_host();
-        let Ok(online) = crate::daemon::agent_registry::list_online(&conn, &host) else {
-            return base;
-        };
-        let taken: std::collections::HashSet<String> =
-            online.into_iter().map(|a| a.agent_name).collect();
-        if !taken.contains(&base) {
-            return base;
-        }
-        // `planner-2`, `planner-3`, … — bounded so a pathological registry
-        // cannot spin here.
-        (2..100)
-            .map(|n| format!("{base}-{n}"))
-            .find(|candidate| !taken.contains(candidate))
-            .unwrap_or(base)
-    }
 
     /// `explicit` comes from `--nick` and is used verbatim: the operator chose
     /// it so they can find it in `/switch`, and silently suffixing it would make
     /// the menu entry not match what they typed. A collision with a live session
     /// surfaces at register time as an error rather than being papered over.
-    /// The nick previously chosen for this directory, if it is still free.
-    ///
-    /// Read-only and best-effort: the daemon may not have run yet, and a
-    /// session that cannot consult the memory must still start — it simply
-    /// starts under the project default.
-    fn recall_chosen_nick(cwd: &std::path::Path) -> Option<String> {
-        let conn = crate::daemon::chat::open_chat_db_readonly().ok()?;
-        let host = crate::daemon::agent_registry::this_host();
-        let nick = crate::daemon::agent_registry::recall_nick(
-            &conn,
-            &host,
-            &cwd.to_string_lossy(),
-            &controlling_terminal(),
-        )
-        .ok()??;
-        // Someone else in this directory is already using it. Two live sessions
-        // cannot share a name, so fall through to the disambiguated default.
-        match crate::daemon::agent_registry::nick_is_taken(&conn, &nick, None) {
-            Ok(true) => None,
-            Ok(false) => Some(nick),
-            Err(_) => None,
+    /// The nick this session starts under, asked of the daemon it joins: the
+    /// one remembered for this host, directory and terminal if still free,
+    /// else `base` made unique (`agent_registry::startup_nick`). Best-effort —
+    /// a session that cannot ask must still start, under `base`.
+    fn startup_nick(endpoint: &crate::daemon::remote::Endpoint, cwd: Option<&std::path::Path>, base: &str) -> (String, bool) {
+        let Some(cwd) = cwd else { return (base.to_owned(), false) };
+        let (host, terminal) = (crate::daemon::agent_registry::this_host(), controlling_terminal());
+        let cwd = cwd.to_string_lossy().into_owned();
+        if endpoint.is_local() {
+            return match crate::daemon::chat::open_chat_db_readonly() {
+                Ok(conn) => crate::daemon::agent_registry::startup_nick(&conn, &host, &cwd, &terminal, base),
+                Err(_) => (base.to_owned(), false),
+            };
+        }
+        let asked = crate::daemon::run_tokio(async {
+            let mut c = crate::daemon::client::DaemonClient::connect_to(endpoint).await?;
+            c.call_tool(
+                "session_startup_nick",
+                serde_json::json!({ "host": host, "cwd": cwd, "terminal": terminal, "base": base }),
+            )
+            .await
+        });
+        match asked {
+            Ok(v) => (
+                v["nick"].as_str().unwrap_or(base).to_owned(),
+                v["chosen"].as_bool().unwrap_or(false),
+            ),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "could not ask the daemon for a nick; using the project default");
+                (base.to_owned(), false)
+            }
         }
     }
 
@@ -799,24 +756,21 @@ pub mod identity {
         // old name resolved to nobody — the operator had to `/switch` again
         // after every restart. Recalling the name is what makes
         // `restore_bindings_for` find anything to restore.
-        let remembered = cwd.as_ref().and_then(|c| recall_chosen_nick(c));
-        let chosen = remembered.is_some();
-
-        let name = remembered.unwrap_or_else(|| {
-            let derived = cwd
-                .as_ref()
-                .and_then(|cwd| {
-                    crate::project_config::load(cwd)
-                        .map(|cfg| cfg.name)
-                        .or_else(|| {
-                            cwd.file_name()
-                                .map(|n| n.to_string_lossy().trim().to_string())
-                                .filter(|s| !s.is_empty())
-                        })
-                })
-                .unwrap_or_else(|| "claude".to_string());
-            disambiguate(nick_from_label(&derived))
-        });
+        let derived = cwd
+            .as_ref()
+            .and_then(|cwd| {
+                crate::project_config::load(cwd)
+                    .map(|cfg| cfg.name)
+                    .or_else(|| {
+                        cwd.file_name()
+                            .map(|n| n.to_string_lossy().trim().to_string())
+                            .filter(|s| !s.is_empty())
+                    })
+            })
+            .unwrap_or_else(|| "claude".to_string());
+        // `claudebase run` resolved and exported the daemon before we got here.
+        let endpoint = crate::daemon::remote::Endpoint::resolve().unwrap_or(crate::daemon::remote::Endpoint::Local);
+        let (name, chosen) = startup_nick(&endpoint, cwd.as_deref(), &nick_from_label(&derived));
 
         AgentIdentity {
             agent_id: uuid::Uuid::new_v4().to_string(),

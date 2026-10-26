@@ -5,7 +5,7 @@ Every project has a journal: the decisions, findings and updates of every earlie
 ## Where it lives and whose it is
 
 - The claudebase daemon owns every journal (`~/.claude/claudebase/journals/`, one file per project). `claudebase journal …` asks the daemon; never open, copy or edit those files yourself.
-- The project is the directory `claudebase run` was started in. Every command — from any subdirectory — works on that project's journal and only that one: you never see, and must not try to reach, another project's entries, categories or tags.
+- The project is the repository of the directory `claudebase run` was started in (its git remote), or that directory itself when it has no remote — so every checkout of a repository, on this machine or a machine joined to this daemon (`claudebase run --daemon <name>`), shares one journal. Every command — from any subdirectory — works on that project's journal and only that one: you never see, and must not try to reach, another project's entries, categories or tags.
 - Writing (`add`, `delete`) needs a session started with `claudebase run`. If `journal add` answers that it needs such a session, or that the daemon is not reachable, tell the operator once and carry on without journaling; do not work around it.
 
 ## Read — before you decide

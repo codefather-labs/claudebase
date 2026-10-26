@@ -15,7 +15,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 
 use crate::daemon::ipc::{read_frame, write_frame};
@@ -37,7 +36,112 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// what makes "pair, then message me" work without a restart.
 const RESCAN_INTERVAL: Duration = Duration::from_secs(15);
 
+/// Where the pump's routing questions are answered — "is this chat mine",
+/// "who owns this topic", "what is this sender called". With a local daemon:
+/// `chat.db`, read directly, as the supervisor always has. With a remote one
+/// there is no such file here, so the same questions go to the daemon's
+/// `session_*` tools, which run the same queries (`agent_registry`).
+pub(crate) struct Oracle {
+    endpoint: crate::daemon::remote::Endpoint,
+    client: tokio::sync::Mutex<Option<crate::daemon::client::DaemonClient>>,
+}
+
+impl Oracle {
+    pub(crate) fn new(endpoint: crate::daemon::remote::Endpoint) -> Self {
+        Oracle { endpoint, client: tokio::sync::Mutex::new(None) }
+    }
+
+    fn is_local(&self) -> bool {
+        self.endpoint.is_local()
+    }
+
+    /// One call on a connection kept for these questions; a failed call drops
+    /// it so the next one reconnects.
+    async fn ask(&self, tool: &str, args: Value) -> Result<Value> {
+        let mut guard = self.client.lock().await;
+        if guard.is_none() {
+            *guard = Some(crate::daemon::client::DaemonClient::connect_to(&self.endpoint).await?);
+        }
+        let result = guard.as_mut().expect("just set").call_tool(tool, args).await;
+        if result.is_err() {
+            *guard = None;
+        }
+        result
+    }
+
+    pub(crate) async fn threads_to_subscribe(
+        &self,
+        identity: &crate::supervisor::AgentIdentity,
+        extra: &[String],
+    ) -> Vec<String> {
+        if self.is_local() {
+            return crate::supervisor::threads_to_subscribe(identity, extra);
+        }
+        let mut threads = vec![format!("agent:{}", identity.agent_id)];
+        match self.ask("session_bound_threads", json!({ "agent_id": identity.agent_id })).await {
+            Ok(v) => threads.extend(
+                v["threads"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned),
+            ),
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "remote: cannot read bound chats"),
+        }
+        threads.extend(extra.iter().cloned());
+        threads.sort();
+        threads.dedup();
+        threads
+    }
+
+    /// Same answers, and the same fail-closed rule, as
+    /// `supervisor::thread_belongs_to`.
+    pub(crate) async fn thread_belongs_to(&self, agent_id: &str, thread: &str) -> bool {
+        if self.is_local() {
+            return crate::supervisor::thread_belongs_to(agent_id, thread);
+        }
+        let Some(chat_id) = thread.strip_prefix("telegram:").and_then(|c| c.parse::<i64>().ok()) else {
+            return true;
+        };
+        match self.ask("session_chat_bound", json!({ "chat_id": chat_id, "agent_id": agent_id })).await {
+            Ok(v) => match v["owner"].as_str() {
+                Some(owner) => owner == agent_id,
+                None => true,
+            },
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), thread, "cannot determine chat ownership; withholding");
+                false
+            }
+        }
+    }
+
+    /// Same answers, and the same fail-closed rule, as
+    /// `supervisor::routing_belongs_to`.
+    pub(crate) async fn routing_belongs_to(&self, agent_id: &str, chat_id: i64, topic: Option<i64>) -> bool {
+        if self.is_local() {
+            return crate::supervisor::routing_belongs_to(agent_id, chat_id, topic);
+        }
+        match self.ask("session_topic_owner", json!({ "chat_id": chat_id, "topic": topic })).await {
+            Ok(v) => v["owner"].as_str() == Some(agent_id),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), chat_id, ?topic, "cannot determine topic ownership; withholding");
+                false
+            }
+        }
+    }
+
+    pub(crate) async fn nick_for(&self, agent_id: &str) -> String {
+        if self.is_local() || agent_id.is_empty() {
+            return nick_for(agent_id);
+        }
+        match self.ask("session_nick_of", json!({ "agent_id": agent_id })).await {
+            Ok(v) => v["nick"].as_str().map(str::to_owned).unwrap_or_else(|| agent_id.to_owned()),
+            Err(e) => {
+                tracing::warn!(agent_id, error = %format!("{e:#}"), "could not read agent nick; falling back to id");
+                agent_id.to_owned()
+            }
+        }
+    }
+}
+
 pub struct SubscribeClient {
+    oracle: Oracle,
     read: crate::daemon::remote::BoxRead,
     write: crate::daemon::remote::BoxWrite,
     next_id: u64,
@@ -52,6 +156,7 @@ impl SubscribeClient {
         let endpoint = crate::daemon::remote::Endpoint::resolve()?;
         let (read, write) = crate::daemon::remote::connect(&endpoint).await?;
         Ok(Self {
+            oracle: Oracle::new(endpoint),
             read,
             write,
             next_id: 1,
@@ -122,7 +227,7 @@ impl SubscribeClient {
         identity: &crate::supervisor::AgentIdentity,
         extra_threads: &[String],
     ) {
-        let wanted = crate::supervisor::threads_to_subscribe(identity, extra_threads);
+        let wanted = self.oracle.threads_to_subscribe(identity, extra_threads).await;
         let fresh: Vec<String> = wanted
             .into_iter()
             .filter(|t| !self.subscribed.contains(t))
@@ -162,7 +267,7 @@ impl SubscribeClient {
     ///
     /// Messages the session itself sent are skipped for the same reason live
     /// ones are (F-7 echo loop): an agent must not read its own words as input.
-    fn deliver_backlog(
+    async fn deliver_backlog(
         &self,
         response: &Value,
         thread: &str,
@@ -172,7 +277,7 @@ impl SubscribeClient {
         // The chat may have been `/switch`-ed to another session between our
         // subscribe and its answer. Injecting then would put the operator's
         // conversation into a session they did not choose.
-        if !crate::supervisor::thread_belongs_to(self_agent_id, thread) {
+        if !self.oracle.thread_belongs_to(self_agent_id, thread).await {
             tracing::info!(%thread, "backlog skipped — chat is bound to another session");
             return;
         }
@@ -212,7 +317,7 @@ impl SubscribeClient {
         let mut not_ours = 0usize;
         for msg in messages {
             if let (Some(chat_id), Some(topic)) = (chat_id, msg.topic) {
-                if !crate::supervisor::routing_belongs_to(self_agent_id, chat_id, Some(topic)) {
+                if !self.oracle.routing_belongs_to(self_agent_id, chat_id, Some(topic)).await {
                     not_ours += 1;
                     continue;
                 }
@@ -254,6 +359,28 @@ impl SubscribeClient {
     ) -> Result<()> {
         let self_agent_id = identity.agent_id.as_str();
         let mut last_scan = tokio::time::Instant::now();
+        // Frames are read by their own task and handed over whole. Waiting on
+        // `read_frame` under a timeout dropped whatever part of a frame had
+        // arrived when the timeout fired — harmless on a local socket, where a
+        // frame lands at once, and a desynchronised stream over a network.
+        let mut read: crate::daemon::remote::BoxRead = std::mem::replace(&mut self.read, Box::new(tokio::io::empty()));
+        let (frame_tx, mut frames) = tokio::sync::mpsc::channel::<Result<Vec<u8>>>(64);
+        let reader = tokio::spawn(async move {
+            loop {
+                let r = read_frame(&mut read).await;
+                let failed = r.is_err();
+                if frame_tx.send(r).await.is_err() || failed {
+                    return;
+                }
+            }
+        });
+        struct AbortOnDrop(tokio::task::JoinHandle<()>);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _reader = AbortOnDrop(reader);
         loop {
             if done.load(Ordering::SeqCst) {
                 return Ok(());
@@ -264,13 +391,9 @@ impl SubscribeClient {
             }
             // Bounded wait so session shutdown is noticed even on a silent
             // socket.
-            let frame = match tokio::time::timeout(
-                Duration::from_millis(500),
-                read_frame(&mut self.read),
-            )
-            .await
-            {
-                Ok(r) => r.context("daemon connection closed")?,
+            let frame = match tokio::time::timeout(Duration::from_millis(500), frames.recv()).await {
+                Ok(Some(r)) => r.context("daemon connection closed")?,
+                Ok(None) => anyhow::bail!("daemon connection closed"),
                 Err(_) => continue,
             };
 
@@ -288,7 +411,7 @@ impl SubscribeClient {
             // one the operator is watching for.
             if let Some(id) = value.get("id").and_then(|v| v.as_u64()) {
                 if let Some(thread) = self.pending_subscribes.remove(&id) {
-                    self.deliver_backlog(&value, &thread, self_agent_id, tx);
+                    self.deliver_backlog(&value, &thread, self_agent_id, tx).await;
                 }
                 continue;
             }
@@ -353,7 +476,14 @@ impl SubscribeClient {
             let (content, sender_hint) = split_agent_preamble(raw_content);
 
 
-            let (thread, source) = classify(&meta, sender_hint.clone());
+            let (thread, mut source) = classify_with(&meta, sender_hint.clone(), self.oracle.is_local());
+            // A remote daemon's registry is not on this disk: name the sender
+            // through the daemon instead.
+            if !self.oracle.is_local() {
+                if let Source::Agent { nick } = &mut source {
+                    *nick = self.oracle.nick_for(nick).await;
+                }
+            }
 
             // On a TELEGRAM thread only the operator is inbound. Every other
             // sender there is an agent whose reply the daemon published to the
@@ -403,10 +533,8 @@ impl SubscribeClient {
                 .strip_prefix("telegram:")
                 .and_then(|c| c.parse::<i64>().ok());
             let ours = match (chat, topic) {
-                (Some(chat), Some(topic)) => {
-                    crate::supervisor::routing_belongs_to(self_agent_id, chat, Some(topic))
-                }
-                _ => crate::supervisor::thread_belongs_to(self_agent_id, &thread),
+                (Some(chat), Some(topic)) => self.oracle.routing_belongs_to(self_agent_id, chat, Some(topic)).await,
+                _ => self.oracle.thread_belongs_to(self_agent_id, &thread).await,
             };
             if !ours {
                 tracing::debug!(thread = %thread, ?topic, "message belongs to another session; skipping");
@@ -445,7 +573,14 @@ impl SubscribeClient {
 /// Classifying on a `telegram:` prefix alone therefore misread every real
 /// Telegram message. Order matters: an explicit prefix wins, then the
 /// `agent:` shape, then a bare numeric chat id — which only Telegram produces.
+#[cfg(test)]
 fn classify(meta: &Value, sender_hint: Option<String>) -> (String, Source) {
+    classify_with(meta, sender_hint, true)
+}
+
+/// `resolve_nick = false` leaves the sender's agent id in `Source::Agent` for
+/// the caller to name — the registry may be on another machine.
+fn classify_with(meta: &Value, sender_hint: Option<String>, resolve_nick: bool) -> (String, Source) {
     let field = |key: &str| meta.get(key).and_then(|v| v.as_str()).map(|s| s.to_string());
     let thread_field = field("thread");
     let chat_field = field("chat_id");
@@ -458,7 +593,7 @@ fn classify(meta: &Value, sender_hint: Option<String>) -> (String, Source) {
             .unwrap_or_default();
         let _ = meta;
         Source::Agent {
-            nick: nick_for(&sender),
+            nick: if resolve_nick { nick_for(&sender) } else { sender },
         }
     };
 
@@ -543,15 +678,7 @@ fn nick_for(agent_id: &str) -> String {
     // `open_chat_db_readonly`), or it competes with the daemon storing the very
     // message being labelled.
     let looked_up = crate::daemon::chat::open_chat_db_readonly()
-        .and_then(|conn| {
-            conn.query_row(
-                "SELECT agent_name FROM agent_registry WHERE agent_id = ?1",
-                [agent_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(anyhow::Error::from)
-        })
+        .and_then(|conn| crate::daemon::agent_registry::nick_of(&conn, agent_id).map_err(anyhow::Error::from))
         .unwrap_or_else(|e| {
             // Distinguishable in the log from a genuinely unknown sender, which
             // returns Ok(None) and says nothing.

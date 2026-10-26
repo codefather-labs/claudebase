@@ -839,6 +839,13 @@ where
                     let resp = handle_chat_list_pending_asks(echo_id, &args).await;
                     let _ = outbound_tx.send(resp);
                 }
+                name if name.starts_with("session_") => {
+                    let resp = match crate::daemon::session_tools::handle(name, args).await {
+                        Ok(payload) => tool_text_response(echo_id, &payload),
+                        Err(e) => tool_error_response(echo_id, -32602, &format!("{e:#}")),
+                    };
+                    let _ = outbound_tx.send(resp);
+                }
                 name if name.starts_with("journal_") => {
                     let resp = match crate::daemon::journal_tools::handle(name, args).await {
                         Ok(payload) => tool_text_response(echo_id, &payload),
@@ -1493,6 +1500,8 @@ async fn handle_agent_register(
         .get("cwd")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let project_id_arg = args.get("project_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_owned);
+    let branch_arg = args.get("branch").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_owned);
     // pty-transport Slice 1 — optional per-session token. Minted by the PTY
     // supervisor and exported into its `claude` child, so short-lived CLI
     // processes spawned inside that session can prove which agent they are
@@ -1616,8 +1625,13 @@ async fn handle_agent_register(
         }
         if let Some(cwd_str) = cwd_arg {
             let cwd_path = std::path::PathBuf::from(&cwd_str);
-            let project_id = crate::project_id::resolve_project_id(&cwd_path);
-            let branch = git_current_branch(&cwd_path);
+            // The client resolves both where the checkout is; a session on
+            // another machine names a directory this one does not have.
+            // Resolving here remains the fallback for older clients.
+            let project_id = project_id_arg
+                .clone()
+                .unwrap_or_else(|| crate::project_id::resolve_project_id(&cwd_path));
+            let branch = branch_arg.clone().or_else(|| crate::project_id::current_branch(&cwd_path));
             let _ = crate::daemon::agent_registry::capture_identity(
                 &conn,
                 &agent_id_for_capture,
@@ -1651,30 +1665,6 @@ async fn handle_agent_register(
     }
 }
 
-/// Slice 3 of cli-to-cli-routing — shells out to `git -C <cwd>
-/// rev-parse --abbrev-ref HEAD`. Returns `Some("feat/foo")` on a
-/// branch, `None` if the cwd isn't a git repo OR is at detached HEAD
-/// OR git is missing. Defensive: never panics, never blocks the
-/// caller's task long enough to matter (git config-only operations
-/// complete in <10ms on a local repo).
-fn git_current_branch(cwd: &std::path::Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8(out.stdout).ok()?;
-    let trimmed = s.trim();
-    if trimmed.is_empty() || trimmed == "HEAD" {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
 
 
 /// Handle `agent_rename` — change the nick a session is addressed by.

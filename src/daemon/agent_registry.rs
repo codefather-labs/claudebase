@@ -821,6 +821,90 @@ pub fn nick_is_taken(
     }
 }
 
+// ---------------------------------------------------------------------------
+// What a session asks the registry about itself. The supervisor reads these
+// straight from chat.db when its daemon is local; a session on a remote daemon
+// asks for the same answers through the `session_*` tools
+// (daemon/session_tools.rs), which call these same functions — one query, two
+// ways to reach it.
+// ---------------------------------------------------------------------------
+
+/// Telegram threads routed to `agent_id` — the chats the operator `/switch`-ed
+/// to this session.
+pub fn bound_telegram_threads(conn: &Connection, agent_id: &str) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT routing_chat_id FROM agent_registry \
+         WHERE agent_id = ?1 AND routing_chat_id IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([agent_id], |row| row.get::<_, i64>(0))?;
+    Ok(rows.filter_map(|r| r.ok()).map(|chat_id| format!("telegram:{chat_id}")).collect())
+}
+
+/// The live session holding exactly `(chat_id, topic)`, if any.
+pub fn topic_owner(conn: &Connection, chat_id: i64, topic: Option<i64>) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT agent_id FROM agent_registry \
+         WHERE routing_chat_id = ?1 \
+           AND COALESCE(routing_thread_id, -1) = COALESCE(?2, -1) \
+           AND state = 'alive' \
+         ORDER BY last_pinged_at DESC LIMIT 1",
+        params![chat_id, topic],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// `agent_id` if it is live and holds any topic of `chat_id`.
+pub fn chat_bound_to(conn: &Connection, chat_id: i64, agent_id: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT agent_id FROM agent_registry \
+         WHERE routing_chat_id = ?1 AND state = 'alive' \
+           AND agent_id = ?2 \
+         LIMIT 1",
+        params![chat_id, agent_id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// The nick `agent_id` goes by.
+pub fn nick_of(conn: &Connection, agent_id: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT agent_name FROM agent_registry WHERE agent_id = ?1",
+        [agent_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+}
+
+/// The nick a starting session takes when none was given: the one chosen
+/// earlier for this host, directory and terminal if it is still free, else
+/// `base` made unique among live sessions (`base-2`, …). Returns whether the
+/// nick was a remembered choice.
+pub fn startup_nick(conn: &Connection, host: &str, cwd: &str, terminal: &str, base: &str) -> (String, bool) {
+    if let Ok(Some(nick)) = recall_nick(conn, host, cwd, terminal) {
+        // Someone else is already using it: two live sessions cannot share a
+        // name, so fall through to the disambiguated default.
+        if let Ok(false) = nick_is_taken(conn, &nick, None) {
+            return (nick, true);
+        }
+    }
+    let Ok(online) = list_online(conn, host) else {
+        return (base.to_owned(), false);
+    };
+    let taken: std::collections::HashSet<String> = online.into_iter().map(|a| a.agent_name).collect();
+    if !taken.contains(base) {
+        return (base.to_owned(), false);
+    }
+    // `planner-2`, `planner-3`, … — bounded so a pathological registry
+    // cannot spin here.
+    let nick = (2..100)
+        .map(|n| format!("{base}-{n}"))
+        .find(|candidate| !taken.contains(candidate))
+        .unwrap_or_else(|| base.to_owned());
+    (nick, false)
+}
+
 pub fn this_host() -> String {
     #[cfg(unix)]
     {

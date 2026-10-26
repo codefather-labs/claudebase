@@ -619,6 +619,55 @@ than orders.
 
 ---
 
+## 🌐 Remote daemon — a session here, its agents on another machine
+
+A session can join the daemon of another machine — prod, dev — as one of its agents: listed with
+them, messaging them both ways, reachable from that daemon's Telegram bot and callbacks, and writing
+the same project journal. That is how a Claude on your laptop talks to and orchestrates the agents
+running on a server.
+
+On the server, once:
+
+```bash
+claudebase daemon remote enable                      # TLS on 0.0.0.0:8586; generates a self-signed cert
+claudebase daemon restart
+claudebase daemon remote issue laptop --host prod.example   # prints a connection string, once
+```
+
+On the laptop, once, then per session:
+
+```bash
+claudebase daemon remote add prod                    # paste the connection string (stdin, not argv)
+claudebase daemon remote test prod                   # connected in 90 ms, 3 session(s) online
+claudebase run --daemon prod                          # this session joins prod's daemon
+claudebase daemon remote default prod                 # optional: make it the default (`local` undoes it)
+```
+
+- **Encryption without a CA.** The certificate is generated on the server and pinned by its
+  SHA-256 in the connection string; no domain or HTTPS setup is needed, and a server with another
+  certificate is refused at the handshake.
+- **One token per client**, stored hashed, re-issuable and revocable (`daemon remote revoke laptop`,
+  `daemon remote status` shows last use). A token lets its holder type into every session on that
+  daemon, including those running with permissions skipped: treat it like an SSH key to the machine.
+- **Session surface only.** A remote connection may register, subscribe, send and read messages, use
+  the journal and Telegram replies; administration (access lists, bots, callback and remote tokens,
+  reaping) is refused and stays with the machine's own user.
+- **Everything the session runs follows it.** `run --daemon prod` exports `CLAUDEBASE_DAEMON=prod`,
+  so `agent send`, `agent list`, `whoami`, `telegram send` and `journal` inside it reach prod. It
+  never falls back to the local daemon: an unreachable or unknown profile stops the start.
+- **One journal per repository.** Journals are filed by the repository's normalized git remote, so a
+  checkout at `/home/me/shop` on the laptop and one at `/srv/shop` on prod share a journal. A
+  directory without a remote keeps a journal of its own, as before; an existing directory journal is
+  adopted by its repository the first time a session writes to it.
+- **Machine-bound.** The per-session callback socket exists on the daemon's machine; inspection
+  commands that read a local `chat.db` (`chat list`, `chat threads`, `agent inspect`,
+  `agent list-alive`) refuse while a remote daemon is selected (`CLAUDEBASE_DAEMON=local` for this
+  machine's).
+
+Design: [`docs/design/remote-daemon.md`](docs/design/remote-daemon.md).
+
+---
+
 ## 🪝 HTTP callbacks — something outside pings a session
 
 A CI job, a webhook or a script can write directly into a session's terminal input:

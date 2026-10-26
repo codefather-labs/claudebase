@@ -30,6 +30,7 @@ pub mod journal_tools;
 pub mod pending_asks;
 pub mod remote;
 pub mod server;
+pub mod session_tools;
 pub mod subscribe_client;
 pub mod service;
 pub mod telegram;

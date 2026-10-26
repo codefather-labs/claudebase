@@ -256,7 +256,33 @@ fn main() -> std::process::ExitCode {
 ///     legacy NULL-project_id rows are excluded.
 ///   * `all` — no filter; everything alive across all known projects.
 ///   * `<literal slug>` — exact match against the column.
+/// Inspection commands that read this machine's `chat.db` directly. With a
+/// remote daemon selected they would show this machine's data under the
+/// remote's name, so they say so instead. Session commands (`agent send`,
+/// `agent list`, `whoami`, `telegram send`, `journal`) follow the daemon.
+fn refuse_remote(what: &str) -> Option<std::process::ExitCode> {
+    match claudebase::daemon::remote::Endpoint::resolve() {
+        Ok(e) if e.is_local() => None,
+        Ok(e) => {
+            eprintln!(
+                "claudebase {what}: reads this machine's daemon only, and the daemon in use is {}.\n\
+                 Run it on that machine, or here with {}=local.",
+                e.describe(),
+                claudebase::daemon::remote::DAEMON_ENV
+            );
+            Some(std::process::ExitCode::from(2))
+        }
+        Err(e) => {
+            eprintln!("claudebase {what}: {e:#}");
+            Some(std::process::ExitCode::from(2))
+        }
+    }
+}
+
 fn run_agent_list_alive(args: &cli::AgentListAliveArgs) -> std::process::ExitCode {
+    if let Some(code) = refuse_remote("agent list-alive") {
+        return code;
+    }
     use claudebase::daemon::chat::open_chat_db;
     let conn = match open_chat_db() {
         Ok(c) => c,
@@ -371,6 +397,9 @@ fn run_agent_list_alive(args: &cli::AgentListAliveArgs) -> std::process::ExitCod
 /// registry row + undelivered_count from chat_messages. Exit 1 when
 /// the agent_id is absent.
 fn run_agent_inspect(args: &cli::AgentInspectArgs) -> std::process::ExitCode {
+    if let Some(code) = refuse_remote("agent inspect") {
+        return code;
+    }
     use claudebase::daemon::chat::open_chat_db;
     let conn = match open_chat_db() {
         Ok(c) => c,
@@ -735,6 +764,9 @@ fn which(name: &str) -> Option<std::path::PathBuf> {
 /// ensured on open so a fresh box without a daemon ever running still
 /// works (prints empty when no rows exist).
 fn run_chat_list(args: &cli::ChatListArgs) -> std::process::ExitCode {
+    if let Some(code) = refuse_remote("chat list") {
+        return code;
+    }
     use claudebase::daemon::chat;
     let path = claudebase::store::user_level_chat_db_path();
     if let Some(parent) = path.parent() {
@@ -836,9 +868,7 @@ fn run_chat_dump(args: &cli::ChatDumpArgs) -> anyhow::Result<String> {
             None
         }
     };
-    let nick = claudebase::daemon::chat::open_chat_db_readonly()
-        .ok()
-        .and_then(|c| claudebase::daemon::agent_registry::recall_conversation_nick(&c, &id).ok().flatten());
+    let nick = conversation_nick(&id);
     let extras = chat_transfer::DumpExtras { journal, nick };
     let r = chat_transfer::dump_conversation(&claude_dir, &cwd, &id, args.out.as_deref(), &extras)?;
     let size = std::fs::metadata(&r.archive).map(|m| m.len()).unwrap_or(0);
@@ -911,6 +941,21 @@ fn run_chat_load(args: &cli::ChatLoadArgs) -> anyhow::Result<String> {
     Ok(msg)
 }
 
+/// The nick conversation `id` answers to, from the daemon in use.
+fn conversation_nick(id: &str) -> Option<String> {
+    let endpoint = claudebase::daemon::remote::Endpoint::resolve().ok()?;
+    if endpoint.is_local() {
+        let c = claudebase::daemon::chat::open_chat_db_readonly().ok()?;
+        return claudebase::daemon::agent_registry::recall_conversation_nick(&c, id).ok().flatten();
+    }
+    let v = claudebase::daemon::run_tokio(async {
+        let mut c = claudebase::daemon::client::DaemonClient::connect_to(&endpoint).await?;
+        c.call_tool("session_conversation_nick", serde_json::json!({ "session_id": id })).await
+    })
+    .ok()?;
+    v["nick"].as_str().map(str::to_owned)
+}
+
 /// Give the loaded conversation back the nick it had, unless this machine
 /// already remembers one for it.
 fn load_nick(r: &claudebase::chat_transfer::LoadReport) -> String {
@@ -921,6 +966,13 @@ fn load_nick(r: &claudebase::chat_transfer::LoadReport) -> String {
     // From another machine: only a name the daemon would accept.
     if agent_registry::validate_agent_name(nick).is_err() {
         return format!("nick: `{nick}` is not a valid nick here, not kept");
+    }
+    match claudebase::daemon::remote::Endpoint::resolve() {
+        Ok(e) if e.is_local() => {}
+        // The conversation will be resumed against that daemon; it learns the
+        // nick from the session's first rename or bind there.
+        Ok(e) => return format!("nick: `{nick}` (not recorded: the daemon in use is {})", e.describe()),
+        Err(e) => return format!("nick: `{nick}` not kept ({e:#})"),
     }
     let result = chat::open_chat_db().map_err(anyhow::Error::from).and_then(|c| {
         if agent_registry::recall_conversation_nick(&c, &r.session_id)?.is_some() {
@@ -938,6 +990,9 @@ fn load_nick(r: &claudebase::chat_transfer::LoadReport) -> String {
 
 /// `claudebase chat threads` — list all known chat threads.
 fn run_chat_threads(args: &cli::ChatThreadsArgs) -> std::process::ExitCode {
+    if let Some(code) = refuse_remote("chat threads") {
+        return code;
+    }
     use claudebase::daemon::chat;
     let path = claudebase::store::user_level_chat_db_path();
     if let Some(parent) = path.parent() {

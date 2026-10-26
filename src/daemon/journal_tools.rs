@@ -25,7 +25,11 @@ use crate::journal::{self, Filter, NewEntry, SearchMode};
 
 /// Who is asking, and therefore which journal.
 struct Caller {
+    /// What the journal is filed under (`journal::project_key`).
     project: PathBuf,
+    /// The directory the caller works in — on ITS machine, which for a
+    /// session joined from elsewhere is not this one.
+    path: PathBuf,
     /// Present for a session; `None` for a directory read.
     agent_id: Option<String>,
     nick: Option<String>,
@@ -86,15 +90,17 @@ fn resolve(args: &Value, need_session: bool) -> Result<Caller> {
                  if the daemon was restarted, restart the session with `claudebase run`"
             );
         }
-        let (cwd, nick): (Option<String>, Option<String>) = conn.query_row(
-            "SELECT cwd, agent_name FROM agent_registry WHERE agent_id = ?1",
+        let (cwd, nick, project_id): (Option<String>, Option<String>, Option<String>) = conn.query_row(
+            "SELECT cwd, agent_name, project_id FROM agent_registry WHERE agent_id = ?1",
             rusqlite::params![agent_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         let cwd = cwd.filter(|c| !c.is_empty()).ok_or_else(|| {
             anyhow!("the daemon does not know which directory this session was started in; restart it with `claudebase run`")
         })?;
-        return Ok(Caller { project: PathBuf::from(cwd), agent_id: Some(agent_id.into()), nick });
+        let path = PathBuf::from(cwd);
+        let project = journal::project_key(project_id.as_deref(), &path);
+        return Ok(Caller { project, path, agent_id: Some(agent_id.into()), nick });
     }
     if need_session {
         bail!(
@@ -108,7 +114,12 @@ fn resolve(args: &Value, need_session: bool) -> Result<Caller> {
     if !cwd.is_absolute() {
         bail!("cwd must be an absolute path");
     }
-    Ok(Caller { project: nearest_journal(&journal::journals_dir(), &cwd), agent_id: None, nick: None })
+    // A repository's journal when it has one; else the closest directory
+    // journal, as before (including one not yet adopted under the repository).
+    let dir = journal::journals_dir();
+    let key = journal::project_key(str_arg(args, "project_id").as_deref(), &cwd);
+    let project = if key != cwd && journal::journal_path(&dir, &key).exists() { key } else { nearest_journal(&dir, &cwd) };
+    Ok(Caller { project, path: cwd, agent_id: None, nick: None })
 }
 
 /// The closest directory at or above `cwd` that has a journal; `cwd` itself
@@ -124,15 +135,35 @@ fn nearest_journal(dir: &Path, cwd: &Path) -> PathBuf {
 /// that is when its old `insights.db` is brought in.
 fn open(dir: &Path, caller: &Caller) -> Result<Option<rusqlite::Connection>> {
     let create = caller.agent_id.is_some();
+    if create {
+        adopt(dir, caller);
+    }
     let Some(mut conn) = journal::open(dir, &caller.project, create)? else { return Ok(None) };
     if create {
-        match journal::import_legacy_insights(&mut conn, &caller.project) {
+        // `path` is the caller's own directory; for a session joined from
+        // another machine it does not exist here, and there is nothing to import.
+        match journal::import_legacy_insights(&mut conn, &caller.path) {
             Ok(n) if n > 0 => tracing::info!(project = %caller.project.display(), imported = n, "journal: imported insights.db"),
             Ok(_) => {}
             Err(e) => tracing::warn!(project = %caller.project.display(), error = %e, "journal: insights.db import failed"),
         }
     }
     Ok(Some(conn))
+}
+
+/// File the directory's journal under the repository, the first time a
+/// session of that repository writes. Best effort: a failure leaves both
+/// journals readable and is logged.
+fn adopt(dir: &Path, caller: &Caller) {
+    match journal::adopt_path_journal(dir, &caller.project, &caller.path) {
+        Ok(true) => tracing::info!(
+            from = %caller.path.display(),
+            to = %caller.project.display(),
+            "journal: filed the directory's journal under its repository"
+        ),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(error = %format!("{e:#}"), "journal: could not adopt the directory journal"),
+    }
 }
 
 fn project_json(caller: &Caller) -> Value {
@@ -173,15 +204,17 @@ pub const MAX_IMPORT_BATCH: usize = 100;
 /// identical note in the same category into the existing entry.
 fn import(dir: &Path, args: &Value) -> Result<Value> {
     let cwd = str_arg(args, "cwd").ok_or_else(|| anyhow!("cwd required: the directory to import into"))?;
-    let project = PathBuf::from(cwd);
-    if !project.is_absolute() {
+    let path = PathBuf::from(cwd);
+    if !path.is_absolute() {
         bail!("cwd must be an absolute path");
     }
+    let project = journal::project_key(str_arg(args, "project_id").as_deref(), &path);
     let entries = args.get("entries").and_then(Value::as_array).ok_or_else(|| anyhow!("entries required (array)"))?;
     if entries.len() > MAX_IMPORT_BATCH {
         bail!("at most {MAX_IMPORT_BATCH} entries per call, got {}", entries.len());
     }
-    let caller = Caller { project, agent_id: None, nick: None };
+    let caller = Caller { project, path, agent_id: None, nick: None };
+    adopt(dir, &caller);
     let mut conn = journal::open(dir, &caller.project, true)?.expect("created on demand");
     let now = journal::now_secs();
     let (mut written, mut merged, mut refused) = (0, 0, Vec::new());

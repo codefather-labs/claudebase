@@ -6,6 +6,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **Remote daemon: a session on one machine joins the daemon of another.** `claudebase daemon remote
+  enable` turns on a TLS listener (self-signed certificate, generated; clients pin its SHA-256 — no CA
+  or domain needed); `daemon remote issue <client>` prints a connection string with a per-client token
+  (stored hashed, revocable with `revoke`, listed by `status`). On the joining machine `daemon remote
+  add|list|remove|default|test` keep named profiles, and `claudebase run --daemon <name>` starts a
+  session on that daemon: registered with its agents, agent-to-agent messages both ways, its Telegram
+  bot and callbacks, its journal. Everything the session runs follows it (`CLAUDEBASE_DAEMON`); an
+  unreachable profile stops the start instead of falling back to the local daemon. A remote connection
+  may call the session surface only; administration is refused.
+- **Journals are filed by repository.** A project with a git remote has one journal for every checkout
+  of it — on this machine or a laptop joined to this daemon. A directory journal is adopted by its
+  repository the first time a session writes; directories without a remote keep their own.
+
+### Changed
+
+- **Sessions read the registry through the daemon when it is remote.** Inbound routing (topic
+  ownership, bound chats, sender nicks), the startup nick, `agent send` / `list` / `whoami` and
+  `telegram send` / `status` ask the daemon's new `session_*` tools, which run the same queries the
+  local path runs on `chat.db`. `chat list`, `chat threads`, `agent inspect` and `agent list-alive`
+  read this machine's `chat.db` only and refuse while a remote daemon is selected.
+- **Sessions send their project id and branch at registration**, resolved where the checkout is.
+
+### Fixed
+
+- **A frame could be cut in half by the subscriber's read timeout.** The supervisor waited on
+  `read_frame` under a 500 ms timeout, losing whatever part of a frame had arrived when it fired —
+  harmless on a local socket, a desynchronised stream over a network. Frames are now read by their
+  own task, and a frame is written in one write.
+
 ## [0.15.0] - 2026-10-24
 
 ### Added

@@ -144,11 +144,22 @@ pub async fn send(text: &str, explicit_thread: Option<&str>) -> Result<String> {
     }
 
     let agent_id = std::env::var(AGENT_ID_ENV).ok().filter(|s| !s.is_empty());
-    let conn = chat::open_chat_db().context("open chat.db")?;
-    let (thread, topic, source) = resolve_thread(&conn, explicit_thread, agent_id.as_deref())?;
-    drop(conn);
-
-    let mut client = DaemonClient::connect().await?;
+    let endpoint = crate::daemon::remote::Endpoint::resolve()?;
+    let mut client = DaemonClient::connect_to(&endpoint).await?;
+    let (thread, topic, source) = if endpoint.is_local() {
+        let conn = chat::open_chat_db().context("open chat.db")?;
+        resolve_thread(&conn, explicit_thread, agent_id.as_deref())?
+    } else {
+        // The bindings are the remote daemon's: resolve there, by the same rules.
+        let v = client
+            .call_tool("session_telegram_target", json!({ "explicit": explicit_thread, "agent_id": agent_id }))
+            .await?;
+        (
+            v["thread"].as_str().context("daemon resolved no thread")?.to_owned(),
+            v["topic"].as_i64(),
+            ThreadSource::RoutingKey,
+        )
+    };
     // `message_thread_id` is a string on the wire because that is what
     // `chat_reply` parses; omitted entirely when there is no topic, so a DM
     // send is byte-for-byte what it always was.
@@ -177,15 +188,25 @@ pub async fn send(text: &str, explicit_thread: Option<&str>) -> Result<String> {
 /// Run `claudebase telegram status` — what this session would send to, and why.
 pub fn status() -> Result<String> {
     let agent_id = std::env::var(AGENT_ID_ENV).ok().filter(|s| !s.is_empty());
+    let endpoint = crate::daemon::remote::Endpoint::resolve()?;
+    if !endpoint.is_local() {
+        let text = crate::agent_cli::remote_text(&endpoint, "session_telegram_status", json!({ "agent_id": agent_id }))?;
+        return Ok(format!("{text}daemon: {}\n", endpoint.describe()));
+    }
     let conn = chat::open_chat_db().context("open chat.db")?;
+    status_with(&conn, agent_id.as_deref())
+}
+
+/// `telegram status` against the registry in `conn`.
+pub fn status_with(conn: &rusqlite::Connection, agent_id: Option<&str>) -> Result<String> {
 
     let mut out = String::new();
     out.push_str(&format!(
         "session agent: {}\n",
-        agent_id.as_deref().unwrap_or("<not set — session not launched via `claudebase run`>")
+        agent_id.unwrap_or("<not set — session not launched via `claudebase run`>")
     ));
 
-    match resolve_thread(&conn, None, agent_id.as_deref()) {
+    match resolve_thread(conn, None, agent_id) {
         Ok((thread, topic, source)) => {
             // The topic belongs in the answer to "where would this go", or the
             // status line says a forum-bound session targets the whole group.
@@ -201,8 +222,8 @@ pub fn status() -> Result<String> {
         Err(e) => out.push_str(&format!("default target: unresolved — {e}\n")),
     }
 
-    let threads = chat::list_threads(&conn).context("list chat threads")?;
-    let alive = agent_registry::list_alive(&conn, None).unwrap_or_default();
+    let threads = chat::list_threads(conn).context("list chat threads")?;
+    let alive = agent_registry::list_alive(conn, None).unwrap_or_default();
     out.push_str(&format!(
         "known telegram threads: {}\nalive agents: {}\n",
         threads

@@ -91,7 +91,12 @@ pub async fn export_entries(project: &std::path::Path) -> Result<Option<Vec<Valu
         let p = client
             .call_tool(
                 "journal_list",
-                json!({ "cwd": project.to_string_lossy(), "offset": page * size, "limit": size }),
+                json!({
+                    "cwd": project.to_string_lossy(),
+                    "project_id": crate::project_id::resolve_project_id(project),
+                    "offset": page * size,
+                    "limit": size,
+                }),
             )
             .await?;
         if p.get("project").is_none() || p["project"].is_null() {
@@ -187,11 +192,15 @@ pub async fn import_entries(
             }
         }
     }
+    let project_id = crate::project_id::resolve_project_id(project);
     let mut client = DaemonClient::connect().await?;
     let mut report = ImportReport { project: project.to_string_lossy().into_owned(), ..Default::default() };
     for (n, batch) in entries.chunks(crate::daemon::journal_tools::MAX_IMPORT_BATCH).enumerate() {
         let r = client
-            .call_tool("journal_import", json!({ "cwd": project.to_string_lossy(), "entries": batch }))
+            .call_tool(
+                "journal_import",
+                json!({ "cwd": project.to_string_lossy(), "project_id": project_id, "entries": batch }),
+            )
             .await?;
         report.written += r["written"].as_u64().unwrap_or(0);
         report.merged += r["merged"].as_u64().unwrap_or(0);
@@ -216,6 +225,9 @@ fn with_caller(mut args: Value) -> Value {
     }
     if let Ok(cwd) = std::env::current_dir() {
         args["cwd"] = json!(cwd.to_string_lossy());
+        // Which repository this is, resolved here where the checkout is: the
+        // daemon may be on another machine (docs/design/remote-daemon.md).
+        args["project_id"] = json!(crate::project_id::resolve_project_id(&cwd));
     }
     args
 }

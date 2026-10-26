@@ -701,6 +701,9 @@ relayed untouched. A lease that runs out expires the job and keeps the worker ou
 runs `claudebase pool ready`; a worker whose session vanishes fails its job as `worker_lost` after 15 s.
 The daemon keeps no queue of its own. Design: [`docs/design/pool-dispatch.md`](docs/design/pool-dispatch.md).
 
+Operating a daemon — the service, the HTTP and remote listeners, the pool, tokens, and what to check
+when something does not arrive: [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
+
 ---
 
 ## 🪝 HTTP callbacks — something outside pings a session

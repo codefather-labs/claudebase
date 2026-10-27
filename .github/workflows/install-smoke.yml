@@ -362,7 +362,9 @@ jobs:
         shell: bash
         run: |
           set -eu
-          home=$(getent passwd "${{ matrix.user }}" | cut -d: -f6)
+          # Root's home in a GitHub container job is $HOME (/github/home), not
+          # the /root that /etc/passwd names; the installer used $HOME.
+          if [ "${{ matrix.user }}" = root ]; then home=$HOME; else home=$(getent passwd "${{ matrix.user }}" | cut -d: -f6); fi
           cb="$home/.claude/tools/claudebase/claudebase"
           jqb=$(command -v jq || echo "$home/.claude/tools/claudebase/bin/jq")
           "$jqb" -e '[.hooks.SessionStart[]?.hooks[]?.command] | any(test("claudebase-channel-contract"))' \

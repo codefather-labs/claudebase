@@ -6,6 +6,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- **Installing the daemon as root is warned about, no longer refused.** On a server where everything
+  runs as root, Claude sessions included, the refusal protected nothing and left the machine with no
+  daemon service at all. The warning names the risk: the daemon writes outside messages into the
+  user's terminals.
+- **The installers set up the daemon before downloading the models.** A model download that fails
+  or is interrupted can no longer leave a machine without its daemon. That happened on every run
+  of an install whose host could not reach huggingface.co.
+- **Linux: linger is enabled for the installing user.** Without it, systemd stops user services at
+  the last logout, so on a server the daemon died with the ssh session. Set `CLAUDEBASE_NO_LINGER=1`
+  to keep it off.
+- **No systemd user manager** (a container, WSL): the daemon is started in the background instead
+  of not at all, with a warning that it will not come back after a reboot.
+
+### Added
+
+- **The installers end with checks** for the binary, the daemon, the SessionStart hooks in
+  `settings.json`, the agent rules, and the optional model, language-server and Claude CLI pieces.
+  - The final banner reads "WITH PROBLEMS" when one of the required checks fails.
+  - The installers then exit non-zero, instead of announcing "install complete" over a half-working
+    machine.
+- **jq comes as its static build** (`jq-1.8.2`, into `~/.claude/tools/claudebase/bin`) when no
+  package can be installed (not root, no sudo).
+- **CI: `install-smoke` installs onto bare containers** with curl and git only, no jq and no sudo:
+  Ubuntu 24.04 and Debian 13 as root, and Ubuntu as an ordinary user. The installer's own checks
+  decide the result.
+
+### Fixed
+
+- **`claudebase run` did not start as root.** It passes `--dangerously-skip-permissions`, and
+  Claude Code refuses that flag as root ("cannot be used with root/sudo privileges") unless
+  `IS_SANDBOX=1` is set; pool workers included. As root, `claudebase run` now sets `IS_SANDBOX=1` for
+  `claude` and says so. An `IS_SANDBOX` you set yourself is left alone, and `--no-skip-permissions`
+  avoids it altogether.
+- **`auth setup-token` failed with "Read-only file system"** on every Linux machine running the
+  daemon as a systemd service. The unit had `ProtectHome=read-only`, and the token is written to
+  `~/.profile` and `~/.config/environment.d`. The same setting froze the socket directory under
+  `/run/user/<uid>`. The unit now has `ReadWritePaths=%h %t/claudebase`; the rest of the hardening
+  stays. Reinstall to regenerate the unit.
+- **The installer called `claudebase` by name.** For a user whose alias went to `~/.local/bin`, not
+  yet on PATH, the daemon was never set up. It now uses the binary's full path.
+
 ## [0.19.2] - 2026-10-27
 
 ### Added

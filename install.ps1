@@ -1085,9 +1085,9 @@ Register-BashAllowlist
 Disable-Autocompact
 Install-LanguageServers
 Install-Pdfium
-Install-AsrModel
-Preload-Encoder
 Invoke-UnpatchOfficialTelegramPlugin
+# The models come after the daemon (below): a download that fails or is
+# interrupted must not leave the machine without its daemon. See install.sh.
 
 # Post-install daemon spawn (default-on, current-user, no admin needed)
 #
@@ -1180,6 +1180,47 @@ if ($env:CLAUDEBASE_SKIP_DAEMON -eq "1") {
     }
 }
 
+Install-AsrModel
+Preload-Encoder
+
+# ============================================================================
+# What works and what does not, before claiming success (see install.sh).
+# ============================================================================
+function Test-ClaudebaseInstall {
+    $exe = Join-Path $Script:ClaudeDir 'tools\claudebase\claudebase.exe'
+    Write-Host ""
+    Write-Host "  Checks" -ForegroundColor White
+    function Show-Check([bool]$Critical, [string]$Label, [scriptblock]$Test) {
+        $ok = $false
+        try { $ok = [bool](& $Test) } catch { $ok = $false }
+        if ($ok) { Write-Host "    ok    $Label" -ForegroundColor Green }
+        elseif ($Critical) { Write-Host "    FAIL  $Label" -ForegroundColor Red; $script:installFailed = $true }
+        else { Write-Host "    --    $Label" -ForegroundColor Yellow }
+    }
+    $script:installFailed = $false
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    Show-Check $true "claudebase binary runs" { (Test-Path $exe) -and ((& $exe --version 2>$null) -match 'claudebase') }
+    Show-Check $true "daemon reachable" { (& $exe daemon status --json 2>$null) -match '"state":\s*"running"' }
+    Show-Check $true "SessionStart hooks wired in settings.json" {
+        $j = Get-Content (Join-Path $Script:ClaudeDir 'settings.json') -Raw | ConvertFrom-Json
+        @($j.hooks.SessionStart | ForEach-Object { $_.hooks } | ForEach-Object { $_.command }) -match 'claudebase-channel-contract'
+    }
+    Show-Check $true "agent rules installed" { Test-Path (Join-Path $Script:ClaudeDir 'rules\project-journal.md') }
+    Show-Check $false "e5 encoder model (semantic journal search; 'claudebase warmup')" {
+        Test-Path (Join-Path $Script:ClaudeDir 'tools\claudebase\models\models--intfloat--multilingual-e5-small\snapshots')
+    }
+    Show-Check $false "rust-analyzer for Claude Code's LSP tool" { Test-NativeOk 'rust-analyzer' @('--version') }
+    Show-Check $false "Claude Code CLI" { [bool](Get-Command claude -ErrorAction SilentlyContinue) }
+    $ErrorActionPreference = $prev
+    if ($script:installFailed) {
+        Write-Host ""
+        Write-Err "claudebase is NOT fully installed - fix the FAIL lines above and re-run the installer"
+    }
+    return (-not $script:installFailed)
+}
+$installOk = Test-ClaudebaseInstall
+
 # Cleanup the temp clone (only when we made one).
 if (-not $Local -and $Script:ScriptDir -and (Test-Path $Script:ScriptDir) -and $Script:ScriptDir -like "$env:TEMP\*") {
     Remove-Item -Recurse -Force $Script:ScriptDir -ErrorAction SilentlyContinue
@@ -1187,7 +1228,11 @@ if (-not $Local -and $Script:ScriptDir -and (Test-Path $Script:ScriptDir) -and $
 
 Write-Host ""
 Write-Host "============================================" -ForegroundColor White
-Write-Host "  claudebase install complete" -ForegroundColor White
+if ($installOk) {
+    Write-Host "  claudebase install complete" -ForegroundColor White
+} else {
+    Write-Host "  claudebase install finished WITH PROBLEMS (see Checks)" -ForegroundColor Red
+}
 Write-Host "============================================" -ForegroundColor White
 Write-Host ""
 Write-Host "  Open a NEW terminal for PATH changes to take effect."
@@ -1210,3 +1255,4 @@ Write-Host "                      /claudebase-setup-remote-daemon"
 Write-Host "                      /claudebase-setup-claude-token"
 Write-Host "  Agents installed:   reflection (Drift), consolidator (Mnem)"
 Write-Host ""
+if (-not $installOk) { exit 1 }

@@ -91,6 +91,11 @@ containers on every change to the installer and fails if that stops being true.
 **Opt-outs** (env vars before running the installer):
 - `CLAUDEBASE_VERSION=x.y.z` — pin a specific version (downgrade, repeatable CI installs), honoured before anything else is resolved. Default: newest `claudebase-v*` tag on origin (via `git ls-remote`, no API quota). Falls back to a baked-in constant only when that lookup cannot run — no git, no network, air-gapped.
 - `CLAUDEBASE_SKIP_WHISPER=1` — skip the speech model download (fetched on the first voice note instead)
+- `--no-models` (or `CLAUDEBASE_SKIP_MODELS=1`) — skip both model downloads (e5 encoder, speech model); `claudebase warmup` fetches the encoder later
+- `--no-lsp` — skip the language servers (and the Rust / Node.js toolchains installed for them)
+- `CLAUDEBASE_NO_LINGER=1` — do not enable systemd linger (the daemon then stops with your last session)
+
+The installer ends with a **Checks** list (binary, daemon, hooks, rules, models, language servers) and exits non-zero when a required one fails. Installing as root works (with a warning); without a systemd user manager (containers, WSL) the daemon is started in the background.
 - `CLAUDEBASE_ASR_BACKEND=parakeet` — select the Parakeet backend and fetch its model instead of
   whisper's. Needs a binary built with `--features asr-sherpa`; the released one has only whisper
 

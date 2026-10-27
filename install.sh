@@ -1233,14 +1233,155 @@ pkg_install() {
 # settings.json is merged with jq: without it the hooks, the allowlist and the
 # auto-compact setting are only printed as instructions, and a session never
 # learns how outside messages arrive. So get it before anything merges.
+JQ_VERSION="jq-1.8.2"
+
+# jq's own static build, for when no package can be installed (not root, no
+# sudo). It lives with claudebase's tools and is put on PATH for this run.
+fetch_static_jq() {
+  local os arch dir="$CLAUDE_DIR/tools/claudebase/bin"
+  case "$(uname -s)" in Linux) os=linux ;; Darwin) os=macos ;; *) return 1 ;; esac
+  case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) return 1 ;; esac
+  mkdir -p "$dir"
+  fetch_to_stdout "https://github.com/jqlang/jq/releases/download/$JQ_VERSION/jq-$os-$arch" > "$dir/jq.part" \
+    && chmod +x "$dir/jq.part" && "$dir/jq.part" --version >/dev/null 2>&1 \
+    && mv -f "$dir/jq.part" "$dir/jq" || { rm -f "$dir/jq.part"; return 1; }
+  export PATH="$dir:$PATH"
+}
+
 ensure_jq() {
   command -v jq >/dev/null 2>&1 && return 0
+  if [ -x "$CLAUDE_DIR/tools/claudebase/bin/jq" ]; then
+    export PATH="$CLAUDE_DIR/tools/claudebase/bin:$PATH"
+    return 0
+  fi
   log_info "installing jq (needed to merge ~/.claude/settings.json)..."
   if pkg_install jq && command -v jq >/dev/null 2>&1; then
     log_ok "jq installed"
+  elif fetch_static_jq; then
+    log_ok "jq $JQ_VERSION (static build, in $CLAUDE_DIR/tools/claudebase/bin)"
   else
-    log_warn "jq could not be installed (${PKG_NOTE:-$PKG_MGR failed}) — settings.json will NOT be merged; install jq and re-run"
+    log_warn "jq could not be installed (${PKG_NOTE:-$PKG_MGR failed}, download failed) — settings.json will NOT be merged; install jq and re-run"
   fi
+}
+
+# ============================================================================
+# Daemon as a service (default-on, idempotent full lifecycle)
+# ============================================================================
+# Replace any existing service unit with the fresh one and start it. Opt-out
+# via `CLAUDEBASE_SKIP_DAEMON=1`.
+#
+# Linux: systemd user units run only while the user has a session — over ssh,
+# the daemon died with the last logout — unless linger is on, which is now
+# enabled here (own user, no root needed; CLAUDEBASE_NO_LINGER=1 to keep it
+# off). Without a systemd user manager at all (a container, WSL) the daemon is
+# started in the background instead, and the summary says it will not come
+# back after a reboot.
+#
+# CRITICAL: `uninstall --keep-data`. A bare `daemon uninstall --yes` wipes the
+# operator's bot token (secrets.toml), daemon.toml AND chat history (chat.db);
+# an upgrade must only swap the service definition.
+DAEMON_MODE=""
+# By its path, not by name: the alias may sit in a PATH directory this shell
+# does not have (~/.local/bin for a user who cannot write /usr/local/bin).
+CB_BIN="$CLAUDE_DIR/tools/claudebase/claudebase"
+
+daemon_up() {
+  "$CB_BIN" daemon status 2>/dev/null | grep -q '^state: running'
+}
+
+start_daemon_in_background() {
+  local log="$CLAUDE_DIR/claudebase/daemon.log"
+  mkdir -p "$(dirname "$log")"
+  ( setsid nohup "$CB_BIN" daemon serve >>"$log" 2>&1 < /dev/null & ) 2>/dev/null \
+    || ( nohup "$CB_BIN" daemon serve >>"$log" 2>&1 < /dev/null & )
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    daemon_up && return 0
+    sleep 1
+  done
+  return 1
+}
+
+install_daemon_service() {
+  if [ "${CLAUDEBASE_SKIP_DAEMON:-0}" = "1" ]; then
+    log_info "CLAUDEBASE_SKIP_DAEMON=1 — skipping daemon service install"
+    DAEMON_MODE=skipped
+    return 0
+  fi
+  log_info "Installing the claudebase daemon as a user service..."
+  "$CB_BIN" daemon stop >/dev/null 2>&1 || true
+  "$CB_BIN" daemon uninstall --yes --keep-data >/dev/null 2>&1 || true
+
+  local has_user_systemd=false
+  if [ "$(uname -s)" = Linux ] && systemctl --user --version >/dev/null 2>&1 \
+     && systemctl --user show-environment >/dev/null 2>&1; then
+    has_user_systemd=true
+  fi
+  if [ "$(uname -s)" = Darwin ] || [ "$has_user_systemd" = true ]; then
+    local out
+    if out=$("$CB_BIN" daemon install --yes 2>&1) && "$CB_BIN" daemon start >/dev/null 2>&1; then
+      printf '%s\n' "$out" | grep -i '^warning' | while IFS= read -r l; do log_warn "$l"; done
+      DAEMON_MODE=service
+      log_ok "daemon installed as a service and started"
+      if [ "$has_user_systemd" = true ] && [ "${CLAUDEBASE_NO_LINGER:-0}" != "1" ]; then
+        if loginctl enable-linger "$(id -un)" >/dev/null 2>&1; then
+          log_ok "linger on for $(id -un): the daemon keeps running after logout and starts at boot"
+        else
+          log_warn "could not enable linger — the daemon stops with your last session; run: loginctl enable-linger $(id -un)"
+        fi
+      fi
+      return 0
+    fi
+    log_warn "daemon service install/start failed: $(printf '%s' "$out" | tail -n 1)"
+  else
+    log_info "no systemd user manager here (container / WSL?) — starting the daemon in the background"
+  fi
+  if daemon_up || start_daemon_in_background; then
+    DAEMON_MODE=background
+    log_ok "daemon running in the background (log: $CLAUDE_DIR/claudebase/daemon.log)"
+    log_warn "  it will not restart by itself after a reboot: start it again with 'claudebase daemon serve &'"
+  else
+    DAEMON_MODE=failed
+    log_error "the daemon is not running — see $CLAUDE_DIR/claudebase/daemon.log"
+  fi
+}
+
+# ============================================================================
+# What works and what does not, before claiming success
+# ============================================================================
+# The installer is best effort step by step, which used to mean a run could end
+# with "install complete" over a machine with no daemon and no hooks. These are
+# the things a session cannot do without; any of them missing fails the run.
+verify_install() {
+  local failed=0 settings="$CLAUDE_DIR/settings.json"
+  echo ""
+  echo -e "${BOLD}  Checks${NC}"
+  check() { # <critical 0|1> <label> <command...>
+    local critical="$1" label="$2"; shift 2
+    if "$@" >/dev/null 2>&1; then
+      echo -e "    ${GREEN}ok${NC}    $label"
+    elif [ "$critical" = 1 ]; then
+      echo -e "    ${RED}FAIL${NC}  $label"
+      failed=1
+    else
+      echo -e "    ${YELLOW}--${NC}    $label"
+    fi
+  }
+  check 1 "claudebase binary runs ($("$CB_BIN" --version 2>/dev/null | head -n 1))" "$CB_BIN" --version
+  check 0 "'claudebase' on this shell's PATH (else open a new shell)" sh -c 'command -v claudebase' 
+  check 1 "daemon reachable ($DAEMON_MODE)" daemon_up
+  check 1 "SessionStart hooks wired in settings.json" \
+    sh -c "jq -e '[.hooks.SessionStart[]?.hooks[]?.command] | any(test(\"claudebase-channel-contract\"))' '$settings'"
+  check 1 "agent rules installed" test -f "$CLAUDE_DIR/rules/project-journal.md"
+  check 0 "e5 encoder model (semantic journal search; 'claudebase warmup')" \
+    test -d "$CLAUDE_DIR/tools/claudebase/models/models--intfloat--multilingual-e5-small/snapshots"
+  check 0 "rust-analyzer for Claude Code's LSP tool" rust-analyzer --version
+  check 0 "Claude Code CLI" claude --version
+  if [ "$failed" = 1 ]; then
+    echo ""
+    log_error "claudebase is NOT fully installed — fix the FAIL lines above and re-run the installer"
+  fi
+  return $failed
 }
 
 # ============================================================================
@@ -1280,61 +1421,30 @@ register_bash_allowlist
 disable_autocompact
 install_language_servers
 install_pdfium
+unpatch_official_telegram_plugin
+# The daemon before the models: a model download that fails or is interrupted
+# (a host that cannot reach huggingface.co sat at 0% until Ctrl+C) must not
+# leave a machine without its daemon — that is what happened on 2026-10-27,
+# every run stopping before this step.
+install_daemon_service
 install_asr_model
 preload_encoder
-unpatch_official_telegram_plugin
-
-# ============================================================================
-# Post-install daemon-as-service (default-on, idempotent full lifecycle)
-# ============================================================================
-# Always-on by default: replace any existing daemon service unit with the
-# fresh one and start it. Opt-out via `CLAUDEBASE_SKIP_DAEMON=1`.
-#
-# launchd (macOS) and systemd-user (Linux) both run user-scope — no root
-# required. The 'stop || true / uninstall || true' prelude makes the
-# whole block idempotent even on a fresh box where there's no existing
-# service to stop or uninstall.
-#
-# Linux: systemd user units only auto-start when the user is logged in
-# OR `loginctl enable-linger $USER` has been run. We surface that hint
-# but do not auto-enable linger (would change system PAM state).
-if [ "${CLAUDEBASE_SKIP_DAEMON:-0}" = "1" ]; then
-  log_info "CLAUDEBASE_SKIP_DAEMON=1 — skipping daemon service install"
-else
-  log_info "Installing claudebase daemon as user service (idempotent)..."
-  # Stop and uninstall any prior service before reinstalling the plist.
-  # CRITICAL: --keep-data. A bare `daemon uninstall --yes` FULL-WIPES the
-  # operator's bot token (secrets.toml), daemon config (daemon.toml) AND
-  # chat history (chat.db) — running that inside the installer means every
-  # upgrade silently destroys the user's setup. An install/upgrade MUST be
-  # non-destructive, so we keep data and only swap the service definition.
-  # Silenced + '|| true' so a clean box with no prior service still works.
-  claudebase daemon stop >/dev/null 2>&1 || true
-  claudebase daemon uninstall --yes --keep-data >/dev/null 2>&1 || true
-  if claudebase daemon install --yes >/dev/null 2>&1; then
-    if claudebase daemon start; then
-      log_ok "Daemon installed and started (auto-starts on next user session)"
-      if [ "$(uname -s)" = "Linux" ]; then
-        log_info "  Tip (Linux): for boot-time start without login, run once:"
-        log_info "    loginctl enable-linger \"$USER\""
-      fi
-    else
-      log_warn "Daemon installed but failed to start. Try 'claudebase daemon start' manually."
-    fi
-  else
-    log_warn "Daemon install failed; continuing without daemon."
-    log_warn "  Re-run later: claudebase daemon install && claudebase daemon start"
-  fi
-fi
 
 # Cleanup the temp clone (only when we made one).
 if [ "$LOCAL_MODE" = false ] && [ -n "$SCRIPT_DIR" ] && [ -d "$SCRIPT_DIR" ] && [ "$SCRIPT_DIR" != "/" ]; then
   rm -rf "$SCRIPT_DIR"
 fi
 
+INSTALL_STATUS=0
+verify_install || INSTALL_STATUS=1
+
 echo ""
 echo -e "${BOLD}============================================${NC}"
-echo -e "${BOLD}  claudebase install complete${NC}"
+if [ "$INSTALL_STATUS" = 0 ]; then
+  echo -e "${BOLD}  claudebase install complete${NC}"
+else
+  echo -e "${BOLD}  claudebase install finished WITH PROBLEMS (see Checks)${NC}"
+fi
 echo -e "${BOLD}============================================${NC}"
 echo ""
 echo "  Quick start:"
@@ -1368,3 +1478,4 @@ echo ""
 echo "  Tip: re-ingest existing PDFs (\`claudebase ingest <path>\`) to upgrade"
 echo "  pre-v2 indexes to schema v3 — that's what unlocks per-page citations."
 echo ""
+exit "$INSTALL_STATUS"

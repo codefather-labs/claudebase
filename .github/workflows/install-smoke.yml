@@ -307,6 +307,80 @@ jobs:
             systemd-analyze verify --user-unit "$unit" || true
           fi
 
+  # The jobs above bootstrap jq and sudo and run as root, which is why none of
+  # them saw what a real server hit on 2026-10-27: a root shell with no sudo
+  # (every `sudo apt-get` failed), no jq (settings.json was never merged, so no
+  # hook was wired), a fresh Claude Code without the official plugin
+  # marketplace, and an install interrupted at the model download before the
+  # daemon step. Here the container is bare — curl, git and certificates only,
+  # what any server has — the binary comes from the newest release like a real
+  # install, and the installer's own final checks decide: it exits non-zero
+  # when the binary, the daemon or the hooks are not in place.
+  install-bare:
+    name: bare ${{ matrix.image }} as ${{ matrix.user }}${{ matrix.lsp && ' + language servers' || '' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: 'ubuntu:24.04', user: root, lsp: true }
+          - { image: 'debian:13', user: root, lsp: false }
+          - { image: 'ubuntu:24.04', user: dev, lsp: false }
+    container:
+      image: ${{ matrix.image }}
+      options: --user root
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bare bootstrap (curl, git, certificates; no jq, no sudo)
+        run: |
+          set -eux
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends curl ca-certificates git
+          ! command -v jq
+          ! command -v sudo
+          if [ "${{ matrix.user }}" != root ]; then
+            useradd -m "${{ matrix.user }}"
+            cp install.sh "/home/${{ matrix.user }}/install.sh"
+            chown "${{ matrix.user }}" "/home/${{ matrix.user }}/install.sh"
+          fi
+
+      - name: Run the installer (its own checks decide)
+        shell: bash
+        run: |
+          set -eu
+          flags="--yes --no-models"
+          [ "${{ matrix.lsp }}" = true ] || flags="$flags --no-lsp"
+          if [ "${{ matrix.user }}" = root ]; then
+            bash install.sh $flags
+          else
+            su "${{ matrix.user }}" -c "cd ~ && bash install.sh $flags"
+          fi
+
+      - name: Hooks wired, daemon answering
+        shell: bash
+        run: |
+          set -eu
+          home=$(getent passwd "${{ matrix.user }}" | cut -d: -f6)
+          cb="$home/.claude/tools/claudebase/claudebase"
+          jqb=$(command -v jq || echo "$home/.claude/tools/claudebase/bin/jq")
+          "$jqb" -e '[.hooks.SessionStart[]?.hooks[]?.command] | any(test("claudebase-channel-contract"))' \
+            "$home/.claude/settings.json" >/dev/null || { echo "hooks not wired"; exit 1; }
+          if [ "${{ matrix.user }}" = root ]; then "$cb" daemon status; else su "${{ matrix.user }}" -c "$cb daemon status"; fi \
+            | grep -q '^state: running' || { echo "daemon not running"; exit 1; }
+
+      - name: Language servers run
+        if: matrix.lsp
+        shell: bash
+        run: |
+          set -eu
+          export PATH="$HOME/.cargo/bin:$PATH"
+          export NVM_DIR="$HOME/.nvm"; set +u; . "$NVM_DIR/nvm.sh"; set -u
+          rust-analyzer --version
+          pyright --version
+          typescript-language-server --version
+
   install-windows:
     name: install.ps1 on windows-latest
     runs-on: windows-latest

@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.19.3] - 2026-10-27
+
 ### Changed
 
 - **Installing the daemon as root is warned about, no longer refused.** On a server where everything

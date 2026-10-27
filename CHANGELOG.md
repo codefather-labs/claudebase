@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.18.8] - 2026-10-27
+
+### Changed
+
+- **The installers turn Claude Code's auto-compact off** by writing `"autoCompactEnabled": false` to
+  `~/.claude/settings.json`. When the context fills, a session stops with "prompt too long" instead
+  of replacing its history with a summary mid-task; it is then cleared or compacted by hand
+  (`/clear`, `/compact`, or the pool's per-worker clear). The key is written only while it is
+  absent, so turning auto-compact back on in `/config` survives later updates. Verified with
+  Claude Code 2.1.311: `/config` reads `Auto-compact false` with this key in `settings.json`.
+
 ## [0.18.7] - 2026-10-27
 
 ### Fixed

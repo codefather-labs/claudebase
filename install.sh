@@ -98,6 +98,9 @@ OPTIONS:
   --yes                       Skip confirmation prompts
   --local                     Use local checkout (skip git clone)
   --no-lsp                    Do not install language servers (nor Rust / Node.js for them)
+  --no-models                 Do not download the e5 encoder (~490 MB) nor the speech model (~1.5 GB):
+                              journal search stays keyword-only until 'claudebase warmup',
+                              voice notes fetch their model on first use
   --help                      Show this help
 
 WHAT GETS INSTALLED:
@@ -147,6 +150,7 @@ while [ $# -gt 0 ]; do
     --yes|-y)    ASSUME_YES=true; shift ;;
     --local)     LOCAL_MODE=true; shift ;;
     --no-lsp)    SKIP_LSP=true; shift ;;
+    --no-models) SKIP_MODELS=true; shift ;;
     --help|-h)   print_help; exit 0 ;;
     *) log_error "unknown flag: $1"; print_help; exit 2 ;;
   esac
@@ -901,7 +905,15 @@ unpatch_official_telegram_plugin() {
 # ============================================================================
 # Pre-warm e5 encoder so first `claudebase ingest` doesn't pay ~30s cold start
 # ============================================================================
+skip_models() {
+  [ "${SKIP_MODELS:-false}" = true ] || [ "${CLAUDEBASE_SKIP_MODELS:-0}" = "1" ]
+}
+
 preload_encoder() {
+  if skip_models; then
+    log_info "skipping the e5 encoder download (--no-models); run 'claudebase warmup' later for semantic journal search"
+    return 0
+  fi
   local exe_ext=""
   case "$(uname -ms)" in MINGW*|MSYS*|CYGWIN*) exe_ext=".exe" ;; esac
   local bin="$CLAUDE_DIR/tools/claudebase/claudebase${exe_ext}"
@@ -943,7 +955,7 @@ preload_encoder() {
 # fetch. It is opt-in because it needs a binary built with `--features
 # asr-sherpa`; the released binary ships whisper.
 install_asr_model() {
-  if [ "${CLAUDEBASE_SKIP_WHISPER:-0}" = "1" ] || [ "${CLAUDEBASE_SKIP_ASR_MODEL:-0}" = "1" ]; then
+  if skip_models || [ "${CLAUDEBASE_SKIP_WHISPER:-0}" = "1" ] || [ "${CLAUDEBASE_SKIP_ASR_MODEL:-0}" = "1" ]; then
     log_info "skipping the speech model download (opt-out set)"
     return 0
   fi

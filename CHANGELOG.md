@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **`--no-models` / `-NoModels`** (or `CLAUDEBASE_SKIP_MODELS=1`): install without the e5 encoder
+  (~490 MB) and the speech model (~1.5 GB). Combines with `--local`.
+  - Journal search stays keyword-only until `claudebase warmup` is run.
+  - Voice notes fetch their model on first use.
+
+### Fixed
+
+- **`claudebase warmup` could wait forever** for an encoder download that never started. On a host
+  that cannot reach huggingface.co it sat at 0% indefinitely, because fastembed's HTTP client has
+  no stall timeout. After 120 s with no data it now gives up, says why and what to do (retry, or
+  copy the model from another machine), and exits 1. The installer then carries on.
+- **The Windows installer hid the encoder download entirely** (`2>&1 | Out-Null`). On a console it
+  now shows the progress bar; redirected, it shows the progress lines.
+
 ## [0.19.1] - 2026-10-27
 
 ### Fixed

@@ -24,6 +24,8 @@ param(
     [switch]$SkipAsrModel,
     # Do not install language servers for Claude Code's LSP tool.
     [switch]$NoLsp,
+    # Skip both model downloads (e5 encoder ~490 MB, speech model ~1.5 GB).
+    [switch]$NoModels,
     [switch]$Help
 )
 
@@ -96,12 +98,15 @@ Installs the claudebase CLI binary and agent toolkit (rules, commands,
 agents) into %USERPROFILE%\.claude\.
 
 USAGE:
-  .\install.ps1 [-Yes] [-Local] [-NoLsp] [-Help]
+  .\install.ps1 [-Yes] [-Local] [-NoLsp] [-NoModels] [-Help]
 
 OPTIONS:
   -Yes        Skip confirmation prompts
   -Local      Use local checkout (skip git clone of $($Script:RepoUrl))
   -NoLsp      Do not install language servers (nor Rust / Node.js for them)
+  -NoModels   Do not download the e5 encoder (~490 MB) nor the speech model
+              (~1.5 GB): journal search stays keyword-only until
+              `claudebase warmup`, voice notes fetch their model on first use
   -Help       Show this help
 
 WHAT GETS INSTALLED:
@@ -850,13 +855,29 @@ function Install-Pdfium {
 # ============================================================================
 # Pre-warm e5 encoder
 # ============================================================================
+function Test-SkipModels {
+    return ($NoModels -or $env:CLAUDEBASE_SKIP_MODELS -eq '1')
+}
+
 function Preload-Encoder {
+    if (Test-SkipModels) {
+        Write-Info "skipping the e5 encoder download (-NoModels); run 'claudebase warmup' later for semantic journal search"
+        return
+    }
     $bin = Join-Path $Script:ClaudeDir 'tools\claudebase\claudebase.exe'
     if (-not (Test-Path $bin)) { return }
 
     Write-Info "Pre-loading e5-multilingual-small encoder (~490 MB download on first run)..."
     try {
-        & $bin warmup --quiet 2>&1 | Out-Null
+        # Progress goes to stderr. On a console it is drawn there directly; it
+        # used to be `2>&1 | Out-Null`, a silent multi-minute step. Continue,
+        # not Stop: a redirected native stderr line is no error here.
+        $ErrorActionPreference = 'Continue'
+        if ([Console]::IsErrorRedirected) {
+            & $bin warmup --quiet 2>&1 | ForEach-Object { Write-Host "    $_" }
+        } else {
+            & $bin warmup --quiet
+        }
         if ($LASTEXITCODE -eq 0) {
             Write-Ok "encoder ready (cached at ~\.claude\tools\claudebase\models\)"
         } else {
@@ -923,7 +944,7 @@ function Set-AsrBackend {
 # not. It used to: the whisper path was written here AND in the binary, and the
 # two disagreed for a release.
 function Install-AsrModel {
-    if ($SkipAsrModel -or $env:CLAUDEBASE_SKIP_ASR_MODEL -eq '1' -or $env:CLAUDEBASE_SKIP_WHISPER -eq '1') {
+    if ($SkipAsrModel -or (Test-SkipModels) -or $env:CLAUDEBASE_SKIP_ASR_MODEL -eq '1' -or $env:CLAUDEBASE_SKIP_WHISPER -eq '1') {
         Write-Info "skipping the speech model download (opt-out set)"
         return
     }

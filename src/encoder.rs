@@ -70,6 +70,13 @@ pub fn model_cached() -> bool {
         .unwrap_or(false)
 }
 
+/// Set by `claudebase warmup`: give up on a download that has received nothing
+/// for [`STALL_LIMIT`] and exit, instead of waiting forever (fastembed's HTTP
+/// client has no stall timeout; a host that cannot reach huggingface.co sat
+/// at 0% indefinitely). Other callers just keep waiting.
+pub static EXIT_ON_STALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// fastembed's cache folder for the model.
 const MODEL_DIR: &str = "models--intfloat--multilingual-e5-small";
 /// What the download comes to (the ONNX graph, its data, the tokenizer).
@@ -104,8 +111,19 @@ fn report_download(dir: std::path::PathBuf, done: std::sync::Arc<std::sync::atom
     let mut last_line = std::time::Instant::now();
     let mut width = 0usize;
     let mut got = 0;
+    let (mut seen, mut moved_at) = (u64::MAX, std::time::Instant::now());
     while !done.load(Ordering::Relaxed) {
         got = dir_bytes(&dir);
+        if got != seen {
+            (seen, moved_at) = (got, std::time::Instant::now());
+        } else if moved_at.elapsed() >= STALL_LIMIT && EXIT_ON_STALL.load(Ordering::Relaxed) {
+            eprintln!(
+                "\n  encoder model: nothing received for {} s — giving up. Is huggingface.co reachable from here? \
+                 Retry later with `claudebase warmup`, or copy ~/.claude/tools/claudebase/models/{MODEL_DIR} from a machine that has it.",
+                STALL_LIMIT.as_secs()
+            );
+            std::process::exit(1);
+        }
         if tty {
             // The same bar as the speech model's, on stderr (stdout may be
             // the command's answer). Padding, not ANSI, clears the rest.

@@ -2176,6 +2176,7 @@ fn expand_full_text(
 /// (offline install, HF rate limit) are warnings, NOT errors — the
 /// fallback path is fastembed's lazy download on first real use.
 fn run_warmup(args: &cli::WarmupArgs) -> std::process::ExitCode {
+    encoder::EXIT_ON_STALL.store(true, std::sync::atomic::Ordering::Relaxed);
     if !args.quiet {
         eprintln!(
             "warmup: pre-loading e5-multilingual-small encoder into ~/.claude/tools/claudebase/models/ ..."

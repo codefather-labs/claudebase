@@ -307,7 +307,7 @@ pub fn remote_may_call(tool: &str) -> bool {
             | "agent_set_dnd"
             | "agent_unregister"
             | "agent_list_alive"
-    ) || tool.starts_with("journal_")
+    ) || (tool.starts_with("journal_") && tool != "journal_feedback")
         || tool.starts_with("session_")
         // Setting this machine's Claude token from the operator's own machine is
         // the point of `auth setup-token`; a remote token is already full trust.

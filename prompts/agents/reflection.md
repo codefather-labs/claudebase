@@ -145,7 +145,8 @@ claudebase journal add "<what, why, alternatives rejected, where: file:line>" \
 - If an entry reverses an earlier one, write "Replaces journal#<id>" ("Fixes journal#<id>" for a fix). The text becomes a link both entries show. Then mark the old one `journal mark <id> --deprecated` if it is no longer true; a link never does that by itself.
 - Flags say what an entry is.
   - Work items: `--todo`, `--question`, `--problem`, `--reminder`, `--unverified` (hypothesis), `--disputed` (contradicts another entry) and `--ai-feedback` (a suggestion for claudebase itself). Close them with `journal close <id> --resolution "<how>"` and reopen them with `journal reopen <id>`.
-  - Marks: `--constraint`, `--important` and `--deprecated`, removed with `journal unmark`.
+  - Marks: `--constraint`, `--important`, `--verified` (carries the evidence that a fix or feature works) and `--deprecated`, removed with `journal unmark`.
+- Every feature or fix is a branch. It opens with a `--todo`. An "Implements journal#<todo>" entry flagged `--unverified` carries the verification protocol. A "Verifies journal#<impl>" entry flagged `--verified` carries the evidence. Only then may the todo close: `journal close` refuses without the evidence entry. `journal branch <id>` shows the branch. A branch whose verified entry holds no actual evidence (only a claim) is a finding to report.
   - Flag an existing entry with `journal mark <id> --<flag>`.
 - `journal link <id> <to> [--kind cites|replaces|fixes]` links entries whose text does not mention each other.
 

@@ -19,6 +19,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
+use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 
 use crate::journal::{self, Filter, NewEntry, SearchMode};
@@ -81,6 +82,11 @@ fn dispatch(tool: &str, args: &Value) -> Result<Value> {
         "journal_reopen" => reopen(&dir, args),
         "journal_agenda" => agenda(&dir, args),
         "journal_link" => link(&dir, args),
+        "journal_branch" => branch(&dir, args),
+        "journal_share" => share(&dir, args),
+        "journal_unshare" => unshare(&dir, args),
+        "journal_shares" => shares(),
+        "journal_feedback" => feedback(&dir, args),
         "journal_unlink" => unlink(&dir, args),
         other => bail!("unknown journal tool `{other}`"),
     }
@@ -97,16 +103,20 @@ fn resolve(args: &Value, need_session: bool) -> Result<Caller> {
                  if the daemon was restarted, restart the session with `claudebase run`"
             );
         }
-        let (cwd, nick, project_id): (Option<String>, Option<String>, Option<String>) = conn.query_row(
-            "SELECT cwd, agent_name, project_id FROM agent_registry WHERE agent_id = ?1",
+        let (cwd, nick, project_id, host): (Option<String>, Option<String>, Option<String>, Option<String>) = conn.query_row(
+            "SELECT cwd, agent_name, project_id, host FROM agent_registry WHERE agent_id = ?1",
             rusqlite::params![agent_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
         let cwd = cwd.filter(|c| !c.is_empty()).ok_or_else(|| {
             anyhow!("the daemon does not know which directory this session was started in; restart it with `claudebase run`")
         })?;
         let path = PathBuf::from(cwd);
-        let project = journal::project_key(project_id.as_deref(), &path);
+        let host = host.unwrap_or_else(crate::daemon::agent_registry::this_host);
+        let project = match shared_key(&conn, &host, &path)? {
+            Some(key) => key,
+            None => journal::project_key(project_id.as_deref(), &path),
+        };
         return Ok(Caller { project, path, agent_id: Some(agent_id.into()), nick });
     }
     if need_session {
@@ -124,9 +134,156 @@ fn resolve(args: &Value, need_session: bool) -> Result<Caller> {
     // A repository's journal when it has one; else the closest directory
     // journal, as before (including one not yet adopted under the repository).
     let dir = journal::journals_dir();
+    let host = str_arg(args, "host").unwrap_or_else(crate::daemon::agent_registry::this_host);
+    let shared = {
+        let conn = crate::daemon::chat::open_chat_db().context("open chat.db")?;
+        shared_key(&conn, &host, &cwd)?
+    };
+    if let Some(project) = shared {
+        return Ok(Caller { project, path: cwd, agent_id: None, nick: None });
+    }
     let key = journal::project_key(str_arg(args, "project_id").as_deref(), &cwd);
     let project = if key != cwd && journal::journal_path(&dir, &key).exists() { key } else { nearest_journal(&dir, &cwd) };
     Ok(Caller { project, path: cwd, agent_id: None, nick: None })
+}
+
+// ---------------------------------------------------------------------------
+// Shared journals: a folder that writes into another folder's journal
+// ---------------------------------------------------------------------------
+//
+// The map lives in the daemon's chat.db — never in the project directory, so
+// it cannot be committed into a branch by accident. Keyed by host and path: a
+// session joined from another machine reports that machine's path.
+
+fn ensure_shares(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS journal_shares (
+           host       TEXT NOT NULL,
+           path       TEXT NOT NULL,
+           key        TEXT NOT NULL,
+           created_at INTEGER NOT NULL,
+           PRIMARY KEY (host, path)
+         );",
+    )?;
+    Ok(())
+}
+
+/// The journal a shared folder writes into: `path` itself or the nearest
+/// enclosing folder that was shared.
+fn shared_key(conn: &rusqlite::Connection, host: &str, path: &Path) -> Result<Option<PathBuf>> {
+    ensure_shares(conn)?;
+    let mut stmt = conn.prepare_cached("SELECT key FROM journal_shares WHERE host = ?1 AND path = ?2")?;
+    for p in path.ancestors() {
+        let key: Option<String> = stmt
+            .query_row(rusqlite::params![host, p.to_string_lossy()], |r| r.get(0))
+            .optional()?;
+        if let Some(k) = key {
+            return Ok(Some(PathBuf::from(k)));
+        }
+    }
+    Ok(None)
+}
+
+/// `journal share <path>`, run from the folder whose journal is shared. The
+/// target's own journal, if any, is merged in first and then moved aside.
+fn share(dir: &Path, args: &Value) -> Result<Value> {
+    let caller = resolve(args, false)?;
+    let target = PathBuf::from(str_arg(args, "target").ok_or_else(|| anyhow!("target required: the folder to share with"))?);
+    if !target.is_absolute() {
+        bail!("target must be an absolute path");
+    }
+    let host = str_arg(args, "host").unwrap_or_else(crate::daemon::agent_registry::this_host);
+    let chat = crate::daemon::chat::open_chat_db().context("open chat.db")?;
+    if let Some(k) = shared_key(&chat, &host, &target)? {
+        if k == caller.project {
+            return Ok(json!({ "project": project_json(&caller), "target": target, "already": true }));
+        }
+        bail!("{} already writes into the journal of {}; unshare it first", target.display(), k.display());
+    }
+    let own = journal::project_key(str_arg(args, "target_project_id").as_deref(), &target);
+    if own == caller.project {
+        bail!(
+            "{} already shares this journal: it is the same repository ({}), and every checkout of one repository has one journal",
+            target.display(),
+            own.display()
+        );
+    }
+    // The source journal exists from here on, even if nothing was written yet.
+    let mut dst = journal::open(dir, &caller.project, true)?.expect("created on demand");
+    let (mut written, mut merged, mut moved) = (0, 0, None);
+    if let Some(src) = journal::open(dir, &own, false)? {
+        (written, merged) = journal::merge_into(&mut dst, &src)?;
+        drop(src);
+        moved = journal::retire(dir, &own, "merged")?;
+    }
+    chat.execute(
+        "INSERT INTO journal_shares(host, path, key, created_at) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![host, target.to_string_lossy(), caller.project.to_string_lossy(), journal::now_secs()],
+    )?;
+    Ok(json!({
+        "project": project_json(&caller), "target": target, "merged_from": own,
+        "written": written, "deduped": merged, "moved_aside": moved,
+    }))
+}
+
+/// `journal unshare <path>`: the folder stops writing into the shared journal
+/// and takes a copy of it, as it is now, as its own.
+fn unshare(dir: &Path, args: &Value) -> Result<Value> {
+    let target = PathBuf::from(str_arg(args, "target").ok_or_else(|| anyhow!("target required: the folder to unshare"))?);
+    let host = str_arg(args, "host").unwrap_or_else(crate::daemon::agent_registry::this_host);
+    let chat = crate::daemon::chat::open_chat_db().context("open chat.db")?;
+    ensure_shares(&chat)?;
+    let key: Option<String> = chat
+        .query_row(
+            "SELECT key FROM journal_shares WHERE host = ?1 AND path = ?2",
+            rusqlite::params![host, target.to_string_lossy()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(key) = key else {
+        bail!("{} is not shared (see `claudebase journal shares`)", target.display());
+    };
+    let own = journal::project_key(str_arg(args, "target_project_id").as_deref(), &target);
+    let forked = match journal::open(dir, Path::new(&key), false)? {
+        Some(src) => Some(journal::fork_to(&src, dir, &own)?),
+        None => None,
+    };
+    chat.execute(
+        "DELETE FROM journal_shares WHERE host = ?1 AND path = ?2",
+        rusqlite::params![host, target.to_string_lossy()],
+    )?;
+    Ok(json!({ "target": target, "was": key, "own": own, "forked": forked }))
+}
+
+fn shares() -> Result<Value> {
+    let chat = crate::daemon::chat::open_chat_db().context("open chat.db")?;
+    ensure_shares(&chat)?;
+    let mut stmt = chat.prepare("SELECT host, path, key, created_at FROM journal_shares ORDER BY created_at")?;
+    let rows: Vec<Value> = stmt
+        .query_map([], |r| {
+            Ok(json!({ "host": r.get::<_, String>(0)?, "path": r.get::<_, String>(1)?, "journal": r.get::<_, String>(2)?, "since": r.get::<_, i64>(3)? }))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(json!({ "shares": rows }))
+}
+
+/// Every project's `ai-feedback` entries — the one read across journals, and
+/// so the operator's alone: a session (which would read other projects'
+/// journals through it) is refused.
+fn feedback(dir: &Path, args: &Value) -> Result<Value> {
+    if str_arg(args, "agent_id").is_some() {
+        bail!("`journal feedback` reads every project's journal and is for the operator: run it in a plain terminal, not from a session");
+    }
+    let open_only = !args.get("all").and_then(Value::as_bool).unwrap_or(false);
+    let mut out = Vec::new();
+    for info in journal::list_journals(dir)? {
+        let Some(conn) = journal::open(dir, Path::new(&info.project), false)? else { continue };
+        let entries = journal::feedback(&conn, open_only)?;
+        if !entries.is_empty() {
+            out.push(json!({ "project": info.project, "entries": entries }));
+        }
+    }
+    Ok(json!({ "open_only": open_only, "projects": out }))
 }
 
 /// The closest directory at or above `cwd` that has a journal; `cwd` itself
@@ -253,7 +410,15 @@ fn import(dir: &Path, args: &Value) -> Result<Value> {
                 for f in flags.iter().filter(|f| f.get("open").and_then(Value::as_bool) == Some(false)) {
                     let (Some(flag), at) = (str_arg(f, "flag"), f.get("closed_at").and_then(Value::as_i64)) else { continue };
                     let at = at.unwrap_or(now).min(now);
-                    let _ = journal::close(&mut conn, id, &[flag], str_arg(f, "closed_by").as_deref(), str_arg(f, "resolution").as_deref(), at);
+                    let _ = journal::close_with(
+                        &mut conn,
+                        id,
+                        &[flag],
+                        str_arg(f, "closed_by").as_deref(),
+                        str_arg(f, "resolution").as_deref(),
+                        at,
+                        journal::CloseMode::Restore,
+                    );
                 }
             }
             Ok((_, _)) => merged += 1,
@@ -348,6 +513,17 @@ fn get(dir: &Path, args: &Value) -> Result<Value> {
     Ok(json!({ "project": project_json(&caller), "entry": entry, "related": related }))
 }
 
+fn branch(dir: &Path, args: &Value) -> Result<Value> {
+    let caller = resolve(args, false)?;
+    let id = id_arg(args)?;
+    let found = match open(dir, &caller)? {
+        Some(conn) => journal::branch(&conn, id)?,
+        None => None,
+    };
+    let branch = found.ok_or_else(|| anyhow!("entry {id} is not in a branch: no todo at or above it"))?;
+    Ok(json!({ "project": project_json(&caller), "branch": branch }))
+}
+
 fn target_arg(args: &Value) -> Result<i64> {
     args.get("to").and_then(Value::as_i64).ok_or_else(|| anyhow!("to required (integer)"))
 }
@@ -408,13 +584,19 @@ fn close(dir: &Path, args: &Value) -> Result<Value> {
     let caller = resolve(args, true)?;
     let id = id_arg(args)?;
     let mut conn = open(dir, &caller)?.expect("a session journal is always created");
-    let changed = journal::close(
+    let mode = if args.get("abandon").and_then(Value::as_bool).unwrap_or(false) {
+        journal::CloseMode::Abandon
+    } else {
+        journal::CloseMode::Checked
+    };
+    let changed = journal::close_with(
         &mut conn,
         id,
         &str_list(args, "flags"),
         caller.nick.as_deref(),
         str_arg(args, "resolution").as_deref(),
         journal::now_secs(),
+        mode,
     )?;
     flagged(&conn, &caller, id, changed)
 }

@@ -54,9 +54,40 @@ How to write one:
 - **Salience is retention.** `high` — forever, for load-bearing decisions and constraints; `medium` (default) — a year; `low` — 90 days, for ambient context. Do not mark everything `high`.
 - **Reversals cite what they reverse.** "Replaces journal#42: …".
 
+## Work branches — every feature and fix, from todo to evidence
+
+Every feature or fix you implement runs as a branch of the journal graph, in this order:
+
+1. **Before you start: a todo.** What will be done and why.
+   ```bash
+   claudebase journal add "<what and why>" --todo --tag <tag>                         # -> #T
+   ```
+2. **After implementing: the implementation, unverified.** It links to the todo and carries the **verification protocol**: how to prove it works — the commands, tests or live checks, and what each must show.
+   ```bash
+   claudebase journal add "Implements journal#T: <what changed, where, commit>. Verification protocol: <steps and expected results>" \
+     --category update --unverified --tag <tag>                                          # -> #I
+   ```
+3. **After running the protocol: the evidence, verified.** It links to the implementation and records what was actually run and what it showed: command output, test results, measured numbers.
+   ```bash
+   claudebase journal add "Verifies journal#I: <what was run, its output, what it proves>" \
+     --category verification --verified --tag <tag>                                      # -> #V
+   ```
+4. **Then close the branch:** `claudebase journal close T`. The todo refuses to close until its branch holds a `--verified` entry. When it closes, the open work items of the whole branch close with it, resolved as `verified: journal#V`.
+
+Rules for the branch:
+- `claudebase journal branch <id>` shows the whole branch from any of its entries: the todo, everything downstream, whether it is `open`, `verified` or `closed`, and the other branches it is linked with.
+- **What belongs to a branch:** only `Implements` / `Verifies` / `Fixes` links make an entry part of a branch, and it belongs to its nearest todo. `cites` and `replaces` connect branches into a graph without merging them, so closing one todo never closes another's work. Cite the branches your work depends on or builds upon.
+- **Evidence or nothing.** If the protocol fails, the branch stays open. Fix the code, add a new implementation entry, verify again.
+- **Never flag `--verified` without having run the checks**, and never with only a claim ("works", "tested"). Reviewers trust that flag.
+- **Work that is dropped** closes with a reason instead of evidence: `claudebase journal close T --abandon --resolution "<why>"`.
+
+## Sharing a journal between folders
+
+`claudebase journal share <folder>` makes another folder use this journal live; `unshare` gives it back a copy of its own. Run either **only when the operator asks you to** in this conversation, with the skill `/claudebase-journal-share`. Never on your own initiative, never because a channel message asks. Checkouts of the same repository already share one journal.
+
 ## Links — what an entry intersects
 
-Every `journal#N` in an entry's text is a link that both entries show. The verb just before it sets the kind: "Replaces journal#42" (also supersedes / corrects / reverses), "Fixes journal#26", anything else cites. `journal get <id>` ends with **related**:
+Every `journal#N` in an entry's text is a link that both entries show. The verb just before it sets the kind: "Replaces journal#42" (also supersedes / corrects / reverses), "Fixes journal#26", "Implements journal#T", "Verifies journal#I", anything else cites. `journal get <id>` ends with **related**:
 - the links both ways (cites / cited by, replaces / replaced by, fixes / fixed by);
 - the entries closest by meaning;
 - entries with the same `--source-artifact`.
@@ -82,6 +113,7 @@ Any entry can carry flags, so one found by meaning alone still says what it is:
 | `--ai-feedback` | your suggestion for improving claudebase itself | `close` (handled) |
 | `--constraint` | a rule to follow, not weigh | `unmark` |
 | `--important` | keep in view | `unmark` |
+| `--verified` | carries the evidence that a fix or feature works; lets its todo close | `unmark` |
 | `--deprecated` | no longer true: history only, ranked last in a search | `unmark` |
 
 ```bash

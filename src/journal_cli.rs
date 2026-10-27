@@ -36,6 +36,18 @@ pub async fn run(sub: JournalSubcommand) -> Result<String> {
 
 /// The tool to call, its arguments, and whether to print JSON.
 fn request(sub: JournalSubcommand) -> Result<(&'static str, Value, bool)> {
+    // The other folder as this machine names it: the daemon may be elsewhere.
+    let target = |path: &std::path::Path| -> Result<Value> {
+        let canon = std::fs::canonicalize(path)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        if !canon.is_dir() {
+            bail!("{} is not a directory", canon.display());
+        }
+        Ok(json!({
+            "target": canon.to_string_lossy(),
+            "target_project_id": crate::project_id::resolve_project_id(&canon),
+        }))
+    };
     Ok(match sub {
         JournalSubcommand::Add(a) => {
             let body = read_body(a.body.as_deref())?;
@@ -85,10 +97,15 @@ fn request(sub: JournalSubcommand) -> Result<(&'static str, Value, bool)> {
         JournalSubcommand::Unmark(a) => ("journal_unmark", json!({ "id": a.id, "flags": a.flags.names() }), a.json),
         JournalSubcommand::Close(a) => (
             "journal_close",
-            json!({ "id": a.id, "flags": a.flags.names(), "resolution": a.resolution }),
+            json!({ "id": a.id, "flags": a.flags.names(), "resolution": a.resolution, "abandon": a.abandon }),
             a.json,
         ),
         JournalSubcommand::Reopen(a) => ("journal_reopen", json!({ "id": a.id, "flags": a.flags.names() }), a.json),
+        JournalSubcommand::Share(a) => ("journal_share", target(&a.path)?, a.json),
+        JournalSubcommand::Unshare(a) => ("journal_unshare", target(&a.path)?, a.json),
+        JournalSubcommand::Shares(a) => ("journal_shares", json!({}), a.json),
+        JournalSubcommand::Feedback(a) => ("journal_feedback", json!({ "all": a.all }), a.json),
+        JournalSubcommand::Branch(a) => ("journal_branch", json!({ "id": a.id }), a.json),
         JournalSubcommand::Agenda(a) => ("journal_agenda", json!({ "limit": a.limit }), a.json),
     })
 }
@@ -237,6 +254,7 @@ fn with_caller(mut args: Value) -> Value {
         args["agent_id"] = json!(id);
         args["session_token"] = json!(token);
     }
+    args["host"] = json!(crate::daemon::agent_registry::this_host());
     if let Ok(cwd) = std::env::current_dir() {
         args["cwd"] = json!(cwd.to_string_lossy());
         // Which repository this is, resolved here where the checkout is: the
@@ -341,6 +359,110 @@ fn render(tool: &str, p: &Value) -> String {
             let verb = if p["added"] == true { "linked" } else { "already linked" };
             format!("{verb}: #{} {} #{}", p["id"], p["kind"].as_str().unwrap_or(""), p["to"])
         }
+        "journal_branch" => {
+            let b = &p["branch"];
+            let mut out = format!(
+                "branch of todo #{} — {}{}\n",
+                b["root"],
+                b["state"].as_str().unwrap_or(""),
+                b["verified"].as_i64().map(|v| format!(" (verified in #{v})")).unwrap_or_default()
+            );
+            let entries = b["entries"].as_array().cloned().unwrap_or_default();
+            // Depth from the parent chain, for indentation.
+            let depth = |mut id: i64| {
+                let mut d = 0;
+                while let Some(e) = entries.iter().find(|e| e["entry"]["id"].as_i64() == Some(id)) {
+                    match e["parent"].as_i64() {
+                        Some(p) if d < 50 => {
+                            id = p;
+                            d += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                d
+            };
+            for e in &entries {
+                let id = e["entry"]["id"].as_i64().unwrap_or(0);
+                let flags: Vec<&str> = e["entry"]["flags"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+                let via = e["via"].as_str().map(|v| format!("{v} ")).unwrap_or_default();
+                out.push_str(&format!(
+                    "{}{via}#{id} {}{} — {}\n",
+                    "  ".repeat(depth(id) + 1),
+                    e["entry"]["category"].as_str().unwrap_or(""),
+                    if flags.is_empty() { String::new() } else { format!(" [{}]", flags.join(", ")) },
+                    one_line(e["entry"]["excerpt"].as_str().unwrap_or(""), 120)
+                ));
+            }
+            let linked = b["linked_branches"].as_array().cloned().unwrap_or_default();
+            if !linked.is_empty() {
+                out.push_str("linked branches:\n");
+                for l in &linked {
+                    out.push_str(&format!(
+                        "  todo #{} ({}) — {}\n",
+                        l["root"],
+                        l["via"].as_str().unwrap_or(""),
+                        one_line(l["todo"]["excerpt"].as_str().unwrap_or(""), 100)
+                    ));
+                }
+            }
+            out
+        }
+        "journal_share" => {
+            if p["already"] == true {
+                return format!("{} already shares the journal of {project}", p["target"].as_str().unwrap_or(""));
+            }
+            let mut out = format!("{} now writes into the journal of {project}", p["target"].as_str().unwrap_or(""));
+            if let Some(m) = p["moved_aside"].as_str() {
+                out.push_str(&format!(
+                    "\nits own journal was merged in ({} entries written, {} already there) and moved aside: {m}",
+                    p["written"], p["deduped"]
+                ));
+            }
+            out
+        }
+        "journal_unshare" => {
+            let mut out = format!("{} no longer shares the journal of {}", p["target"].as_str().unwrap_or(""), p["was"].as_str().unwrap_or(""));
+            match p["forked"].as_str() {
+                Some(f) => out.push_str(&format!("\nit keeps a copy as its own journal ({}): {f}", p["own"].as_str().unwrap_or(""))),
+                None => out.push_str("\nthe shared journal had no entries; it starts empty"),
+            }
+            out
+        }
+        "journal_shares" => {
+            let items = p["shares"].as_array().cloned().unwrap_or_default();
+            if items.is_empty() {
+                return "no shared folders".into();
+            }
+            let mut out = String::from("shared folders:\n");
+            for i in &items {
+                out.push_str(&format!(
+                    "  {}:{}  ->  {}\n",
+                    i["host"].as_str().unwrap_or(""),
+                    i["path"].as_str().unwrap_or(""),
+                    i["journal"].as_str().unwrap_or("")
+                ));
+            }
+            out
+        }
+        "journal_feedback" => {
+            let projects = p["projects"].as_array().cloned().unwrap_or_default();
+            if projects.is_empty() {
+                return format!("no {}ai-feedback entries in any journal", if p["open_only"] == true { "open " } else { "" });
+            }
+            let mut out = String::new();
+            for pr in &projects {
+                out.push_str(&format!("\n{}\n", pr["project"].as_str().unwrap_or("")));
+                for e in pr["entries"].as_array().cloned().unwrap_or_default() {
+                    out.push_str(&format!(
+                        "  {}\n    {}\n",
+                        headline(&e),
+                        one_line(e["body"].as_str().unwrap_or(""), 300)
+                    ));
+                }
+            }
+            out
+        }
         "journal_unlink" => format!("unlinked #{} from #{} ({} link(s))", p["id"], p["to"], p["removed"]),
         "journal_delete" => format!("deleted #{} from the journal of {project}", p["deleted"]),
         "journal_mark" | "journal_unmark" | "journal_close" | "journal_reopen" => {
@@ -435,6 +557,8 @@ fn link_words(kind: &str, dir: &str) -> String {
         ("cites", "in") => "cited by".into(),
         ("replaces", "in") => "replaced by".into(),
         ("fixes", "in") => "fixed by".into(),
+        ("implements", "in") => "implemented by".into(),
+        ("verifies", "in") => "verified by".into(),
         (k, _) => k.to_string(),
     }
 }

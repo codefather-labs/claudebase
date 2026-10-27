@@ -223,6 +223,15 @@ async fn entries_carry_work_items_a_session_closes_and_reopens() {
         let open = j(&["list", "--todo", "--problem", "--open", "--json"]);
         assert_eq!(open["total"], 2, "{open}");
 
+        // A todo closes only on evidence: refused first, then a verified entry
+        // in its branch lets it close (with the branch).
+        journal(&home, &s.dir, Some(&s), &["close", &todo.to_string()])
+            .failure()
+            .stderr(predicates::str::contains("--verified"));
+        let proof = j(&["add", &format!("Verifies journal#{todo}: benchmark ran, 3x faster"), "--category", "verification", "--verified", "--tag", "perf", "--json"])["id"].as_i64().unwrap();
+        let tree = journal(&home, &s.dir, Some(&s), &["branch", &proof.to_string()]).success().get_output().stdout.clone();
+        let tree = String::from_utf8_lossy(&tree);
+        assert!(tree.contains(&format!("branch of todo #{todo} — verified (verified in #{proof})")) && tree.contains(&format!("verifies #{proof}")), "{tree}");
         let closed = j(&["close", &todo.to_string(), "--resolution", "done in 7935425", "--json"]);
         assert_eq!(closed["changed"], json!(["todo"]));
         let f = &closed["entry"]["flags"][0];
@@ -286,4 +295,69 @@ async fn entries_carry_work_items_a_session_closes_and_reopens() {
     let f = &payload(&r).unwrap()["entries"][0]["flags"];
     assert_eq!(f, &json!([{ "flag": "todo", "open": true, "set_at": 5 }, { "flag": "question", "open": false, "set_at": 5, "closed_at": 6, "closed_by": "mira", "resolution": "yes" }]), "{f}");
     drop(client);
+}
+
+/// `journal share` / `unshare` / `shares` and the operator's `feedback`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_folder_shares_a_journal_live_and_leaves_with_a_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().canonicalize().unwrap();
+    let a = Session { id: "agent-a", token: "tok-a", dir: home.join("work/a") };
+    let b = Session { id: "agent-b", token: "tok-b", dir: home.join("work/b-worktree") };
+    for s in [&a, &b] {
+        std::fs::create_dir_all(&s.dir).unwrap();
+    }
+    let _daemon = Daemon(spawn_daemon_with_home(&home).expect("daemon spawned"));
+    let socket = socket_under(&home);
+    wait_for_socket(&socket, Duration::from_secs(10)).await.expect("socket");
+    let mut connections = Vec::new();
+    for (n, s) in [&a, &b].iter().enumerate() {
+        let mut c = Client::connect(&socket).await.expect("connect");
+        let r = c
+            .call("agent_register", json!({ "agent_id": s.id, "name": s.id, "session_token": s.token, "cwd": s.dir.to_str().unwrap() }), n as u32 + 1)
+            .await
+            .unwrap();
+        assert!(payload(&r).is_some(), "{r}");
+        connections.push(c);
+    }
+
+    let h = home.clone();
+    tokio::task::spawn_blocking(move || {
+        let home = h;
+        journal(&home, &a.dir, Some(&a), &["add", "a knows this", "--category", "finding", "--tag", "x"]).success();
+        journal(&home, &b.dir, Some(&b), &["add", "b found this first", "--category", "finding", "--tag", "x"]).success();
+        journal(&home, &b.dir, Some(&b), &["add", "an idea for claudebase", "--ai-feedback", "--tag", "x"]).success();
+
+        // Shared from a's folder: b's entries come over, b's file moves aside.
+        let shared = json_out(journal(&home, &a.dir, Some(&a), &["share", b.dir.to_str().unwrap(), "--json"]));
+        assert_eq!((shared["written"].as_u64(), shared["project"].as_str()), (Some(2), a.dir.to_str()), "{shared}");
+        assert!(shared["moved_aside"].is_string());
+        // From now on b's session writes into a's journal, and reads it.
+        journal(&home, &b.dir, Some(&b), &["add", "written from b after sharing", "--category", "finding", "--tag", "x"]).success();
+        let seen = json_out(journal(&home, &a.dir, Some(&a), &["list", "--json"]));
+        assert_eq!(seen["total"], 4, "{seen}");
+        let from_b = json_out(journal(&home, &b.dir, None, &["list", "--json"]));
+        assert_eq!((from_b["project"].as_str(), from_b["total"].as_i64()), (a.dir.to_str(), Some(4)));
+        let all = json_out(journal(&home, &a.dir, None, &["shares", "--json"]));
+        assert_eq!(all["shares"].as_array().unwrap().len(), 1);
+        // Sharing again is a no-op; the repository case is refused elsewhere.
+        assert_eq!(json_out(journal(&home, &a.dir, None, &["share", b.dir.to_str().unwrap(), "--json"]))["already"], true);
+
+        // The operator's cross-project view; a session may not read it.
+        journal(&home, &a.dir, Some(&a), &["feedback"]).failure().stderr(predicates::str::contains("operator"));
+        let fb = json_out(journal(&home, &a.dir, None, &["feedback", "--json"]));
+        assert_eq!(fb["projects"][0]["entries"][0]["body"], "an idea for claudebase", "{fb}");
+
+        // Unshared: b keeps a copy as its own, and the two diverge.
+        let un = json_out(journal(&home, &a.dir, None, &["unshare", b.dir.to_str().unwrap(), "--json"]));
+        assert!(un["forked"].is_string(), "{un}");
+        journal(&home, &b.dir, Some(&b), &["add", "only in b's own journal now", "--category", "finding", "--tag", "x"]).success();
+        let bl = json_out(journal(&home, &b.dir, Some(&b), &["list", "--json"]));
+        assert_eq!((bl["project"].as_str(), bl["total"].as_i64()), (b.dir.to_str(), Some(5)));
+        assert_eq!(json_out(journal(&home, &a.dir, Some(&a), &["list", "--json"]))["total"], 4);
+        journal(&home, &a.dir, None, &["unshare", b.dir.to_str().unwrap()]).failure().stderr(predicates::str::contains("not shared"));
+    })
+    .await
+    .unwrap();
+    drop(connections);
 }

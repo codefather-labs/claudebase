@@ -1105,8 +1105,13 @@ pub enum JournalSubcommand {
     Unmark(JournalFlagIdArgs),
     /// Close an entry's open work items (todo, question, problem, reminder,
     /// unverified, disputed, ai-feedback) — the named ones, or all of them —
-    /// saying how (`--resolution`). Needs a session.
+    /// saying how (`--resolution`). A todo closes only once its branch holds a
+    /// `--verified` entry, and then closes the whole branch. Needs a session.
     Close(JournalCloseArgs),
+    /// A todo and the work under it: the entries that implement, verify, fix
+    /// or cite it, downstream, and whether it is open, verified or closed.
+    /// Give the todo or any entry of its branch.
+    Branch(JournalIdArgs),
     /// Open closed work items of an entry again. Needs a session.
     Reopen(JournalFlagIdArgs),
     /// Everything still open: work items, constraints and important entries.
@@ -1116,6 +1121,37 @@ pub enum JournalSubcommand {
     Link(JournalLinkArgs),
     /// Remove a link. Needs a session.
     Unlink(JournalUnlinkArgs),
+    /// Make another folder (a worktree, a branch checkout, any directory) use
+    /// THIS folder's journal from now on — one live journal both write to.
+    /// Its own journal, if any, is merged in first and moved aside. An agent
+    /// runs this only when the operator asks (skill claudebase-journal-share).
+    Share(JournalShareArgs),
+    /// Stop a folder sharing: it takes a copy of the shared journal, as it is
+    /// now, as its own, and the two diverge from then on.
+    Unshare(JournalShareArgs),
+    /// Every shared folder and the journal it writes into.
+    Shares(JournalJsonArgs),
+    /// The operator's view of every project's `ai-feedback` entries — agents'
+    /// suggestions for claudebase itself. Open ones unless --all. Refused from
+    /// a session: it reads every project's journal.
+    Feedback(JournalFeedbackArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct JournalShareArgs {
+    /// The other folder.
+    pub path: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct JournalFeedbackArgs {
+    /// Closed ones too.
+    #[arg(long)]
+    pub all: bool,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1133,6 +1169,8 @@ pub enum LinkKind {
     Cites,
     Replaces,
     Fixes,
+    Implements,
+    Verifies,
 }
 
 impl LinkKind {
@@ -1141,6 +1179,8 @@ impl LinkKind {
             Self::Cites => "cites",
             Self::Replaces => "replaces",
             Self::Fixes => "fixes",
+            Self::Implements => "implements",
+            Self::Verifies => "verifies",
         }
     }
 }
@@ -1203,6 +1243,10 @@ pub struct JournalFlags {
     /// An important note.
     #[arg(long)]
     pub important: bool,
+    /// Carries the evidence that a fix or feature works; lets its todo's
+    /// branch close.
+    #[arg(long)]
+    pub verified: bool,
     /// No longer true: kept for history, ranked last in a search.
     #[arg(long)]
     pub deprecated: bool,
@@ -1220,6 +1264,7 @@ impl JournalFlags {
             (self.ai_feedback, "ai-feedback"),
             (self.constraint, "constraint"),
             (self.important, "important"),
+            (self.verified, "verified"),
             (self.deprecated, "deprecated"),
         ]
         .into_iter()
@@ -1246,6 +1291,10 @@ pub struct JournalCloseArgs {
     /// How it was closed: the answer, the fix, the commit.
     #[arg(long)]
     pub resolution: Option<String>,
+    /// Close a todo whose work was dropped, without a verified entry. Needs
+    /// --resolution saying why.
+    #[arg(long)]
+    pub abandon: bool,
     #[arg(long)]
     pub json: bool,
 }

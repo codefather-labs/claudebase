@@ -111,7 +111,7 @@ CREATE INDEX IF NOT EXISTS entry_links_to ON entry_links(to_id);
 
 /// How one entry refers to another. Read from the text (`journal#N`, see
 /// [`parse_refs`]) or set with `journal link`.
-pub const LINK_KINDS: [&str; 3] = ["cites", "replaces", "fixes"];
+pub const LINK_KINDS: [&str; 5] = ["cites", "replaces", "fixes", "implements", "verifies"];
 
 /// The `journal#N` references in an entry, with what the (up to three) words
 /// right before them say: "Replaces journal#42" / "supersedes" / "corrects" /
@@ -142,6 +142,10 @@ pub fn parse_refs(body: &str) -> Vec<(i64, &'static str)> {
             "replaces"
         } else if said(&["fixes"]) {
             "fixes"
+        } else if said(&["implements"]) {
+            "implements"
+        } else if said(&["verifies"]) {
+            "verifies"
         } else {
             "cites"
         };
@@ -219,11 +223,13 @@ fn backfill_links(conn: &mut Connection) -> Result<()> {
 ///   checking it), `disputed` (contradicts another entry, closed when settled),
 ///   `ai-feedback` (an agent's suggestion for claudebase itself).
 /// - Marks, removed with `unmark`: `constraint` (a rule to follow, not weigh),
-///   `important`, `deprecated` (no longer true; ranked last in a search).
+///   `important`, `verified` (the entry carries the evidence that a fix or
+///   feature works — what lets its todo's branch close), `deprecated` (no
+///   longer true; ranked last in a search).
 ///
 /// An open work item, a constraint or an important mark keeps its entry past
-/// retention; a deprecated mark does not.
-pub const FLAGS: [&str; 10] = [
+/// retention; a verified or deprecated mark does not (salience decides).
+pub const FLAGS: [&str; 11] = [
     "todo",
     "question",
     "problem",
@@ -233,10 +239,11 @@ pub const FLAGS: [&str; 10] = [
     "ai-feedback",
     "constraint",
     "important",
+    "verified",
     "deprecated",
 ];
 
-const MARKS: [&str; 3] = ["constraint", "important", "deprecated"];
+const MARKS: [&str; 4] = ["constraint", "important", "verified", "deprecated"];
 
 pub fn closable(flag: &str) -> bool {
     !MARKS.contains(&flag)
@@ -615,19 +622,42 @@ pub fn close(
     resolution: Option<&str>,
     now: i64,
 ) -> Result<Vec<String>> {
+    close_with(conn, id, flags, by, resolution, now, CloseMode::Checked)
+}
+
+/// How a close treats a todo's branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseMode {
+    /// A todo closes only once its branch holds a `verified` entry, and then
+    /// takes every open work item of the branch with it.
+    Checked,
+    /// The work was dropped, not done: the branch closes without a verified
+    /// entry, and a resolution saying why is required.
+    Abandon,
+    /// History coming back (`journal import`): just the named flags, no gate.
+    Restore,
+}
+
+pub fn close_with(
+    conn: &mut Connection,
+    id: i64,
+    flags: &[String],
+    by: Option<&str>,
+    resolution: Option<&str>,
+    now: i64,
+    mode: CloseMode,
+) -> Result<Vec<String>> {
     let named = normalize_flags(flags)?;
     if let Some(f) = named.iter().find(|f| !closable(f)) {
         bail!("`{f}` is a mark, not a work item: unmark it instead");
     }
+    let resolution = resolution.map(str::trim).filter(|r| !r.is_empty());
+    let by = by.map(str::trim).filter(|b| !b.is_empty());
     let tx = write_tx(conn)?;
     if !exists(&tx, id)? {
         bail!("no entry {id}");
     }
-    let open: Vec<String> = {
-        let mut stmt = tx.prepare("SELECT flag FROM entry_flags WHERE entry_id = ?1 AND closed_at IS NULL")?;
-        let rows = stmt.query_map(params![id], |r| r.get::<_, String>(0))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().filter(|f| closable(f)).collect()
-    };
+    let open = open_work_items(&tx, id)?;
     let targets: Vec<String> = if named.is_empty() { open.clone() } else { named };
     if let Some(f) = targets.iter().find(|f| !open.contains(f)) {
         bail!("entry {id} has no open `{f}`");
@@ -635,16 +665,237 @@ pub fn close(
     if targets.is_empty() {
         bail!("entry {id} has nothing open to close");
     }
-    let resolution = resolution.map(str::trim).filter(|r| !r.is_empty());
-    let by = by.map(str::trim).filter(|b| !b.is_empty());
+
+    // A todo is the root of a branch: everything that implements, verifies,
+    // fixes or cites it, downstream. It closes as one, and only on evidence.
+    let mut also: Vec<i64> = Vec::new();
+    let mut resolution = resolution.map(str::to_owned);
+    if targets.iter().any(|f| f == "todo") && mode != CloseMode::Restore {
+        let branch = branch_ids(&tx, id)?;
+        match mode {
+            CloseMode::Checked => {
+                let verified = branch
+                    .iter()
+                    .copied()
+                    .find(|e| *e != id && has_open_flag(&tx, *e, "verified").unwrap_or(false));
+                let Some(v) = verified else {
+                    bail!(
+                        "todo {id} cannot close yet: its branch has no entry flagged --verified. \
+                         Add one that cites the implementation (\"Verifies journal#<id>\") and carries the evidence \
+                         that it works — commands run, their output, what was checked — then close #{id}. \
+                         If the work was dropped instead, close it with --abandon --resolution \"<why>\"."
+                    );
+                };
+                if resolution.is_none() {
+                    resolution = Some(format!("verified: journal#{v}"));
+                }
+            }
+            CloseMode::Abandon => {
+                if resolution.is_none() {
+                    bail!("--abandon needs --resolution \"<why the work was dropped>\"");
+                }
+                resolution = resolution.map(|r| format!("abandoned: {r}"));
+            }
+            CloseMode::Restore => unreachable!(),
+        }
+        also = branch.into_iter().filter(|e| *e != id).collect();
+    }
+
+    let mut closed = Vec::new();
     for flag in &targets {
         tx.execute(
             "UPDATE entry_flags SET closed_at = ?1, closed_by = ?2, resolution = ?3 WHERE entry_id = ?4 AND flag = ?5",
             params![now, by, resolution, id, flag],
         )?;
+        closed.push(flag.clone());
+    }
+    for e in also {
+        for flag in open_work_items(&tx, e)? {
+            tx.execute(
+                "UPDATE entry_flags SET closed_at = ?1, closed_by = ?2, resolution = ?3 WHERE entry_id = ?4 AND flag = ?5",
+                params![now, by, resolution, e, flag],
+            )?;
+            closed.push(format!("#{e} {flag}"));
+        }
     }
     tx.commit()?;
-    Ok(targets)
+    Ok(closed)
+}
+
+fn open_work_items(conn: &Connection, id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached("SELECT flag FROM entry_flags WHERE entry_id = ?1 AND closed_at IS NULL")?;
+    let rows = stmt.query_map(params![id], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().filter(|f| closable(f)).collect())
+}
+
+fn has_open_flag(conn: &Connection, id: i64, flag: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM entry_flags WHERE entry_id = ?1 AND flag = ?2 AND closed_at IS NULL",
+            params![id, flag],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Most entries a branch walk visits: a branch is a piece of work, not the
+/// whole journal, and a cycle of links must not make it run away.
+const BRANCH_LIMIT: usize = 200;
+
+/// The links that make a branch: an implementation implements its todo, the
+/// evidence verifies the implementation, a follow-up fixes it. Every other link
+/// (cites, replaces) connects branches into the graph without pulling one
+/// into another — or closing one todo would close another's work.
+const STRUCTURAL: [&str; 3] = ["implements", "verifies", "fixes"];
+
+fn structural_sql(col: &str) -> String {
+    format!("{col} IN ({})", STRUCTURAL.iter().map(|k| format!("'{k}'")).collect::<Vec<_>>().join(","))
+}
+
+fn is_todo(conn: &Connection, e: i64) -> Result<bool> {
+    Ok(conn.query_row("SELECT 1 FROM entry_flags WHERE entry_id = ?1 AND flag = 'todo'", params![e], |_| Ok(())).optional()?.is_some())
+}
+
+/// `root` and the entries that belong to its branch: reached downstream over
+/// structural links, each one hanging from `root` rather than from another
+/// todo (an entry that implements todo B and fixes something in A's branch is
+/// B's). In the order reached.
+fn branch_ids(conn: &Connection, root: i64) -> Result<Vec<i64>> {
+    let mut seen = vec![root];
+    let mut queue = std::collections::VecDeque::from([root]);
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT from_id FROM entry_links WHERE to_id = ?1 AND {} ORDER BY from_id",
+        structural_sql("kind")
+    ))?;
+    while let Some(at) = queue.pop_front() {
+        let children: Vec<i64> = stmt.query_map(params![at], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        for c in children {
+            if seen.contains(&c) || seen.len() >= BRANCH_LIMIT || is_todo(conn, c)? {
+                continue;
+            }
+            if branch_root(conn, c)? == Some(root) {
+                seen.push(c);
+                queue.push_back(c);
+            }
+        }
+    }
+    Ok(seen)
+}
+
+/// The todo a branch hangs from: `id` itself when it is a todo, else the
+/// nearest todo upstream over structural links (breadth first, so the
+/// closest one wins).
+fn branch_root(conn: &Connection, id: i64) -> Result<Option<i64>> {
+    let mut seen = vec![id];
+    let mut queue = std::collections::VecDeque::from([id]);
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT to_id FROM entry_links WHERE from_id = ?1 AND {} ORDER BY to_id DESC",
+        structural_sql("kind")
+    ))?;
+    while let Some(at) = queue.pop_front() {
+        if is_todo(conn, at)? {
+            return Ok(Some(at));
+        }
+        let parents: Vec<i64> = stmt.query_map(params![at], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        for p in parents {
+            if !seen.contains(&p) && seen.len() < BRANCH_LIMIT {
+                seen.push(p);
+                queue.push_back(p);
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// A todo and the work under it.
+#[derive(Debug, Clone, Serialize)]
+pub struct Branch {
+    pub root: i64,
+    /// `open` (work under way), `verified` (a verified entry is in, the todo
+    /// can close), `closed`.
+    pub state: &'static str,
+    /// The verified entry, when there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified: Option<i64>,
+    /// Root first, then downstream, each with the entry it hangs from.
+    pub entries: Vec<BranchEntry>,
+    /// Other branches this one is linked with (any link, either way, from any
+    /// of its entries): the graph between pieces of work.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub linked_branches: Vec<LinkedBranch>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LinkedBranch {
+    /// That branch's todo.
+    pub root: i64,
+    /// The link that connects them, read from this branch: `#12 cites #40`.
+    pub via: String,
+    pub todo: Brief,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BranchEntry {
+    /// The entry this one links to within the branch (`None` for the root).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
+    pub entry: Brief,
+}
+
+/// The branch `id` belongs to: from its todo down.
+pub fn branch(conn: &Connection, id: i64) -> Result<Option<Branch>> {
+    let Some(root) = branch_root(conn, id)? else { return Ok(None) };
+    let ids = branch_ids(conn, root)?;
+    let mut entries = Vec::new();
+    let mut verified = None;
+    for e in &ids {
+        let parent: Option<(i64, String)> = if *e == root {
+            None
+        } else {
+            conn.query_row(
+                &format!(
+                    "SELECT to_id, kind FROM entry_links WHERE from_id = ?1 AND to_id IN ({}) ORDER BY to_id DESC LIMIT 1",
+                    ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",")
+                ),
+                params![e],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+        };
+        if *e != root && verified.is_none() && has_open_flag(conn, *e, "verified")? {
+            verified = Some(*e);
+        }
+        if let Some(b) = brief(conn, *e)? {
+            entries.push(BranchEntry { parent: parent.as_ref().map(|p| p.0), via: parent.map(|p| p.1), entry: b });
+        }
+    }
+    let mut linked_branches: Vec<LinkedBranch> = Vec::new();
+    for e in &ids {
+        for l in links_of(conn, *e)? {
+            if ids.contains(&l.id) {
+                continue;
+            }
+            let Some(other) = branch_root(conn, l.id)? else { continue };
+            if other == root || linked_branches.iter().any(|b| b.root == other) {
+                continue;
+            }
+            let via = if l.dir == "out" { format!("#{e} {} #{}", l.kind, l.id) } else { format!("#{} {} #{e}", l.id, l.kind) };
+            if let Some(todo) = brief(conn, other)? {
+                linked_branches.push(LinkedBranch { root: other, via, todo });
+            }
+        }
+    }
+    let state = if !has_open_flag(conn, root, "todo")? {
+        "closed"
+    } else if verified.is_some() {
+        "verified"
+    } else {
+        "open"
+    };
+    Ok(Some(Branch { root, state, verified, entries, linked_branches }))
 }
 
 /// Open closed work items again — the named ones, or every closed one.
@@ -978,7 +1229,8 @@ pub fn related(conn: &Connection, id: i64, similar: usize) -> Result<Related> {
 /// each. Flags with nothing open are left out.
 pub fn agenda(conn: &Connection, limit: usize) -> Result<Vec<(String, i64, Vec<Entry>)>> {
     let mut out = Vec::new();
-    for flag in FLAGS.iter().filter(|f| **f != "deprecated") {
+    // Evidence and history are not "open": verified and deprecated stay out.
+    for flag in FLAGS.iter().filter(|f| !matches!(**f, "deprecated" | "verified")) {
         let filter = Filter { flags: vec![flag.to_string()], open: Some(true), ..Default::default() };
         let (total, entries) = list(conn, &filter, 0, limit)?;
         if total > 0 {
@@ -1228,7 +1480,7 @@ pub struct GcReport {
 pub fn gc(conn: &Connection, now: i64, dry_run: bool) -> Result<GcReport> {
     let count = |salience: &str, ttl: i64| -> rusqlite::Result<i64> {
         conn.query_row(
-            "SELECT COUNT(*) FROM entries WHERE salience = ?1 AND created_at < ?2 AND id NOT IN (SELECT entry_id FROM entry_flags WHERE closed_at IS NULL AND flag != 'deprecated')",
+            "SELECT COUNT(*) FROM entries WHERE salience = ?1 AND created_at < ?2 AND id NOT IN (SELECT entry_id FROM entry_flags WHERE closed_at IS NULL AND flag NOT IN ('deprecated', 'verified'))",
             params![salience, now - ttl],
             |r| r.get(0),
         )
@@ -1237,7 +1489,7 @@ pub fn gc(conn: &Connection, now: i64, dry_run: bool) -> Result<GcReport> {
     if !dry_run && report.medium + report.low > 0 {
         conn.execute(
             "DELETE FROM entries WHERE ((salience = 'medium' AND created_at < ?1) OR (salience = 'low' AND created_at < ?2)) \
-             AND id NOT IN (SELECT entry_id FROM entry_flags WHERE closed_at IS NULL AND flag != 'deprecated')",
+             AND id NOT IN (SELECT entry_id FROM entry_flags WHERE closed_at IS NULL AND flag NOT IN ('deprecated', 'verified'))",
             params![now - MEDIUM_TTL_SECS, now - LOW_TTL_SECS],
         )?;
     }
@@ -1281,6 +1533,117 @@ pub fn list_journals(dir: &Path) -> Result<Vec<JournalInfo>> {
     }
     out.sort_by(|a, b| b.last_entry_at.cmp(&a.last_entry_at).then(a.project.cmp(&b.project)));
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Sharing: one journal for several folders
+// ---------------------------------------------------------------------------
+
+/// Copy every entry of `src` into `dst` — tags, flags with their open/closed
+/// state, and the links between them, renumbered — oldest first. An entry
+/// `dst` already has (same text and category within the dedup window) is
+/// merged, not duplicated. Returns (written, merged).
+pub fn merge_into(dst: &mut Connection, src: &Connection) -> Result<(usize, usize)> {
+    let ids: Vec<i64> = {
+        let mut stmt = src.prepare("SELECT id FROM entries ORDER BY created_at, id")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut map: HashMap<i64, i64> = HashMap::new();
+    let (mut written, mut merged) = (0, 0);
+    for old in ids {
+        let Some(e) = get(src, old)? else { continue };
+        let entry = NewEntry {
+            body: e.body.clone(),
+            category: e.category.clone(),
+            tags: e.tags.clone(),
+            salience: e.salience.clone(),
+            agent: e.agent.clone(),
+            agent_id: e.agent_id.clone(),
+            session_id: e.session_id.clone(),
+            feature: e.feature.clone(),
+            source_artifact: e.source_artifact.clone(),
+            flags: e.flags.iter().map(|f| f.flag.clone()).collect(),
+            // Links are copied below by id; the text's numbers are src's.
+            foreign: true,
+        };
+        let (status, new) = add(dst, &entry, e.created_at)?;
+        match status {
+            AddStatus::Written => written += 1,
+            AddStatus::Deduped => merged += 1,
+        }
+        map.insert(old, new);
+        for f in e.flags.iter().filter(|f| !f.open) {
+            let _ = close_with(
+                dst,
+                new,
+                &[f.flag.clone()],
+                f.closed_by.as_deref(),
+                f.resolution.as_deref(),
+                f.closed_at.unwrap_or(e.created_at),
+                CloseMode::Restore,
+            );
+        }
+    }
+    let links: Vec<(i64, i64, String)> = {
+        let mut stmt = src.prepare("SELECT from_id, to_id, kind FROM entry_links")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (from, to, kind) in links {
+        if let (Some(f), Some(t)) = (map.get(&from), map.get(&to)) {
+            if f != t {
+                dst.execute("INSERT OR IGNORE INTO entry_links(from_id, to_id, kind) VALUES (?1, ?2, ?3)", params![f, t, kind])?;
+            }
+        }
+    }
+    Ok((written, merged))
+}
+
+/// A complete copy of the journal `src` as the journal of `key`, ids and all —
+/// what a folder takes with it when it stops sharing. Fails when `key` already
+/// has a journal.
+pub fn fork_to(src: &Connection, dir: &Path, key: &Path) -> Result<PathBuf> {
+    let target = journal_path(dir, key);
+    if target.exists() {
+        bail!("{} already has a journal ({})", key.display(), target.display());
+    }
+    create_private_dir(dir)?;
+    src.execute("VACUUM INTO ?1", params![target.to_string_lossy()])
+        .with_context(|| format!("copy the journal to {}", target.display()))?;
+    restrict(&target);
+    let copy = open_file(&target)?;
+    copy.execute("UPDATE journal_meta SET value = ?1 WHERE key = 'project_path'", params![key.to_string_lossy()])?;
+    copy.execute(
+        "INSERT OR REPLACE INTO journal_meta(key, value) VALUES ('forked_at', ?1)",
+        params![now_secs().to_string()],
+    )?;
+    Ok(target)
+}
+
+/// Move the journal of `key` out of the way — renamed, not deleted, and out of
+/// what `list_journals` reads. `None` when it has none.
+pub fn retire(dir: &Path, key: &Path, why: &str) -> Result<Option<PathBuf>> {
+    let from = journal_path(dir, key);
+    if !from.exists() {
+        return Ok(None);
+    }
+    {
+        let conn = open_file(&from)?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    }
+    let to = from.with_extension(format!("{why}-{}", now_secs()));
+    std::fs::rename(&from, &to).with_context(|| format!("move {} aside", from.display()))?;
+    for ext in ["db-wal", "db-shm"] {
+        let _ = std::fs::remove_file(from.with_extension(ext));
+    }
+    Ok(Some(to))
+}
+
+/// Entries flagged `ai-feedback` in one journal: `open` only, or all.
+pub fn feedback(conn: &Connection, open_only: bool) -> Result<Vec<Entry>> {
+    let filter = Filter { flags: vec!["ai-feedback".into()], open: open_only.then_some(true), ..Default::default() };
+    Ok(list(conn, &filter, 0, MAX_PAGE_SIZE)?.1)
 }
 
 /// Where the pre-journal insights of a project lived.
@@ -1757,7 +2120,7 @@ mod tests {
         let todo = low("open todo", &["todo"]);
         let done = low("closed todo", &["todo"]);
         let star = low("highlight", &["important"]);
-        close(&mut c, done, &[], None, None, old + 1).unwrap();
+        close_with(&mut c, done, &[], None, Some("dropped"), old + 1, CloseMode::Abandon).unwrap();
         assert_eq!(gc(&c, now, true).unwrap().low, 2);
         gc(&c, now, false).unwrap();
         assert!(get(&c, plain).unwrap().is_none() && get(&c, done).unwrap().is_none());
@@ -1798,6 +2161,8 @@ mod tests {
         // The verb must be about this reference, not somewhere in the sentence.
         assert_eq!(parse_refs("(a 'replaces' edge also sets the deprecated flag on the target, journal#39 flags)"), vec![(39, "cites")]);
         assert_eq!(parse_refs("this replaces the old journal#5"), vec![(5, "replaces")]);
+        assert_eq!(parse_refs("Implements journal#7. Verifies journal#8"), vec![(7, "implements"), (8, "verifies")]);
+        assert_eq!(parse_refs("the unverified journal#9"), vec![(9, "cites")], "unverified is not verifies");
     }
 
     #[test]
@@ -1876,6 +2241,128 @@ mod tests {
         let r = related(&c, fresh, 3).unwrap();
         assert!(r.similar.is_empty());
         assert_eq!(r.linked[0].0, Link { kind: "fixes".into(), dir: "out", id: a });
+    }
+
+    #[test]
+    fn a_todo_branch_closes_only_on_evidence_and_closes_whole() {
+        let (_d, mut c) = journal();
+        let mut todo = entry("make the pool clear a worker's context", "", &["pool"]);
+        todo.flags = vec!["todo".into()];
+        let (_, t) = add(&mut c, &todo, 1).unwrap();
+        let mut imp = entry(&format!("Implements journal#{t}: POST /pool/<pool>/workers/<id>/clear"), "update", &["pool"]);
+        imp.flags = vec!["unverified".into()];
+        let (_, i) = add(&mut c, &imp, 2).unwrap();
+        let (_, note) = add(&mut c, &entry(&format!("a side note on journal#{i}"), "finding", &["pool"]), 3).unwrap();
+        assert_eq!(get(&c, i).unwrap().unwrap().links, vec![
+            Link { kind: "cites".into(), dir: "in", id: note },
+            Link { kind: "implements".into(), dir: "out", id: t },
+        ]);
+
+        // No verified entry yet: the todo refuses, and says how to proceed.
+        let err = close(&mut c, t, &[], Some("w"), None, 4).unwrap_err().to_string();
+        assert!(err.contains("--verified") && err.contains("--abandon"), "{err}");
+        let b = branch(&c, i).unwrap().expect("any entry of the branch finds its todo");
+        assert_eq!((b.root, b.state, b.verified), (t, "open", None));
+        // A note that only cites the implementation is linked, not a member.
+        assert_eq!(b.entries.iter().map(|e| e.entry.id).collect::<Vec<_>>(), vec![t, i]);
+        assert!(branch(&c, note).unwrap().is_none());
+        assert_eq!(b.entries[1].via.as_deref(), Some("implements"));
+
+        let mut proof = entry(&format!("Verifies journal#{i}: e2e test passed, live clear in 2.6 s"), "verification", &["pool"]);
+        proof.flags = vec!["verified".into()];
+        let (_, v) = add(&mut c, &proof, 5).unwrap();
+        assert_eq!(branch(&c, t).unwrap().unwrap().state, "verified");
+
+        let closed = close(&mut c, t, &[], Some("w"), None, 6).unwrap();
+        assert_eq!(closed, vec!["todo".to_string(), format!("#{i} unverified")]);
+        let f = &get(&c, i).unwrap().unwrap().flags[0];
+        assert_eq!((f.open, f.resolution.clone()), (false, Some(format!("verified: journal#{v}"))));
+        assert_eq!(branch(&c, v).unwrap().unwrap().state, "closed");
+
+        // Dropped work closes with a reason instead of evidence.
+        let mut other = entry("port the pool to Windows", "", &["pool"]);
+        other.flags = vec!["todo".into()];
+        let (_, o) = add(&mut c, &other, 7).unwrap();
+        assert!(close_with(&mut c, o, &[], None, None, 8, CloseMode::Abandon).is_err(), "a reason is required");
+        close_with(&mut c, o, &[], None, Some("not needed"), 8, CloseMode::Abandon).unwrap();
+        assert_eq!(get(&c, o).unwrap().unwrap().flags[0].resolution.as_deref(), Some("abandoned: not needed"));
+        // An entry outside any todo's branch has none.
+        let (_, lone) = add(&mut c, &entry("lone", "finding", &["x"]), 9).unwrap();
+        assert!(branch(&c, lone).unwrap().is_none());
+    }
+
+    #[test]
+    fn branches_link_into_a_graph_without_swallowing_each_other() {
+        let (_d, mut c) = journal();
+        let todo = |c: &mut Connection, body: &str, at| {
+            let mut e = entry(body, "", &["t"]);
+            e.flags = vec!["todo".into()];
+            add(c, &e, at).unwrap().1
+        };
+        let flagged = |c: &mut Connection, body: &str, flag: &str, at| {
+            let mut e = entry(body, "update", &["t"]);
+            e.flags = vec![flag.into()];
+            add(c, &e, at).unwrap().1
+        };
+        let a = todo(&mut c, "pinned dispatch", 1);
+        let ai = flagged(&mut c, &format!("Implements journal#{a}"), "unverified", 2);
+        let b = todo(&mut c, "clear a worker", 3);
+        // B's implementation cites A's: a graph edge, not membership.
+        let bi = flagged(&mut c, &format!("Implements journal#{b}, building on journal#{ai}"), "unverified", 4);
+        // And a fix in B's branch for something in A's: still B's (its todo is nearer).
+        let bf = flagged(&mut c, &format!("Implements journal#{b}. Fixes journal#{ai}"), "unverified", 5);
+        flagged(&mut c, &format!("Verifies journal#{ai}"), "verified", 6);
+
+        let ba = branch(&c, a).unwrap().unwrap();
+        assert_eq!(ba.entries.iter().map(|e| e.entry.id).collect::<Vec<_>>(), vec![a, ai, 6]);
+        assert_eq!(ba.linked_branches.iter().map(|l| l.root).collect::<Vec<_>>(), vec![b]);
+        let bb = branch(&c, bi).unwrap().unwrap();
+        assert_eq!((bb.root, bb.entries.len()), (b, 3), "{:?}", bb.entries.iter().map(|e| e.entry.id).collect::<Vec<_>>());
+        assert!(bb.entries.iter().any(|e| e.entry.id == bf));
+        assert_eq!(bb.linked_branches.iter().map(|l| l.root).collect::<Vec<_>>(), vec![a]);
+
+        // Closing A closes A's work only.
+        close(&mut c, a, &[], None, None, 7).unwrap();
+        assert!(get(&c, bi).unwrap().unwrap().flags[0].open, "B's work stays open");
+        assert!(get(&c, bf).unwrap().unwrap().flags[0].open);
+        assert!(!get(&c, ai).unwrap().unwrap().flags[0].open);
+        assert!(close(&mut c, b, &[], None, None, 8).is_err(), "B has no evidence of its own");
+    }
+
+    #[test]
+    fn a_journal_merges_with_links_and_forks_with_its_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = open(dir.path(), Path::new("/w/a"), true).unwrap().unwrap();
+        add(&mut a, &entry("shared knowledge", "finding", &["x"]), 1).unwrap();
+        let mut b = open(dir.path(), Path::new("/w/b"), true).unwrap().unwrap();
+        let mut t = entry("b's todo", "", &["y"]);
+        t.flags = vec!["todo".into()];
+        let (_, bt) = add(&mut b, &t, 2).unwrap();
+        let mut done = entry("b's question", "", &["y"]);
+        done.flags = vec!["question".into()];
+        let (_, bq) = add(&mut b, &done, 3).unwrap();
+        close(&mut b, bq, &[], Some("w"), Some("yes"), 4).unwrap();
+        add(&mut b, &entry(&format!("Implements journal#{bt}"), "update", &["y"]), 5).unwrap();
+        add(&mut b, &entry("shared knowledge", "finding", &["x"]), 6).unwrap();
+
+        assert_eq!(merge_into(&mut a, &b).unwrap(), (3, 1));
+        let (_, page) = list(&a, &Filter::default(), 0, 10).unwrap();
+        let imp = page.iter().find(|e| e.body.starts_with("Implements")).unwrap();
+        let todo = page.iter().find(|e| e.body == "b's todo").unwrap();
+        assert_eq!(imp.links, vec![Link { kind: "implements".into(), dir: "out", id: todo.id }], "links renumbered");
+        let q = page.iter().find(|e| e.body == "b's question").unwrap();
+        assert_eq!((q.flags[0].open, q.flags[0].resolution.as_deref()), (false, Some("yes")));
+
+        drop(b);
+        let moved = retire(dir.path(), Path::new("/w/b"), "merged").unwrap().unwrap();
+        assert!(moved.exists() && !journal_path(dir.path(), Path::new("/w/b")).exists());
+        assert_eq!(list_journals(dir.path()).unwrap().len(), 1, "a retired journal is not listed");
+
+        let fork = fork_to(&a, dir.path(), Path::new("/w/b")).unwrap();
+        assert!(fork.exists());
+        let f = open(dir.path(), Path::new("/w/b"), false).unwrap().expect("the fork is b's journal now");
+        assert_eq!(get(&f, imp.id).unwrap().unwrap().links, imp.links, "same ids, same links");
+        assert!(fork_to(&a, dir.path(), Path::new("/w/b")).is_err());
     }
 
     #[test]

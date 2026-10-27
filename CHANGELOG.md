@@ -24,9 +24,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `claude-plugins-official` marketplace first, and a failed plugin install prints its reason.
 - **"Pre-loading e5-multilingual-small encoder" looked hung.** fastembed draws its download bar
   only on a terminal, so an installer run over plain ssh or by an agent sat silent through a
-  ~490 MB download, announced as ~120 MB. The encoder now reports its own progress on stderr: one
-  line rewritten in place on a terminal; otherwise a line every 10%, repeated every 30 s while it
-  does not move.
+  ~490 MB download, announced as ~120 MB. The encoder now reports its own progress.
+- **Model downloads show a progress bar.** Both the e5 encoder and the whisper/parakeet speech
+  model draw the same bar on a terminal, redrawn in place:
+  `whisper model [#############-----------]  53%  805 / 1533 MB  86.0 MB/s  ~8 s`.
+  - The installers run the speech-model download unpiped when they are on a terminal, so the bar
+    is visible. A pipe used to flatten it.
+  - Without a terminal, progress comes as lines: every 10 s for the speech model; every 10% and
+    every 30 s while stalled for the encoder.
+- **`install.sh --local` could not find cargo** that an earlier run had installed into
+  `~/.cargo/bin`, since a shell that has not re-read its profile lacks it on PATH. It now adds
+  that directory, or installs rustup. Its build-dependency command no longer uses sudo as root,
+  and it runs `apt-get update` first.
+
+### Removed
+
+- **The installers no longer install ffmpeg and whisper-cli.** Nothing uses them: speech
+  recognition is built into the binary (whisper-rs), and Telegram's OGG/Opus voice notes are
+  decoded in-process (`src/daemon/asr/decoder.rs`). On Ubuntu the `whisper-cpp` package does not
+  even exist, so every install ended in a warning. `CLAUDEBASE_SKIP_WHISPER=1` still skips the
+  speech model download.
 
 ## [0.19.0] - 2026-10-27
 

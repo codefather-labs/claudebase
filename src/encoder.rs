@@ -90,33 +90,44 @@ fn dir_bytes(dir: &std::path::Path) -> u64 {
 /// Progress of the model download, on stderr, until `done` is set. A ~490 MB
 /// download that prints nothing looks hung; fastembed's own bar is drawn only
 /// on a terminal, so an installer run over plain ssh or by an agent showed a
-/// silent "Pre-loading ..." for minutes. On a terminal: one line rewritten in
-/// place. Otherwise: a line every 10%, and every 30 s while it does not move,
-/// so a stalled download reads as stalled rather than as silence.
+/// silent "Pre-loading ..." for minutes. On a terminal: the speech model's
+/// bar, redrawn in place. Otherwise: a line every 10%, and every 30 s while it
+/// does not move, so a stalled download reads as stalled rather than silence.
 fn report_download(dir: std::path::PathBuf, done: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use crate::daemon::asr::download::{bar_line, progress_line};
     use std::io::{IsTerminal, Write};
     use std::sync::atomic::Ordering;
     let tty = std::io::stderr().is_terminal();
+    let start = std::time::Instant::now();
+    let label = "encoder model";
     let mut last_step = u64::MAX;
     let mut last_line = std::time::Instant::now();
-    let mut shown = false;
+    let mut width = 0usize;
+    let mut got = 0;
     while !done.load(Ordering::Relaxed) {
-        let got = dir_bytes(&dir);
-        let pct = (got * 100 / MODEL_BYTES).min(99);
-        let line = format!("encoder model: {} / ~{} MB ({pct}%)", got / 1_000_000, MODEL_BYTES / 1_000_000);
+        got = dir_bytes(&dir);
         if tty {
-            eprint!("\r  {line}   ");
+            // The same bar as the speech model's, on stderr (stdout may be
+            // the command's answer). Padding, not ANSI, clears the rest.
+            let line = bar_line(label, got.min(MODEL_BYTES), Some(MODEL_BYTES), got, start.elapsed());
+            let pad = width.saturating_sub(line.chars().count());
+            width = line.chars().count();
+            eprint!("\r  {line}{}", " ".repeat(pad));
             let _ = std::io::stderr().flush();
-            shown = true;
-        } else if pct / 10 != last_step || last_line.elapsed() >= std::time::Duration::from_secs(30) {
-            last_step = pct / 10;
-            last_line = std::time::Instant::now();
-            eprintln!("  {line}");
+        } else {
+            let step = got * 10 / MODEL_BYTES;
+            if step != last_step || last_line.elapsed() >= std::time::Duration::from_secs(30) {
+                last_step = step;
+                last_line = std::time::Instant::now();
+                eprintln!("  {}", progress_line(label, got, Some(MODEL_BYTES), got, start.elapsed()));
+            }
         }
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
-    if tty && shown {
-        eprintln!("\r  encoder model: downloaded                         ");
+    if tty && got > 0 {
+        let line = bar_line(label, MODEL_BYTES, Some(MODEL_BYTES), got.max(1), start.elapsed());
+        let pad = width.saturating_sub(line.chars().count());
+        eprintln!("\r  {line}{}", " ".repeat(pad));
     }
 }
 

@@ -868,94 +868,6 @@ function Preload-Encoder {
 }
 
 # ============================================================================
-# Install whisper-cli + ffmpeg (voice transcription dependencies). Mirrors
-# install.sh's install_whisper_stack. Best-effort + idempotent.
-# Opt-out: set $env:CLAUDEBASE_SKIP_WHISPER=1.
-# The model itself is fetched by Install-AsrModel below, not here. The old
-# comment pointed at ~\AppData\Local\whisper-cpp\models\, which the daemon has
-# never read -- it looks in ~\.claude\tools\claudebase\models\whisper\.
-# ============================================================================
-function Install-WhisperStack {
-    if ($env:CLAUDEBASE_SKIP_WHISPER -eq '1') {
-        Write-Info "CLAUDEBASE_SKIP_WHISPER=1 - skipping ffmpeg + whisper-cli install"
-        return
-    }
-
-    $needFfmpeg = -not (Get-Command ffmpeg -ErrorAction SilentlyContinue)
-    $needWhisper = -not (Get-Command whisper-cli -ErrorAction SilentlyContinue)
-    if (-not $needFfmpeg -and -not $needWhisper) {
-        Write-Ok "ffmpeg + whisper-cli already on PATH (voice transcription ready)"
-        return
-    }
-
-    # Detect package manager - winget preferred, then choco, then scoop.
-    $pkgMgr = $null
-    if (Get-Command winget -ErrorAction SilentlyContinue) {
-        $pkgMgr = 'winget'
-    } elseif (Get-Command choco -ErrorAction SilentlyContinue) {
-        $pkgMgr = 'choco'
-    } elseif (Get-Command scoop -ErrorAction SilentlyContinue) {
-        $pkgMgr = 'scoop'
-    } else {
-        Write-Warn "no supported package manager detected (winget/choco/scoop); voice transcription disabled"
-        Write-Warn "  to enable, install manually:"
-        Write-Warn "    winget install ggerganov.whisper-cpp Gyan.FFmpeg"
-        Write-Warn "    OR choco install whisper-cpp ffmpeg"
-        Write-Warn "    OR scoop install whisper-cpp ffmpeg"
-        return
-    }
-
-    $cmds = @{
-        winget = @{
-            # winget requires BOTH --accept-source-agreements (source EULA,
-            # one-time) AND --accept-package-agreements (per-package
-            # license). Without the second flag winget exits with
-            # APPINSTALLER_CLI_ERROR_PACKAGE_AGREEMENTS_NOT_ACCEPTED
-            # (-1978335212 / 0x8A150014) on packages that ship a EULA.
-            ffmpeg  = @('install', '--accept-source-agreements', '--accept-package-agreements', '-e', 'Gyan.FFmpeg')
-            whisper = @('install', '--accept-source-agreements', '--accept-package-agreements', '-e', 'ggerganov.whisper-cpp')
-        }
-        choco = @{
-            ffmpeg  = @('install', '-y', 'ffmpeg')
-            whisper = @('install', '-y', 'whisper-cpp')
-        }
-        scoop = @{
-            ffmpeg  = @('install', 'ffmpeg')
-            whisper = @('install', 'whisper-cpp')
-        }
-    }
-
-    if ($needFfmpeg) {
-        Write-Info "installing ffmpeg via $pkgMgr..."
-        try {
-            & $pkgMgr @($cmds[$pkgMgr]['ffmpeg']) | Out-Null
-            if ($LASTEXITCODE -eq 0) {
-                Write-Ok "ffmpeg installed"
-            } else {
-                Write-Warn "ffmpeg install via $pkgMgr returned exit $LASTEXITCODE; install manually"
-            }
-        } catch {
-            Write-Warn "ffmpeg install via $pkgMgr failed: $($_.Exception.Message)"
-        }
-    }
-
-    if ($needWhisper) {
-        Write-Info "installing whisper-cli via $pkgMgr (this can take a few minutes)..."
-        try {
-            & $pkgMgr @($cmds[$pkgMgr]['whisper']) | Out-Null
-            if ($LASTEXITCODE -eq 0) {
-                Write-Ok "whisper-cli installed"
-            } else {
-                Write-Warn "whisper-cli install via $pkgMgr returned exit $LASTEXITCODE; install manually"
-            }
-        } catch {
-            Write-Warn "whisper-cli install via $pkgMgr failed: $($_.Exception.Message)"
-        }
-    }
-
-}
-
-# ============================================================================
 # Fetch the whisper model so the first voice note does not pay for it
 # ============================================================================
 # ~1.5 GB, previously left for the first voice message to fetch lazily -- which
@@ -1044,7 +956,13 @@ function Install-AsrModel {
         # slow line meant many minutes of a silent installer that looked hung --
         # and got interrupted. stdout only: under ErrorActionPreference=Stop a
         # redirected stderr line would be raised as an error and abort the step.
-        & $bin daemon warmup --asr | ForEach-Object { Write-Host "    $_" }
+        # On a console the command draws its own bar in place, which a pipe
+        # would turn into lines; piped (ssh, an agent) it prints lines itself.
+        if ([Console]::IsOutputRedirected) {
+            & $bin daemon warmup --asr | ForEach-Object { Write-Host "    $_" }
+        } else {
+            & $bin daemon warmup --asr
+        }
         if (Test-Path $expected) { Write-Ok "speech model ready" }
         else { throw "warmup finished but the model is not there" }
     } catch {
@@ -1146,7 +1064,6 @@ Register-BashAllowlist
 Disable-Autocompact
 Install-LanguageServers
 Install-Pdfium
-Install-WhisperStack
 Install-AsrModel
 Preload-Encoder
 Invoke-UnpatchOfficialTelegramPlugin

@@ -8,7 +8,7 @@
 //! output, and an operator watching `downloading the whisper model ...` for
 //! eighteen minutes reasonably concluded it had hung and interrupted it.
 
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -29,8 +29,12 @@ pub static REPORT_PROGRESS: AtomicBool = AtomicBool::new(false);
 pub const STALL_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Between progress lines. Lines, not `\r` redraws: the installers pipe this.
+/// Between progress lines when stdout is not a terminal (an installer run over
+/// ssh or by an agent pipes it): lines, since a pipe cannot redraw.
 const REPORT_EVERY: Duration = Duration::from_secs(10);
+/// Between redraws of the bar on a terminal.
+const REDRAW_EVERY: Duration = Duration::from_millis(250);
+const BAR_WIDTH: usize = 24;
 
 /// The client every model download uses. reqwest's blocking `timeout` bounds
 /// the wait for the response headers and each read of the body separately —
@@ -57,7 +61,8 @@ pub fn copy_with_progress(
     total: Option<u64>,
 ) -> io::Result<u64> {
     let report = REPORT_PROGRESS.load(Ordering::Relaxed);
-    if report {
+    let mut bar = report.then(|| Redraw::new(io::stdout().is_terminal()));
+    if report && !bar.as_ref().is_some_and(|b| b.tty) {
         let size = total.map(|t| format!(" of {}", mb(t))).unwrap_or_default();
         if already > 0 {
             println!("{label}: resuming at {}{size}", mb(already));
@@ -78,16 +83,73 @@ pub fn copy_with_progress(
         };
         to.write_all(&buf[..n])?;
         copied += n as u64;
-        if report && last.elapsed() >= REPORT_EVERY {
-            last = Instant::now();
-            println!("{}", progress_line(label, already + copied, total, copied, start.elapsed()));
-            let _ = io::stdout().flush();
+        match bar.as_mut() {
+            Some(b) if b.tty && last.elapsed() >= REDRAW_EVERY => {
+                last = Instant::now();
+                b.draw(&bar_line(label, already + copied, total, copied, start.elapsed()));
+            }
+            Some(b) if !b.tty && last.elapsed() >= REPORT_EVERY => {
+                last = Instant::now();
+                println!("{}", progress_line(label, already + copied, total, copied, start.elapsed()));
+                let _ = io::stdout().flush();
+            }
+            _ => {}
         }
     }
-    if report {
-        println!("{}", progress_line(label, already + copied, total, copied, start.elapsed()));
+    match bar.as_mut() {
+        Some(b) if b.tty => {
+            b.draw(&bar_line(label, already + copied, total, copied, start.elapsed()));
+            println!();
+        }
+        Some(_) => println!("{}", progress_line(label, already + copied, total, copied, start.elapsed())),
+        None => {}
     }
     Ok(copied)
+}
+
+/// One line on a terminal, rewritten in place: `\r` and padding over what
+/// the last draw left, no ANSI codes (a legacy Windows console prints them).
+pub struct Redraw {
+    pub tty: bool,
+    width: usize,
+}
+
+impl Redraw {
+    pub fn new(tty: bool) -> Self {
+        Self { tty, width: 0 }
+    }
+
+    pub fn draw(&mut self, line: &str) {
+        let len = line.chars().count();
+        let pad = self.width.saturating_sub(len);
+        print!("\r{line}{}", " ".repeat(pad));
+        self.width = len;
+        let _ = io::stdout().flush();
+    }
+}
+
+/// `whisper model [#########---------------] 41%  640 / 1533 MB  1.4 MB/s  ~11 min`
+/// — the terminal form of [`progress_line`]. Without a known size: no bar.
+pub fn bar_line(label: &str, done: u64, total: Option<u64>, copied_now: u64, elapsed: Duration) -> String {
+    let rate = copied_now as f64 / elapsed.as_secs_f64().max(0.001);
+    let speed = if copied_now > 0 { format!("  {:.1} MB/s", rate / 1e6) } else { String::new() };
+    let Some(total) = total.filter(|t| *t > 0) else {
+        return format!("{label}  {}{speed}", mb(done));
+    };
+    let frac = (done as f64 / total as f64).clamp(0.0, 1.0);
+    let filled = (frac * BAR_WIDTH as f64).round() as usize;
+    let mut line = format!(
+        "{label} [{}{}] {:>3.0}%  {} / {}{speed}",
+        "#".repeat(filled),
+        "-".repeat(BAR_WIDTH - filled),
+        frac * 100.0,
+        done / 1_000_000,
+        mb(total)
+    );
+    if rate > 0.0 && done < total {
+        line.push_str(&format!("  ~{}", eta((total - done) as f64 / rate)));
+    }
+    line
 }
 
 /// `whisper model: 640 MB of 1533 MB (41%), 1.4 MB/s, ~11 min left`
@@ -146,6 +208,15 @@ mod tests {
         // Done: no estimate.
         let line = progress_line("m", 10_000_000, Some(10_000_000), 10_000_000, Duration::from_secs(10));
         assert_eq!(line, "m: 10 MB of 10 MB (100%), 1.0 MB/s");
+    }
+
+    #[test]
+    fn the_bar_fills_with_the_download() {
+        let line = bar_line("whisper model", 640_000_000, Some(1_533_000_000), 140_000_000, Duration::from_secs(100));
+        assert_eq!(line, "whisper model [##########--------------]  42%  640 / 1533 MB  1.4 MB/s  ~11 min");
+        let line = bar_line("m", 10_000_000, Some(10_000_000), 10_000_000, Duration::from_secs(10));
+        assert_eq!(line, "m [########################] 100%  10 / 10 MB  1.0 MB/s");
+        assert_eq!(bar_line("p", 5_000_000, None, 0, Duration::from_secs(1)), "p  5 MB");
     }
 
     #[test]

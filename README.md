@@ -68,7 +68,7 @@ cd claudebase
 bash install.sh --local --yes      # or .\install.ps1 -Yes -Local on Windows
 ```
 
-> The installer downloads the pre-built `claudebase` binary from the latest GitHub release, drops the agent toolkit (rules / commands / agents / hooks) into `~/.claude/`, installs PDFium + the e5 encoder cache, best-effort installs `ffmpeg` + `whisper-cli` for voice transcription, and registers the daemon as a user service. It does NOT touch Claude Code's plugins. No Rust toolchain required on the install machine.
+> The installer downloads the pre-built `claudebase` binary from the latest GitHub release, drops the agent toolkit (rules / commands / agents / hooks) into `~/.claude/`, installs PDFium + the e5 encoder cache and the speech model, sets up language servers for Claude Code's LSP tool (installing Rust and Node.js for them when missing; `--no-lsp` skips it), and registers the daemon as a user service. Voice transcription is built into the binary: no ffmpeg or whisper-cli needed.
 
 **Building from source instead** (`install.sh --local`) needs a Rust toolchain, a C compiler,
 `pkg-config`, plus `cmake` and `clang` — the last two for the bundled whisper speech-to-text. The
@@ -90,7 +90,7 @@ containers on every change to the installer and fails if that stops being true.
 
 **Opt-outs** (env vars before running the installer):
 - `CLAUDEBASE_VERSION=x.y.z` — pin a specific version (downgrade, repeatable CI installs), honoured before anything else is resolved. Default: newest `claudebase-v*` tag on origin (via `git ls-remote`, no API quota). Falls back to a baked-in constant only when that lookup cannot run — no git, no network, air-gapped.
-- `CLAUDEBASE_SKIP_WHISPER=1` — skip ffmpeg + whisper-cli install (no voice transcription)
+- `CLAUDEBASE_SKIP_WHISPER=1` — skip the speech model download (fetched on the first voice note instead)
 - `CLAUDEBASE_ASR_BACKEND=parakeet` — select the Parakeet backend and fetch its model instead of
   whisper's. Needs a binary built with `--features asr-sherpa`; the released one has only whisper
 
@@ -446,7 +446,7 @@ button per option, the operator taps, and the answer is routed back to the askin
 
 ### Voice messages
 
-Voice notes are transcribed locally by whisper (`ffmpeg` + the bundled whisper.cpp, `ggml-medium`)
+Voice notes are transcribed locally by whisper (the bundled whisper.cpp, `ggml-medium`; OGG/Opus is decoded in-process)
 and arrive prefixed `[telegram_voice_message]:` — deliberately not the same prefix as typed text, so
 the agent knows the words came out of speech recognition and treats exact strings in them (filenames,
 flags, identifiers) as things to confirm rather than to act on. Nothing leaves the machine.

@@ -275,6 +275,13 @@ install_binary() {
   # SIGKILL it on first exec: a plain cp of a signed binary invalidates
   # the signature and the kernel kills the process with code 137.
   if [ "$LOCAL_MODE" = true ]; then
+    # A rustup from an earlier run sits in ~/.cargo/bin, which a shell that
+    # has not re-read its profile does not have on PATH; without any, install
+    # it (the language-server step would do so later anyway).
+    if ! command -v cargo >/dev/null 2>&1; then
+      [ -x "$HOME/.cargo/bin/cargo" ] && export PATH="$HOME/.cargo/bin:$PATH"
+      command -v cargo >/dev/null 2>&1 || ensure_rustup || true
+    fi
     if ! command -v cargo >/dev/null 2>&1; then
       log_error "--local binary build needs cargo (install the rust toolchain via rustup)"
       return 1
@@ -700,13 +707,15 @@ ensure_build_deps() {
 
   [ ${#missing_desc[@]} -eq 0 ] && return 0
 
-  local pm="" cmd=""
-  if   command -v apt-get >/dev/null 2>&1; then pm=apt-get; cmd="sudo apt-get install -y build-essential pkg-config cmake clang libclang-dev"
-  elif command -v dnf     >/dev/null 2>&1; then pm=dnf;     cmd="sudo dnf install -y gcc pkgconf-pkg-config cmake clang clang-devel"
-  elif command -v yum     >/dev/null 2>&1; then pm=yum;     cmd="sudo yum install -y gcc pkgconfig cmake clang clang-devel"
-  elif command -v pacman  >/dev/null 2>&1; then pm=pacman;  cmd="sudo pacman -S --needed --noconfirm base-devel pkgconf cmake clang"
-  elif command -v zypper  >/dev/null 2>&1; then pm=zypper;  cmd="sudo zypper install -y gcc pkg-config cmake clang llvm-clang-devel"
-  elif command -v apk     >/dev/null 2>&1; then pm=apk;     cmd="sudo apk add build-base pkgconfig cmake clang clang-dev"
+  # sudo only when not root: a root shell often has no sudo at all.
+  local pm="" cmd="" sudo_=""
+  [ "$(id -u)" -ne 0 ] && sudo_="sudo "
+  if   command -v apt-get >/dev/null 2>&1; then pm=apt-get; cmd="${sudo_}apt-get update && ${sudo_}apt-get install -y build-essential pkg-config cmake clang libclang-dev"
+  elif command -v dnf     >/dev/null 2>&1; then pm=dnf;     cmd="${sudo_}dnf install -y gcc pkgconf-pkg-config cmake clang clang-devel"
+  elif command -v yum     >/dev/null 2>&1; then pm=yum;     cmd="${sudo_}yum install -y gcc pkgconfig cmake clang clang-devel"
+  elif command -v pacman  >/dev/null 2>&1; then pm=pacman;  cmd="${sudo_}pacman -S --needed --noconfirm base-devel pkgconf cmake clang"
+  elif command -v zypper  >/dev/null 2>&1; then pm=zypper;  cmd="${sudo_}zypper install -y gcc pkg-config cmake clang llvm-clang-devel"
+  elif command -v apk     >/dev/null 2>&1; then pm=apk;     cmd="${sudo_}apk add build-base pkgconfig cmake clang clang-dev"
   elif command -v brew    >/dev/null 2>&1; then pm=brew;    cmd="brew install pkg-config cmake llvm"
   fi
 
@@ -906,72 +915,6 @@ preload_encoder() {
   fi
 }
 
-# ============================================================================
-# Install whisper-cli + ffmpeg (voice transcription dependencies)
-# ============================================================================
-# Needed by the upcoming Rust port of the official Telegram plugin which
-# transcribes inbound voice messages locally via whisper.cpp before
-# emitting them as channel notifications.
-#
-# Best-effort:
-#   - If both binaries are already on PATH → log + return 0 (idempotent).
-#   - If a package manager is detected → attempt install; warn on failure.
-#   - If no package manager → log clear manual-install hint + return 0.
-# The model itself is fetched by `install_asr_model` below, not here.
-#
-# NOTE: this comment used to point operators at
-# ~/.local/share/whisper-cpp/models/ggml-medium.bin. The daemon has never read
-# that path — it looks in ~/.claude/tools/claudebase/models/whisper/ — so
-# anyone who followed the advice put 1.5 GB somewhere claudebase ignores.
-#
-# Opt-out: set CLAUDEBASE_SKIP_WHISPER=1 to bypass entirely (no install,
-# no log spam). For headless CI where audio deps would just add minutes
-# to the install for no benefit.
-install_whisper_stack() {
-  if [ "${CLAUDEBASE_SKIP_WHISPER:-0}" = "1" ]; then
-    log_info "CLAUDEBASE_SKIP_WHISPER=1 — skipping ffmpeg + whisper-cli install"
-    return 0
-  fi
-
-  local need_ffmpeg=true
-  local need_whisper=true
-  command -v ffmpeg >/dev/null 2>&1 && need_ffmpeg=false
-  command -v whisper-cli >/dev/null 2>&1 && need_whisper=false
-
-  if ! $need_ffmpeg && ! $need_whisper; then
-    log_ok "ffmpeg + whisper-cli already on PATH (voice transcription ready)"
-    return 0
-  fi
-
-  if ! detect_pkg_manager; then
-    log_warn "cannot install packages ($PKG_NOTE); voice transcription disabled"
-    log_warn "  to enable, install manually:"
-    log_warn "    macOS:  brew install whisper-cpp ffmpeg"
-    log_warn "    Linux:  apt install whisper-cpp ffmpeg  (or dnf/pacman equivalent)"
-    return 0
-  fi
-  local pkg_mgr="$PKG_MGR" pkg_ffmpeg="ffmpeg" pkg_whisper="whisper-cpp"
-
-  if $need_ffmpeg; then
-    log_info "installing ffmpeg via $pkg_mgr..."
-    if pkg_install $pkg_ffmpeg; then
-      log_ok "ffmpeg installed"
-    else
-      log_warn "ffmpeg install via $pkg_mgr failed; install manually: $PKG_INSTALL $pkg_ffmpeg"
-    fi
-  fi
-
-  if $need_whisper; then
-    log_info "installing whisper-cli via $pkg_mgr (this can take a few minutes)..."
-    if pkg_install $pkg_whisper; then
-      log_ok "whisper-cli installed"
-    else
-      log_warn "whisper-cli install via $pkg_mgr failed; install manually: $PKG_INSTALL $pkg_whisper"
-    fi
-  fi
-
-  return 0
-}
 
 # ============================================================================
 # Fetch the whisper model so the first voice note does not pay for it
@@ -1029,9 +972,17 @@ install_asr_model() {
   # Show the command's progress lines. This used to go to /dev/null, so a slow
   # line meant many minutes of a silent installer that looked hung — and got
   # interrupted. `while read` rather than `sed -u`: BSD sed has no -u.
+  # On a terminal the command draws its own progress bar in place; a pipe
+  # would leave nothing to redraw, so it runs unpiped there. Piped (ssh without
+  # a tty, an agent) it prints a line every 10 s, indented here.
   local rc
-  "$bin" daemon warmup --asr 2>&1 | while IFS= read -r line; do printf '    %s\n' "$line"; done
-  rc=${PIPESTATUS[0]}
+  if [ -t 1 ]; then
+    "$bin" daemon warmup --asr
+    rc=$?
+  else
+    "$bin" daemon warmup --asr 2>&1 | while IFS= read -r line; do printf '    %s\n' "$line"; done
+    rc=${PIPESTATUS[0]}
+  fi
   if [ "$rc" -eq 0 ]; then
     log_ok "speech model ready"
   else
@@ -1223,8 +1174,8 @@ install_language_servers() {
 # One place that knows how to install a package here. sudo only when not root:
 # a root shell on a server or in a container often has no sudo at all, and
 # `sudo apt-get` then failed every package. apt gets `update` once (a fresh
-# image has no package lists) and DEBIAN_FRONTEND=noninteractive (ffmpeg pulls
-# tzdata, which otherwise stops to ask for a time zone).
+# image has no package lists) and DEBIAN_FRONTEND=noninteractive (a package
+# that pulls tzdata otherwise stops to ask for a time zone).
 PKG_MGR=""
 PKG_SUDO=""
 PKG_INSTALL=""
@@ -1317,7 +1268,6 @@ register_bash_allowlist
 disable_autocompact
 install_language_servers
 install_pdfium
-install_whisper_stack
 install_asr_model
 preload_encoder
 unpatch_official_telegram_plugin

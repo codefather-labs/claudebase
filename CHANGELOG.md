@@ -6,6 +6,67 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-27
+
+### Added
+
+- **Language servers for Claude Code's LSP tool.** The installers set up, per language, the server
+  and the official Claude Code plugin that runs it:
+  - Rust: `rustup component add rust-analyzer` and the `rust-analyzer-lsp` plugin;
+  - Python: `pyright` (npm -g) and the `pyright-lsp` plugin;
+  - JS/TS: `typescript-language-server` (npm -g) and the `typescript-lsp` plugin.
+
+  With them, agents get exact callers, callees, references and definitions (`incomingCalls`,
+  `outgoingCalls`, …) instead of grepping.
+
+  A missing toolchain is installed first:
+  - Rust: the official rustup installer, minimal profile, with `rust-analyzer` and `rust-src`.
+    Without `rust-src`, rust-analyzer resolves nothing from std.
+  - Node.js: Homebrew on macOS; nvm on Linux, per user and without sudo, because distro packages
+    are often too old for typescript-language-server; winget / choco / scoop (LTS) on Windows.
+
+  The step is best effort and never fails the install:
+  - a plugin is installed only once its server runs. An enabled plugin without its server made
+    every LSP call fail with "rust-analyzer crashed with exit code 1", because rustup's
+    `rust-analyzer` proxy is on PATH before the component is.
+
+  Opt out of all of it with `--no-lsp` / `-NoLsp` or `CLAUDEBASE_SKIP_LSP=1`.
+
+- **Journal flags.** Any entry can carry flags, set at `journal add` or later with
+  `journal mark <id>`, so an entry found by meaning alone still says how far to trust it.
+  - **Work items:** `--todo`, `--question`, `--problem`, `--reminder`, `--unverified` (a hypothesis
+    not yet checked), `--disputed` (contradicts another entry) and `--ai-feedback` (an agent's
+    suggestion for claudebase itself). They stay open until a session closes them with
+    `journal close <id> [--todo …] --resolution "<how>"`, which records when, by whom and how;
+    `journal reopen <id>` opens them again.
+  - **Marks:** `--constraint` (a rule to follow), `--important` and `--deprecated` (no longer true),
+    removed with `journal unmark`.
+  - **Filtering:** `journal list` / `search` filter by flag and by `--open` / `--closed`, and
+    `journal agenda` shows the open work items, constraints and important entries.
+  - **Search:** deprecated entries rank last.
+  - **Retention:** an entry with an open work item, a constraint or an important mark is kept past
+    its salience's retention; a deprecated one is not.
+  - **Transfer:** flags travel with `chat dump` / `chat load`.
+  - **Category:** with a flag and no `--category`, the first flag is the category.
+- **The journal as a graph.** Every `journal#N` in an entry is a link, and the verb before it sets
+  the kind: "Replaces journal#42" (or supersedes / corrects / reverses), "Fixes journal#26",
+  anything else cites. Existing journals get their links once, from the text.
+  - `journal get <id>` ends with a **related** block: the links both ways (cites / cited by,
+    replaces / replaced by, fixes / fixed by), the closest entries by meaning (from the stored e5
+    vectors) and those with the same `--source-artifact`, each with its flags.
+  - `list` and `search` show the links in one line per entry.
+  - `journal link <id> <to> [--kind]` and `journal unlink` add and remove links the text does not
+    make.
+  - A link never sets a flag: marking the replaced entry `--deprecated` stays the agent's call.
+  - Entries brought in by `chat load` / `journal import` do not get links from their text, since
+    their `journal#N` numbers another journal.
+
+### Fixed
+
+- **The retired `claudebase-dev` marketplace was never removed.** The installers ran
+  `claude plugin marketplace remove codefather-labs/claudebase`, but `remove` takes the marketplace
+  name, so it matched nothing and the error was swallowed. Now they remove `claudebase-dev`.
+
 ## [0.18.8] - 2026-10-27
 
 ### Changed

@@ -29,7 +29,7 @@ set -u
 # this constant sat at 0.9.2 through four releases because nothing checked it,
 # and every fresh install in that window silently got a binary two minor
 # versions old.
-CLAUDEBASE_VERSION_FALLBACK="0.19.3"
+CLAUDEBASE_VERSION_FALLBACK="0.19.4"
 CLAUDEBASE_PDFIUM_VERSION="chromium/7802"
 REPO_URL="https://github.com/codefather-labs/claudebase.git"
 RELEASE_BASE="https://github.com/codefather-labs/claudebase/releases/download"
@@ -123,7 +123,7 @@ WHAT GETS INSTALLED:
   ~/.claude/hooks/claudebase-agent-routing-reminder.sh  PreToolUse:EnterPlanMode - peers exist
   ~/.claude/hooks/claudebase-feature-describe.sh   PostToolUse:ExitPlanMode - publish the plan
   /usr/local/bin/claudebase                 Global alias (symlink)
-  ~/.claude/settings.json                   Bash allowlist + the hooks above, merged; autoCompactEnabled false
+  ~/.claude/settings.json                   Bash allowlist + the hooks above, merged
   language servers (unless --no-lsp)        Rust (rustup) and Node.js (brew / nvm) when missing, then
                                             rust-analyzer (rustup), pyright + typescript-language-server (npm -g)
                                             and the Claude Code plugins rust-analyzer-lsp, pyright-lsp,
@@ -429,36 +429,6 @@ register_alias() {
       log_warn "  add to your shell rc: export PATH=\"$link_dir:\$PATH\""
       ;;
   esac
-}
-
-# ============================================================================
-# Claude Code auto-compact off (settings.json)
-# ============================================================================
-# A session that compacts on its own swaps its history for a summary in the
-# middle of whatever it was doing; claudebase sessions are cleared on purpose
-# instead (`/clear`, the pool's per-worker clear). Written only while the key is
-# absent, so an operator who turns it back on in /config keeps that choice
-# across updates.
-disable_autocompact() {
-  local settings="$CLAUDE_DIR/settings.json"
-  [ -f "$settings" ] || echo '{}' > "$settings"
-  if ! command -v jq >/dev/null 2>&1; then
-    log_warn "jq required to turn auto-compact off — set \"autoCompactEnabled\": false in $settings"
-    return 0
-  fi
-  if jq -e 'has("autoCompactEnabled")' "$settings" >/dev/null 2>&1; then
-    log_ok "settings.json autoCompactEnabled left as set ($(jq -c .autoCompactEnabled "$settings"))"
-    return 0
-  fi
-  local tmp; tmp="$(mktemp)"
-  if jq '.autoCompactEnabled = false' "$settings" > "$tmp" && jq -e . "$tmp" >/dev/null 2>&1; then
-    mv "$tmp" "$settings"
-    chmod 0644 "$settings"
-    log_ok "settings.json (autoCompactEnabled: false)"
-  else
-    rm -f "$tmp"
-    log_warn "settings.json: could not set autoCompactEnabled; set it to false manually"
-  fi
 }
 
 # ============================================================================
@@ -1230,8 +1200,8 @@ pkg_install() {
   $PKG_INSTALL "$@" >/dev/null 2>&1
 }
 
-# settings.json is merged with jq: without it the hooks, the allowlist and the
-# auto-compact setting are only printed as instructions, and a session never
+# settings.json is merged with jq: without it the hooks and the allowlist are
+# only printed as instructions, and a session never
 # learns how outside messages arrive. So get it before anything merges.
 JQ_VERSION="jq-1.8.2"
 
@@ -1418,7 +1388,6 @@ install_claudebase_hooks
 install_binary
 register_alias
 register_bash_allowlist
-disable_autocompact
 install_language_servers
 install_pdfium
 unpatch_official_telegram_plugin

@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.19.4] - 2026-10-27
+
+### Changed
+
+- **The installers no longer turn Claude Code's auto-compact off.** The step added in 0.18.8 is
+  gone. Where an earlier install wrote `"autoCompactEnabled": false`, it stays until you turn
+  auto-compact back on in `/config` or remove the key from `~/.claude/settings.json`; the installer
+  does not undo it, since it cannot tell its own value from one you chose.
+
 ## [0.19.3] - 2026-10-27
 
 ### Changed

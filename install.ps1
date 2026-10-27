@@ -40,7 +40,7 @@ $ErrorActionPreference = 'Stop'
 # this constant sat at 0.9.2 through four releases because nothing checked it,
 # and every fresh install in that window silently got a binary two minor
 # versions old.
-$Script:ClaudebaseVersionFallback = '0.19.3'
+$Script:ClaudebaseVersionFallback = '0.19.4'
 $Script:ClaudebasePdfiumVersion = 'chromium/7802'
 
 # Which version to install: an explicit request, else the newest published tag,
@@ -528,28 +528,6 @@ function Install-LanguageServers {
         } else {
             Write-Warn "claude plugin install $($s.Plugin)@claude-plugins-official failed - run it by hand"
         }
-    }
-}
-
-# ============================================================================
-# Claude Code auto-compact off (settings.json). Written only while the key is
-# absent, so turning it back on in /config survives updates. See the sh twin.
-# ============================================================================
-function Disable-Autocompact {
-    $settings = Join-Path $Script:ClaudeDir 'settings.json'
-    try {
-        $obj = if (Test-Path $settings) { Get-Content $settings -Raw | ConvertFrom-Json } else { [pscustomobject]@{} }
-        if ($null -eq $obj) { $obj = [pscustomobject]@{} }
-        if ($obj.PSObject.Properties.Name -contains 'autoCompactEnabled') {
-            Write-Ok "settings.json autoCompactEnabled left as set ($($obj.autoCompactEnabled))"
-            return
-        }
-        $obj | Add-Member -NotePropertyName autoCompactEnabled -NotePropertyValue $false -Force
-        $json = $obj | ConvertTo-Json -Depth 20
-        [System.IO.File]::WriteAllText($settings, $json, [System.Text.UTF8Encoding]::new($false))
-        Write-Ok "settings.json (autoCompactEnabled: false)"
-    } catch {
-        Write-Warn "settings.json: could not set autoCompactEnabled ($($_.Exception.Message)); set it to false manually"
     }
 }
 
@@ -1082,7 +1060,6 @@ Install-ClaudebaseHooks
 Install-Binary
 Register-Alias
 Register-BashAllowlist
-Disable-Autocompact
 Install-LanguageServers
 Install-Pdfium
 Invoke-UnpatchOfficialTelegramPlugin

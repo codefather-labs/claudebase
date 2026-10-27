@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-10-27
+
 ### Fixed
 
 - **A root install without sudo wrote no hooks.** On a server or container shell as root, the

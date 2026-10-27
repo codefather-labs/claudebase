@@ -40,7 +40,7 @@ $ErrorActionPreference = 'Stop'
 # this constant sat at 0.9.2 through four releases because nothing checked it,
 # and every fresh install in that window silently got a binary two minor
 # versions old.
-$Script:ClaudebaseVersionFallback = '0.19.4'
+$Script:ClaudebaseVersionFallback = '0.20.0'
 $Script:ClaudebasePdfiumVersion = 'chromium/7802'
 
 # Which version to install: an explicit request, else the newest published tag,
@@ -119,7 +119,7 @@ WHAT GETS INSTALLED:
   %USERPROFILE%\.claude\skills\       daemon-change-nick, daemon-setup-auth-token,
                                       daemon-callback-info, chat-dump (claudebase-chat-dump),
                                       chat-load (claudebase-chat-load), setup-remote-daemon,
-                                      setup-claude-token
+                                      setup-claude-token, journal-share
   %USERPROFILE%\.claude\hooks\        SessionStart x2 (channel contract, journal),
                                       UserPromptSubmit (self-check),
                                       Pre/PostToolUse (peer routing, feature describe)
@@ -1230,6 +1230,7 @@ Write-Host "                      /claudebase-chat-load"
 Write-Host "                      /claudebase-daemon-setup-auth-token"
 Write-Host "                      /claudebase-setup-remote-daemon"
 Write-Host "                      /claudebase-setup-claude-token"
+Write-Host "                      /claudebase-journal-share"
 Write-Host "  Agents installed:   reflection (Drift), consolidator (Mnem)"
 Write-Host ""
 if (-not $installOk) { exit 1 }

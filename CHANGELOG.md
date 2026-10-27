@@ -6,6 +6,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-10-28
+
+### Added
+
+- **`journal share <folder>` / `unshare` / `shares`: one journal for several folders.** Run from a
+  folder, `share` makes another folder (a worktree, a branch checkout, any directory) write into this
+  journal live from then on.
+  - **Merging:** if the other folder had a journal, its entries are merged in first, renumbered,
+    with their tags, flags and links. The old file is moved aside, not deleted.
+  - **`unshare`:** the folder takes a copy of the shared journal, as it is at that moment and with
+    the same entry numbers, as its own, and the two diverge.
+  - **Where the map lives:** in the daemon, keyed by host and path, never in the project directory.
+  - **Same repository:** checkouts of one repository already share a journal, so `share` refuses
+    them.
+  - **The skill `/claudebase-journal-share`:** agents run it only when the operator asks in the
+    conversation.
+- **`journal feedback`: every project's `ai-feedback` entries** in one view, for retrospectives on
+  claudebase itself. Open ones unless `--all`. It is operator-only: refused from a session and from
+  remote machines, since it reads every project's journal.
+
+- **Work branches in the journal.** Every feature or fix runs as a branch of the journal graph:
+  1. a `--todo` before the work;
+  2. an "Implements journal#T" entry flagged `--unverified`, carrying the verification protocol;
+  3. a "Verifies journal#I" entry flagged `--verified`, carrying the evidence (what was run and what
+     it showed).
+
+  The branch rules:
+  - **Closing is gated.** `journal close <todo>` refuses until the branch holds a `--verified`
+    entry. It then closes every open work item of the branch, resolved as `verified: journal#V`.
+  - **Dropped work** closes with `--abandon --resolution "<why>"`.
+  - **`journal branch <id>`** shows the branch from any of its entries, and whether it is open,
+    verified or closed.
+  - **New flag and link kinds:** `--verified` (a mark; kept out of `agenda` and not exempt from
+    retention); `implements` and `verifies`, read from the text like `replaces` and `fixes`.
+  - **Prompts:** the journal rule, the reminder hook and the consolidator/reflection prompts teach
+    the protocol.
+
 ## [0.19.4] - 2026-10-27
 
 ### Changed

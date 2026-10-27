@@ -29,7 +29,7 @@ set -u
 # this constant sat at 0.9.2 through four releases because nothing checked it,
 # and every fresh install in that window silently got a binary two minor
 # versions old.
-CLAUDEBASE_VERSION_FALLBACK="0.19.4"
+CLAUDEBASE_VERSION_FALLBACK="0.20.0"
 CLAUDEBASE_PDFIUM_VERSION="chromium/7802"
 REPO_URL="https://github.com/codefather-labs/claudebase.git"
 RELEASE_BASE="https://github.com/codefather-labs/claudebase/releases/download"
@@ -116,7 +116,8 @@ WHAT GETS INSTALLED:
                                             /claudebase-daemon-callback-info,
                                             /claudebase-chat-dump, /claudebase-chat-load,
                                             /claudebase-setup-remote-daemon,
-                                            /claudebase-setup-claude-token
+                                            /claudebase-setup-claude-token,
+                                            /claudebase-journal-share
   ~/.claude/hooks/claudebase-channel-contract.sh   SessionStart - how outside messages arrive
   ~/.claude/hooks/claudebase-journal-reminder.sh   SessionStart - read and keep the project journal
   ~/.claude/hooks/claudebase-selfcheck-reminder.sh UserPromptSubmit - self-check reminder
@@ -1367,7 +1368,7 @@ echo "    tools/claudebase/   (binary + pdfium + e5 model)"
 echo "    rules/              (2 files - cognitive-self-check, project-journal)"
 echo "    commands/           (4 files — knowledge-ingest, reflect, consolidate, update-claudebase)"
 echo "    agents/             (2 files — reflection, consolidator)"
-echo "    skills/             (7 skills — change-nick, setup-auth-token, callback-info, chat-dump, chat-load, setup-remote-daemon, setup-claude-token)"
+echo "    skills/             (8 skills — change-nick, setup-auth-token, callback-info, chat-dump, chat-load, setup-remote-daemon, setup-claude-token, journal-share)"
 echo "    hooks/              (5 hooks — 2x SessionStart, UserPromptSubmit, Pre/PostToolUse)"
 echo ""
 
@@ -1438,6 +1439,7 @@ echo "    /claudebase-chat-dump                 Pack a conversation into a .zip 
 echo "    /claudebase-chat-load                 Unpack one here so /resume lists it"
 echo "    /claudebase-setup-remote-daemon       Join another machine's daemon (prod, dev, LAN)"
 echo "    /claudebase-setup-claude-token        Sign in every Claude on a machine with one token"
+echo "    /claudebase-journal-share             Share this journal with another folder (operator's request only)"
 echo "    /claudebase-daemon-setup-auth-token   The HTTP callback token for a session"
 echo ""
 echo "  Agents installed:"

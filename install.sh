@@ -97,6 +97,7 @@ USAGE:
 OPTIONS:
   --yes                       Skip confirmation prompts
   --local                     Use local checkout (skip git clone)
+  --no-lsp                    Do not install language servers (nor Rust / Node.js for them)
   --help                      Show this help
 
 WHAT GETS INSTALLED:
@@ -119,7 +120,11 @@ WHAT GETS INSTALLED:
   ~/.claude/hooks/claudebase-agent-routing-reminder.sh  PreToolUse:EnterPlanMode - peers exist
   ~/.claude/hooks/claudebase-feature-describe.sh   PostToolUse:ExitPlanMode - publish the plan
   /usr/local/bin/claudebase                 Global alias (symlink)
-  ~/.claude/settings.json                   Bash allowlist + the hooks above, merged
+  ~/.claude/settings.json                   Bash allowlist + the hooks above, merged; autoCompactEnabled false
+  language servers (unless --no-lsp)        Rust (rustup) and Node.js (brew / nvm) when missing, then
+                                            rust-analyzer (rustup), pyright + typescript-language-server (npm -g)
+                                            and the Claude Code plugins rust-analyzer-lsp, pyright-lsp,
+                                            typescript-lsp, so agents get call hierarchy and references
 
 WHAT IS *REMOVED* (reverse migration, idempotent):
   the old Stop[insight-capture] and SessionStart[read-insights] hooks, the
@@ -141,6 +146,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --yes|-y)    ASSUME_YES=true; shift ;;
     --local)     LOCAL_MODE=true; shift ;;
+    --no-lsp)    SKIP_LSP=true; shift ;;
     --help|-h)   print_help; exit 0 ;;
     *) log_error "unknown flag: $1"; print_help; exit 2 ;;
   esac
@@ -847,7 +853,9 @@ unpatch_official_telegram_plugin() {
   # v0.6-era leftovers: uninstall before removing the marketplace, otherwise
   # the removal is rejected with 'plugin still installed from this source'.
   claude plugin uninstall claudebase@claudebase-dev >/dev/null 2>&1 || true
-  claude plugin marketplace remove codefather-labs/claudebase >/dev/null 2>&1 || true
+  # `remove` takes the marketplace NAME; the source `codefather-labs/claudebase`
+  # matched nothing, so the retired marketplace outlived every reinstall.
+  claude plugin marketplace remove claudebase-dev >/dev/null 2>&1 || true
 
   local plugin_root="$CLAUDE_DIR/plugins/cache/claude-plugins-official/telegram"
   if [ ! -d "$plugin_root" ]; then
@@ -1090,6 +1098,137 @@ set_asr_backend() {
 }
 
 # ============================================================================
+# Language servers for Claude Code's LSP tool
+# ============================================================================
+# Claude Code's LSP tool (callers, callees, references, definitions) needs, per
+# language, the server binary and the official plugin that tells Claude Code to
+# run it. Rust, Python and JS/TS only. The toolchains come first when missing:
+# rustup (official installer, minimal profile) and Node.js (Homebrew on macOS,
+# nvm on Linux — per user, no sudo, and distro packages are often too old for
+# typescript-language-server). Best effort: nothing here fails the install. A
+# plugin is enabled only once its binary runs — an enabled plugin without one
+# makes every LSP call crash ("rust-analyzer crashed with exit code 1": rustup's
+# proxy is on PATH before the component is).
+NVM_VERSION="v0.40.8"
+
+fetch_to_stdout() {
+  if command -v curl >/dev/null 2>&1; then
+    curl --proto '=https' --tlsv1.2 -fsSL "$1"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO- "$1"
+  else
+    return 1
+  fi
+}
+
+ensure_rustup() {
+  if command -v rustup >/dev/null 2>&1; then return 0; fi
+  if [ -x "$HOME/.cargo/bin/rustup" ]; then
+    export PATH="$HOME/.cargo/bin:$PATH"
+    return 0
+  fi
+  log_info "installing Rust (rustup, minimal profile + rust-analyzer, rust-src)..."
+  if fetch_to_stdout https://sh.rustup.rs | sh -s -- -y --profile minimal -c rust-analyzer,rust-src >/dev/null 2>&1; then
+    export PATH="$HOME/.cargo/bin:$PATH"
+    log_ok "Rust toolchain (rustup; PATH added to your shell profile)"
+  else
+    log_warn "rustup install failed — see https://rustup.rs"
+    return 1
+  fi
+}
+
+# nvm is a shell function and trips `set -u`; load it with -u off.
+load_nvm() {
+  export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+  [ -s "$NVM_DIR/nvm.sh" ] || return 1
+  set +u
+  . "$NVM_DIR/nvm.sh"
+  local rc=$?
+  set -u
+  return $rc
+}
+
+ensure_node() {
+  if command -v npm >/dev/null 2>&1; then return 0; fi
+  if load_nvm && command -v npm >/dev/null 2>&1; then return 0; fi
+  if [ "$(uname -s)" = Darwin ] && command -v brew >/dev/null 2>&1; then
+    log_info "installing Node.js (brew)..."
+    if brew install node >/dev/null 2>&1; then log_ok "Node.js (brew)"; return 0; fi
+    log_warn "brew install node failed"
+    return 1
+  fi
+  if ! load_nvm; then
+    log_info "installing nvm $NVM_VERSION (Node.js version manager, per user)..."
+    if ! fetch_to_stdout "https://raw.githubusercontent.com/nvm-sh/nvm/$NVM_VERSION/install.sh" | bash >/dev/null 2>&1 || ! load_nvm; then
+      log_warn "nvm install failed — install Node.js 18+ yourself, then re-run the installer"
+      return 1
+    fi
+  fi
+  log_info "installing Node.js LTS (nvm)..."
+  set +u
+  nvm install --lts >/dev/null 2>&1 && nvm alias default 'lts/*' >/dev/null 2>&1
+  local rc=$?
+  set -u
+  if [ $rc -eq 0 ] && command -v npm >/dev/null 2>&1; then
+    log_ok "Node.js LTS (nvm; loaded by your shell profile)"
+  else
+    log_warn "nvm install --lts failed"
+    return 1
+  fi
+}
+lsp_binary_works() {
+  case "$1" in
+    rust-analyzer)     rust-analyzer --version >/dev/null 2>&1 ;;
+    pyright-langserver) command -v pyright-langserver >/dev/null 2>&1 && pyright --version >/dev/null 2>&1 ;;
+    *)                 "$1" --version >/dev/null 2>&1 ;;
+  esac
+}
+
+install_language_servers() {
+  if [ "${SKIP_LSP:-false}" = true ] || [ "${CLAUDEBASE_SKIP_LSP:-0}" = "1" ]; then
+    log_info "language servers skipped (--no-lsp)"
+    return 0
+  fi
+  if ensure_rustup; then
+    # rust-src: without the standard library's sources rust-analyzer cannot
+    # resolve anything from std.
+    if rustup component add rust-analyzer rust-src >/dev/null 2>&1; then
+      log_ok "rust-analyzer, rust-src (rustup components)"
+    else
+      log_warn "rustup component add rust-analyzer rust-src failed — run it by hand"
+    fi
+  else
+    log_info "no Rust toolchain — rust-analyzer skipped"
+  fi
+  if ensure_node; then
+    if npm install -g pyright typescript typescript-language-server >/dev/null 2>&1; then
+      log_ok "pyright, typescript-language-server (npm -g)"
+    else
+      log_warn "npm install -g failed (is the global prefix writable?) — run: npm install -g pyright typescript typescript-language-server"
+    fi
+  else
+    log_info "no Node.js — pyright and typescript-language-server skipped"
+  fi
+  if ! command -v claude >/dev/null 2>&1; then
+    log_warn "claude CLI not found — once it is: claude plugin install rust-analyzer-lsp@claude-plugins-official (and pyright-lsp, typescript-lsp)"
+    return 0
+  fi
+  local pair plugin bin
+  for pair in rust-analyzer-lsp:rust-analyzer pyright-lsp:pyright-langserver typescript-lsp:typescript-language-server; do
+    plugin="${pair%%:*}"; bin="${pair##*:}"
+    if ! lsp_binary_works "$bin"; then
+      log_info "$bin not available — Claude Code plugin $plugin not installed"
+      continue
+    fi
+    if claude plugin install "$plugin@claude-plugins-official" --scope user >/dev/null 2>&1; then
+      log_ok "Claude Code plugin $plugin"
+    else
+      log_warn "claude plugin install $plugin@claude-plugins-official failed — run it by hand"
+    fi
+  done
+}
+
+# ============================================================================
 # Main
 # ============================================================================
 echo ""
@@ -1123,6 +1262,7 @@ install_binary
 register_alias
 register_bash_allowlist
 disable_autocompact
+install_language_servers
 install_pdfium
 install_whisper_stack
 install_asr_model

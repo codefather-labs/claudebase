@@ -22,6 +22,8 @@ param(
     [switch]$Local,
     # Skip the ~1.5 GB whisper model; voice notes then fetch it on first use.
     [switch]$SkipAsrModel,
+    # Do not install language servers for Claude Code's LSP tool.
+    [switch]$NoLsp,
     [switch]$Help
 )
 
@@ -94,11 +96,12 @@ Installs the claudebase CLI binary and agent toolkit (rules, commands,
 agents) into %USERPROFILE%\.claude\.
 
 USAGE:
-  .\install.ps1 [-Yes] [-Local] [-Help]
+  .\install.ps1 [-Yes] [-Local] [-NoLsp] [-Help]
 
 OPTIONS:
   -Yes        Skip confirmation prompts
   -Local      Use local checkout (skip git clone of $($Script:RepoUrl))
+  -NoLsp      Do not install language servers (nor Rust / Node.js for them)
   -Help       Show this help
 
 WHAT GETS INSTALLED:
@@ -117,6 +120,10 @@ WHAT GETS INSTALLED:
                                       Pre/PostToolUse (peer routing, feature describe)
   %USERPROFILE%\.claude\bin\claudebase.cmd  Global wrapper (User PATH)
   %USERPROFILE%\.claude\bin\claudebase      Same, for Git Bash (where agents run commands)
+  language servers (unless -NoLsp)    Rust (rustup-init) and Node.js LTS (winget/choco/scoop) when
+                                      missing, then rust-analyzer, pyright + typescript-language-server
+                                      (npm -g) and the Claude Code plugins rust-analyzer-lsp,
+                                      pyright-lsp, typescript-lsp: call hierarchy and references
 
 WHAT IS *REMOVED* (reverse migration, idempotent):
   the old Stop[insight-capture] and SessionStart[read-insights] hooks, the
@@ -385,6 +392,133 @@ function Register-Alias {
         Write-Ok "User PATH updated (open a new terminal for the change to take effect)"
     } else {
         Write-Ok "User PATH already contains $binDir"
+    }
+}
+
+# ============================================================================
+# Language servers for Claude Code's LSP tool. See the sh twin: per language a
+# server binary plus the official plugin that runs it, after the toolchain when
+# it is missing (rustup-init; Node.js LTS via winget/choco/scoop); best effort;
+# a plugin is installed only once its binary runs, or every LSP call crashes.
+# ============================================================================
+function Test-NativeOk {
+    param([string]$Exe, [string[]]$ArgList)
+    # Only the exit code counts. rustup reports progress on stderr, which under
+    # 'Stop' Windows PowerShell 5.1 turns into a terminating error.
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $Exe @ArgList *> $null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    }
+}
+
+# This session's PATH, re-read: an installer that just ran (rustup-init, the
+# Node.js MSI) only updated the registry.
+function Update-SessionPath {
+    $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $user = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $env:Path = (@($machine, $user) | Where-Object { $_ }) -join ';'
+}
+
+function Install-Rustup {
+    if (Get-Command rustup -ErrorAction SilentlyContinue) { return $true }
+    $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
+    $init = Join-Path $env:TEMP 'rustup-init.exe'
+    Write-Host "  installing Rust (rustup, minimal profile + rust-analyzer, rust-src)..."
+    try {
+        $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri "https://win.rustup.rs/$arch" -OutFile $init -UseBasicParsing
+        # Empty stdin: a question rustup-init still asks (the MSVC build tools
+        # one) reads end of input instead of waiting for a person.
+        $ok = $false
+        $ErrorActionPreference = 'Continue'
+        '' | & $init -y --profile minimal -c 'rust-analyzer,rust-src' *> $null
+        $ok = ($LASTEXITCODE -eq 0)
+    } catch {
+        $ok = $false
+    } finally {
+        Remove-Item $init -ErrorAction SilentlyContinue
+    }
+    Update-SessionPath
+    if ($ok -and (Get-Command rustup -ErrorAction SilentlyContinue)) {
+        Write-Ok "Rust toolchain (rustup)"
+        return $true
+    }
+    Write-Warn "rustup install failed - see https://rustup.rs"
+    return $false
+}
+
+function Install-Node {
+    if (Get-Command npm.cmd -ErrorAction SilentlyContinue) { return $true }
+    $how = $null
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        $how = @('winget', @('install', '--accept-source-agreements', '--accept-package-agreements', '-e', '--id', 'OpenJS.NodeJS.LTS'))
+    } elseif (Get-Command choco -ErrorAction SilentlyContinue) {
+        $how = @('choco', @('install', '-y', 'nodejs-lts'))
+    } elseif (Get-Command scoop -ErrorAction SilentlyContinue) {
+        $how = @('scoop', @('install', 'nodejs-lts'))
+    }
+    if (-not $how) {
+        Write-Warn "no winget/choco/scoop - install Node.js LTS from https://nodejs.org, then re-run the installer"
+        return $false
+    }
+    Write-Host "  installing Node.js LTS ($($how[0]))..."
+    $ok = Test-NativeOk $how[0] $how[1]
+    Update-SessionPath
+    if (Get-Command npm.cmd -ErrorAction SilentlyContinue) {
+        Write-Ok "Node.js LTS ($($how[0]))"
+        return $true
+    }
+    Write-Warn "Node.js install via $($how[0]) failed (exit ok: $ok)"
+    return $false
+}
+
+function Install-LanguageServers {
+    if ($NoLsp -or $env:CLAUDEBASE_SKIP_LSP -eq '1') {
+        Write-Host "  language servers skipped (-NoLsp)"
+        return
+    }
+    if (Install-Rustup) {
+        # rust-src: without std's sources rust-analyzer resolves nothing from std.
+        if (Test-NativeOk 'rustup' @('component', 'add', 'rust-analyzer', 'rust-src')) {
+            Write-Ok "rust-analyzer, rust-src (rustup components)"
+        } else {
+            Write-Warn "rustup component add rust-analyzer rust-src failed - run it by hand"
+        }
+    } else {
+        Write-Host "  no Rust toolchain - rust-analyzer skipped"
+    }
+    # npm.cmd, not npm: the npm.ps1 shim is blocked under a Restricted policy.
+    if (Install-Node) {
+        if (Test-NativeOk 'npm.cmd' @('install', '-g', 'pyright', 'typescript', 'typescript-language-server')) {
+            Write-Ok "pyright, typescript-language-server (npm -g)"
+        } else {
+            Write-Warn "npm install -g failed - run: npm install -g pyright typescript typescript-language-server"
+        }
+    } else {
+        Write-Host "  no Node.js - pyright and typescript-language-server skipped"
+    }
+    if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
+        Write-Warn "claude CLI not found - once it is: claude plugin install rust-analyzer-lsp@claude-plugins-official (and pyright-lsp, typescript-lsp)"
+        return
+    }
+    $servers = @(
+        @{ Plugin = 'rust-analyzer-lsp'; Exe = 'rust-analyzer';                  Check = @('--version') },
+        @{ Plugin = 'pyright-lsp';       Exe = 'pyright.cmd';                    Check = @('--version') },
+        @{ Plugin = 'typescript-lsp';    Exe = 'typescript-language-server.cmd'; Check = @('--version') }
+    )
+    foreach ($s in $servers) {
+        if (-not (Get-Command $s.Exe -ErrorAction SilentlyContinue) -or -not (Test-NativeOk $s.Exe $s.Check)) {
+            Write-Host "  $($s.Exe) not available - Claude Code plugin $($s.Plugin) not installed"
+            continue
+        }
+        if (Test-NativeOk 'claude' @('plugin', 'install', "$($s.Plugin)@claude-plugins-official", '--scope', 'user')) {
+            Write-Ok "Claude Code plugin $($s.Plugin)"
+        } else {
+            Write-Warn "claude plugin install $($s.Plugin)@claude-plugins-official failed - run it by hand"
+        }
     }
 }
 
@@ -939,7 +1073,8 @@ function Invoke-UnpatchOfficialTelegramPlugin {
     $prevErrPref = $ErrorActionPreference
     $ErrorActionPreference = 'SilentlyContinue'
     try { & claude plugin uninstall claudebase@claudebase-dev 2>&1 | Out-Null } catch {}
-    try { & claude plugin marketplace remove codefather-labs/claudebase 2>&1 | Out-Null } catch {}
+    # `remove` takes the marketplace NAME, not its source (see the sh twin).
+    try { & claude plugin marketplace remove claudebase-dev 2>&1 | Out-Null } catch {}
     $ErrorActionPreference = $prevErrPref
 
     $pluginRoot = Join-Path $Script:ClaudeDir 'plugins\cache\claude-plugins-official\telegram'
@@ -1005,6 +1140,7 @@ Install-Binary
 Register-Alias
 Register-BashAllowlist
 Disable-Autocompact
+Install-LanguageServers
 Install-Pdfium
 Install-WhisperStack
 Install-AsrModel

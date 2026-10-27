@@ -1068,17 +1068,22 @@ pub struct AuthSetupTokenArgs {
 /// ever read from or written to another project's journal.
 #[derive(Subcommand, Debug)]
 pub enum JournalSubcommand {
-    /// Record a decision or a finding. Needs a session started with
-    /// `claudebase run`. The same text in the same category within 30 days is
-    /// stored once (its new tags are merged in).
+    /// Record a decision, a finding, an update — or, with a flag, a todo, an
+    /// open question, a problem, a reminder, a hypothesis (`--unverified`), a
+    /// constraint. Needs a session started with `claudebase run`. A
+    /// `journal#N` in the text links the two entries. The same text in the
+    /// same category within 30 days is stored once (its new tags and flags
+    /// are merged in).
     Add(JournalAddArgs),
     /// Find earlier entries: BM25 plus semantic search, fused. Filters by tag,
     /// category and the rest are exact.
     Search(JournalSearchArgs),
-    /// Entries newest first, a page at a time.
+    /// Entries newest first, a page at a time, each with its flags and links.
     List(JournalListArgs),
-    /// One entry in full.
-    Get(JournalIdArgs),
+    /// One entry in full, with what it intersects: the entries it cites,
+    /// replaces or fixes and those that do so to it, the closest entries by
+    /// meaning, and those from the same source.
+    Get(JournalGetArgs),
     /// Delete one entry. Needs a session started with `claudebase run`.
     Delete(JournalIdArgs),
     /// Tags used in this project's journal, most used first.
@@ -1094,6 +1099,164 @@ pub enum JournalSubcommand {
     /// of the current directory. `chat load` does this itself; this is for when
     /// the daemon was not running then. Loading twice writes nothing new.
     Import(JournalImportArgs),
+    /// Flag an existing entry: `journal mark 37 --todo`. Needs a session.
+    Mark(JournalFlagIdArgs),
+    /// Remove flags from an entry, open or closed. Needs a session.
+    Unmark(JournalFlagIdArgs),
+    /// Close an entry's open work items (todo, question, problem, reminder,
+    /// unverified, disputed, ai-feedback) — the named ones, or all of them —
+    /// saying how (`--resolution`). Needs a session.
+    Close(JournalCloseArgs),
+    /// Open closed work items of an entry again. Needs a session.
+    Reopen(JournalFlagIdArgs),
+    /// Everything still open: work items, constraints and important entries.
+    Agenda(JournalAgendaArgs),
+    /// Link one entry to another when its text does not already say so
+    /// (`journal#N` in an entry is linked by itself). Needs a session.
+    Link(JournalLinkArgs),
+    /// Remove a link. Needs a session.
+    Unlink(JournalUnlinkArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct JournalGetArgs {
+    pub id: i64,
+    /// How many of the closest entries by meaning to show.
+    #[arg(long, default_value_t = 5)]
+    pub similar: usize,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum LinkKind {
+    Cites,
+    Replaces,
+    Fixes,
+}
+
+impl LinkKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cites => "cites",
+            Self::Replaces => "replaces",
+            Self::Fixes => "fixes",
+        }
+    }
+}
+
+#[derive(Args, Debug)]
+pub struct JournalLinkArgs {
+    /// The entry that refers.
+    pub id: i64,
+    /// The entry referred to.
+    pub to: i64,
+    /// `replaces` does not flag the older entry: mark it `--deprecated`
+    /// yourself if it is no longer true.
+    #[arg(long, value_enum, default_value_t = LinkKind::Cites)]
+    pub kind: LinkKind,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct JournalUnlinkArgs {
+    pub id: i64,
+    pub to: i64,
+    /// Only this kind; without it, every link from `id` to `to`.
+    #[arg(long, value_enum)]
+    pub kind: Option<LinkKind>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// The flags an entry can carry (`journal::FLAGS`). Work items — todo,
+/// question, problem, reminder, unverified, disputed, ai-feedback — stay open
+/// until closed and keep the entry past retention while open. Marks —
+/// constraint, important, deprecated — are removed with `unmark`.
+#[derive(Args, Debug, Default, Clone)]
+pub struct JournalFlags {
+    /// Something to do.
+    #[arg(long)]
+    pub todo: bool,
+    /// An open question.
+    #[arg(long)]
+    pub question: bool,
+    /// An unresolved problem.
+    #[arg(long)]
+    pub problem: bool,
+    /// Something to come back to.
+    #[arg(long)]
+    pub reminder: bool,
+    /// A hypothesis or assumption not yet checked; close it once it is.
+    #[arg(long)]
+    pub unverified: bool,
+    /// Contradicts another entry; close it once settled.
+    #[arg(long)]
+    pub disputed: bool,
+    /// An agent's suggestion for improving claudebase itself.
+    #[arg(long = "ai-feedback")]
+    pub ai_feedback: bool,
+    /// A rule to follow, not to weigh.
+    #[arg(long)]
+    pub constraint: bool,
+    /// An important note.
+    #[arg(long)]
+    pub important: bool,
+    /// No longer true: kept for history, ranked last in a search.
+    #[arg(long)]
+    pub deprecated: bool,
+}
+
+impl JournalFlags {
+    pub fn names(&self) -> Vec<&'static str> {
+        [
+            (self.todo, "todo"),
+            (self.question, "question"),
+            (self.problem, "problem"),
+            (self.reminder, "reminder"),
+            (self.unverified, "unverified"),
+            (self.disputed, "disputed"),
+            (self.ai_feedback, "ai-feedback"),
+            (self.constraint, "constraint"),
+            (self.important, "important"),
+            (self.deprecated, "deprecated"),
+        ]
+        .into_iter()
+        .filter_map(|(on, name)| on.then_some(name))
+        .collect()
+    }
+}
+
+#[derive(Args, Debug)]
+pub struct JournalFlagIdArgs {
+    pub id: i64,
+    #[command(flatten)]
+    pub flags: JournalFlags,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct JournalCloseArgs {
+    pub id: i64,
+    /// Close only these; without any, every open one.
+    #[command(flatten)]
+    pub flags: JournalFlags,
+    /// How it was closed: the answer, the fix, the commit.
+    #[arg(long)]
+    pub resolution: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct JournalAgendaArgs {
+    /// Entries shown per flag, newest first.
+    #[arg(long, default_value_t = 20)]
+    pub limit: usize,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1124,6 +1287,15 @@ pub struct JournalFilterArgs {
     /// Only entries newer than this: `<N>` + `s|m|h|d|w`, e.g. `30d`, `12h`.
     #[arg(long)]
     pub since: Option<String>,
+    /// Only entries carrying ANY of these flags.
+    #[command(flatten)]
+    pub flags: JournalFlags,
+    /// Only entries whose flag (the named ones, or any) is still open.
+    #[arg(long, conflicts_with = "closed")]
+    pub open: bool,
+    /// Only entries whose flag (the named ones, or any) is closed.
+    #[arg(long)]
+    pub closed: bool,
 }
 
 /// `claudebase journal add "<text>" --category <c> --tag <t>`.
@@ -1135,9 +1307,13 @@ pub struct JournalAddArgs {
     pub body: Option<String>,
     /// What kind of entry: free text, normalized to lowercase-with-dashes.
     /// Reuse what `claudebase journal categories` lists before inventing one —
-    /// typical: decision, finding, bug, lesson, assumption-falsified.
+    /// typical: decision, finding, bug, lesson, assumption-falsified. With a
+    /// flag and no category, the first flag is the category.
     #[arg(long)]
-    pub category: String,
+    pub category: Option<String>,
+    /// Flags to set, open.
+    #[command(flatten)]
+    pub flags: JournalFlags,
     /// At least one (repeatable). Tags are how the entry is found again; reuse
     /// what `claudebase journal tags` lists.
     #[arg(long = "tag", alias = "tags")]

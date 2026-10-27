@@ -28,6 +28,10 @@ On a fresh context window (session start, resume, post-compact), read before you
 2. Pull what bears on the task, by tag and category - not an exhaustive scan:
      claudebase journal search "<keywords>" --tag <tag>
      claudebase journal list --category decision --tag <tag>
+3. See what is still open, and the constraints of this project (binding):
+     claudebase journal agenda
+Never act on an entry flagged deprecated; treat unverified or disputed ones as assumptions.
+Before relying on an entry, read it with `claudebase journal get <id>`: its related block shows what replaces, fixes or cites it and the closest entries by meaning, each with its flags.
 Mid-task with the context already in hand, skip this.
 
 While you work, journal every decision you make, every finding you uncover and every update you make, one entry each, as you go. The journal is both the record of decisions and the project changelog:
@@ -37,7 +41,8 @@ While you work, journal every decision you make, every finding you uncover and e
 - Tags: 1-4 specific nouns (component, technology, feature); reuse existing tags so the entry is found again.
 - Self-contained: a later session reads the entry without this conversation.
 - --salience high for load-bearing entries (kept forever), low for ambient context (90 days); medium is the default (a year).
-- Before a non-trivial decision, search for an earlier one on the same subject; if you reverse it, say so and cite its #id.
+- Before a non-trivial decision, search for an earlier one on the same subject; if you reverse it, write "Replaces journal#<id>" (or "Fixes journal#<id>") - that text becomes a link both entries show - and mark the old one --deprecated if it is no longer true.
+- Flags say what an entry is: --todo --question --problem --reminder --unverified --disputed --ai-feedback (work items, closed with `journal close <id> --resolution "<how>"`, reopened with `journal reopen <id>`) and --constraint --important --deprecated (marks, removed with `journal unmark`). Flag an existing entry with `journal mark <id> --deprecated`; when something stops being true, mark it deprecated. Suggestions for improving claudebase itself go in with --ai-feedback.
 
 If `journal add` answers that it needs a session started with `claudebase run`, tell the operator once and carry on without it.
 

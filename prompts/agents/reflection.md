@@ -116,7 +116,14 @@ claudebase journal categories                    # what kinds of entries exist
 claudebase journal tags                          # the tag vocabulary, most used first
 claudebase journal search "<keywords>" --tag <tag> --top-k 5 --json
 claudebase journal list --category decision --tag <tag> --json
+claudebase journal agenda                        # open todos/questions/problems/hypotheses/disputes, constraints, important
+claudebase journal get <id>                      # one entry + related: what replaces/fixes/cites it, closest by meaning
 ```
+
+Read an entry's flags and related block before relying on it:
+- `deprecated` is history and must not be acted on. `replaced by #N` means #N is the current word.
+- `unverified` and `disputed` are assumptions, not facts.
+- `constraint` is binding.
 
 Cite load-bearing entries in `## Facts → ### Verified facts` as:
 
@@ -135,8 +142,13 @@ claudebase journal add "<what, why, alternatives rejected, where: file:line>" \
 - Reuse the categories and tags the journal already has (`journal categories`, `journal tags`) before inventing new ones — an entry is only as findable as its labels.
 - Entries are self-contained: a later session reads them without this conversation.
 - Salience drives retention: `high` forever, `medium` 365 days, `low` 90 days.
-- If an entry reverses an earlier one, say so and cite its `journal#<id>`.
+- If an entry reverses an earlier one, write "Replaces journal#<id>" ("Fixes journal#<id>" for a fix). The text becomes a link both entries show. Then mark the old one `journal mark <id> --deprecated` if it is no longer true; a link never does that by itself.
+- Flags say what an entry is.
+  - Work items: `--todo`, `--question`, `--problem`, `--reminder`, `--unverified` (hypothesis), `--disputed` (contradicts another entry) and `--ai-feedback` (a suggestion for claudebase itself). Close them with `journal close <id> --resolution "<how>"` and reopen them with `journal reopen <id>`.
+  - Marks: `--constraint`, `--important` and `--deprecated`, removed with `journal unmark`.
+  - Flag an existing entry with `journal mark <id> --<flag>`.
+- `journal link <id> <to> [--kind cites|replaces|fixes]` links entries whose text does not mention each other.
 
 Full protocol: `~/.claude/rules/project-journal.md`.
 
-As reflection: journal each non-obvious observation as `--category observation`, so focused agents that would systematically miss it find it later.
+As reflection: journal each non-obvious observation as `--category observation`, so focused agents that would systematically miss it find it later. An observation that is a hunch rather than verified goes in with `--unverified`. One that needs action goes in with `--todo` or `--problem`. One about claudebase itself (its hooks, journal, prompts, tooling) goes in with `--ai-feedback`.

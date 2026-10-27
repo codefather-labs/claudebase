@@ -47,6 +47,7 @@ fn request(sub: JournalSubcommand) -> Result<(&'static str, Value, bool)> {
                 "agent": a.agent,
                 "feature": a.feature,
                 "source_artifact": a.source_artifact,
+                "flags": a.flags.names(),
                 // Claude Code exports the conversation id into every tool
                 // shell; it links the entry back to the transcript.
                 "session_id": std::env::var(SESSION_ID_ENV).ok().filter(|s| !s.is_empty()),
@@ -67,13 +68,28 @@ fn request(sub: JournalSubcommand) -> Result<(&'static str, Value, bool)> {
             args["limit"] = json!(size);
             ("journal_list", args, a.json)
         }
-        JournalSubcommand::Get(a) => ("journal_get", json!({ "id": a.id }), a.json),
+        JournalSubcommand::Get(a) => ("journal_get", json!({ "id": a.id, "similar": a.similar }), a.json),
+        JournalSubcommand::Link(a) => ("journal_link", json!({ "id": a.id, "to": a.to, "kind": a.kind.as_str() }), a.json),
+        JournalSubcommand::Unlink(a) => (
+            "journal_unlink",
+            json!({ "id": a.id, "to": a.to, "kind": a.kind.map(|k| k.as_str()) }),
+            a.json,
+        ),
         JournalSubcommand::Delete(a) => ("journal_delete", json!({ "id": a.id }), a.json),
         JournalSubcommand::Tags(a) => ("journal_tags", json!({ "category": a.category }), a.json),
         JournalSubcommand::Categories(a) => ("journal_categories", json!({}), a.json),
         JournalSubcommand::Gc(a) => ("journal_gc", json!({ "dry_run": a.dry_run }), a.json),
         JournalSubcommand::Projects(a) => ("journal_projects", json!({}), a.json),
         JournalSubcommand::Import(_) => unreachable!("handled in run"),
+        JournalSubcommand::Mark(a) => ("journal_mark", json!({ "id": a.id, "flags": a.flags.names() }), a.json),
+        JournalSubcommand::Unmark(a) => ("journal_unmark", json!({ "id": a.id, "flags": a.flags.names() }), a.json),
+        JournalSubcommand::Close(a) => (
+            "journal_close",
+            json!({ "id": a.id, "flags": a.flags.names(), "resolution": a.resolution }),
+            a.json,
+        ),
+        JournalSubcommand::Reopen(a) => ("journal_reopen", json!({ "id": a.id, "flags": a.flags.names() }), a.json),
+        JournalSubcommand::Agenda(a) => ("journal_agenda", json!({ "limit": a.limit }), a.json),
     })
 }
 
@@ -242,6 +258,8 @@ fn filter_json(f: &JournalFilterArgs) -> Result<Value> {
         "salience": f.salience.map(|s| s.as_str()),
         "feature": f.feature,
         "since_secs": since,
+        "flags": f.flags.names(),
+        "state": if f.open { Some("open") } else if f.closed { Some("closed") } else { None },
     }))
 }
 
@@ -271,7 +289,7 @@ fn render(tool: &str, p: &Value) -> String {
             }
             let mut out = format!("journal of {project} — {} hit(s), {}\n", hits.len(), p["mode"].as_str().unwrap_or(""));
             for h in &hits {
-                out.push_str(&format!("\n{}\n  {}\n", headline(h), h["snippet"].as_str().unwrap_or("")));
+                out.push_str(&format!("\n{}\n{}  {}\n", headline(h), links_line(h), h["snippet"].as_str().unwrap_or("")));
             }
             out
         }
@@ -287,7 +305,7 @@ fn render(tool: &str, p: &Value) -> String {
                 first + entries.len() as i64 - 1
             );
             for e in &entries {
-                out.push_str(&format!("\n{}\n  {}\n", headline(e), one_line(e["body"].as_str().unwrap_or(""), 200)));
+                out.push_str(&format!("\n{}\n{}  {}\n", headline(e), links_line(e), one_line(e["body"].as_str().unwrap_or(""), 200)));
             }
             out
         }
@@ -299,11 +317,62 @@ fn render(tool: &str, p: &Value) -> String {
                     out.push_str(&format!("{label}: {v}\n"));
                 }
             }
+            for f in e["flags"].as_array().cloned().unwrap_or_default() {
+                let name = f["flag"].as_str().unwrap_or("");
+                if f["open"] == true {
+                    out.push_str(&format!("{name}: open since {}\n", f["set_at"].as_i64().map(date).unwrap_or_default()));
+                } else {
+                    let mut line = format!("{name}: closed {}", f["closed_at"].as_i64().map(date).unwrap_or_default());
+                    if let Some(by) = f["closed_by"].as_str() {
+                        line.push_str(&format!(" by {by}"));
+                    }
+                    if let Some(r) = f["resolution"].as_str() {
+                        line.push_str(&format!(" — {r}"));
+                    }
+                    out.push_str(&format!("{line}\n"));
+                }
+            }
             out.push('\n');
             out.push_str(e["body"].as_str().unwrap_or(""));
+            out.push_str(&related_block(&p["related"]));
             out
         }
+        "journal_link" => {
+            let verb = if p["added"] == true { "linked" } else { "already linked" };
+            format!("{verb}: #{} {} #{}", p["id"], p["kind"].as_str().unwrap_or(""), p["to"])
+        }
+        "journal_unlink" => format!("unlinked #{} from #{} ({} link(s))", p["id"], p["to"], p["removed"]),
         "journal_delete" => format!("deleted #{} from the journal of {project}", p["deleted"]),
+        "journal_mark" | "journal_unmark" | "journal_close" | "journal_reopen" => {
+            let changed: Vec<&str> = p["changed"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+            let verb = match tool {
+                "journal_mark" => "marked",
+                "journal_unmark" => "unmarked",
+                "journal_close" => "closed",
+                _ => "reopened",
+            };
+            let what = if changed.is_empty() { "nothing new".to_string() } else { changed.join(", ") };
+            format!("#{}: {verb} {what}\n{}", p["id"], headline(&p["entry"]))
+        }
+        "journal_agenda" => {
+            let groups = p["agenda"].as_array().cloned().unwrap_or_default();
+            if groups.is_empty() {
+                return format!("nothing open in the journal of {project}");
+            }
+            let mut out = format!("open in the journal of {project}:\n");
+            for g in &groups {
+                let entries = g["entries"].as_array().cloned().unwrap_or_default();
+                out.push_str(&format!("\n{} ({})\n", g["flag"].as_str().unwrap_or(""), g["open"]));
+                for e in &entries {
+                    out.push_str(&format!("  #{} {}  {}\n", e["id"], e["created_at"].as_i64().map(date).unwrap_or_default(), one_line(e["body"].as_str().unwrap_or(""), 160)));
+                }
+                let more = g["open"].as_i64().unwrap_or(0) - entries.len() as i64;
+                if more > 0 {
+                    out.push_str(&format!("  … {more} more: claudebase journal list --{} --open\n", g["flag"].as_str().unwrap_or("")));
+                }
+            }
+            out
+        }
         "journal_tags" | "journal_categories" => {
             let key = if tool == "journal_tags" { "tags" } else { "categories" };
             let items = p[key].as_array().cloned().unwrap_or_default();
@@ -336,17 +405,88 @@ fn render(tool: &str, p: &Value) -> String {
     }
 }
 
-/// `#12 2026-10-24 14:05Z decision [sqlite, locking] high`
+/// `#12 2026-10-24 14:05Z decision [sqlite, locking] high · todo · question (closed)`
 fn headline(e: &Value) -> String {
     let tags: Vec<&str> = e["tags"].as_array().map(|t| t.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+    let flags: String = e["flags"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|f| {
+                    let name = f["flag"].as_str().unwrap_or("");
+                    if f["open"] == true { format!(" · {name}") } else { format!(" · {name} (closed)") }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     format!(
-        "#{} {} {} [{}] {}",
+        "#{} {} {} [{}] {}{flags}",
         e["id"],
         e["created_at"].as_i64().map(date).unwrap_or_default(),
         e["category"].as_str().unwrap_or(""),
         tags.join(", "),
         e["salience"].as_str().unwrap_or("")
     )
+}
+
+/// How a link reads from the entry that has it.
+fn link_words(kind: &str, dir: &str) -> String {
+    match (kind, dir) {
+        ("cites", "in") => "cited by".into(),
+        ("replaces", "in") => "replaced by".into(),
+        ("fixes", "in") => "fixed by".into(),
+        (k, _) => k.to_string(),
+    }
+}
+
+/// `  ↳ replaced by #45 · cites #12 #33` — empty when the entry has no links.
+fn links_line(e: &Value) -> String {
+    let links = e["links"].as_array().cloned().unwrap_or_default();
+    if links.is_empty() {
+        return String::new();
+    }
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    for l in &links {
+        let words = link_words(l["kind"].as_str().unwrap_or(""), l["dir"].as_str().unwrap_or(""));
+        let id = format!("#{}", l["id"]);
+        match groups.iter_mut().find(|(w, _)| *w == words) {
+            Some((_, ids)) => ids.push(id),
+            None => groups.push((words, vec![id])),
+        }
+    }
+    let parts: Vec<String> = groups.into_iter().map(|(w, ids)| format!("{w} {}", ids.join(" "))).collect();
+    format!("  ↳ {}\n", parts.join(" · "))
+}
+
+/// The `related` part of `journal get`: each neighbour with its flags, so a
+/// deprecated or unverified one reads as such before it is trusted.
+fn related_block(r: &Value) -> String {
+    let line = |b: &Value| {
+        let flags: Vec<&str> = b["flags"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+        let flags = if flags.is_empty() { String::new() } else { format!(" [{}]", flags.join(", ")) };
+        format!(
+            "#{} {} {}{flags} — {}",
+            b["id"],
+            b["created"].as_str().map(|c| c.get(..10).unwrap_or(c)).unwrap_or(""),
+            b["category"].as_str().unwrap_or(""),
+            b["excerpt"].as_str().unwrap_or("")
+        )
+    };
+    let mut out = String::new();
+    for pair in r["linked"].as_array().cloned().unwrap_or_default() {
+        let (l, b) = (&pair[0], &pair[1]);
+        out.push_str(&format!("  {} {}\n", link_words(l["kind"].as_str().unwrap_or(""), l["dir"].as_str().unwrap_or("")), line(b)));
+    }
+    for pair in r["similar"].as_array().cloned().unwrap_or_default() {
+        out.push_str(&format!("  similar {:.2} {}\n", pair[0].as_f64().unwrap_or(0.0), line(&pair[1])));
+    }
+    for b in r["same_source"].as_array().cloned().unwrap_or_default() {
+        out.push_str(&format!("  same source {}\n", line(&b)));
+    }
+    if out.is_empty() {
+        return String::new();
+    }
+    format!("\n\nrelated:\n{out}")
 }
 
 /// Minutes matter: several updates land on the same day, and the journal is

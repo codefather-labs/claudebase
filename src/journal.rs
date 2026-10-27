@@ -90,7 +90,170 @@ CREATE TRIGGER IF NOT EXISTS entries_ad AFTER DELETE ON entries BEGIN
     DELETE FROM entries_vec WHERE rowid = old.id;
 END;
 CREATE VIRTUAL TABLE IF NOT EXISTS entries_vec USING vec0(embedding float[384]);
+CREATE TABLE IF NOT EXISTS entry_flags (
+    entry_id   INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+    flag       TEXT NOT NULL,
+    set_at     INTEGER NOT NULL,
+    closed_at  INTEGER,
+    closed_by  TEXT,
+    resolution TEXT,
+    UNIQUE(entry_id, flag)
+);
+CREATE INDEX IF NOT EXISTS entry_flags_open ON entry_flags(flag, closed_at);
+CREATE TABLE IF NOT EXISTS entry_links (
+    from_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+    to_id   INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+    kind    TEXT NOT NULL,
+    UNIQUE(from_id, to_id, kind)
+);
+CREATE INDEX IF NOT EXISTS entry_links_to ON entry_links(to_id);
 ";
+
+/// How one entry refers to another. Read from the text (`journal#N`, see
+/// [`parse_refs`]) or set with `journal link`.
+pub const LINK_KINDS: [&str; 3] = ["cites", "replaces", "fixes"];
+
+/// The `journal#N` references in an entry, with what the (up to three) words
+/// right before them say: "Replaces journal#42" / "supersedes" / "corrects" /
+/// "reverses" -> `replaces`, "fixes journal#26" -> `fixes`, anything else ->
+/// `cites`. A run
+/// such as `journal#40/#41` or `journal#40, #41` names every id in it. A link
+/// only records the reference: it never flags the target (an agent marks an
+/// entry deprecated, deliberately — journal#41).
+pub fn parse_refs(body: &str) -> Vec<(i64, &'static str)> {
+    const MARK: &str = "journal#";
+    let lower = body.to_lowercase();
+    let mut out: Vec<(i64, &'static str)> = Vec::new();
+    let mut from = 0;
+    while let Some(at) = lower[from..].find(MARK).map(|i| from + i) {
+        // Only the words right before the reference decide its kind: a
+        // "replaces" elsewhere in the sentence ("a 'replaces' edge ...,
+        // journal#39") is not about it. A missed `replaces` reads as `cites`;
+        // a wrong one would tell the reader an entry was superseded.
+        let clause_start = lower[..at].rfind(['.', ';', '\n', '(']).map_or(0, |i| i + 1);
+        let before: Vec<&str> = lower[clause_start..at]
+            .split_whitespace()
+            .rev()
+            .take(3)
+            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+            .collect();
+        let said = |verbs: &[&str]| before.iter().any(|w| verbs.contains(w));
+        let kind = if said(&["replaces", "supersedes", "corrects", "reverses"]) {
+            "replaces"
+        } else if said(&["fixes"]) {
+            "fixes"
+        } else {
+            "cites"
+        };
+        let bytes = lower.as_bytes();
+        let mut i = at + MARK.len();
+        loop {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if let Ok(id) = lower[start..i].parse::<i64>() {
+                if !out.iter().any(|(o, k)| *o == id && *k == kind) {
+                    out.push((id, kind));
+                }
+            }
+            // `/#41`, `, #41`, ` and #41` continue the run.
+            let mut j = i;
+            while j < bytes.len() && matches!(bytes[j], b'/' | b',' | b' ') {
+                j += 1;
+            }
+            if lower[j..].starts_with("and ") {
+                j += 4;
+            }
+            if j < bytes.len() && bytes[j] == b'#' && bytes.get(j + 1).is_some_and(u8::is_ascii_digit) {
+                i = j + 1;
+            } else {
+                break;
+            }
+        }
+        from = i.max(at + MARK.len());
+    }
+    out
+}
+
+/// Record the references of entry `id`'s text, to entries that exist.
+fn insert_links(conn: &Connection, id: i64, body: &str) -> Result<()> {
+    let mut stmt = conn.prepare_cached(
+        "INSERT OR IGNORE INTO entry_links(from_id, to_id, kind) \
+         SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM entries WHERE id = ?2)",
+    )?;
+    for (to, kind) in parse_refs(body) {
+        if to != id {
+            stmt.execute(params![id, to, kind])?;
+        }
+    }
+    Ok(())
+}
+
+/// Journals written before links existed get theirs once, from the text.
+fn backfill_links(conn: &mut Connection) -> Result<()> {
+    let done: Option<String> =
+        conn.query_row("SELECT value FROM journal_meta WHERE key = 'links_parsed'", [], |r| r.get(0)).optional()?;
+    if done.is_some() {
+        return Ok(());
+    }
+    let tx = write_tx(conn)?;
+    let rows: Vec<(i64, String)> = {
+        let mut stmt = tx.prepare("SELECT id, body FROM entries")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, body) in rows {
+        insert_links(&tx, id, &body)?;
+    }
+    tx.execute("INSERT OR REPLACE INTO journal_meta(key, value) VALUES ('links_parsed', '1')", [])?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Marks any entry can carry on top of its category, so an entry found by
+/// meaning alone still says how far to trust it.
+///
+/// - Work items, open until a session closes them (`journal close`): todo,
+///   question, problem, reminder, `unverified` (a hypothesis, closed by
+///   checking it), `disputed` (contradicts another entry, closed when settled),
+///   `ai-feedback` (an agent's suggestion for claudebase itself).
+/// - Marks, removed with `unmark`: `constraint` (a rule to follow, not weigh),
+///   `important`, `deprecated` (no longer true; ranked last in a search).
+///
+/// An open work item, a constraint or an important mark keeps its entry past
+/// retention; a deprecated mark does not.
+pub const FLAGS: [&str; 10] = [
+    "todo",
+    "question",
+    "problem",
+    "reminder",
+    "unverified",
+    "disputed",
+    "ai-feedback",
+    "constraint",
+    "important",
+    "deprecated",
+];
+
+const MARKS: [&str; 3] = ["constraint", "important", "deprecated"];
+
+pub fn closable(flag: &str) -> bool {
+    !MARKS.contains(&flag)
+}
+
+/// Known flags, lowercased, de-duplicated, in [`FLAGS`] order.
+pub fn normalize_flags<S: AsRef<str>>(raw: &[S]) -> Result<Vec<String>> {
+    let mut wanted = HashSet::new();
+    for f in raw {
+        let f = f.as_ref().trim().trim_start_matches('#').to_lowercase();
+        if !FLAGS.contains(&f.as_str()) {
+            bail!("unknown flag `{f}`: one of {}", FLAGS.join(", "));
+        }
+        wanted.insert(f);
+    }
+    Ok(FLAGS.iter().filter(|f| wanted.contains(**f)).map(|f| f.to_string()).collect())
+}
 
 /// `~/.claude/claudebase/journals`. HOME-rooted, never joined with input.
 pub fn journals_dir() -> PathBuf {
@@ -216,6 +379,8 @@ fn open_file(path: &Path) -> Result<Connection> {
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
     conn.execute_batch(SCHEMA).context("apply journal schema")?;
+    let mut conn = conn;
+    backfill_links(&mut conn).context("journal links backfill")?;
     Ok(conn)
 }
 
@@ -275,6 +440,11 @@ pub struct NewEntry {
     pub session_id: Option<String>,
     pub feature: Option<String>,
     pub source_artifact: Option<String>,
+    /// [`FLAGS`] to set, open.
+    pub flags: Vec<String>,
+    /// Do not read `journal#N` references from the text: an entry imported
+    /// from another journal numbers them in that journal.
+    pub foreign: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -294,7 +464,11 @@ pub fn add(conn: &mut Connection, entry: &NewEntry, now: i64) -> Result<(AddStat
     if body.chars().count() > MAX_BODY_CHARS {
         bail!("the entry is longer than {MAX_BODY_CHARS} characters; a journal entry is a note — link the document instead (--source-artifact)");
     }
-    let Some(category) = normalize_label(&entry.category) else {
+    let flags = normalize_flags(&entry.flags)?;
+    // A todo or a question is often the whole point of the entry; its flag
+    // then names it, unless a category says more.
+    let category = normalize_label(&entry.category).or_else(|| flags.first().cloned());
+    let Some(category) = category else {
         bail!("a category is required (--category), e.g. decision, finding, bug");
     };
     let tags = normalize_tags(&entry.tags);
@@ -316,8 +490,9 @@ pub fn add(conn: &mut Connection, entry: &NewEntry, now: i64) -> Result<(AddStat
         )
         .optional()?;
     if let Some(id) = existing {
-        // The same note again still teaches us its tags.
+        // The same note again still teaches us its tags and flags.
         insert_tags(&tx, id, &tags)?;
+        insert_flags(&tx, id, &flags, now)?;
         tx.commit()?;
         return Ok((AddStatus::Deduped, id));
     }
@@ -341,8 +516,164 @@ pub fn add(conn: &mut Connection, entry: &NewEntry, now: i64) -> Result<(AddStat
     )?;
     let id = tx.last_insert_rowid();
     insert_tags(&tx, id, &tags)?;
+    insert_flags(&tx, id, &flags, now)?;
+    if !entry.foreign {
+        insert_links(&tx, id, body)?;
+    }
     tx.commit()?;
     Ok((AddStatus::Written, id))
+}
+
+/// Link `from` to `to` explicitly — for a reference the text does not make.
+/// Returns false when the link was already there.
+pub fn link(conn: &mut Connection, from: i64, to: i64, kind: &str) -> Result<bool> {
+    if !LINK_KINDS.contains(&kind) {
+        bail!("link kind must be one of {}, not `{kind}`", LINK_KINDS.join(", "));
+    }
+    if from == to {
+        bail!("an entry cannot link to itself");
+    }
+    let tx = write_tx(conn)?;
+    for id in [from, to] {
+        if !exists(&tx, id)? {
+            bail!("no entry {id}");
+        }
+    }
+    let added = tx.execute("INSERT OR IGNORE INTO entry_links(from_id, to_id, kind) VALUES (?1, ?2, ?3)", params![from, to, kind])? > 0;
+    tx.commit()?;
+    Ok(added)
+}
+
+/// Remove links from `from` to `to` — of one kind, or all. Returns how many.
+pub fn unlink(conn: &Connection, from: i64, to: i64, kind: Option<&str>) -> Result<usize> {
+    Ok(conn.execute(
+        "DELETE FROM entry_links WHERE from_id = ?1 AND to_id = ?2 AND (?3 IS NULL OR kind = ?3)",
+        params![from, to, kind],
+    )?)
+}
+
+/// Set flags; one already set — open or closed — is left as it is.
+fn insert_flags(conn: &Connection, id: i64, flags: &[String], now: i64) -> Result<()> {
+    let mut stmt = conn.prepare_cached("INSERT OR IGNORE INTO entry_flags(entry_id, flag, set_at) VALUES (?1, ?2, ?3)")?;
+    for flag in flags {
+        stmt.execute(params![id, flag, now])?;
+    }
+    Ok(())
+}
+
+fn exists(conn: &Connection, id: i64) -> Result<bool> {
+    Ok(conn.query_row("SELECT 1 FROM entries WHERE id = ?1", params![id], |_| Ok(())).optional()?.is_some())
+}
+
+/// Flag an existing entry. Returns the flags that were not set before.
+pub fn mark(conn: &mut Connection, id: i64, flags: &[String], now: i64) -> Result<Vec<String>> {
+    let flags = normalize_flags(flags)?;
+    if flags.is_empty() {
+        bail!("name at least one flag: {}", FLAGS.join(", "));
+    }
+    let tx = write_tx(conn)?;
+    if !exists(&tx, id)? {
+        bail!("no entry {id}");
+    }
+    let mut added = Vec::new();
+    for flag in flags {
+        if tx.execute("INSERT OR IGNORE INTO entry_flags(entry_id, flag, set_at) VALUES (?1, ?2, ?3)", params![id, flag, now])? > 0 {
+            added.push(flag);
+        }
+    }
+    tx.commit()?;
+    Ok(added)
+}
+
+/// Remove flags from an entry, open or closed. Returns those removed.
+pub fn unmark(conn: &mut Connection, id: i64, flags: &[String]) -> Result<Vec<String>> {
+    let flags = normalize_flags(flags)?;
+    if flags.is_empty() {
+        bail!("name at least one flag: {}", FLAGS.join(", "));
+    }
+    let tx = write_tx(conn)?;
+    if !exists(&tx, id)? {
+        bail!("no entry {id}");
+    }
+    let mut removed = Vec::new();
+    for flag in flags {
+        if tx.execute("DELETE FROM entry_flags WHERE entry_id = ?1 AND flag = ?2", params![id, flag])? > 0 {
+            removed.push(flag);
+        }
+    }
+    tx.commit()?;
+    Ok(removed)
+}
+
+/// Close open work items of an entry — the named ones, or every open one when
+/// none is named — recording who closed them and how. Returns those closed.
+pub fn close(
+    conn: &mut Connection,
+    id: i64,
+    flags: &[String],
+    by: Option<&str>,
+    resolution: Option<&str>,
+    now: i64,
+) -> Result<Vec<String>> {
+    let named = normalize_flags(flags)?;
+    if let Some(f) = named.iter().find(|f| !closable(f)) {
+        bail!("`{f}` is a mark, not a work item: unmark it instead");
+    }
+    let tx = write_tx(conn)?;
+    if !exists(&tx, id)? {
+        bail!("no entry {id}");
+    }
+    let open: Vec<String> = {
+        let mut stmt = tx.prepare("SELECT flag FROM entry_flags WHERE entry_id = ?1 AND closed_at IS NULL")?;
+        let rows = stmt.query_map(params![id], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().filter(|f| closable(f)).collect()
+    };
+    let targets: Vec<String> = if named.is_empty() { open.clone() } else { named };
+    if let Some(f) = targets.iter().find(|f| !open.contains(f)) {
+        bail!("entry {id} has no open `{f}`");
+    }
+    if targets.is_empty() {
+        bail!("entry {id} has nothing open to close");
+    }
+    let resolution = resolution.map(str::trim).filter(|r| !r.is_empty());
+    let by = by.map(str::trim).filter(|b| !b.is_empty());
+    for flag in &targets {
+        tx.execute(
+            "UPDATE entry_flags SET closed_at = ?1, closed_by = ?2, resolution = ?3 WHERE entry_id = ?4 AND flag = ?5",
+            params![now, by, resolution, id, flag],
+        )?;
+    }
+    tx.commit()?;
+    Ok(targets)
+}
+
+/// Open closed work items again — the named ones, or every closed one.
+pub fn reopen(conn: &mut Connection, id: i64, flags: &[String]) -> Result<Vec<String>> {
+    let named = normalize_flags(flags)?;
+    let tx = write_tx(conn)?;
+    if !exists(&tx, id)? {
+        bail!("no entry {id}");
+    }
+    let closed: Vec<String> = {
+        let mut stmt = tx.prepare("SELECT flag FROM entry_flags WHERE entry_id = ?1 AND closed_at IS NOT NULL")?;
+        let rows = stmt.query_map(params![id], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let targets: Vec<String> = if named.is_empty() { closed.clone() } else { named };
+    if let Some(f) = targets.iter().find(|f| !closed.contains(f)) {
+        bail!("entry {id} has no closed `{f}`");
+    }
+    if targets.is_empty() {
+        bail!("entry {id} has nothing closed to reopen");
+    }
+    for flag in &targets {
+        tx.execute(
+            "UPDATE entry_flags SET closed_at = NULL, closed_by = NULL, resolution = NULL WHERE entry_id = ?1 AND flag = ?2",
+            params![id, flag],
+        )?;
+    }
+    tx.commit()?;
+    Ok(targets)
 }
 
 /// Every multi-statement write starts as `BEGIN IMMEDIATE`. A deferred
@@ -377,6 +708,11 @@ pub struct Filter {
     pub feature: Option<String>,
     /// Only entries created at or after this unix second.
     pub since: Option<i64>,
+    /// Only entries carrying ANY of these [`FLAGS`].
+    pub flags: Vec<String>,
+    /// With `Some`, only entries whose (named) flag is open (`true`) or
+    /// closed (`false`).
+    pub open: Option<bool>,
 }
 
 impl Filter {
@@ -398,6 +734,21 @@ impl Filter {
         if let Some(since) = self.since {
             clauses.push("e.created_at >= ?".into());
             values.push(Value::Integer(since));
+        }
+        // Unknown flags were refused where the filter was built.
+        let flags = normalize_flags(&self.flags).unwrap_or_default();
+        if !flags.is_empty() || self.open.is_some() {
+            let mut sub = String::from("SELECT entry_id FROM entry_flags WHERE 1");
+            if !flags.is_empty() {
+                sub.push_str(&format!(" AND flag IN ({})", vec!["?"; flags.len()].join(",")));
+                values.extend(flags.into_iter().map(Value::Text));
+            }
+            match self.open {
+                Some(true) => sub.push_str(" AND closed_at IS NULL"),
+                Some(false) => sub.push_str(" AND closed_at IS NOT NULL"),
+                None => {}
+            }
+            clauses.push(format!("e.id IN ({sub})"));
         }
         let tags = normalize_tags(&self.tags);
         if !tags.is_empty() {
@@ -437,6 +788,56 @@ pub struct Entry {
     pub feature: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_artifact: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub flags: Vec<FlagState>,
+    /// References to and from other entries.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<Link>,
+}
+
+/// One edge as seen from an entry: `out` — this entry `kind`s `id` (cites,
+/// replaces, fixes); `in` — entry `id` `kind`s this one (cited by, ...).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Link {
+    pub kind: String,
+    pub dir: &'static str,
+    pub id: i64,
+}
+
+/// Another entry in brief, as it appears next to the one being read.
+#[derive(Debug, Clone, Serialize)]
+pub struct Brief {
+    pub id: i64,
+    pub created: String,
+    pub category: String,
+    /// Flags as words, closed ones suffixed: `deprecated`, `todo (closed)`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub flags: Vec<String>,
+    pub excerpt: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Related {
+    /// The entries this one links with, in the order of its `links`.
+    pub linked: Vec<(Link, Brief)>,
+    /// Closest by meaning (cosine similarity, from the stored vectors), not
+    /// already linked.
+    pub similar: Vec<(f64, Brief)>,
+    /// Same `source_artifact` (file, commit, URL).
+    pub same_source: Vec<Brief>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FlagState {
+    pub flag: String,
+    pub open: bool,
+    pub set_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
 }
 
 const ENTRY_COLUMNS: &str = "e.id, e.created_at, e.category, e.salience, e.body, e.agent, \
@@ -456,6 +857,8 @@ fn entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
         feature: r.get(8)?,
         source_artifact: r.get(9)?,
         tags: Vec::new(),
+        flags: Vec::new(),
+        links: Vec::new(),
     })
 }
 
@@ -467,10 +870,122 @@ pub fn rfc3339(secs: i64) -> String {
 
 fn attach_tags(conn: &Connection, entries: &mut [Entry]) -> Result<()> {
     let mut stmt = conn.prepare_cached("SELECT tag FROM entry_tags WHERE entry_id = ?1 ORDER BY rowid")?;
+    let mut flags = conn.prepare_cached(
+        "SELECT flag, set_at, closed_at, closed_by, resolution FROM entry_flags WHERE entry_id = ?1",
+    )?;
     for e in entries.iter_mut() {
         e.tags = stmt.query_map(params![e.id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let mut set: Vec<FlagState> = flags
+            .query_map(params![e.id], |r| {
+                let closed_at: Option<i64> = r.get(2)?;
+                Ok(FlagState {
+                    flag: r.get(0)?,
+                    open: closed_at.is_none(),
+                    set_at: r.get(1)?,
+                    closed_at,
+                    closed_by: r.get(3)?,
+                    resolution: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        set.sort_by_key(|f| FLAGS.iter().position(|k| *k == f.flag));
+        e.flags = set;
+        e.links = links_of(conn, e.id)?;
     }
     Ok(())
+}
+
+fn links_of(conn: &Connection, id: i64) -> Result<Vec<Link>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT kind, 'out', to_id FROM entry_links WHERE from_id = ?1 \
+         UNION ALL SELECT kind, 'in', from_id FROM entry_links WHERE to_id = ?1",
+    )?;
+    let mut links: Vec<Link> = stmt
+        .query_map(params![id], |r| {
+            let dir: String = r.get(1)?;
+            Ok(Link { kind: r.get(0)?, dir: if dir == "out" { "out" } else { "in" }, id: r.get(2)? })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    // What replaces this entry first: it is the one thing a reader must not miss.
+    let rank = |l: &Link| match (l.kind.as_str(), l.dir) {
+        ("replaces", "in") => 0,
+        ("replaces", _) => 1,
+        ("fixes", _) => 2,
+        _ => 3,
+    };
+    links.sort_by_key(|l| (rank(l), l.dir, l.id));
+    Ok(links)
+}
+
+fn brief(conn: &Connection, id: i64) -> Result<Option<Brief>> {
+    let Some(e) = get(conn, id)? else { return Ok(None) };
+    let flags = e.flags.iter().map(|f| if f.open { f.flag.clone() } else { format!("{} (closed)", f.flag) }).collect();
+    let flat = e.body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let excerpt = if flat.chars().count() > 160 { format!("{}…", flat.chars().take(160).collect::<String>()) } else { flat };
+    Ok(Some(Brief { id: e.id, created: e.created, category: e.category, flags, excerpt }))
+}
+
+/// What entry `id` intersects: its links, the `similar` entries closest to it
+/// by meaning, and those from the same source. Similarity needs the entry's
+/// vector; until the daemon has embedded it, `similar` is empty.
+pub fn related(conn: &Connection, id: i64, similar: usize) -> Result<Related> {
+    let links = links_of(conn, id)?;
+    let mut linked = Vec::new();
+    for l in &links {
+        if let Some(b) = brief(conn, l.id)? {
+            linked.push((l.clone(), b));
+        }
+    }
+    let mut near = Vec::new();
+    let vector: Option<Vec<u8>> =
+        conn.query_row("SELECT embedding FROM entries_vec WHERE rowid = ?1", params![id], |r| r.get(0)).optional()?;
+    if let (Some(v), true) = (vector, similar > 0) {
+        let mut stmt = conn.prepare("SELECT rowid, distance FROM entries_vec WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance")?;
+        let k = (similar + links.len() + 1) as i64;
+        let hits: Vec<(i64, f64)> = stmt.query_map(params![v, k], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        for (other, distance) in hits {
+            if other == id || links.iter().any(|l| l.id == other) {
+                continue;
+            }
+            // e5 vectors are unit length: cosine = 1 - d^2 / 2.
+            if let Some(b) = brief(conn, other)? {
+                near.push((1.0 - distance * distance / 2.0, b));
+            }
+            if near.len() == similar {
+                break;
+            }
+        }
+    }
+    let mut same_source = Vec::new();
+    let ids: Vec<i64> = {
+        let mut stmt = conn.prepare(
+            "SELECT o.id FROM entries e JOIN entries o ON o.source_artifact = e.source_artifact AND o.id != e.id \
+             WHERE e.id = ?1 AND e.source_artifact IS NOT NULL ORDER BY o.created_at DESC LIMIT 5",
+        )?;
+        let rows = stmt.query_map(params![id], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for other in ids {
+        if let Some(b) = brief(conn, other)? {
+            same_source.push(b);
+        }
+    }
+    Ok(Related { linked, similar: near, same_source })
+}
+
+/// What is still open — work items, constraints, important entries — flag by
+/// flag in [`FLAGS`] order, newest first: the count and up to `limit` entries
+/// each. Flags with nothing open are left out.
+pub fn agenda(conn: &Connection, limit: usize) -> Result<Vec<(String, i64, Vec<Entry>)>> {
+    let mut out = Vec::new();
+    for flag in FLAGS.iter().filter(|f| **f != "deprecated") {
+        let filter = Filter { flags: vec![flag.to_string()], open: Some(true), ..Default::default() };
+        let (total, entries) = list(conn, &filter, 0, limit)?;
+        if total > 0 {
+            out.push((flag.to_string(), total, entries));
+        }
+    }
+    Ok(out)
 }
 
 pub fn get(conn: &Connection, id: i64) -> Result<Option<Entry>> {
@@ -605,6 +1120,9 @@ pub fn search(
             hits.push(Hit { score, snippet: snippet(&entry.body, query), entry });
         }
     }
+    // What is no longer true still answers "what did we think", but never
+    // ahead of what is current.
+    hits.sort_by_key(|h| h.entry.flags.iter().any(|f| f.flag == "deprecated"));
     Ok((effective, hits))
 }
 
@@ -705,11 +1223,12 @@ pub struct GcReport {
     pub low: i64,
 }
 
-/// Drop entries past their salience's retention.
+/// Drop entries past their salience's retention — except those with an open
+/// work item or an `important` mark, which stay until it is closed or removed.
 pub fn gc(conn: &Connection, now: i64, dry_run: bool) -> Result<GcReport> {
     let count = |salience: &str, ttl: i64| -> rusqlite::Result<i64> {
         conn.query_row(
-            "SELECT COUNT(*) FROM entries WHERE salience = ?1 AND created_at < ?2",
+            "SELECT COUNT(*) FROM entries WHERE salience = ?1 AND created_at < ?2 AND id NOT IN (SELECT entry_id FROM entry_flags WHERE closed_at IS NULL AND flag != 'deprecated')",
             params![salience, now - ttl],
             |r| r.get(0),
         )
@@ -717,7 +1236,8 @@ pub fn gc(conn: &Connection, now: i64, dry_run: bool) -> Result<GcReport> {
     let report = GcReport { medium: count("medium", MEDIUM_TTL_SECS)?, low: count("low", LOW_TTL_SECS)? };
     if !dry_run && report.medium + report.low > 0 {
         conn.execute(
-            "DELETE FROM entries WHERE (salience = 'medium' AND created_at < ?1) OR (salience = 'low' AND created_at < ?2)",
+            "DELETE FROM entries WHERE ((salience = 'medium' AND created_at < ?1) OR (salience = 'low' AND created_at < ?2)) \
+             AND id NOT IN (SELECT entry_id FROM entry_flags WHERE closed_at IS NULL AND flag != 'deprecated')",
             params![now - MEDIUM_TTL_SECS, now - LOW_TTL_SECS],
         )?;
     }
@@ -875,6 +1395,8 @@ fn copy_insights(conn: &mut Connection, legacy: &Path) -> Result<usize> {
             session_id: row.session,
             feature: row.feature,
             source_artifact: row.artifact,
+            flags: Vec::new(),
+            foreign: false,
         };
         // An unusable old row (empty, oversized) is skipped rather than
         // aborting the import of everything after it.
@@ -1180,6 +1702,180 @@ mod tests {
             .map(|s| body.chars().skip(*s).take(500).collect())
             .collect();
         assert_eq!(stitch_chunks(&chunks), body);
+    }
+
+    #[test]
+    fn flags_open_close_reopen_and_filter() {
+        let (_d, mut c) = journal();
+        let mut todo = entry("run the benchmark", "", &["perf"]);
+        todo.flags = vec!["todo".into(), "#Important".into()];
+        let (_, t) = add(&mut c, &todo, 10).unwrap();
+        let got = get(&c, t).unwrap().unwrap();
+        assert_eq!(got.category, "todo", "the first flag names an entry without a category");
+        assert_eq!(got.flags.iter().map(|f| (f.flag.as_str(), f.open)).collect::<Vec<_>>(), vec![("todo", true), ("important", true)]);
+        let (_, q) = add(&mut c, &entry("why is the bus slow?", "finding", &["bus"]), 11).unwrap();
+        assert_eq!(mark(&mut c, q, &["question".into(), "problem".into()], 12).unwrap(), vec!["question", "problem"]);
+        assert!(mark(&mut c, q, &["question".into()], 13).unwrap().is_empty(), "already set");
+        assert!(mark(&mut c, q, &["urgent".into()], 13).is_err());
+
+        let open = |c: &Connection, flags: &[&str], state: Option<bool>| -> Vec<i64> {
+            let f = Filter { flags: flags.iter().map(|s| s.to_string()).collect(), open: state, ..Default::default() };
+            list(c, &f, 0, 10).unwrap().1.iter().map(|e| e.id).collect()
+        };
+        assert_eq!(open(&c, &["question", "todo"], Some(true)), vec![q, t]);
+
+        assert!(close(&mut c, t, &["important".into()], None, None, 20).is_err(), "important is unmarked, not closed");
+        assert_eq!(close(&mut c, q, &["question".into()], Some("mira"), Some("lock contention"), 20).unwrap(), vec!["question"]);
+        assert!(close(&mut c, q, &["question".into()], None, None, 21).is_err(), "already closed");
+        assert_eq!(open(&c, &["question"], Some(true)), Vec::<i64>::new());
+        assert_eq!(open(&c, &["question"], Some(false)), vec![q]);
+        let f = get(&c, q).unwrap().unwrap().flags;
+        assert_eq!((f[0].flag.as_str(), f[0].open, f[0].closed_by.as_deref(), f[0].resolution.as_deref()), ("question", false, Some("mira"), Some("lock contention")));
+        // Closing with nothing named closes every open work item.
+        assert_eq!(close(&mut c, q, &[], None, None, 22).unwrap(), vec!["problem"]);
+        assert!(close(&mut c, q, &[], None, None, 23).is_err());
+        assert_eq!(reopen(&mut c, q, &["question".into()]).unwrap(), vec!["question"]);
+        assert_eq!(open(&c, &["question"], Some(true)), vec![q]);
+        assert_eq!(unmark(&mut c, t, &["important".into()]).unwrap(), vec!["important"]);
+
+        let a = agenda(&c, 10).unwrap();
+        assert_eq!(a.iter().map(|(f, n, _)| (f.as_str(), *n)).collect::<Vec<_>>(), vec![("todo", 1), ("question", 1)]);
+    }
+
+    #[test]
+    fn retention_spares_what_is_still_open_or_important() {
+        let (_d, mut c) = journal();
+        let now = 1_000_000_000;
+        let old = now - 200 * 86_400;
+        let mut low = |body: &str, flags: &[&str]| {
+            let mut e = entry(body, "note", &["t"]);
+            e.salience = "low".into();
+            e.flags = flags.iter().map(|f| f.to_string()).collect();
+            add(&mut c, &e, old).unwrap().1
+        };
+        let plain = low("plain", &[]);
+        let todo = low("open todo", &["todo"]);
+        let done = low("closed todo", &["todo"]);
+        let star = low("highlight", &["important"]);
+        close(&mut c, done, &[], None, None, old + 1).unwrap();
+        assert_eq!(gc(&c, now, true).unwrap().low, 2);
+        gc(&c, now, false).unwrap();
+        assert!(get(&c, plain).unwrap().is_none() && get(&c, done).unwrap().is_none());
+        assert!(get(&c, todo).unwrap().is_some() && get(&c, star).unwrap().is_some());
+    }
+
+    #[test]
+    fn deprecated_knowledge_ranks_last_and_is_not_kept() {
+        let (_d, mut c) = journal();
+        let (_, old) = add(&mut c, &entry("journal writes retry on SQLITE_BUSY", "decision", &["sqlite"]), 1).unwrap();
+        let (_, new) = add(&mut c, &entry("journal writes take BEGIN IMMEDIATE instead of SQLITE_BUSY retries", "decision", &["sqlite"]), 2).unwrap();
+        let (_, hits) = search(&c, "SQLITE_BUSY journal writes retry", None, SearchMode::Lexical, &Filter::default(), 5).unwrap();
+        assert_eq!(hits[0].entry.id, old, "before deprecation the closer match leads");
+        mark(&mut c, old, &["deprecated".into()], 3).unwrap();
+        let (_, hits) = search(&c, "SQLITE_BUSY journal writes retry", None, SearchMode::Lexical, &Filter::default(), 5).unwrap();
+        assert_eq!(hits.iter().map(|h| h.entry.id).collect::<Vec<_>>(), vec![new, old]);
+        assert!(close(&mut c, old, &["deprecated".into()], None, None, 4).unwrap_err().to_string().contains("unmark"));
+
+        let mut rule = entry("never run gh auth switch", "constraint-note", &["gh"]);
+        rule.flags = vec!["constraint".into()];
+        rule.salience = "low".into();
+        let (_, rule) = add(&mut c, &rule, 1).unwrap();
+        c.execute("UPDATE entries SET salience = 'low'", []).unwrap();
+        gc(&c, 1 + 400 * 86_400, false).unwrap();
+        assert!(get(&c, old).unwrap().is_none(), "a deprecated entry is not kept past retention");
+        assert!(get(&c, rule).unwrap().is_some(), "a constraint is");
+        let a = agenda(&c, 10).unwrap();
+        assert_eq!(a.iter().map(|(f, _, _)| f.as_str()).collect::<Vec<_>>(), vec!["constraint"]);
+    }
+
+    #[test]
+    fn references_are_read_with_their_kind() {
+        assert_eq!(parse_refs("Corrects journal#40 (plan)"), vec![(40, "replaces")]);
+        assert_eq!(parse_refs("joins the journal#40/#41 plan"), vec![(40, "cites"), (41, "cites")]);
+        assert_eq!(parse_refs("see journal#6, #7 and #9. Fixes journal#26"), vec![(6, "cites"), (7, "cites"), (9, "cites"), (26, "fixes")]);
+        assert_eq!(parse_refs("Replaces JOURNAL#3; cites journal#4"), vec![(3, "replaces"), (4, "cites")]);
+        assert!(parse_refs("issue #12, journal# and journal#x").is_empty());
+        // The verb must be about this reference, not somewhere in the sentence.
+        assert_eq!(parse_refs("(a 'replaces' edge also sets the deprecated flag on the target, journal#39 flags)"), vec![(39, "cites")]);
+        assert_eq!(parse_refs("this replaces the old journal#5"), vec![(5, "replaces")]);
+    }
+
+    #[test]
+    fn links_come_from_the_text_and_both_ends_see_them() {
+        let (_d, mut c) = journal();
+        let (_, a) = add(&mut c, &entry("retry on SQLITE_BUSY", "decision", &["sqlite"]), 1).unwrap();
+        let (_, b) = add(&mut c, &entry(&format!("Replaces journal#{a}: BEGIN IMMEDIATE. See journal#999"), "decision", &["sqlite"]), 2).unwrap();
+        let got = get(&c, a).unwrap().unwrap();
+        assert_eq!(got.links, vec![Link { kind: "replaces".into(), dir: "in", id: b }]);
+        assert!(got.flags.is_empty(), "a replaces link never deprecates by itself");
+        assert_eq!(get(&c, b).unwrap().unwrap().links, vec![Link { kind: "replaces".into(), dir: "out", id: a }], "#999 does not exist");
+
+        let (_, n) = add(&mut c, &entry("unrelated note", "finding", &["x"]), 3).unwrap();
+        assert!(link(&mut c, n, a, "cites").unwrap());
+        assert!(!link(&mut c, n, a, "cites").unwrap());
+        assert!(link(&mut c, n, n, "cites").is_err() && link(&mut c, n, a, "likes").is_err() && link(&mut c, n, 404, "cites").is_err());
+        assert_eq!(unlink(&c, n, a, None).unwrap(), 1);
+
+        // Imported text numbers another journal's entries: no links from it.
+        let mut foreign = entry(&format!("Replaces journal#{a} over there"), "decision", &["x"]);
+        foreign.foreign = true;
+        let (_, f) = add(&mut c, &foreign, 4).unwrap();
+        assert!(get(&c, f).unwrap().unwrap().links.is_empty());
+        // Deleting an entry takes its links with it.
+        assert!(delete(&c, b).unwrap());
+        assert!(get(&c, a).unwrap().unwrap().links.is_empty());
+    }
+
+    #[test]
+    fn an_older_journal_gets_its_links_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = open(dir.path(), Path::new("/w/old"), true).unwrap().unwrap();
+        add(&mut c, &entry("first", "decision", &["t"]), 1).unwrap();
+        add(&mut c, &entry("Fixes journal#1", "bug", &["t"]), 2).unwrap();
+        // As if written before links existed.
+        c.execute_batch("DELETE FROM entry_links; DELETE FROM journal_meta WHERE key = 'links_parsed';").unwrap();
+        drop(c);
+        let c = open(dir.path(), Path::new("/w/old"), false).unwrap().unwrap();
+        assert_eq!(get(&c, 1).unwrap().unwrap().links, vec![Link { kind: "fixes".into(), dir: "in", id: 2 }]);
+    }
+
+    #[test]
+    fn related_shows_links_meaning_and_source_with_flags() {
+        let (_d, mut c) = journal();
+        let v = |i: usize, j: usize, w: f32| {
+            let mut v = vec![0.0f32; 384];
+            v[i] = w;
+            v[j] = (1.0 - w * w).sqrt();
+            v
+        };
+        let mut src = entry("the bus drops frames", "finding", &["bus"]);
+        src.source_artifact = Some("src/bus.rs".into());
+        let (_, a) = add(&mut c, &src, 1).unwrap();
+        let (_, near) = add(&mut c, &entry("frames lost under load", "finding", &["bus"]), 2).unwrap();
+        let (_, far) = add(&mut c, &entry("telegram pairing", "decision", &["telegram"]), 3).unwrap();
+        let mut same = entry("bus.rs rewritten", "update", &["bus"]);
+        same.source_artifact = Some("src/bus.rs".into());
+        let (_, s) = add(&mut c, &same, 4).unwrap();
+        let (_, cites) = add(&mut c, &entry(&format!("see journal#{a}"), "finding", &["bus"]), 5).unwrap();
+        store_vector(&mut c, a, &v(0, 1, 1.0)).unwrap();
+        store_vector(&mut c, near, &v(0, 1, 0.9)).unwrap();
+        store_vector(&mut c, far, &v(2, 3, 1.0)).unwrap();
+        store_vector(&mut c, s, &v(4, 5, 1.0)).unwrap();
+        store_vector(&mut c, cites, &v(0, 1, 0.95)).unwrap();
+        mark(&mut c, near, &["deprecated".into()], 6).unwrap();
+
+        let r = related(&c, a, 1).unwrap();
+        assert_eq!(r.linked.iter().map(|(l, b)| (l.kind.as_str(), l.dir, b.id)).collect::<Vec<_>>(), vec![("cites", "in", cites)]);
+        assert_eq!(r.similar.len(), 1);
+        let (score, b) = &r.similar[0];
+        assert_eq!((b.id, b.flags.clone()), (near, vec!["deprecated".to_string()]), "the linked entry is not repeated; flags travel");
+        assert!((score - 0.9).abs() < 1e-3, "{score}");
+        assert_eq!(r.same_source.iter().map(|b| b.id).collect::<Vec<_>>(), vec![s]);
+        // Not embedded yet: no neighbours by meaning, the rest still there.
+        let (_, fresh) = add(&mut c, &entry(&format!("Fixes journal#{a}"), "bug", &["bus"]), 7).unwrap();
+        let r = related(&c, fresh, 3).unwrap();
+        assert!(r.similar.is_empty());
+        assert_eq!(r.linked[0].0, Link { kind: "fixes".into(), dir: "out", id: a });
     }
 
     #[test]

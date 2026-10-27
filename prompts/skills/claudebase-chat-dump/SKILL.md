@@ -53,7 +53,7 @@ The transcript, subagent transcripts, spilled tool results and the `/rewind`
 file backups, plus a `manifest.json` with the id, the name, the nick the
 conversation answers to and this machine's project path (so `load` can move
 recorded paths to wherever the project lives there). And the project's
-**journal** — every entry, from the daemon — as `journal.jsonl`. The output
+**journal** — every entry with its flags, from the daemon — as `journal.jsonl`. The output
 says how many entries went in; if it says the journal is NOT in the archive
 (the daemon did not answer), tell the operator: the dump is still a valid
 conversation, but the journal will not arrive with it.

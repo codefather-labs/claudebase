@@ -47,8 +47,11 @@ it themselves, in a new session started from this directory.
   may still mention the other machine's paths.
 - **The journal comes in** — into the journal of THIS directory, whatever it is
   called and wherever it is; the source directory's name does not matter. Each
-  entry keeps its creation time, category, tags, salience and author; a
-  `source_artifact` path under the source project moves here like `cwd`.
+  entry keeps its creation time, category, tags, salience, author and flags
+  (todo, deprecated, … with their open/closed state); a `source_artifact` path
+  under the source project moves here like `cwd`. Entries get new ids here, so
+  the `journal#N` references in their text are NOT turned into links: they
+  number the source journal. Re-link what matters with `claudebase journal link`.
   Entries already in this journal are not written twice. Report the counts from
   the output.
 - **The nick comes back**: the session that resumes the conversation takes the

@@ -75,6 +75,13 @@ fn dispatch(tool: &str, args: &Value) -> Result<Value> {
         "journal_gc" => gc(&dir, args),
         "journal_projects" => Ok(json!({ "journals": journal::list_journals(&dir)? })),
         "journal_import" => import(&dir, args),
+        "journal_mark" => mark(&dir, args),
+        "journal_unmark" => unmark(&dir, args),
+        "journal_close" => close(&dir, args),
+        "journal_reopen" => reopen(&dir, args),
+        "journal_agenda" => agenda(&dir, args),
+        "journal_link" => link(&dir, args),
+        "journal_unlink" => unlink(&dir, args),
         other => bail!("unknown journal tool `{other}`"),
     }
 }
@@ -184,6 +191,8 @@ fn add(dir: &Path, args: &Value) -> Result<Value> {
         session_id: str_arg(args, "session_id"),
         feature: str_arg(args, "feature"),
         source_artifact: str_arg(args, "source_artifact"),
+        flags: str_list(args, "flags"),
+        foreign: false,
     };
     let (status, id) = journal::add(&mut conn, &entry, journal::now_secs())?;
     Ok(json!({ "status": status, "id": id, "project": project_json(&caller) }))
@@ -219,6 +228,8 @@ fn import(dir: &Path, args: &Value) -> Result<Value> {
     let now = journal::now_secs();
     let (mut written, mut merged, mut refused) = (0, 0, Vec::new());
     for (i, e) in entries.iter().enumerate() {
+        // Flags travel as `journal_list` prints them: `[{flag, open, ...}]`.
+        let flags: Vec<&Value> = e.get("flags").and_then(Value::as_array).map(|a| a.iter().collect()).unwrap_or_default();
         let entry = NewEntry {
             body: str_arg(e, "body").unwrap_or_default(),
             category: str_arg(e, "category").unwrap_or_default(),
@@ -230,11 +241,21 @@ fn import(dir: &Path, args: &Value) -> Result<Value> {
             session_id: str_arg(e, "session_id"),
             feature: str_arg(e, "feature"),
             source_artifact: str_arg(e, "source_artifact"),
+            flags: flags.iter().filter_map(|f| str_arg(f, "flag")).collect(),
+            // Its `journal#N` numbers entries of the source journal.
+            foreign: true,
         };
         // A creation time from the future would outlive its retention.
         let created = e.get("created_at").and_then(Value::as_i64).filter(|t| *t > 0).unwrap_or(now).min(now);
         match journal::add(&mut conn, &entry, created) {
-            Ok((journal::AddStatus::Written, _)) => written += 1,
+            Ok((journal::AddStatus::Written, id)) => {
+                written += 1;
+                for f in flags.iter().filter(|f| f.get("open").and_then(Value::as_bool) == Some(false)) {
+                    let (Some(flag), at) = (str_arg(f, "flag"), f.get("closed_at").and_then(Value::as_i64)) else { continue };
+                    let at = at.unwrap_or(now).min(now);
+                    let _ = journal::close(&mut conn, id, &[flag], str_arg(f, "closed_by").as_deref(), str_arg(f, "resolution").as_deref(), at);
+                }
+            }
             Ok((_, _)) => merged += 1,
             Err(err) => refused.push(json!({ "index": i, "error": format!("{err:#}") })),
         }
@@ -252,6 +273,14 @@ fn filter(args: &Value) -> Result<Filter> {
         Some(_) => bail!("since_secs must not be negative"),
         None => None,
     };
+    let flags = str_list(args, "flags");
+    journal::normalize_flags(&flags)?;
+    let open = match str_arg(args, "state").as_deref() {
+        None => None,
+        Some("open") => Some(true),
+        Some("closed") => Some(false),
+        Some(other) => bail!("state must be open or closed, not `{other}`"),
+    };
     Ok(Filter {
         category: str_arg(args, "category"),
         tags: str_list(args, "tags"),
@@ -259,6 +288,8 @@ fn filter(args: &Value) -> Result<Filter> {
         salience,
         feature: str_arg(args, "feature"),
         since,
+        flags,
+        open,
     })
 }
 
@@ -305,12 +336,41 @@ fn id_arg(args: &Value) -> Result<i64> {
 fn get(dir: &Path, args: &Value) -> Result<Value> {
     let caller = resolve(args, false)?;
     let id = id_arg(args)?;
-    let entry = match open(dir, &caller)? {
-        Some(conn) => journal::get(&conn, id)?,
+    let similar = args.get("similar").and_then(Value::as_u64).unwrap_or(5).min(20) as usize;
+    let found = match open(dir, &caller)? {
+        Some(conn) => match journal::get(&conn, id)? {
+            Some(entry) => Some((entry, journal::related(&conn, id, similar)?)),
+            None => None,
+        },
         None => None,
     };
-    let entry = entry.ok_or_else(|| anyhow!("no entry {id} in the journal of {}", caller.project.display()))?;
-    Ok(json!({ "project": project_json(&caller), "entry": entry }))
+    let (entry, related) = found.ok_or_else(|| anyhow!("no entry {id} in the journal of {}", caller.project.display()))?;
+    Ok(json!({ "project": project_json(&caller), "entry": entry, "related": related }))
+}
+
+fn target_arg(args: &Value) -> Result<i64> {
+    args.get("to").and_then(Value::as_i64).ok_or_else(|| anyhow!("to required (integer)"))
+}
+
+fn link(dir: &Path, args: &Value) -> Result<Value> {
+    let caller = resolve(args, true)?;
+    let (from, to) = (id_arg(args)?, target_arg(args)?);
+    let kind = str_arg(args, "kind").unwrap_or_else(|| "cites".into());
+    let mut conn = open(dir, &caller)?.expect("a session journal is always created");
+    let added = journal::link(&mut conn, from, to, &kind)?;
+    Ok(json!({ "project": project_json(&caller), "id": from, "to": to, "kind": kind, "added": added }))
+}
+
+fn unlink(dir: &Path, args: &Value) -> Result<Value> {
+    let caller = resolve(args, true)?;
+    let (from, to) = (id_arg(args)?, target_arg(args)?);
+    let kind = str_arg(args, "kind");
+    let conn = open(dir, &caller)?.expect("a session journal is always created");
+    let removed = journal::unlink(&conn, from, to, kind.as_deref())?;
+    if removed == 0 {
+        bail!("entry {from} has no such link to {to}");
+    }
+    Ok(json!({ "project": project_json(&caller), "id": from, "to": to, "removed": removed }))
 }
 
 fn delete(dir: &Path, args: &Value) -> Result<Value> {
@@ -321,6 +381,64 @@ fn delete(dir: &Path, args: &Value) -> Result<Value> {
         bail!("no entry {id} in the journal of {}", caller.project.display());
     }
     Ok(json!({ "project": project_json(&caller), "deleted": id }))
+}
+
+/// The entry after a flag change, so the caller sees where it now stands.
+fn flagged(conn: &rusqlite::Connection, caller: &Caller, id: i64, changed: Vec<String>) -> Result<Value> {
+    Ok(json!({ "project": project_json(caller), "id": id, "changed": changed, "entry": journal::get(conn, id)? }))
+}
+
+fn mark(dir: &Path, args: &Value) -> Result<Value> {
+    let caller = resolve(args, true)?;
+    let id = id_arg(args)?;
+    let mut conn = open(dir, &caller)?.expect("a session journal is always created");
+    let changed = journal::mark(&mut conn, id, &str_list(args, "flags"), journal::now_secs())?;
+    flagged(&conn, &caller, id, changed)
+}
+
+fn unmark(dir: &Path, args: &Value) -> Result<Value> {
+    let caller = resolve(args, true)?;
+    let id = id_arg(args)?;
+    let mut conn = open(dir, &caller)?.expect("a session journal is always created");
+    let changed = journal::unmark(&mut conn, id, &str_list(args, "flags"))?;
+    flagged(&conn, &caller, id, changed)
+}
+
+fn close(dir: &Path, args: &Value) -> Result<Value> {
+    let caller = resolve(args, true)?;
+    let id = id_arg(args)?;
+    let mut conn = open(dir, &caller)?.expect("a session journal is always created");
+    let changed = journal::close(
+        &mut conn,
+        id,
+        &str_list(args, "flags"),
+        caller.nick.as_deref(),
+        str_arg(args, "resolution").as_deref(),
+        journal::now_secs(),
+    )?;
+    flagged(&conn, &caller, id, changed)
+}
+
+fn reopen(dir: &Path, args: &Value) -> Result<Value> {
+    let caller = resolve(args, true)?;
+    let id = id_arg(args)?;
+    let mut conn = open(dir, &caller)?.expect("a session journal is always created");
+    let changed = journal::reopen(&mut conn, id, &str_list(args, "flags"))?;
+    flagged(&conn, &caller, id, changed)
+}
+
+fn agenda(dir: &Path, args: &Value) -> Result<Value> {
+    let caller = resolve(args, false)?;
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20).clamp(1, journal::MAX_PAGE_SIZE as u64) as usize;
+    let groups = match open(dir, &caller)? {
+        Some(conn) => journal::agenda(&conn, limit)?,
+        None => Vec::new(),
+    };
+    let groups: Vec<Value> = groups
+        .into_iter()
+        .map(|(flag, total, entries)| json!({ "flag": flag, "open": total, "entries": entries }))
+        .collect();
+    Ok(json!({ "project": project_json(&caller), "agenda": groups }))
 }
 
 fn tags(dir: &Path, args: &Value) -> Result<Value> {

@@ -190,3 +190,100 @@ impl Drop for Daemon {
         stop(&mut self.0);
     }
 }
+
+/// Flags through the CLI: set on add and later, filtered open and closed,
+/// closed and reopened by a session, gathered by `agenda`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn entries_carry_work_items_a_session_closes_and_reopens() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().canonicalize().unwrap();
+    let s = Session { id: "agent-gamma", token: "tok-gamma", dir: home.join("work/gamma") };
+    std::fs::create_dir_all(&s.dir).unwrap();
+    let _daemon = Daemon(spawn_daemon_with_home(&home).expect("daemon spawned"));
+    let socket = socket_under(&home);
+    wait_for_socket(&socket, Duration::from_secs(10)).await.expect("socket");
+    let mut client = Client::connect(&socket).await.expect("connect");
+    let r = client
+        .call("agent_register", json!({ "agent_id": s.id, "name": "gamma", "session_token": s.token, "cwd": s.dir.to_str().unwrap() }), 1)
+        .await
+        .unwrap();
+    assert!(payload(&r).is_some(), "{r}");
+
+    let h = home.clone();
+    tokio::task::spawn_blocking(move || {
+        let home = h;
+        let j = |args: &[&str]| json_out(journal(&home, &s.dir, Some(&s), args));
+        let todo = j(&["add", "run the benchmark", "--todo", "--tag", "perf", "--json"])["id"].as_i64().unwrap();
+        let note = j(&["add", "the bus drops frames under load", "--category", "finding", "--tag", "bus", "--json"])["id"].as_i64().unwrap();
+        let marked = j(&["mark", &note.to_string(), "--problem", "--important", "--json"]);
+        assert_eq!(marked["changed"], json!(["problem", "important"]));
+
+        let got = j(&["get", &todo.to_string(), "--json"]);
+        assert_eq!((got["entry"]["category"].as_str(), got["entry"]["flags"][0]["open"].as_bool()), (Some("todo"), Some(true)));
+        let open = j(&["list", "--todo", "--problem", "--open", "--json"]);
+        assert_eq!(open["total"], 2, "{open}");
+
+        let closed = j(&["close", &todo.to_string(), "--resolution", "done in 7935425", "--json"]);
+        assert_eq!(closed["changed"], json!(["todo"]));
+        let f = &closed["entry"]["flags"][0];
+        assert_eq!((f["open"].as_bool(), f["closed_by"].as_str(), f["resolution"].as_str()), (Some(false), Some("gamma"), Some("done in 7935425")));
+        assert_eq!(j(&["list", "--todo", "--closed", "--json"])["total"], 1);
+        assert_eq!(j(&["list", "--todo", "--open", "--json"])["total"], 0);
+        journal(&home, &s.dir, Some(&s), &["close", &note.to_string(), "--important"])
+            .failure()
+            .stderr(predicates::str::contains("unmark"));
+
+        let agenda = j(&["agenda", "--json"]);
+        let flags: Vec<&str> = agenda["agenda"].as_array().unwrap().iter().map(|g| g["flag"].as_str().unwrap()).collect();
+        assert_eq!(flags, vec!["problem", "important"], "{agenda}");
+
+        // An agent's suggestion for the harness is a work item; a deprecated
+        // entry is history, not something open.
+        j(&["add", "pool workers should not load the operator's persona", "--ai-feedback", "--tag", "pool", "--json"]);
+        j(&["mark", &note.to_string(), "--deprecated", "--json"]);
+        let agenda = j(&["agenda", "--json"]);
+        let flags: Vec<&str> = agenda["agenda"].as_array().unwrap().iter().map(|g| g["flag"].as_str().unwrap()).collect();
+        assert_eq!(flags, vec!["problem", "ai-feedback", "important"], "{agenda}");
+        j(&["unmark", &note.to_string(), "--deprecated", "--json"]);
+
+        // The graph: a reference in the text is a link both ends show; an
+        // explicit one can be added and removed; `get` lists the neighbours.
+        let fix = j(&["add", &format!("Fixes journal#{note}: frames are buffered now"), "--category", "update", "--tag", "bus", "--json"])["id"].as_i64().unwrap();
+        let got = j(&["get", &note.to_string(), "--json"]);
+        assert_eq!(got["entry"]["links"], json!([{ "kind": "fixes", "dir": "in", "id": fix }]));
+        assert_eq!(got["related"]["linked"][0][1]["id"], fix, "{got}");
+        assert_eq!(j(&["link", &todo.to_string(), &note.to_string(), "--json"])["added"], true);
+        let human = journal(&home, &s.dir, Some(&s), &["get", &note.to_string()]).success().get_output().stdout.clone();
+        let human = String::from_utf8_lossy(&human);
+        assert!(human.contains("related:") && human.contains(&format!("fixed by #{fix}")) && human.contains(&format!("cited by #{todo}")), "{human}");
+        let listed = journal(&home, &s.dir, Some(&s), &["list", "--tag", "bus"]).success().get_output().stdout.clone();
+        assert!(String::from_utf8_lossy(&listed).contains(&format!("↳ fixed by #{fix} · cited by #{todo}")), "{}", String::from_utf8_lossy(&listed));
+        assert_eq!(j(&["unlink", &todo.to_string(), &note.to_string(), "--json"])["removed"], 1);
+        journal(&home, &s.dir, Some(&s), &["unlink", &todo.to_string(), &note.to_string()]).failure();
+
+        j(&["reopen", &todo.to_string(), "--json"]);
+        assert_eq!(j(&["list", "--todo", "--open", "--json"])["total"], 1);
+        // Reading needs no session; closing does.
+        journal(&home, &s.dir, None, &["agenda"]).success().stdout(predicates::str::contains("run the benchmark"));
+        journal(&home, &s.dir, None, &["close", &todo.to_string()]).failure().stderr(predicates::str::contains("claudebase run"));
+        let human = journal(&home, &s.dir, Some(&s), &["list", "--problem"]).success().get_output().stdout.clone();
+        assert!(String::from_utf8_lossy(&human).contains("· problem · important"), "{}", String::from_utf8_lossy(&human));
+    })
+    .await
+    .unwrap();
+
+    // Flags travel with `chat dump` / `chat load`: an imported entry keeps
+    // them, closed ones closed with how.
+    let target = home.join("work/loaded");
+    std::fs::create_dir_all(&target).unwrap();
+    let flags = json!([{ "flag": "question", "open": false, "set_at": 5, "closed_at": 6, "closed_by": "mira", "resolution": "yes" }, { "flag": "todo", "open": true, "set_at": 5 }]);
+    let r = client
+        .call("journal_import", json!({ "cwd": target.to_str().unwrap(), "entries": [{ "body": "carried over", "category": "finding", "tags": ["x"], "created_at": 5, "flags": flags }] }), 2)
+        .await
+        .unwrap();
+    assert_eq!(payload(&r).unwrap()["written"], 1, "{r}");
+    let r = client.call("journal_list", json!({ "cwd": target.to_str().unwrap() }), 3).await.unwrap();
+    let f = &payload(&r).unwrap()["entries"][0]["flags"];
+    assert_eq!(f, &json!([{ "flag": "todo", "open": true, "set_at": 5 }, { "flag": "question", "open": false, "set_at": 5, "closed_at": 6, "closed_by": "mira", "resolution": "yes" }]), "{f}");
+    drop(client);
+}

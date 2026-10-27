@@ -54,4 +54,51 @@ How to write one:
 - **Salience is retention.** `high` — forever, for load-bearing decisions and constraints; `medium` (default) — a year; `low` — 90 days, for ambient context. Do not mark everything `high`.
 - **Reversals cite what they reverse.** "Replaces journal#42: …".
 
+## Links — what an entry intersects
+
+Every `journal#N` in an entry's text is a link that both entries show. The verb just before it sets the kind: "Replaces journal#42" (also supersedes / corrects / reverses), "Fixes journal#26", anything else cites. `journal get <id>` ends with **related**:
+- the links both ways (cites / cited by, replaces / replaced by, fixes / fixed by);
+- the entries closest by meaning;
+- entries with the same `--source-artifact`.
+
+Each comes with its flags. `list` and `search` show the links in one line under each entry.
+
+- Before relying on an entry, read its related block. A `replaced by #N` means #N is the current word, and a neighbour flagged `deprecated` or `disputed` is not to be trusted as is.
+- A link never changes a flag. When you replace an entry, mark the old one `--deprecated` yourself if it is no longer true.
+- Link entries whose text does not mention each other with `claudebase journal link <id> <to> [--kind cites|replaces|fixes]`; `journal unlink` removes a link.
+
+## Flags — how far to trust an entry, and what is still open
+
+Any entry can carry flags, so one found by meaning alone still says what it is:
+
+| Flag | Meaning | Ends with |
+|---|---|---|
+| `--todo` | something to do | `close` |
+| `--question` | an open question | `close` (the answer) |
+| `--problem` | an unresolved problem | `close` (the fix) |
+| `--reminder` | something to come back to | `close` |
+| `--unverified` | a hypothesis or assumption, not yet checked | `close` (confirmed / falsified) |
+| `--disputed` | contradicts another entry | `close` (who was right; mark the loser deprecated) |
+| `--ai-feedback` | your suggestion for improving claudebase itself | `close` (handled) |
+| `--constraint` | a rule to follow, not weigh | `unmark` |
+| `--important` | keep in view | `unmark` |
+| `--deprecated` | no longer true: history only, ranked last in a search | `unmark` |
+
+```bash
+claudebase journal add "benchmark the bus under load" --todo --tag bus      # category defaults to the flag
+claudebase journal mark 37 --deprecated                                     # flag an existing entry
+claudebase journal agenda                                                   # open work items, constraints, important
+claudebase journal list --question --open | --closed
+claudebase journal close 37 --resolution "done: 7935425"                    # all open items, or name them: --todo
+claudebase journal reopen 37
+claudebase journal unmark 37 --important
+```
+
+- Read `journal agenda` on a fresh context window. Constraints are binding.
+- Never act on a `deprecated` entry. Treat an `unverified` or `disputed` one as an assumption.
+- When an entry stops being true, mark it `--deprecated` and cite it from the entry that replaces it.
+- When you settle a question, fix a problem or finish a todo that has an entry, close it with a `--resolution` that says how. Reopen it if it comes back.
+- Write todos and questions down instead of leaving them in the conversation, where the next session will not see them.
+- An open work item, a constraint or an important mark keeps its entry past retention.
+
 Not for the journal: narration of routine steps (running tests, reading files), restatements of the task, and secrets or credentials of any kind. A commit message does not replace an `update` entry: the journal is searched by tag and category across sessions, git history is not.

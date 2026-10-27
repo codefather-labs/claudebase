@@ -4,902 +4,310 @@
 
 # `claudebase`
 
-**Local infrastructure for LLM agents.**
+**A harness for Claude Code sessions.**
 
-Hybrid retrieval over your books · cross-session agent memory · multi-channel orchestration.
-Single Rust binary · no Python · no external APIs.
+Reach a running session from your phone, a script or another machine · let sessions message each other and share work · give every project a memory that tracks each change from todo to evidence.
 
-[![CI](https://github.com/codefather-labs/claudebase/actions/workflows/release.yml/badge.svg)](https://github.com/codefather-labs/claudebase/actions/workflows/release.yml)
-[![Release](https://img.shields.io/github/v/release/codefather-labs/claudebase?label=release&color=blue)](https://github.com/codefather-labs/claudebase/releases/latest)
+One Rust binary and a local daemon. Claude Code itself runs unmodified.
+
+[![Release](https://github.com/codefather-labs/claudebase/actions/workflows/release.yml/badge.svg)](https://github.com/codefather-labs/claudebase/actions/workflows/release.yml)
+[![Install smoke](https://github.com/codefather-labs/claudebase/actions/workflows/install-smoke.yml/badge.svg)](https://github.com/codefather-labs/claudebase/actions/workflows/install-smoke.yml)
+[![Latest release](https://img.shields.io/github/v/release/codefather-labs/claudebase?label=release&color=blue)](https://github.com/codefather-labs/claudebase/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
-[![Downloads](https://img.shields.io/github/downloads/codefather-labs/claudebase/total?label=downloads&color=green)](https://github.com/codefather-labs/claudebase/releases)
-[![Rust 1.75+](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 
-[📖 Docs](docs/) · [📦 Releases](https://github.com/codefather-labs/claudebase/releases) · [💬 Discussions](https://github.com/codefather-labs/claudebase/discussions) · [🤝 Contributing](CONTRIBUTING.md)
+[📦 Releases](https://github.com/codefather-labs/claudebase/releases) · [🛠 Operations](docs/OPERATIONS.md) · [📝 Changelog](CHANGELOG.md) · [🤝 Contributing](CONTRIBUTING.md)
 
 </div>
 
 ---
 
-## 📦 What is claudebase
+## What it does
 
-`claudebase` is the local **infrastructure layer** that sits next to your Claude Code session and gives the agent four orthogonal capabilities, each independently useful:
+| | |
+|---|---|
+| **Sessions you can reach** | `claudebase run` starts `claude` under a terminal supervisor. Telegram messages, messages from other sessions, HTTP callbacks and socket writes arrive in the session's input as prefixed lines. Replies go out through the CLI. |
+| **Many agents, many machines** | Sessions have names, list and message each other, and can join the daemon of another machine. A pool of sessions can serve model calls for a gateway. |
+| **A project journal** | Agents record decisions, findings and changes; the next session finds them by tag, category and meaning. Entries carry flags (todo, unverified, deprecated, …) and links that form a graph. Every feature or fix runs as a branch from a todo to a verified entry with evidence. |
+| **Operational glue** | The daemon runs as a service, a machine gets one Claude subscription token for all its sessions, conversations move between machines, and the installer sets up language servers for Claude Code's LSP tool. |
+| **Agent toolkit** | Rules, hooks, skills, commands and agents installed into `~/.claude/`, so every session knows the contract above without being told. |
 
-```
-Layer 4 · Multi-channel orchestration   ← planned (server foundation + transports)
-Layer 3 · Channel transport              ← shipping (Telegram in-daemon; Discord/Slack/Matrix next)
-Layer 2 · Cross-session agent memory     ← shipping (project journal)
-Layer 1 · Hybrid retrieval over docs     ← shipping (books corpus)
-Layer 0 · Single static Rust binary, local-first
-```
+A local knowledge base (hybrid search over your PDFs and notes) is also included; it is described at the [end](#-knowledge-base-books-and-documents).
 
-Stop at Layer 1 if all you want is RAG. Go to Layer 4 when you want an orchestrator on your phone talking to a fleet of agents on your desktop and cluster.
+## 🚀 Install
 
-## ✨ Why claudebase
-
-- 🔍 **Hybrid retrieval** — FTS5 BM25 + 384-dim e5-multilingual-small embeddings, fused via RRF (k=60)
-- 🌐 **Multilingual + cross-lingual** — query in English, recall chunks in Russian / Chinese / etc
-- 📄 **Per-page PDF navigation** — every hit carries `path:page:chunk_id` so the agent cites verifiable evidence
-- 🧠 **Cross-session agent memory** (project journal) — agents journal every decision and finding, and the next session finds them by category and tag
-- 💬 **Telegram built into the daemon** — no Claude Code plugin, no MCP channel, nothing a CLI update can break
-- 🚀 **`claudebase run`** — PTY supervisor: runs `claude` unmodified and injects inbound messages into its input
-- 🔌 **Agent toolkit out of the box** (rules, commands, agents, hooks)
-- ⚡ **Pure local** — single static Rust binary, no Python, no external API calls
-
-## 🚀 Quick install
-
-**Linux / macOS** (one-shot):
+**Linux / macOS**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/codefather-labs/claudebase/main/install.sh | bash -s -- --yes
 ```
 
-**Windows** (PowerShell):
+**Windows** (PowerShell)
 
 ```powershell
 iwr -useb https://raw.githubusercontent.com/codefather-labs/claudebase/main/install.ps1 | iex
 ```
 
-**From a local checkout** (contributors):
+**From a checkout** (builds the binary from source; needs a Rust toolchain, a C compiler, `pkg-config`, `cmake` and `clang`, and offers to install what is missing):
 
 ```bash
-git clone https://github.com/codefather-labs/claudebase
-cd claudebase
-bash install.sh --local --yes      # or .\install.ps1 -Yes -Local on Windows
+git clone https://github.com/codefather-labs/claudebase && cd claudebase
+bash install.sh --local --yes          # .\install.ps1 -Yes -Local on Windows
 ```
 
-> The installer downloads the pre-built `claudebase` binary from the latest GitHub release, drops the agent toolkit (rules / commands / agents / hooks) into `~/.claude/`, installs PDFium + the e5 encoder cache and the speech model, sets up language servers for Claude Code's LSP tool (installing Rust and Node.js for them when missing; `--no-lsp` skips it), and registers the daemon as a user service. Voice transcription is built into the binary: no ffmpeg or whisper-cli needed.
+What the installer does, in order:
 
-**Building from source instead** (`install.sh --local`) needs a Rust toolchain, a C compiler,
-`pkg-config`, plus `cmake` and `clang` — the last two for the bundled whisper speech-to-text. The
-installer checks for these, names what is missing, prints the exact command for the detected package
-manager, and installs only with your consent.
+1. Downloads the release binary for your platform (or builds it with `--local`).
+2. Installs the agent toolkit into `~/.claude/` and wires the hooks into `settings.json`.
+3. Sets up language servers for Claude Code's LSP tool, so agents get callers, callees and references instead of grepping: `rust-analyzer`, `pyright`, `typescript-language-server` and their official Claude Code plugins. It installs Rust (rustup) and Node.js (Homebrew / nvm / winget) first when they are missing.
+4. Starts the daemon as a user service. On Linux it enables linger, so the daemon survives logout; without a systemd user manager (containers, WSL) it runs in the background.
+5. Downloads the models: the e5 encoder (~490 MB) for semantic search and the speech model (~1.5 GB) for voice notes. Both show a progress bar.
+6. Ends with a **Checks** list (binary, daemon, hooks, rules, models, language servers) and exits non-zero when a required one fails.
 
-No OpenSSL: the TLS stack is rustls, so the binary links only glibc and libstdc++ and runs on any
-distribution regardless of its OpenSSL version. A CI job installs onto clean Ubuntu 24.04 and 26.04
-containers on every change to the installer and fails if that stops being true.
-
-**Supported binary platforms** (release matrix):
-- **macOS**: arm64 only (M1/M2/M3/M4+). **Intel Mac (`x86_64-apple-darwin`) deprecated as of v0.7.1** — `ort 2.0.0-rc.12` stopped shipping prebuilt binaries for that target. If you're on Intel Mac, either run the Linux binary under Rosetta-via-VM, or build from source: `cargo install --path .` (requires Rust toolchain).
-- **Linux**: x64 + arm64.
-- **Windows**: x64. `claudebase run` drives `claude` through ConPTY and puts the console into the
-  Windows equivalent of raw mode — virtual-terminal input and output, with line input and echo off —
-  restoring both when the session ends. It needs a real console: started from a pipe or an SSH
-  session with no console attached, the supervisor correctly reports that stdin is not a terminal and
-  runs without operator proxying.
-
-**Opt-outs** (env vars before running the installer):
-- `CLAUDEBASE_VERSION=x.y.z` — pin a specific version (downgrade, repeatable CI installs), honoured before anything else is resolved. Default: newest `claudebase-v*` tag on origin (via `git ls-remote`, no API quota). Falls back to a baked-in constant only when that lookup cannot run — no git, no network, air-gapped.
-- `CLAUDEBASE_SKIP_WHISPER=1` — skip the speech model download (fetched on the first voice note instead)
-- `--no-models` (or `CLAUDEBASE_SKIP_MODELS=1`) — skip both model downloads (e5 encoder, speech model); `claudebase warmup` fetches the encoder later
-- `--no-lsp` — skip the language servers (and the Rust / Node.js toolchains installed for them)
-- `CLAUDEBASE_NO_LINGER=1` — do not enable systemd linger (the daemon then stops with your last session)
-
-The installer ends with a **Checks** list (binary, daemon, hooks, rules, models, language servers) and exits non-zero when a required one fails. Installing as root works (with a warning); without a systemd user manager (containers, WSL) the daemon is started in the background.
-- `CLAUDEBASE_ASR_BACKEND=parakeet` — select the Parakeet backend and fetch its model instead of
-  whisper's. Needs a binary built with `--features asr-sherpa`; the released one has only whisper
-
-## 🎬 Demo
-
-```console
-$ claudebase ingest ~/books/clean-architecture.pdf
-✓ ingested 1 doc, 387 chunks, 88 pages, 1.2 MB
-
-$ claudebase search "dependency rule" --top-k 3 --mode hybrid
-1. clean-architecture.pdf:p88:1247  score=2.87  (BM25=1.92, dense=0.95)
-   ...the dependency rule states that source code dependencies must point
-   only inward, toward higher-level policies...
-
-2. clean-architecture.pdf:p89:1251  score=1.43  (BM25=0.81, dense=0.62)
-   ...
-
-$ claudebase journal add "RRF k=60 beats k=40 on the 17-PDF golden set; keeping 60" \
-    --category decision --tag rrf --tag retrieval --salience high
-journaled #42 (/home/me/projects/claudebase)
-
-$ claudebase journal search "RRF parameters" --category decision
-journal of /home/me/projects/claudebase — 1 hit(s), hybrid
-
-#42 2026-10-24 decision [rrf, retrieval] high
-  RRF k=60 beats k=40 on the 17-PDF golden set; keeping 60
-
-$ claudebase run                          # `claude` under a PTY supervisor; Telegram + peer messages arrive in its input
-$ claudebase run --no-telegram            # plain `claude`, no supervisor, no inbound messages
-$ claudebase run -- --debug -c            # forwards extra args verbatim to claude
-```
-
-## 🏗 Architecture
-
-```mermaid
-graph LR
-    A[Documents PDF/MD/TXT] -->|claudebase ingest| B[(index.db<br/>FTS5 + sqlite-vec)]
-    B --> C{claudebase search}
-    C -->|--mode lexical| D[BM25 hits]
-    C -->|--mode dense| E[K-NN cosine hits]
-    C -->|--mode hybrid| F[RRF k=60 fusion]
-    D --> G[Citation-ready chunks<br/>path:page:chunk_id]
-    E --> G
-    F --> G
-    G --> H[Claude Code agent]
-    I[Agent decisions + findings] -->|claudebase journal add| L
-    L -->|one journal per project| J[(journals/*.db<br/>FTS5 + sqlite-vec)]
-    J -.cross-session recall.-> H
-    K[Telegram messages] -->|daemon long-poll + ASR| L[claudebase daemon]
-    L -.channel callbacks.-> H
-```
-
-| Concern | Implementation |
+| Option | Effect |
 |---|---|
-| Lexical retrieval | SQLite FTS5 BM25 with `unicode61` tokenizer |
-| Dense retrieval | `sqlite-vec` v0.1.x vec0 virtual table (L2 over 384-dim unit-norm vectors → cosine-equivalent ranking) |
-| Encoder | `intfloat/multilingual-e5-small` ONNX via `fastembed-rs` v5; `passage:` / `query:` prefix discipline enforced |
-| Fusion | Reciprocal Rank Fusion with k=60 (Cormack/Clarke/Buttcher 2009) |
-| PDF extraction | `pdfium-render` v0.9 (CID fonts, Calibre-converted PDFs, multi-column layouts handled) |
-| OCR (image chunks) | `ocr-rs` v2 / PaddleOCR PP-OCRv4 via MNN runtime |
-| Books-corpus storage | Single `index.db` SQLite file per project — no co-located figure files; image bytes as BLOB |
-| Project journal | Owned by the daemon: one SQLite file per project under `~/.claude/claudebase/journals/`, entries with category, tags, salience, agent, session; FTS5 + vec0 over the entry text, RRF-fused; the project is the directory `claudebase run` started in |
-| Telegram bridge | `src/daemon/telegram.rs` — long-poll, ASR and outbound queue inside the daemon; no external plugin |
-| Session transport | `src/supervisor/` — `claudebase run` owns the pty in which `claude` runs; inbound text is pasted through bracketed paste behind a gate (no modal, no half-typed operator line), and closing the terminal is propagated to the child so a session never outlives its window |
-| HTTP callbacks | `src/daemon/callback.rs` — per-nick token, `X-Api-Token`, off until enabled; hands the body to the same delivery path peer messages use |
-| Inter-process IPC | UDS (named pipe on Windows), length-prefixed JSON frames; TCP + pre-shared-key auth designed in Slice 9 of [`the v0.10 plan`](docs/plans/claudebase-v0.10-pty-transport.md) |
+| `--no-models` / `-NoModels` | Skip both model downloads. Journal search stays keyword-only until `claudebase warmup`; voice notes fetch their model on first use. |
+| `--no-lsp` / `-NoLsp` | Skip the language servers and the toolchains installed for them. |
+| `CLAUDEBASE_VERSION=x.y.z` | Install a specific release. |
+| `CLAUDEBASE_SKIP_WHISPER=1` | Skip the speech model only. |
+| `CLAUDEBASE_SKIP_DAEMON=1` | Do not set up the daemon. |
+| `CLAUDEBASE_NO_LINGER=1` | Do not enable systemd linger (the daemon then stops with your last session). |
 
-Deep-dive (L2/cosine equivalence math, RRF derivation, e5 prefix asymmetry contract): [`docs/architecture/technical-decisions.md`](docs/architecture/technical-decisions.md). Benchmarks (+75% Recall@5 vs lexical baseline on the 12-query golden set): [`docs/benchmarks/2026-05-10-baseline.md`](docs/benchmarks/2026-05-10-baseline.md).
+Root without sudo, a bare container without `jq`, a fresh Claude Code: all supported. A CI job installs onto bare Ubuntu and Debian containers, as root and as an ordinary user, on every change to the installers.
 
-## 💡 Use cases
+**Platforms:** Linux x64 and arm64, macOS arm64, Windows x64. The binary links no OpenSSL (TLS is rustls).
 
-| You want… | claudebase gives you |
+## ⚡ First session
+
+```bash
+cd ~/projects/shop
+claudebase run                 # `claude` under the supervisor; the session registers with the daemon
+```
+
+From another terminal:
+
+```bash
+claudebase agent list                          # who is online, with nicks
+claudebase agent send "status?" --agent_nick shop
+```
+
+The session sees `[agent-to-agent:<your nick>]: status?` in its input and answers with `claudebase agent send … --agent_nick <your nick>`.
+
+`claudebase run` forwards anything after `--` to `claude` (`claudebase run -- --continue`). Its own options:
+
+| Option | |
 |---|---|
-| LLM agents that remember what they decided and found across sessions | The project journal — `claudebase journal add / search / tags / categories` |
-| Claude Code to cite the actual page of the book it's quoting from | Books corpus + per-page navigation via PDFium |
-| To chat with your long-running Claude Code session from your phone | `claudebase telegram addbot` + `claudebase run` |
-| A fleet of specialised agents on different machines coordinating | Planned: server foundation + agent registry — see [`docs/plans/`](docs/plans/) |
-| Local-first RAG without Python, Pinecone, or any external service | Layer 1 alone — `claudebase ingest` + `claudebase search` |
+| `--nick <name>` | Name the session instead of deriving the name from the project. |
+| `--daemon <profile>` | Join another machine's daemon (see [Remote daemon](#-remote-daemon)). |
+| `--pool <pool>` | Make the session a worker of a pool (see [Pool dispatch](#-pool-dispatch)). |
+| `--no-input` | Answer Claude Code's startup questions (folder trust) without an operator. Implied by `--pool`. |
+| `--no-skip-permissions` | Drop the default `--dangerously-skip-permissions`. As root, claudebase otherwise passes `IS_SANDBOX=1` so Claude Code accepts that flag, and says so. |
+| `--no-chrome` | Drop the default `--chrome`. |
+| `--no-telegram` | Plain `claude`, no supervisor and no inbound messages. |
 
-## 📚 Subcommands
+## 💬 How messages reach a session
 
-**Books corpus** (`index.db`) — user-curated PDF/MD/TXT for RAG-style retrieval:
-
-```text
-claudebase ingest <path>                 ingest a file or directory (PDF/MD/TXT)
-claudebase search <query> [--mode M]     M ∈ {lexical, dense, hybrid}; default hybrid
-                          [--top-k N]    top-K hits (default 5)
-                          [--context N]  ±N neighbor chunks per hit (~one page at N=2)
-                          [--json]
-claudebase compare <query>               A/B-test all 3 modes side-by-side
-claudebase page <doc> <N> [--range R]    raw text of page N (or [N-R..N+R]); 1-indexed
-claudebase reindex-pages [--doc X]       backfill pages table for legacy v2 indexes
-claudebase list                          enumerate indexed sources
-claudebase status                        schema_version + doc/chunk counts + db_path
-claudebase delete <source-path>          remove a source and its chunks
-claudebase warmup [--quiet]              pre-load encoder model (~30s first run)
-```
-
-**Project journal** — the decisions and findings of every session, one journal per project:
+Everything from outside arrives as one prefixed line in the session's input:
 
 ```text
-claudebase journal add <text>            record one decision or finding (text, `-`, or stdin)
-                   --category <c>        REQUIRED, free-form: decision, finding, bug, lesson, ...
-                   --tag <t> [--tag ..]  REQUIRED, at least one; how the entry is found again
-                   [--salience high|medium|low] [--agent NAME] [--feature SLUG]
-                   [--source-artifact REF]
-claudebase journal search <query>        BM25 + semantic, RRF-fused (lexical until the e5
-                                         model is installed)
-claudebase journal list                  newest first, a page at a time (--page N --page-size N)
-       search/list filters:              [--tag T ...] (any of) [--category C] [--agent A]
-                                         [--salience S] [--feature F] [--since 30d|12h|..]
-claudebase journal categories            the categories this project uses, with counts
-claudebase journal tags [--category C]   the tags this project uses, with counts
-claudebase journal get <id>              one entry in full
-claudebase journal delete <id>           remove one entry
-claudebase journal gc [--dry-run]        apply retention now (the daemon does it daily)
-claudebase journal projects              every journal the daemon holds
+[telegram_message]: what the operator typed
+[telegram_voice_message]: what the operator dictated (transcribed locally)
+[agent-to-agent:mira]: what another session sent
+[callback:ci]: what a script POSTed
+[pool-job:funnel <req_id> <role>]: a job from a pool gateway
 ```
 
-**Who owns it.** The daemon. `claudebase journal …` never opens a file itself: it asks the daemon,
-which keeps one SQLite journal per project under `~/.claude/claudebase/journals/` — nothing is
-written into the project directory — and is the only writer. That makes the journals of all
-projects one place to orchestrate from (`journal projects`).
-
-**Which project.** The directory `claudebase run` was started in, taken from the session's
-registration with the daemon (`CLAUDEBASE_AGENT_ID` / `CLAUDEBASE_SESSION_TOKEN`), not from where a
-command happens to run — `journal add` from `src/` lands in the project's journal. Every command
-sees only that project's entries, categories and tags. Writing (`add`, `delete`) needs such a
-session and is refused otherwise; reading from a plain terminal uses the nearest enclosing directory
-that has a journal.
-
-**Entries.** Category and tags are free-form and normalized (`#` stripped, lowercased, spaces to
-`-`); reuse what `journal categories` / `journal tags` already list. The same text in the same
-category within 30 days is stored once. Salience sets retention: `high` forever, `medium` 365 days,
-`low` 90 days. Vectors for semantic search are computed by the daemon after the write, and only
-when the e5 model is already installed — it never starts that download itself.
-
-**From insights.** The first time a session uses the journal, the project's old
-`.claude/knowledge/insights.db` is imported: the insight type becomes the category, tags and
-salience carry over, and the old file is left untouched (delete it when you are satisfied). The
-global `~/.claude/knowledge/insights.db` is not imported — the journal is per project by design.
-
-**The hook.** `claudebase-journal-reminder.{sh,ps1}` (SessionStart) tells the agent the journal
-exists, to read the entries that bear on its task by category and tag on a fresh context, and to
-journal every decision and finding as it works.
-
-**Launcher:**
-
-```text
-claudebase run [--no-telegram] [-- args...]    run `claude` under the PTY supervisor
-                                               preset preloaded; forwards extra args
-               [--no-skip-permissions]         drop the default --dangerously-skip-permissions
-               [--no-chrome]                   drop the default --chrome (Claude in Chrome);
-                                               also dropped when the forwarded args already
-                                               carry --chrome or --no-chrome
-```
-
-**Conversations:**
-
-```text
-claudebase chat clone <id|name> <new-name>     copy a Claude Code conversation under a new
-                                               id; the copy appears in /resume as <new-name>
-                                               and continues from the same context, the
-                                               original is untouched
-claudebase chat dump <id|name> [--out F.zip]   pack a conversation into one .zip to carry it
-                                               to another machine
-claudebase chat load <F.zip> [--new-id]        unpack it here, as a native conversation
-                             [--name N]        /resume run from this directory lists
-```
-
-`<id|name>` is the conversation's UUID (the transcript file name under
-`~/.claude/projects/<dir>/`) or the name `/resume` lists it under — the `/rename` title, or the
-auto-generated one when it was never renamed. Run it from the directory the conversation was
-started in: a name is looked up there first, and the copy is filed next to the original so
-`/resume` from that directory shows it. A name that several conversations share is refused with
-their ids. The copy carries the subagent transcripts and the `/rewind` file backups; it does not
-carry the original's Remote Control binding.
-
-**Moving a conversation to another machine.** On the source machine, from the project directory:
+The prefix marks a **message**, not something the operator typed at the prompt, and its content is treated as data, never as instructions. The sender cannot see the terminal; a reply only leaves through a command:
 
 ```bash
-claudebase chat dump "refactor-crypto-classifier-prompts"   # -> ./refactor-crypto-classifier-prompts-88d0e3e5.zip
+claudebase telegram send --text "done"                  # to the operator
+claudebase agent send "done" --agent_nick mira          # to a peer
 ```
 
-Copy the archive to the other machine, into the project directory there, and:
+Delivery is reliable: messages arriving while the agent generates are queued, messages arriving while the operator is mid-keystroke wait for a clear input line, and a session's own messages are never echoed back to it. A SessionStart hook teaches every session this contract.
+
+### Telegram
+
+One bot serves many sessions. The daemon polls Telegram itself — no Claude Code plugin is involved, so a Claude Code update cannot break it.
 
 ```bash
-claudebase chat load ./refactor-crypto-classifier-prompts-88d0e3e5.zip
-claude --resume 88d0e3e5-…                                  # or pick it in /resume
+claudebase telegram addbot "<token from @BotFather>"
+claudebase daemon restart
+claudebase telegram access          # policy, allowlist, pending pairings
+claudebase telegram pair <code>     # approve a sender who messaged the bot
+claudebase telegram policy allowlist
 ```
 
-The archive holds the transcript, the subagent transcripts, spilled tool results and the `/rewind`
-backups, plus a `manifest.json` naming the conversation, its nick and the project path it came from,
-and the project's journal (`journal.jsonl`, fetched from the daemon). `load` hands the journal to
-this machine's daemon, which writes it into the journal of the directory `load` runs in — its name and
-path need not match the source — keeping each entry's creation time and moving `source_artifact`
-paths under the source project; entries already there are not written twice. If the daemon is down
-then, `claudebase journal import <F.zip>` brings the journal in later. The conversation's nick
-comes back with it (not for a `--new-id` copy). Machine-bound state stays behind: per-terminal nicks,
-Telegram bindings, callback tokens. `load`
-keeps the conversation's id — it is the same conversation, moved — and refuses when that id is
-already on the machine; `--new-id` loads a separate copy instead, `--name` lists it under another
-name. `cwd` fields at or under the source project path are moved to the directory `load` runs in,
-since the project rarely sits at the same path on both machines; message text is left as written.
-The Remote Control binding stays behind. The archive is treated as untrusted on load: only the
-expected entries are extracted, by sanitised path, regular files only, and nothing existing is
-overwritten. Project-level memory (`~/.claude/projects/<dir>/memory/`) is not part of a
-conversation and does not travel.
+In the bot: `/agents` lists sessions, `/switch <name>` binds the chat to one, `/whoami` and `/here` show the binding. In a supergroup with topics, each topic can be bound to its own session (the bot must be an administrator to receive ordinary messages). Agents can ask single-choice questions that appear as buttons (in direct messages). Access requests that arrive over a channel are always refused; access is managed only from the operator's terminal.
 
-Inside a session the same is one skill away: `/claudebase-chat-dump` packs the conversation you are
-in (or one you name), and `/claudebase-chat-load <file.zip>` unpacks one into the current
-directory. Both only run the commands above; the load skill asks before importing an archive the
-operator did not make, since a loaded conversation's transcript becomes a model's context when it is
-resumed.
+**Voice notes** are transcribed on the machine by the bundled whisper.cpp (`ggml-medium`) and arrive as `[telegram_voice_message]`, so the agent confirms exact strings instead of acting on a word that merely sounded right. Transcription uses 4 threads by default (`[asr] n_threads` in `daemon.toml`): taking every core stalls whisper on a busy machine rather than speeding it up.
 
-The corpus subcommands accept `--project-root <dir>` (defaults to cwd), and nearly everything takes `--json` for structured output. Journal entries can come from the positional argument, `-`, or piped stdin (a terminal without a body is rejected — designed for non-interactive agent use).
-
-## 🧠 Books and the journal
-
-| | Books corpus (`index.db`) | Project journal |
-|---|---|---|
-| **Direction** | Read-side. You feed it; agents query it. | Write-side. Agents feed it; agents query it (you audit). |
-| **Content** | Curated PDFs / Markdown / plain text — books, regulatory docs, internal style guides. | What was decided and what was found: decisions with their reasons and rejected alternatives, findings, bugs, falsified assumptions, lessons. |
-| **Where** | `<project>/.claude/knowledge/index.db` | With the daemon, `~/.claude/claudebase/journals/`, one per project |
-| **Lifecycle** | Stable; changes only when you re-ingest. | Grows every session; retention by salience, applied daily. |
-| **Why** | Domain knowledge the model was not trained on. | So a session does not re-decide, or re-discover, what an earlier one already did. |
-
-### Salience drives retention
-
-| Salience | Retention | Use for |
-|---|---|---|
-| `high` | indefinite (never gc'd) | Entries whose loss would degrade the whole decision trail. Use sparingly. |
-| `medium` | 365 days | Slice-level or single-decision entries. Default. |
-| `low` | 90 days | Ambient / context-setting observations. Cheap to lose. |
-
-Be honest with the tag — marking everything `high` turns the journal into a write-only log.
-
-### Which to query for what
-
-| Question | Where |
-|---|---|
-| "What does the SQL spec say about FTS5?" | books (`claudebase search`) |
-| "Why did we choose WAL mode for this database?" | journal (`claudebase journal search "WAL" --category decision`) |
-| "How does Kafka's exactly-once delivery work?" | books |
-| "What did we already find out about the deploy pipeline?" | journal (`claudebase journal list --tag deploy`) |
-
-## 💬 Telegram — setup and the message contract
-
-One bot, many Claude Code sessions. The daemon is the single Telegram poller; each chat is routed to
-one session. **No Claude Code plugin is involved** — inbound messages are written straight into the
-session's input, and replies go out through the CLI. That is deliberate: the plugin/channel path
-broke on every Claude Code update, and the terminal does not.
-
-### Setup
-
-```bash
-claudebase telegram addbot "<token from @BotFather>"   # verified via getMe, stored in chat.db
-claudebase daemon restart                              # the daemon reads the registry at boot
-claudebase telegram get_me                             # raw Telegram API response, to confirm
-```
-
-Then message the bot. Under the default `pairing` policy the first message from an unknown sender is
-held and the bot replies with a code:
-
-```bash
-claudebase telegram access            # policy, allowlist, pending codes
-claudebase telegram pair <code>       # approve
-claudebase telegram policy allowlist  # close the door once everyone is in
-```
-
-`pairing` is a bootstrap mode, not a resting state — it lets any stranger trigger a code. Switch to
-`allowlist` when the list is complete (the command refuses if that would lock you out of an empty
-list).
-
-### The message contract
-
-Inbound messages appear in the session's input as a prefixed line:
-
-```text
-[telegram_message]: what the operator sent
-[agent-to-agent:mira]: what a peer session sent
-```
-
-The prefix says two things: this is a MESSAGE rather than something the operator typed at the
-prompt, and — for peer traffic — who sent it. **The sender cannot see the terminal**, so a reply
-only reaches them through a command:
-
-```bash
-claudebase telegram send --text "reply to the operator"
-claudebase telegram send --stdin                        # multi-line body
-claudebase agent send "reply" --agent_nick <nick>       # reply to a peer session
-```
-
-No destination argument is needed for Telegram: it resolves from the session's binding, then from
-the only known chat, and refuses with a candidate list if that is ambiguous. Every claudebase-aware
-session gets this contract injected at SessionStart by the `claudebase-channel-contract` hook, so
-the agent knows it before the first message arrives.
-
-### Bot command reference
-
-| Command | Effect |
-|---|---|
-| `/agents` | List sessions currently online and registered with the daemon. |
-| `/switch <name>` | Rebind this chat to the named session. |
-| `/whoami` | Show which session this chat is bound to. |
-| `/here` | Show the bound session's host and working directory. |
-
-**Group chats:** all members share one binding; `/switch` in a group rebinds it for everyone.
-
-### Forum topics — one topic per session
-
-In a supergroup with topics enabled, **a topic is a session's address**. Bind one, and everything
-typed there goes to that session and everything it answers comes back into that topic. No `/switch`
-mode to hold in your head: the topic you are typing in *is* the address.
-
-Setup, once:
-
-1. Create a supergroup with topics enabled and add the bot.
-2. **Promote the bot to administrator.** This is not optional and its absence is silent: Telegram's
-   privacy mode is on by default, and a non-admin bot receives only commands addressed to it with
-   `@botname`, plus replies. Ordinary text and voice notes never arrive, and the group looks
-   connected while delivering nothing. Admins receive everything.
-   ([Bot API](https://core.telegram.org/bots/features))
-3. In each topic: `/start` → tap `switch` → tap the session. The keyboard is sent into the topic it
-   was invoked from, and the tap binds that topic.
-
-The binding is durable and per-topic. Binding another topic to another session does not disturb it:
-the clearing SQL matches chat AND topic, and `chat_bindings` is keyed by `(chat_id, thread_id)`. A
-session that restarts re-acquires its topic by nick, so a rebind is not needed after every restart.
-
-Delivery is decided per MESSAGE, not per chat. That distinction is load-bearing: one chat carries
-several topics owned by different sessions, so "who owns this conversation" has no single answer in a
-forum, and answering it chat-wide hands every topic to whichever session pinged most recently — which
-is exactly how a second session's messages were silently discarded before v0.10.0.
-
-**One session holds one topic.** The live routing key is a single `(routing_chat_id,
-routing_thread_id)` pair on the session's row, so binding a session to a second topic MOVES it —
-the first topic keeps a durable binding row with no live addressee. Many topics to many sessions is
-the supported shape; one session spread across topics is not.
-
-> **Do not add anyone else to that group yet.** The access gate decides on the SENDER and does not
-> ask what kind of chat a message came from, so an unrecognised member triggers pairing — and the
-> pairing code is replied into the chat it came from, which in a group means published to everyone
-> reading the topic. In a DM that reply is private by construction. Fixing this is the first slice of
-> `docs/plans/claudebase-v0.11-telegram-topics.md`; until then a topics group is for one person.
-
-### `chat_ask` — multiple-choice questions as Telegram buttons
-
-Agents can surface a multiple-choice question as native inline keyboard buttons. The daemon sends one
-button per option, the operator taps, and the answer is routed back to the asking session.
-
-**Scope:** single-select, DM chats only. Free-text and multi-select are not supported.
-
-### Voice messages
-
-Voice notes are transcribed locally by whisper (the bundled whisper.cpp, `ggml-medium`; OGG/Opus is decoded in-process)
-and arrive prefixed `[telegram_voice_message]:` — deliberately not the same prefix as typed text, so
-the agent knows the words came out of speech recognition and treats exact strings in them (filenames,
-flags, identifiers) as things to confirm rather than to act on. Nothing leaves the machine.
-
-Transcription is CPU-bound and it does not get its own machine. By default it takes **4 threads**,
-not every core:
-
-```toml
-[asr]
-backend = "whisper"
-n_threads = 4          # omit for the default
-max_concurrent = 1     # notes transcribed at once; omit for the default
-```
-
-Raise it only where the cores are genuinely idle, and measure rather than assume — the right number
-depends on what else the machine is doing. Same 16-core box, same 4-second note, two different loads:
-
-| threads | at load ~25 | at load ~7 |
-|---|---|---|
-| 16 | 193 s | 72 s |
-| 8 | 87 s | **37 s** |
-| 4 | **69 s** | 42 s |
-
-Taking every core loses badly in both. The default is 4 because this machine spends most of its time
-under load; 8 is the better setting on a quieter one. whisper.cpp joins its workers at every layer,
-so one worker that loses its core holds all the others at the barrier — contention does not divide
-the machine, it stalls it.
-
-`examples/whisper_probe.rs` runs that table on your own machine.
-
-The model is loaded once and kept. Fetching and decoding a note overlap freely; only the inference is
-bounded, by `max_concurrent`, for the same reason the thread count is.
-
-#### A faster backend, if you build it yourself
-
-NVIDIA's **`parakeet-tdt-0.6b-v3`** runs locally through sherpa-onnx and is dramatically faster.
-It is **not** in the released binary and is **not** the default — see why below.
+A much faster backend, NVIDIA `parakeet-tdt-0.6b-v3` (0.65 s instead of 45.7 s for a 7-second note on a 16-core machine), can be built in. It is not in the release binary, because its sherpa-onnx library has to be linked as a shared library next to the binary:
 
 ```bash
 cargo build --release --features asr-whisper,asr-sherpa
-
-# Running from the checkout works as-is. Copying the binary anywhere else needs
-# its libraries alongside it: sherpa-onnx is linked SHARED (see below), and the
-# baked-in rpath is `$ORIGIN/lib`.
 install -d ~/.claude/tools/claudebase/lib
 cp target/sherpa-onnx-prebuilt/*/lib/*.so* ~/.claude/tools/claudebase/lib/
 cp target/release/claudebase ~/.claude/tools/claudebase/claudebase
+# then [asr] backend = "parakeet" in daemon.toml, or CLAUDEBASE_ASR_BACKEND=parakeet ./install.sh
 ```
 
-```toml
-[asr]
-backend = "parakeet"   # "whisper" is the default
+### Callbacks from scripts
+
+Every live session has a socket, no token and no setup needed:
+
+```bash
+printf 'build finished' | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/claudebase/agents/<nick>.sock
 ```
 
-Or at install time: `CLAUDEBASE_ASR_BACKEND=parakeet ./install.sh`, which writes that key and fetches
-the right model (~640 MB, against whisper-medium's 1.5 GB). Both backends can be compiled in at once;
-the config decides which runs.
+(Shell redirection into a socket does not work; use `socat` or a socket library.) Over HTTP, after `claudebase daemon callback enable`:
 
-Measured on one 16-core machine, both backends over the same audio at four threads each:
+```bash
+curl -sS -X POST "http://127.0.0.1:8585/callback/<nick>?label=ci" \
+     -H "X-Api-Token: $(cat ~/.claude/callback-tokens/<nick>)" --data-binary 'build failed'
+```
 
-| audio | whisper-medium | parakeet-tdt-v3 |
+Tokens belong to a nick and follow a rename. The HTTP listener stays on loopback unless explicitly opened. Inside a session, `/claudebase-daemon-callback-info` and `/claudebase-daemon-setup-auth-token` explain and set this up.
+
+## 👥 Many sessions
+
+```bash
+claudebase agent list [--all]                      # nick, id, status, what each one works on
+claudebase agent send "text" --agent_nick <nick>
+claudebase agent describe "what I am working on"
+claudebase agent whoami
+claudebase agent rename "<nick>"                   # or /claudebase-daemon-change-nick
+```
+
+A chosen nick belongs to the **conversation**: resume it a week later in another terminal and it answers to the same name, with its Telegram bindings. Identity is enforced by the daemon — one session cannot send as another — and an ambiguous nick is refused rather than guessed. Hooks around plan mode remind a session that peers exist before it plans, and make it publish what it decided.
+
+### 🌐 Remote daemon
+
+A session on your laptop can join the daemon on a server and work alongside the agents running there: listed with them, messaging them, reachable from that daemon's Telegram bot, writing the same journal.
+
+```bash
+# on the server, once
+claudebase daemon remote enable && claudebase daemon restart
+claudebase daemon remote issue laptop --host prod.example      # prints a connection string once
+
+# on the laptop
+claudebase daemon remote add prod          # paste the connection string (read from stdin)
+claudebase daemon remote test prod
+claudebase run --daemon prod
+```
+
+TLS with a pinned self-signed certificate, one revocable token per client, and only the session surface over the wire — administration stays on the machine. The skill `/claudebase-setup-remote-daemon` walks through it. Design: [docs/design/remote-daemon.md](docs/design/remote-daemon.md).
+
+### 🏭 Pool dispatch
+
+A gateway hands model calls to a pool of sessions over HTTP and gets each answer back by id; the daemon leases a free worker per job.
+
+```bash
+claudebase pool token issue gateway        # X-Api-Token for /pool/*
+claudebase run --pool funnel               # each worker
+claudebase pool workers funnel             # free / busy / clearing / suspect / offline
+```
+
+```text
+POST /pool/funnel/dispatch {req_id, payload, images, worker_id?}   202 leased | 409 busy | 503 none free
+GET  /pool/jobs/<req_id>?wait_ms=25000                            done | failed | expired | leased
+POST /pool/funnel/workers/<worker_id>/clear                       /clear one worker's context
+```
+
+A worker sees `[pool-job:…]`, fetches the job with `claudebase pool job <req_id>` and answers with `claudebase pool reply <req_id>`. A job can be pinned to one worker, and a worker's context can be cleared between conversations. Workers keep the nick the pool gave them. Design: [docs/design/pool-dispatch.md](docs/design/pool-dispatch.md).
+
+## 🧠 The project journal
+
+Every project has a journal held by the daemon — nothing is written into the project directory — and shared by every checkout of the same repository, on this machine or one joined to the daemon. Agents read it on a fresh context and write to it as they work: every decision, finding, bug, lesson and change, one entry each.
+
+```bash
+claudebase journal add "Chose WAL: readers blocked the writer (journal.rs:open); rejected a write queue" \
+    --category decision --tag sqlite --salience high
+claudebase journal search "write locking" --tag sqlite      # BM25 + semantic, fused
+claudebase journal list --category decision --since 30d
+claudebase journal get 42                                   # the entry and what it intersects
+claudebase journal agenda                                   # what is still open
+```
+
+**Flags** say how far to trust an entry found by meaning alone:
+
+| Flag | Meaning | Ends with |
 |---|---|---|
-| 7.1 s of Russian speech | 45.7 s | **0.65 s** |
-| 92.7 s of Russian speech | 126.5 s | **10.2 s** |
+| `--todo` `--question` `--problem` `--reminder` | work items | `journal close <id> --resolution "<how>"` |
+| `--unverified` | a hypothesis, or an implementation not yet proven | `close` once checked |
+| `--disputed` | contradicts another entry | `close` once settled |
+| `--ai-feedback` | an agent's suggestion for claudebase itself | `close` once handled |
+| `--constraint` | a rule to follow, not weigh | `unmark` |
+| `--important` | keep in view | `unmark` |
+| `--verified` | carries the evidence that something works | `unmark` |
+| `--deprecated` | no longer true; ranked last in search | `unmark` |
 
-70x on the short note and 12x on the long one, and that spread is structural rather than noise:
-whisper always processes 30-second windows, so a 7-second note costs it a whole window while a
-92-second one costs four. The advantage is largest on short notes, which is what dictation usually
-is. `examples/asr_ab.rs` reproduces the table on your own audio.
+**Links** come from the text: `journal#N` in an entry links the two, and the verb before it sets the kind — *Replaces*, *Fixes*, *Implements*, *Verifies*, otherwise *cites*. `journal get` ends with the related entries: links both ways, the closest entries by meaning, entries from the same source, each with its flags. `journal link` / `unlink` add the links the text does not make. A link never changes a flag; marking an entry deprecated is always a deliberate act.
 
-**Why it is not the default, in order of weight:**
+**Work branches.** Every feature or fix runs as a branch:
 
-1. **It is not in the release binary.** sherpa-onnx has to be linked as a shared library, because a
-   static one bundles a second copy of ONNX Runtime that collides at link time with the one
-   `fastembed` already provides for retrieval (`duplicate symbol: onnx::ParseData<double>`). Shipping
-   it would mean shipping ~31 MB of `.so` beside the binary on four platforms, which claudebase does
-   not currently do. Building it yourself is therefore the only route today.
-2. **It dropped a phrase.** On the long sample it turned "whisper ai medium" into "whisper". A
-   dropped phrase is worse than a mangled one because it leaves no trace — a wrong word is visible,
-   an absent one is not. Two samples cannot say whether that is characteristic.
-3. **It is not more accurate on the strings that matter.** Neither backend got a single product name
-   right: "nvidia parakeet" came back as `para kit` and `Parkit`, "Claude Code" as `клад кода` and
-   `клоткода`. This is the reason transcripts arrive under their own prefix — treat exact strings in
-   them as things to confirm, whichever backend produced them.
+```text
+#12 todo          "pin pool jobs to a worker"
+ └ implements #13 unverified   "Implements journal#12 … Verification protocol: …"
+    └ verifies #14 verified    "Verifies journal#13: e2e test passed, live run 7 s …"
+```
 
-What Parakeet is clearly better at, besides speed: it punctuates, capitalises and splits sentences,
-where whisper returns one unbroken lowercase run.
+`journal close 12` refuses until the branch holds a `--verified` entry, then closes the whole branch. Dropped work closes with `--abandon --resolution "<why>"`. Only *implements / verifies / fixes* make a branch; *cites* and *replaces* connect branches into a graph without merging them. `journal branch <id>` shows a branch and the branches it is linked with.
 
----
+**Sharing.** Checkouts of one repository already share a journal. For anything else — a folder without a remote, a fork — `journal share <folder>` makes that folder write into this journal live (its own entries are merged in), and `journal unshare <folder>` lets it leave with a copy. Agents do this only when the operator asks (`/claudebase-journal-share`).
 
-## 👥 Multi-agent coordination — session-to-session routing
+**Retention** follows salience: `high` forever, `medium` a year, `low` 90 days — except that an open work item, a constraint or an important entry is kept until it is resolved. `journal feedback` gives the operator every project's `ai-feedback` entries in one view.
 
-Multiple Claude Code sessions on one machine discover each other, publish what they are working on,
-and message each other directly. The pain it solves: three CC windows across three worktrees of the
-same repo, drafting plans that collide on the same files.
-
-Every session started with `claudebase run` registers in `chat.db`'s `agent_registry` with its nick,
-`project_id` (normalized git remote), `branch`, `working_dir` and description.
+## 🧰 Machines and conversations
 
 ```bash
-claudebase agent list                              # nick, id, online/offline, what each is on
-claudebase agent list --all --json                 # include offline sessions, machine-readable
-claudebase agent send "text" --agent_nick <nick>   # DM a peer
-claudebase agent send "text" --agent_id <id>       # when two sessions share a nick
-claudebase agent describe "what I am working on"   # publish into your own row
+claudebase auth setup-token             # paste a `claude setup-token` token (stdin): every Claude on the machine signs in
+claudebase daemon status | start | stop | restart | logs
+claudebase chat dump "<conversation>"   # pack a conversation, its subagents and the project journal into a .zip
+claudebase chat load ./archive.zip      # resume it on another machine
+claudebase chat clone <id|name> <new>   # a copy that /resume lists separately
 ```
 
-Inbound peer messages arrive as `[agent-to-agent:<nick>]: text`.
+`auth setup-token` also works for a remote daemon's machine, so one command signs in every worker of a pool box. `chat dump` / `load` carry the transcript, subagent transcripts, `/rewind` backups and the journal with its flags; skills `/claudebase-chat-dump` and `/claudebase-chat-load` do the same from inside a session.
 
-### Nicks
+## 🧩 What gets installed into `~/.claude/`
 
-The nick is the address: `/switch` from Telegram and `--agent_nick` both resolve it. It defaults to
-the project name, so every window opened in one repository answers to the same one — which is why a
-session is asked at startup to give itself a distinctive one:
-
-```bash
-claudebase agent whoami                # nick, id, and whether it was chosen or derived
-claudebase agent rename "<nick>"       # rename this session (also /claudebase-daemon-change-nick)
-claudebase agent rename "<nick>" --new-callback-token   # ...and retire the old callback token
-claudebase run --nick "<nick>"         # set it at startup instead
-```
-
-A **chosen** nick belongs to the CONVERSATION, not to the window or the checkout. Resume that
-conversation a week later, in another terminal, and it answers to the same name. That is not a
-convenience: Telegram chat bindings are keyed by nick precisely so they outlive a process, so a
-session returning under a different name would silently stop receiving. For the same reason a rename
-carries its bindings with it — the chat follows the session rather than being stranded on the old
-name.
-
-Three keys, in the order they apply:
-
-| Key | Set by | Answers |
-|---|---|---|
-| Claude conversation id | the SessionStart hook, once `claude` is running | what has this conversation always been called |
-| controlling terminal | the supervisor, before `claude` starts | what is this window called right now |
-| working directory | either | what was last chosen in this project |
-
-The conversation id is the durable one — on this machine a single id spans two months and 363
-separate runs — but it cannot name a session at startup, because the supervisor has to choose a name
-before `claude` exists to say which conversation it is resuming. So the terminal supplies the opening
-name and the conversation corrects it a moment later, renaming the session and moving its bindings.
-The directory-level entry is the fallback for a window opened somewhere new.
-
-Resuming rather than starting fresh is what keeps that identity: `claudebase run -- --continue`
-forwards `--continue` to `claude`, which continues the last conversation instead of creating a new
-one. A fresh `claudebase run` starts a new conversation, and starting one only to `/resume` the real
-one leaves an empty stub behind in the `/resume` list.
-
-A nick is held only by a session whose process is actually alive, so a crashed window does not keep
-its name reserved. A rename also survives a reconnect: the name the supervisor reports at
-registration is the INITIAL name only, so a daemon restart cannot roll a rename back.
-
-**Identity is enforced, not declared.** The daemon resolves the sender from the connection, or from a
-`(agent_id, session_token)` pair it minted itself at registration and handed to the session through
-its environment. A bare `--from` is refused, so one session cannot speak as another. Only sessions
-started with `claudebase run` can send.
-
-Ambiguity is always an error: two live sessions sharing a nick makes `--agent_nick` refuse and list
-the candidate ids rather than pick one. Delivering to the wrong peer is not recoverable.
-
-Two hooks wire this into every claudebase-aware session:
-
-- **`PreToolUse:EnterPlanMode`** — surfaces that peers exist and nudges `claudebase agent list`
-  before drafting, to catch overlapping work.
-- **`PostToolUse:ExitPlanMode`** — mandates `claudebase agent describe` so peers immediately see what
-  was decided.
-
-Trust model is single-box, single-user: peer messages are untrusted-but-friendly, read as data rather
-than orders.
-
----
-
-## 🌐 Remote daemon — a session here, its agents on another machine
-
-A session can join the daemon of another machine — prod, dev — as one of its agents: listed with
-them, messaging them both ways, reachable from that daemon's Telegram bot and callbacks, and writing
-the same project journal. That is how a Claude on your laptop talks to and orchestrates the agents
-running on a server.
-
-On the server, once:
-
-```bash
-claudebase daemon remote enable                      # TLS on 0.0.0.0:8586; generates a self-signed cert
-claudebase daemon restart
-claudebase daemon remote issue laptop --host prod.example   # prints a connection string, once
-```
-
-On the laptop, once, then per session:
-
-```bash
-claudebase daemon remote add prod                    # paste the connection string (stdin, not argv)
-claudebase daemon remote test prod                   # connected in 90 ms, 3 session(s) online
-claudebase run --daemon prod                          # this session joins prod's daemon
-claudebase daemon remote default prod                 # optional: make it the default (`local` undoes it)
-```
-
-- **Encryption without a CA.** The certificate is generated on the server and pinned by its
-  SHA-256 in the connection string; no domain or HTTPS setup is needed, and a server with another
-  certificate is refused at the handshake.
-- **One token per client**, stored hashed, re-issuable and revocable (`daemon remote revoke laptop`,
-  `daemon remote status` shows last use). A token lets its holder type into every session on that
-  daemon, including those running with permissions skipped: treat it like an SSH key to the machine.
-- **Session surface only.** A remote connection may register, subscribe, send and read messages, use
-  the journal and Telegram replies; administration (access lists, bots, callback and remote tokens,
-  reaping) is refused and stays with the machine's own user.
-- **Everything the session runs follows it.** `run --daemon prod` exports `CLAUDEBASE_DAEMON=prod`,
-  so `agent send`, `agent list`, `whoami`, `telegram send` and `journal` inside it reach prod. It
-  never falls back to the local daemon: an unreachable or unknown profile stops the start.
-- **One journal per repository.** Journals are filed by the repository's normalized git remote, so a
-  checkout at `/home/me/shop` on the laptop and one at `/srv/shop` on prod share a journal. A
-  directory without a remote keeps a journal of its own, as before; an existing directory journal is
-  adopted by its repository the first time a session writes to it.
-- **Machine-bound.** The per-session callback socket exists on the daemon's machine; inspection
-  commands that read a local `chat.db` (`chat list`, `chat threads`, `agent inspect`,
-  `agent list-alive`) refuse while a remote daemon is selected (`CLAUDEBASE_DAEMON=local` for this
-  machine's).
-
-Design: [`docs/design/remote-daemon.md`](docs/design/remote-daemon.md).
-
----
-
-## 🏭 Pool dispatch — a gateway hands model calls to a pool of sessions
-
-A gateway (a queue of model calls, in place of an Ollama gateway) dispatches each call to a FREE
-session of a pool and gets its answer back by id. The daemon is the router: it knows which workers
-are free, leases one per job, and frees it when it answers.
-
-On the pool's machine:
-
-```bash
-claudebase daemon callback enable --bind 0.0.0.0:8585 --i-know-this-is-remote   # the HTTP listener
-claudebase daemon restart
-claudebase pool token issue gateway          # X-Api-Token for /pool/*, shown once
-claudebase run --pool funnel                 # each worker session (N of them)
-claudebase pool workers funnel               # who is free, busy, suspect, offline
-```
-
-The gateway:
-
-```
-GET  /pool/funnel/workers                    free / busy / suspect / offline
-POST /pool/funnel/dispatch {req_id, payload, images[{path}|{base64,mime}], timeout_ms, wait_ms}
-       202 leased | 200 existing (idempotent by req_id) | 503 no_free_worker (keep it queued)
-GET  /pool/jobs/<req_id>?wait_ms=25000       long-poll: done {result} | failed | expired | leased
-POST /pool/jobs/<req_id>/cancel
-```
-
-A worker gets `[pool-job:funnel <req_id> <role>]` in its input, fetches the job with
-`claudebase pool job <req_id>` (payload and images land on its own machine, so workers may be joined
-to a remote daemon), and answers with `claudebase pool reply <req_id>` — `{content}` or `{tool_calls}`,
-relayed untouched. A lease that runs out expires the job and keeps the worker out until it answers or
-runs `claudebase pool ready`; a worker whose session vanishes fails its job as `worker_lost` after 15 s.
-The daemon keeps no queue of its own. Design: [`docs/design/pool-dispatch.md`](docs/design/pool-dispatch.md).
-
-Operating a daemon — the service, the HTTP and remote listeners, the pool, tokens, and what to check
-when something does not arrive: [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
-
----
-
-## 🪝 HTTP callbacks — something outside pings a session
-
-A CI job, a webhook or a script can write directly into a session's terminal input:
-
-```bash
-curl -sS -X POST 'http://127.0.0.1:8585/callback/<nick>?label=ci' \
-     -H "X-Api-Token: $(cat ~/.claude/callback-tokens/<nick>)" \
-     --data-binary 'build failed on lint'
-```
-
-arrives as `[callback:ci]: build failed on lint`. The label is optional; without it the prefix is
-plain `[callback]`.
-
-This is a thin front over the path peer messages already take, so the injection gate and the
-queue-rather-than-drop guarantee apply unchanged: a callback sent while the agent is generating
-lands when it finishes, and one sent while the operator is mid-keystroke waits for a clear line.
-
-### A UNIX socket per session — the local, zero-setup path
-
-Every live session also gets a socket, created automatically and needing no
-token, no port and no enabling:
-
-```
-$XDG_RUNTIME_DIR/claudebase/agents/<nick>.sock      # 0600, in a 0700 directory
-```
-
-Connect, write the message, close. The connection closing IS the end of the
-message — no length prefix, no delimiter:
-
-```python
-import socket
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.connect("/run/user/1000/claudebase/agents/mira.sock")
-s.sendall(b"build finished")
-s.shutdown(socket.SHUT_WR)
-print(s.recv(4096))     # {"ok":true,"delivery":"delivered",...}
-```
-
-or `socat - UNIX-CONNECT:/run/user/1000/claudebase/agents/mira.sock`. A
-`{"text": "...", "label": "..."}` body works here too, exactly as over HTTP.
-
-**There is no token, and that is deliberate.** The socket lives in the user's own
-runtime directory at mode 0700/0600, so being able to open it already means
-being that user — the kernel is enforcing what a token would only attest. The
-HTTP endpoint needs a token because a TCP port is reachable by anyone who can
-route to it; a socket here is not.
-
-Two things that do NOT work, both verified rather than assumed:
-
-- `echo text > …/mira.sock` — shell redirection calls `open(2)` on the path and
-  the kernel refuses it for a socket with `ENXIO`. Use a socket library.
-- `nc -U …` on Ubuntu — the shipped AppArmor profile `nc.openbsd` denies netcat
-  the connection (`apparmor="DENIED" operation="connect"`). Nothing claudebase
-  can fix; use `socat` or a library.
-
-### Setup
-
-```bash
-claudebase daemon callback enable --bind 127.0.0.1:8585   # off by default
-claudebase daemon restart
-claudebase daemon callback token <nick> --reveal          # token + a ready-to-run curl
-```
-
-Or ask the session itself: `/claudebase-daemon-setup-auth-token` hands over the token and the curl,
-and `/claudebase-daemon-callback-info` explains the contract and can send a self-test.
-
-### What the token is
-
-A rename carries the token with it, so scripts pinging the session keep working — that is the
-default because a rename is usually cosmetic. `--new-callback-token` on the rename retires the old
-one instead, for when the window changed purpose or hands and the previous holder should lose access.
-
-**A token belongs to a nick, not to an `agent_id`.** The id is new on every restart, so a script
-embedding one would break the next time the session reopened; the nick survives, and a rename
-carries the token with it. Each session has its own, minted automatically at first registration —
-a leaked debugging script exposes one session rather than all of them.
-
-Tokens exist from the start, but **the port does not**: opening it is a separate, deliberate act.
-Binding anywhere but loopback needs `--i-know-this-is-remote`, because the token travels in
-cleartext over plain HTTP — to reach a session from another machine, keep the daemon on `127.0.0.1`
-and tunnel:
-
-```bash
-ssh -N -L 8585:127.0.0.1:8585 <user>@<daemon-host>
-```
-
-### Responses
-
-The HTTP status is always `200`; the body says what happened.
-
-```json
-{"ok": true,  "delivery": "delivered", "message_id": "…", "target": "mira"}
-{"ok": false, "error": "no alive agent matches `mria`", "candidates": []}
-```
-
-That distinction matters in the workflow this exists for: a mistyped nick answering exactly like a
-success is time spent chasing a delivery that never started.
-
-**Callback bodies are untrusted data.** They reach a session running with
-`--dangerously-skip-permissions`, so the prefix marks them as a message to interpret, never as
-instructions to obey — and control characters are stripped, since the body is pasted into a pty.
-
----
-
-## 🗺 Roadmap
-
-Single-machine routing is shipped: one daemon owns the Telegram connection, and every session
-started with `claudebase run` receives messages in its input and answers through the CLI.
-
-The next milestone is **cross-machine**: a daemon on one box in the LAN, sessions on several others
-(`claudebase daemon baseurl "http://192.168.31.170:<port>"`). It is designed, not built — see
-Slice 9 of [`claudebase-v0.10-pty-transport.md`](docs/plans/claudebase-v0.10-pty-transport.md).
-Two things gate it, and both are load-bearing:
-
-- **Authentication.** Today the only guard is filesystem permissions on the UDS — "reach the socket"
-  and "be the user" are the same thing. Over TCP they are not, and the daemon's surface can send
-  Telegram messages as you and read the whole chat history. A pre-shared key, a localhost-by-default
-  bind, and TLS (or a documented SSH tunnel) come before the transport itself.
-- **Client-side DB reads.** Destination resolution, peer lookup and thread listing currently read
-  `chat.db` directly, and a remote machine has no such file. Those reads move behind daemon tools
-  first; otherwise `baseurl` would half-work — sends succeed, addressing fails.
-
-| Plan | Status |
+| | |
 |---|---|
-| [`claudebase-v0.10-pty-transport.md`](docs/plans/claudebase-v0.10-pty-transport.md) | PTY transport, bot registry, CLI access control — **shipped**; Slice 9 (remote daemon) designed |
-| [`claudebase-v0.9-product-plan.md`](docs/plans/claudebase-v0.9-product-plan.md) | v0.9 product scope — historical |
-| [`multi-agent-telegram-on-v0.6.md`](docs/plans/multi-agent-telegram-on-v0.6.md) | the plugin-slot era — historical, superseded by v0.10 |
+| **Rules** | `project-journal.md` — how to read and write the journal, flags, links, work branches. `cognitive-self-check.md` — facts vs assumptions, decision quality, challenging the task. |
+| **Hooks** | SessionStart: the message contract and the journal reminder (also after `/clear`). UserPromptSubmit: the self-check reminder. Around plan mode: peers exist; publish what was decided. |
+| **Skills** | `/claudebase-daemon-change-nick`, `-callback-info`, `-setup-auth-token`, `/claudebase-setup-remote-daemon`, `/claudebase-setup-claude-token`, `/claudebase-chat-dump`, `/claudebase-chat-load`, `/claudebase-journal-share` |
+| **Commands** | `/reflect`, `/consolidate`, `/update-claudebase`, `/knowledge-ingest` |
+| **Agents** | `reflection` and `consolidator` — passes that look for drift and blind spots across the work |
+| **Language servers** | rust-analyzer, pyright, typescript-language-server + their Claude Code plugins |
 
-Discuss in [GH Discussions](https://github.com/codefather-labs/claudebase/discussions) or open an issue.
+## 📚 Knowledge base (books and documents)
 
-## 🆚 Comparison
+A local retrieval index for your own documents, for when an agent needs to cite the book it is quoting:
 
-| | claudebase | lance | chroma | qdrant | vectara |
-|---|:---:|:---:|:---:|:---:|:---:|
-| Local-first (no external API) | ✅ | ✅ | ✅ | ✅ (self-host) | ❌ |
-| Single static binary | ✅ | ❌ (Python) | ❌ (Python) | ❌ (Go + Python) | n/a |
-| Hybrid retrieval (BM25 + dense + RRF) | ✅ | partial | partial | partial | ✅ |
-| Per-page PDF citations | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Cross-session agent memory | ✅ (project journal) | ❌ | ❌ | ❌ | ❌ |
-| Claude Code MCP server | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Telegram bridge (no plugin required) | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Multilingual / cross-lingual recall | ✅ (e5) | depends on chosen embedder | depends on chosen embedder | depends on chosen embedder | ✅ |
-| Engine | SQLite + FTS5 + sqlite-vec | columnar (LanceDB) | DuckDB / SQLite | custom vector engine | hosted |
-
-Different tools, different sweet spots. claudebase aims at the **agent-infrastructure** niche specifically.
-
-## 📂 Repository layout
-
-```
-claudebase/
-├── src/                    Rust source (cli, store, search, ingest, encoder, ocr, pdf, ...)
-├── tests/                  Integration tests + fixtures
-├── hooks/                  SessionStart / UserPromptSubmit hooks installed into ~/.claude/hooks/
-├── prompts/                Claude Code agent toolkit installed into ~/.claude/
-│   ├── rules/              knowledge-base, knowledge-base-tool, tool-limitations
-│   ├── commands/           /knowledge-ingest, /reflect, /consolidate, /update-claudebase
-│   ├── skills/             /claudebase-daemon-{change-nick,setup-auth-token,callback-info},
-│   │                       /claudebase-chat-{dump,load}
-│   └── agents/             reflection (Drift), consolidator (Mnem)
-├── bench/                  Benchmark harness + golden query set
-├── docs/                   Self-contained product documentation
-│   ├── PRD.md              Product requirements
-│   ├── design.md           System design
-│   ├── architecture/       Stack rationale + math
-│   ├── benchmarks/         Golden-set numbers
-│   └── plans/              Forward-looking design docs (roadmap items)
-├── .github/                Issue templates, PR template, workflows
-├── Cargo.toml              Workspace root (single member since v0.10)
-├── install.sh / install.ps1   Cross-platform installer
-├── CONTRIBUTING.md / SECURITY.md / CODE_OF_CONDUCT.md / CHANGELOG.md
-├── RELEASING.md            Release procedure (tag claudebase-vX.Y.Z → workflow → GH release)
-├── LICENSE                 MIT
-└── README.md               This file
+```bash
+claudebase ingest ~/books/clean-architecture.pdf
+claudebase search "dependency rule" --top-k 5            # hybrid by default
+claudebase page clean-architecture.pdf 88                # the page a hit came from
+claudebase compare "dependency rule"                     # lexical vs dense vs hybrid side by side
 ```
 
-## 🔗 Companion repo
+PDF, Markdown and plain text, with per-page citations (`path:page:chunk_id`). SQLite FTS5 BM25 and 384-dimensional multilingual e5 embeddings (sqlite-vec), fused by reciprocal rank fusion — so a query in one language finds passages in another. OCR covers images in PDFs. One `index.db` per project under `.claude/knowledge/`; no external service. Details: [technical decisions](docs/architecture/technical-decisions.md), [benchmarks](docs/benchmarks/2026-05-10-baseline.md).
 
-For the documentation-first TDD pipeline that uses claudebase as its memory + observation infrastructure — 19 specialist agents plus the orchestrator persona Mira — install [`claude-code-sdlc`](https://github.com/codefather-labs/claude-code-sdlc). Its installer chains to this one; either repo can also be installed standalone.
+## 📂 Repository
 
-## 🤝 Contributing
+```text
+src/          the binary: supervisor, daemon, journal, pool, Telegram, retrieval
+hooks/        hooks installed into ~/.claude/hooks/
+prompts/      rules, skills, commands and agents installed into ~/.claude/
+tests/        integration tests (a real daemon on a temp HOME)
+docs/         operations, design notes, PRD, plans, benchmarks
+install.sh / install.ps1
+```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Open-ended ideas → [Discussions](https://github.com/codefather-labs/claudebase/discussions). Security vulnerabilities → [SECURITY.md](SECURITY.md) (private disclosure, do not open public issues).
+Operating a daemon — services, listeners, tokens, pools, what to check when something does not arrive: [docs/OPERATIONS.md](docs/OPERATIONS.md). Releasing: [RELEASING.md](RELEASING.md).
 
-## 📜 License + history
+## 🤝 Contributing · License
 
-MIT — see [LICENSE](LICENSE).
+See [CONTRIBUTING.md](CONTRIBUTING.md); security reports go through [SECURITY.md](SECURITY.md). MIT — see [LICENSE](LICENSE).
 
-`claudebase` was extracted from the [`claude-code-sdlc`](https://github.com/codefather-labs/claude-code-sdlc) monorepo's `tools/sdlc-knowledge/` crate on 2026-05-10. The CLI was renamed from `claudeknows` to `claudebase` at the same time. Versioning continues from the last `sdlc-knowledge` release: claudebase v0.4.0 succeeded sdlc-knowledge v0.4.0 directly. Pre-extraction history lives in the SDLC monorepo's git log up to commit [`ca3ecb5`](https://github.com/codefather-labs/claude-code-sdlc/commit/ca3ecb5).
-
-## 🙏 Acknowledgments
-
-Built on [`sqlite-vec`](https://github.com/asg017/sqlite-vec), [`fastembed-rs`](https://github.com/Anush008/fastembed-rs), [`pdfium-render`](https://github.com/ajrcarey/pdfium-render), [`ocr-rs`](https://github.com/ChunelFeng/ocr-rs) / [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR), [`tracing`](https://github.com/tokio-rs/tracing), [`tokio`](https://github.com/tokio-rs/tokio), and the [official Anthropic Telegram plugin](https://github.com/anthropics/claude-plugins-official) (Apache-2.0 — the pairing and access-gate logic in `src/daemon/` is derived from it; see [`NOTICE`](NOTICE)).
+claudebase was extracted from the [`claude-code-sdlc`](https://github.com/codefather-labs/claude-code-sdlc) monorepo in May 2026. Built on [`sqlite-vec`](https://github.com/asg017/sqlite-vec), [`fastembed-rs`](https://github.com/Anush008/fastembed-rs), [`pdfium-render`](https://github.com/ajrcarey/pdfium-render), [`ocr-rs`](https://github.com/ChunelFeng/ocr-rs) / PaddleOCR, [`whisper-rs`](https://github.com/tazz4843/whisper-rs), [`tokio`](https://github.com/tokio-rs/tokio), and the [official Anthropic Telegram plugin](https://github.com/anthropics/claude-plugins-official), from which the pairing and access-gate logic is derived (Apache-2.0, see [NOTICE](NOTICE)).

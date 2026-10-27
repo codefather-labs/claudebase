@@ -314,33 +314,39 @@ fn data_paths_full_wipe() -> Result<Vec<PathBuf>> {
 }
 
 // ---------------------------------------------------------------------------
-// SEC-2-2 — refuse-root
+// SEC-2-2 — root: warned, no longer refused
 // ---------------------------------------------------------------------------
 
-/// Returns `Err` when running as root on Unix. The literal stderr line
-/// `error: do not run 'daemon install' as root` is emitted by callers
-/// that surface the error to the user (TC-2.10 substring match).
+/// What to tell an operator installing the service as root, or `None`.
+///
+/// This used to refuse outright. The daemon runs as the user whose sessions it
+/// serves, and on a server where everything runs as root — Claude sessions
+/// included — refusing protected nothing: the operator started
+/// `daemon serve` as root by hand, with no service, no restart and no boot
+/// start (2026-10-27, a Debian prod box). The risk is real and is said
+/// instead: the daemon writes channel messages (Telegram, other agents, HTTP
+/// callbacks) into terminals, so as root a flaw there is a root compromise.
 #[cfg(unix)]
-pub fn refuse_root_install_with_euid(euid: u32) -> Result<()> {
-    if euid == 0 {
-        bail!("do not run 'daemon install' as root");
-    }
-    Ok(())
+pub fn root_install_warning(euid: u32) -> Option<&'static str> {
+    (euid == 0).then_some(
+        "warning: installing the claudebase daemon as root. It writes messages from outside \
+         (Telegram, other agents, HTTP callbacks) into the terminals of this user's sessions; \
+         run as an ordinary user where you can.",
+    )
 }
 
 #[cfg(unix)]
-pub fn refuse_root_install() -> Result<()> {
+fn warn_root_install() {
     extern "C" {
         fn geteuid() -> u32;
     }
-    let euid = unsafe { geteuid() };
-    refuse_root_install_with_euid(euid)
+    if let Some(w) = root_install_warning(unsafe { geteuid() }) {
+        eprintln!("{w}");
+    }
 }
 
 #[cfg(not(unix))]
-pub fn refuse_root_install() -> Result<()> {
-    Ok(())
-}
+fn warn_root_install() {}
 
 // ---------------------------------------------------------------------------
 // SEC-2-5 — canonical binary path + world-writable refuse
@@ -530,6 +536,12 @@ pub fn xml_escape(s: &str) -> String {
 /// Every
 /// hardening directive in SEC-2-1 is present; no `User=` directive
 /// exists.
+/// Home stays writable (`ReadWritePaths=%h`, no `ProtectHome=read-only`): the
+/// daemon's job includes writing the user's login environment —
+/// `auth setup-token` puts the token in `~/.profile` and
+/// `~/.config/environment.d` (`daemon::auth`) — and under a read-only home it
+/// failed with EROFS on every Linux machine running the service. `%t/claudebase`
+/// is the socket directory, which `ProtectSystem=strict` would also freeze.
 pub fn generate_systemd_unit(binary_path: &Path) -> String {
     let exec = binary_path.to_string_lossy();
     let mut s = String::with_capacity(1024);
@@ -547,8 +559,7 @@ RestartSec=5\n\
 NoNewPrivileges=true\n\
 PrivateTmp=true\n\
 ProtectSystem=strict\n\
-ProtectHome=read-only\n\
-ReadWritePaths=%h/.claude %h/.config/claudebase\n\
+ReadWritePaths=%h %t/claudebase\n\
 ProtectKernelTunables=true\n\
 ProtectControlGroups=true\n\
 RestrictNamespaces=true\n\
@@ -1328,7 +1339,7 @@ mod platform {
 // ---------------------------------------------------------------------------
 
 pub fn install(args: &InstallArgs) -> Result<()> {
-    refuse_root_install()?;
+    warn_root_install();
     let bin = resolve_binary_path()?;
     platform::install(args, &bin)
 }
@@ -1556,8 +1567,7 @@ mod tests {
             "ProtectSystem=strict",
             "NoNewPrivileges=true",
             "PrivateTmp=true",
-            "ProtectHome=read-only",
-            "ReadWritePaths=%h/.claude %h/.config/claudebase",
+            "ReadWritePaths=%h %t/claudebase",
             "ProtectKernelTunables=true",
             "ProtectControlGroups=true",
             "RestrictNamespaces=true",
@@ -1565,6 +1575,7 @@ mod tests {
             "LockPersonality=true",
             "MemoryDenyWriteExecute=true",
             "SystemCallArchitectures=native",
+            // No ProtectHome=read-only: `auth setup-token` writes ~/.profile.
             // No CapabilityBoundingSet / AmbientCapabilities here on purpose —
             // see `systemd_user_unit_does_not_try_to_drop_capabilities`.
         ] {
@@ -1609,19 +1620,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn refuse_root_install_with_euid_blocks_zero() {
-        let err = refuse_root_install_with_euid(0).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("do not run 'daemon install' as root"),
-            "wrong stderr: {msg}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn refuse_root_install_with_euid_allows_nonzero() {
-        assert!(refuse_root_install_with_euid(1000).is_ok());
+    fn root_is_warned_not_refused() {
+        assert!(root_install_warning(0).is_some_and(|w| w.contains("as root")));
+        assert!(root_install_warning(1000).is_none());
     }
 
     #[test]

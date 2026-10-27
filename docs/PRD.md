@@ -370,7 +370,7 @@ As the SDLC pipeline operator, I want a persistent Telegram bot backed by a loca
 
 #### FR-ACD-8: Cross-Platform Service Installer (Slice 2, plan lines 115–128)
 
-1. **FR-ACD-8.1:** On Linux, `daemon install` MUST generate a systemd user unit at `~/.config/systemd/user/claudebase.service`. The unit MUST include: `ProtectSystem=strict`, `ProtectHome=read-only`, `ReadWritePaths=%h/.claude %h/.config/claudebase`, `NoNewPrivileges=true`, `PrivateTmp=true`. `User=root` MUST NOT appear.
+1. **FR-ACD-8.1:** On Linux, `daemon install` MUST generate a systemd user unit at `~/.config/systemd/user/claudebase.service`. The unit MUST include: `ProtectSystem=strict`, `ReadWritePaths=%h %t/claudebase`, `NoNewPrivileges=true`, `PrivateTmp=true`. `User=root` MUST NOT appear. *(Amended 2026-10-27: was `ProtectHome=read-only` + `ReadWritePaths=%h/.claude %h/.config/claudebase`. That made `auth setup-token`, which writes `~/.profile` and `~/.config/environment.d`, fail with EROFS on every systemd-run daemon, and froze the socket directory under `/run/user/<uid>`. Home is writable; the rest of the hardening stays.)*
 2. **FR-ACD-8.2:** On macOS, `daemon install` MUST generate a launchd plist at `~/Library/LaunchAgents/dev.codefather.claudebase.plist` using SIP-aware sandboxing with equivalent access restrictions.
 3. **FR-ACD-8.3:** On Windows, `daemon install` MUST register a Windows Service running as the current user (NOT `LocalSystem`).
 4. **FR-ACD-8.4:** `install.sh` and `install.ps1` MUST support an opt-in `CLAUDEBASE_INSTALL_DAEMON=1` environment variable that calls `claudebase daemon install --no-start` as a post-install step. Without this variable, the daemon is NOT installed as a system service during `bash install.sh --yes`.

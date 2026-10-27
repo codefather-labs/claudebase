@@ -221,6 +221,31 @@ fn answer_startup_questions(
 }
 
 /// Entry point for `claudebase run`.
+/// Whether `claude` needs `IS_SANDBOX=1` to start. Claude Code refuses
+/// `--dangerously-skip-permissions` as root unless `IS_SANDBOX=1` (or
+/// `CLAUDE_CODE_BUBBLEWRAP`) is set — checked in 2.1.311:
+/// `process.getuid()===0 && process.env.IS_SANDBOX!=="1" && !CLAUDE_CODE_BUBBLEWRAP`
+/// — so every `claudebase run`, pool workers included, died at once on a
+/// server where everything runs as root. An `IS_SANDBOX` the operator set
+/// is theirs and left alone.
+fn needs_root_sandbox_env(euid: Option<u32>, skip_permissions: bool, already_set: bool) -> bool {
+    euid == Some(0) && skip_permissions && !already_set
+}
+
+fn current_euid() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        Some(unsafe { geteuid() })
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 pub fn run(args: &RunArgs) -> Result<std::process::ExitCode> {
     let identity = identity::derive(args.nick.as_deref(), args.pool.as_deref());
     tracing::info!(agent_id = %identity.agent_id, name = %identity.name, "supervisor identity");
@@ -239,7 +264,20 @@ pub fn run(args: &RunArgs) -> Result<std::process::ExitCode> {
     let mut cmd = CommandBuilder::new("claude");
     // NOTE: no `--channels`. The whole point of this transport is that Claude
     // Code runs unmodified and unaware.
-    cmd.args(args.claude_args());
+    let claude_args = args.claude_args();
+    if needs_root_sandbox_env(
+        current_euid(),
+        claude_args.iter().any(|a| a == "--dangerously-skip-permissions"),
+        std::env::var_os("IS_SANDBOX").is_some(),
+    ) {
+        eprintln!(
+            "claudebase: running as root — passing IS_SANDBOX=1 to claude so \
+             --dangerously-skip-permissions is accepted. Every tool call then runs as root \
+             without a prompt; run as an ordinary user where you can, or use --no-skip-permissions."
+        );
+        cmd.env("IS_SANDBOX", "1");
+    }
+    cmd.args(claude_args);
     if let Ok(cwd) = std::env::current_dir() {
         cmd.cwd(cwd);
     }
@@ -1201,5 +1239,19 @@ mod default_nick_tests {
             validate_agent_name(&nick_from_label(label)).unwrap();
         }
         assert!(nick_from_label(&"x".repeat(200)).len() <= 60);
+    }
+}
+
+#[cfg(test)]
+mod root_sandbox_tests {
+    use super::needs_root_sandbox_env;
+
+    #[test]
+    fn only_root_with_skip_permissions_and_no_operator_value_gets_it() {
+        assert!(needs_root_sandbox_env(Some(0), true, false));
+        assert!(!needs_root_sandbox_env(Some(0), true, true), "the operator's IS_SANDBOX is theirs");
+        assert!(!needs_root_sandbox_env(Some(0), false, false), "--no-skip-permissions needs nothing");
+        assert!(!needs_root_sandbox_env(Some(1000), true, false));
+        assert!(!needs_root_sandbox_env(None, true, false), "Windows has no root");
     }
 }

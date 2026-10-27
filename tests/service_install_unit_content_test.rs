@@ -28,8 +28,9 @@ fn test_systemd_unit_contains_all_hardening_directives() {
         "ProtectSystem=strict",
         "NoNewPrivileges=true",
         "PrivateTmp=true",
-        "ProtectHome=read-only",
-        "ReadWritePaths=%h/.claude %h/.config/claudebase",
+        // Not ProtectHome=read-only: `auth setup-token` writes ~/.profile and
+        // ~/.config/environment.d, which failed with EROFS under it.
+        "ReadWritePaths=%h %t/claudebase",
         "ProtectKernelTunables=true",
         "ProtectControlGroups=true",
         "RestrictNamespaces=true",

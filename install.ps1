@@ -509,6 +509,10 @@ function Install-LanguageServers {
         @{ Plugin = 'pyright-lsp';       Exe = 'pyright.cmd';                    Check = @('--version') },
         @{ Plugin = 'typescript-lsp';    Exe = 'typescript-language-server.cmd'; Check = @('--version') }
     )
+    # A fresh Claude Code knows only its built-in directory (see the sh twin).
+    if (-not (Test-NativeOk 'claude' @('plugin', 'marketplace', 'add', 'anthropics/claude-plugins-official'))) {
+        Write-Warn "could not add the claude-plugins-official marketplace"
+    }
     foreach ($s in $servers) {
         if (-not (Get-Command $s.Exe -ErrorAction SilentlyContinue) -or -not (Test-NativeOk $s.Exe $s.Check)) {
             Write-Host "  $($s.Exe) not available - Claude Code plugin $($s.Plugin) not installed"
@@ -850,7 +854,7 @@ function Preload-Encoder {
     $bin = Join-Path $Script:ClaudeDir 'tools\claudebase\claudebase.exe'
     if (-not (Test-Path $bin)) { return }
 
-    Write-Info "Pre-loading e5-multilingual-small encoder (~120 MB on first run)..."
+    Write-Info "Pre-loading e5-multilingual-small encoder (~490 MB download on first run)..."
     try {
         & $bin warmup --quiet 2>&1 | Out-Null
         if ($LASTEXITCODE -eq 0) {

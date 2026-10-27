@@ -898,7 +898,7 @@ preload_encoder() {
   local bin="$CLAUDE_DIR/tools/claudebase/claudebase${exe_ext}"
   if [ ! -x "$bin" ]; then return 0; fi
 
-  log_info "Pre-loading e5-multilingual-small encoder (~120 MB on first run)..."
+  log_info "Pre-loading e5-multilingual-small encoder (~490 MB download on first run)..."
   if "$bin" warmup --quiet 2>&1; then
     log_ok "encoder ready (cached at ~/.claude/tools/claudebase/models/)"
   else
@@ -943,46 +943,30 @@ install_whisper_stack() {
     return 0
   fi
 
-  # Detect package manager (try most reliable first).
-  local pkg_mgr=""
-  local pkg_install=""
-  local pkg_ffmpeg="ffmpeg"
-  local pkg_whisper="whisper-cpp"
-  if command -v brew >/dev/null 2>&1; then
-    pkg_mgr="brew"
-    pkg_install="brew install"
-  elif command -v apt-get >/dev/null 2>&1; then
-    pkg_mgr="apt-get"
-    pkg_install="sudo apt-get install -y"
-  elif command -v dnf >/dev/null 2>&1; then
-    pkg_mgr="dnf"
-    pkg_install="sudo dnf install -y"
-  elif command -v pacman >/dev/null 2>&1; then
-    pkg_mgr="pacman"
-    pkg_install="sudo pacman -S --noconfirm"
-  else
-    log_warn "no supported package manager detected (brew/apt-get/dnf/pacman); voice transcription disabled"
+  if ! detect_pkg_manager; then
+    log_warn "cannot install packages ($PKG_NOTE); voice transcription disabled"
     log_warn "  to enable, install manually:"
     log_warn "    macOS:  brew install whisper-cpp ffmpeg"
     log_warn "    Linux:  apt install whisper-cpp ffmpeg  (or dnf/pacman equivalent)"
     return 0
   fi
+  local pkg_mgr="$PKG_MGR" pkg_ffmpeg="ffmpeg" pkg_whisper="whisper-cpp"
 
   if $need_ffmpeg; then
     log_info "installing ffmpeg via $pkg_mgr..."
-    if $pkg_install $pkg_ffmpeg >/dev/null 2>&1; then
+    if pkg_install $pkg_ffmpeg; then
       log_ok "ffmpeg installed"
     else
-      log_warn "ffmpeg install via $pkg_mgr failed; install manually: $pkg_install $pkg_ffmpeg"
+      log_warn "ffmpeg install via $pkg_mgr failed; install manually: $PKG_INSTALL $pkg_ffmpeg"
     fi
   fi
 
   if $need_whisper; then
     log_info "installing whisper-cli via $pkg_mgr (this can take a few minutes)..."
-    if $pkg_install $pkg_whisper >/dev/null 2>&1; then
+    if pkg_install $pkg_whisper; then
       log_ok "whisper-cli installed"
     else
-      log_warn "whisper-cli install via $pkg_mgr failed; install manually: $pkg_install $pkg_whisper"
+      log_warn "whisper-cli install via $pkg_mgr failed; install manually: $PKG_INSTALL $pkg_whisper"
     fi
   fi
 
@@ -1213,19 +1197,87 @@ install_language_servers() {
     log_warn "claude CLI not found — once it is: claude plugin install rust-analyzer-lsp@claude-plugins-official (and pyright-lsp, typescript-lsp)"
     return 0
   fi
-  local pair plugin bin
+  # A fresh Claude Code knows only its built-in directory; without the official
+  # marketplace every install answers "not found in marketplace". Adding it
+  # again when it is there is a no-op.
+  claude plugin marketplace add anthropics/claude-plugins-official >/dev/null 2>&1 \
+    || log_warn "could not add the claude-plugins-official marketplace"
+  local pair plugin bin out
   for pair in rust-analyzer-lsp:rust-analyzer pyright-lsp:pyright-langserver typescript-lsp:typescript-language-server; do
     plugin="${pair%%:*}"; bin="${pair##*:}"
     if ! lsp_binary_works "$bin"; then
       log_info "$bin not available — Claude Code plugin $plugin not installed"
       continue
     fi
-    if claude plugin install "$plugin@claude-plugins-official" --scope user >/dev/null 2>&1; then
+    if out=$(claude plugin install "$plugin@claude-plugins-official" --scope user 2>&1); then
       log_ok "Claude Code plugin $plugin"
     else
-      log_warn "claude plugin install $plugin@claude-plugins-official failed — run it by hand"
+      log_warn "claude plugin install $plugin@claude-plugins-official failed: $(printf '%s' "$out" | tail -n 1)"
     fi
   done
+}
+
+# ============================================================================
+# System packages
+# ============================================================================
+# One place that knows how to install a package here. sudo only when not root:
+# a root shell on a server or in a container often has no sudo at all, and
+# `sudo apt-get` then failed every package. apt gets `update` once (a fresh
+# image has no package lists) and DEBIAN_FRONTEND=noninteractive (ffmpeg pulls
+# tzdata, which otherwise stops to ask for a time zone).
+PKG_MGR=""
+PKG_SUDO=""
+PKG_INSTALL=""
+PKG_NOTE=""
+PKG_REFRESHED=false
+
+detect_pkg_manager() {
+  if [ -n "$PKG_MGR" ]; then [ "$PKG_MGR" != none ]; return; fi
+  local sudo=""
+  if [ "$(id -u)" -ne 0 ] && ! command -v brew >/dev/null 2>&1; then
+    if command -v sudo >/dev/null 2>&1; then
+      sudo="sudo"
+    else
+      PKG_MGR=none PKG_NOTE="not root and no sudo"
+      return 1
+    fi
+  fi
+  if command -v brew >/dev/null 2>&1; then
+    PKG_MGR=brew PKG_INSTALL="brew install"
+  elif command -v apt-get >/dev/null 2>&1; then
+    PKG_MGR=apt-get PKG_INSTALL="$sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y"
+  elif command -v dnf >/dev/null 2>&1; then
+    PKG_MGR=dnf PKG_INSTALL="$sudo dnf install -y"
+  elif command -v pacman >/dev/null 2>&1; then
+    PKG_MGR=pacman PKG_INSTALL="$sudo pacman -S --noconfirm"
+  else
+    PKG_MGR=none PKG_NOTE="no brew/apt-get/dnf/pacman"
+    return 1
+  fi
+  PKG_INSTALL="${PKG_INSTALL# }"
+  PKG_SUDO="$sudo"
+}
+
+pkg_install() {
+  detect_pkg_manager || return 1
+  if [ "$PKG_MGR" = apt-get ] && [ "$PKG_REFRESHED" = false ]; then
+    $PKG_SUDO env DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null 2>&1 || true
+    PKG_REFRESHED=true
+  fi
+  $PKG_INSTALL "$@" >/dev/null 2>&1
+}
+
+# settings.json is merged with jq: without it the hooks, the allowlist and the
+# auto-compact setting are only printed as instructions, and a session never
+# learns how outside messages arrive. So get it before anything merges.
+ensure_jq() {
+  command -v jq >/dev/null 2>&1 && return 0
+  log_info "installing jq (needed to merge ~/.claude/settings.json)..."
+  if pkg_install jq && command -v jq >/dev/null 2>&1; then
+    log_ok "jq installed"
+  else
+    log_warn "jq could not be installed (${PKG_NOTE:-$PKG_MGR failed}) — settings.json will NOT be merged; install jq and re-run"
+  fi
 }
 
 # ============================================================================
@@ -1251,6 +1303,7 @@ if ! confirm "Proceed with installation?"; then
 fi
 
 get_source_dir
+ensure_jq
 install_prompts
 # Defined since the hooks landed, but never invoked until 2026-08-17 — found by
 # installing onto a clean machine, where ~/.claude/hooks simply did not exist.

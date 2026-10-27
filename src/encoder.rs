@@ -65,9 +65,59 @@ fn model_cache_dir() -> Result<PathBuf, EncoderError> {
 /// `claudebase warmup`, and until then callers stay lexical.
 pub fn model_cached() -> bool {
     let Ok(dir) = model_cache_dir() else { return false };
-    std::fs::read_dir(dir.join("models--intfloat--multilingual-e5-small").join("snapshots"))
+    std::fs::read_dir(dir.join(MODEL_DIR).join("snapshots"))
         .map(|mut d| d.next().is_some())
         .unwrap_or(false)
+}
+
+/// fastembed's cache folder for the model.
+const MODEL_DIR: &str = "models--intfloat--multilingual-e5-small";
+/// What the download comes to (the ONNX graph, its data, the tokenizer).
+const MODEL_BYTES: u64 = 487_000_000;
+
+/// Bytes under `dir`, following nothing: the download lands in `blobs/`.
+fn dir_bytes(dir: &std::path::Path) -> u64 {
+    let Ok(read) = std::fs::read_dir(dir) else { return 0 };
+    read.flatten()
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => dir_bytes(&e.path()),
+            Ok(t) if t.is_file() => e.metadata().map(|m| m.len()).unwrap_or(0),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Progress of the model download, on stderr, until `done` is set. A ~490 MB
+/// download that prints nothing looks hung; fastembed's own bar is drawn only
+/// on a terminal, so an installer run over plain ssh or by an agent showed a
+/// silent "Pre-loading ..." for minutes. On a terminal: one line rewritten in
+/// place. Otherwise: a line every 10%, and every 30 s while it does not move,
+/// so a stalled download reads as stalled rather than as silence.
+fn report_download(dir: std::path::PathBuf, done: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::io::{IsTerminal, Write};
+    use std::sync::atomic::Ordering;
+    let tty = std::io::stderr().is_terminal();
+    let mut last_step = u64::MAX;
+    let mut last_line = std::time::Instant::now();
+    let mut shown = false;
+    while !done.load(Ordering::Relaxed) {
+        let got = dir_bytes(&dir);
+        let pct = (got * 100 / MODEL_BYTES).min(99);
+        let line = format!("encoder model: {} / ~{} MB ({pct}%)", got / 1_000_000, MODEL_BYTES / 1_000_000);
+        if tty {
+            eprint!("\r  {line}   ");
+            let _ = std::io::stderr().flush();
+            shown = true;
+        } else if pct / 10 != last_step || last_line.elapsed() >= std::time::Duration::from_secs(30) {
+            last_step = pct / 10;
+            last_line = std::time::Instant::now();
+            eprintln!("  {line}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    if tty && shown {
+        eprintln!("\r  encoder model: downloaded                         ");
+    }
 }
 
 /// Compose the e5 passage-prefixed input. **Critical**: exactly ONE
@@ -92,9 +142,21 @@ fn ensure_loaded() -> Result<(), EncoderError> {
         return Ok(());
     }
     let cache_dir = model_cache_dir()?;
-    let opts = InitOptions::new(EmbeddingModel::MultilingualE5Small).with_cache_dir(cache_dir);
-    let model = TextEmbedding::try_new(opts).map_err(|e| EncoderError::Load(format!("{e}")))?;
-    *guard = Some(model);
+    // Our own progress instead of fastembed's (see `report_download`).
+    let progress = (!model_cached()).then(|| {
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (dir, flag) = (cache_dir.join(MODEL_DIR), done.clone());
+        (done, std::thread::spawn(move || report_download(dir, flag)))
+    });
+    let opts = InitOptions::new(EmbeddingModel::MultilingualE5Small)
+        .with_cache_dir(cache_dir)
+        .with_show_download_progress(false);
+    let model = TextEmbedding::try_new(opts).map_err(|e| EncoderError::Load(format!("{e}")));
+    if let Some((done, reporter)) = progress {
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = reporter.join();
+    }
+    *guard = Some(model?);
     Ok(())
 }
 

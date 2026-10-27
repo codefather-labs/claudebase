@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **A root install without sudo wrote no hooks.** On a server or container shell as root, the
+  installer could not do the things that need a package or `jq`:
+  - **System packages.** Every package install ran `sudo apt-get …`, which fails where sudo does
+    not exist. Now sudo is used only when not root. apt gets `apt-get update` first, since a fresh
+    image has no package lists, and `DEBIAN_FRONTEND=noninteractive`, since ffmpeg pulls tzdata,
+    which otherwise stops to ask for a time zone.
+  - **`jq`.** It is now installed before anything is merged into `~/.claude/settings.json`.
+    Without it, the hooks, the allowlist and the auto-compact setting were only printed as
+    instructions, so sessions never learned how outside messages arrive.
+- **The LSP plugins failed to install on a fresh Claude Code** ("not found in marketplace"). A new
+  Claude Code knows only its built-in directory. The installers now add the
+  `claude-plugins-official` marketplace first, and a failed plugin install prints its reason.
+- **"Pre-loading e5-multilingual-small encoder" looked hung.** fastembed draws its download bar
+  only on a terminal, so an installer run over plain ssh or by an agent sat silent through a
+  ~490 MB download, announced as ~120 MB. The encoder now reports its own progress on stderr: one
+  line rewritten in place on a terminal; otherwise a line every 10%, repeated every 30 s while it
+  does not move.
+
 ## [0.19.0] - 2026-10-27
 
 ### Added

@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src=".github/assets/title.png" alt="claudebase" width="800" />
+<img src=".github/assets/title.png" alt="claudebase — local infrastructure for Claude Code agents" width="800" />
 
 # `claudebase`
 

@@ -241,9 +241,29 @@ claudebase journal agenda                                   # what is still open
 | `--verified` | carries the evidence that something works | `unmark` |
 | `--deprecated` | no longer true; ranked last in search | `unmark` |
 
-**Links** come from the text: `journal#N` in an entry links the two, and the verb before it sets the kind — *Replaces*, *Fixes*, *Implements*, *Verifies*, otherwise *cites*. `journal get` ends with the related entries: links both ways, the closest entries by meaning, entries from the same source, each with its flags. `journal link` / `unlink` add the links the text does not make. A link never changes a flag; marking an entry deprecated is always a deliberate act.
+### 🕸️ The knowledge graph
 
-**Work branches.** Every feature or fix runs as a branch:
+The journal is a graph: entries are nodes and references between them are edges. The text makes most of the edges itself. Writing `journal#N` in an entry links the two, and up to three words right before the reference set the kind:
+
+| Written | Edge | Reads on the other end |
+|---|---|---|
+| *Replaces / supersedes / corrects / reverses* `journal#N` | `replaces` | replaced by |
+| *Fixes* `journal#N` | `fixes` | fixed by |
+| *Implements* `journal#N` | `implements` | implemented by |
+| *Verifies* `journal#N` | `verifies` | verified by |
+| anything else | `cites` | cited by |
+
+`journal link <id> <to> --kind …` and `journal unlink` add or remove the edges the text does not make. An edge never changes a flag. When one entry replaces another, the agent marks the old one `--deprecated` itself, so it is always a deliberate act.
+
+**Reading an entry brings its neighbourhood.** `journal get <id>` ends with a *related* block, and each entry in it carries its flags:
+
+- **linked** — the edges both ways: cites / cited by, replaces / replaced by, fixes / fixed by, and so on;
+- **similar** — the closest entries by meaning, by cosine similarity of the stored vectors, even when nobody linked them (`--similar N`, 5 by default);
+- **same source** — entries with the same `--source-artifact`: a file, a commit, a URL.
+
+So an agent that finds an entry by search also sees whether it was replaced, disputed or fixed later. `list` and `search` show each entry's edges on one line under it (`↳ replaced by #45 · cites #12`).
+
+**Work branches.** Every feature or fix runs as a branch, from a todo to a verified entry with evidence:
 
 ```text
 #12 todo          "pin pool jobs to a worker"
@@ -251,11 +271,33 @@ claudebase journal agenda                                   # what is still open
     └ verifies #14 verified    "Verifies journal#13: e2e test passed, live run 7 s …"
 ```
 
-`journal close 12` refuses until the branch holds a `--verified` entry, then closes the whole branch. Dropped work closes with `--abandon --resolution "<why>"`. Only *implements / verifies / fixes* make a branch; *cites* and *replaces* connect branches into a graph without merging them. `journal branch <id>` shows a branch and the branches it is linked with.
+Only the structural edges *implements*, *verifies* and *fixes* make a branch. An entry belongs to the nearest todo upstream of it along those edges, so work that implements todo B while fixing something in A's branch is B's. *cites* and *replaces* join branches into the graph without merging them, otherwise closing one todo would close another's work. `journal close 12` refuses until the branch holds a `--verified` entry, then closes the whole branch. Dropped work closes with `--abandon --resolution "<why>"`. `journal branch <id>` shows a branch with its state and the branches linked to it.
 
-**Sharing.** Checkouts of one repository already share a journal. For anything else — a folder without a remote, a fork — `journal share <folder>` makes that folder write into this journal live (its own entries are merged in), and `journal unshare <folder>` lets it leave with a copy. Agents do this only when the operator asks (`/claudebase-journal-share`).
+```mermaid
+graph LR
+  T12["#12 todo"] -->|implemented by| I13["#13 unverified"] -->|verified by| V14["#14 verified"]
+  T20["#20 todo"] -->|implemented by| I21["#21"]
+  I21 -. cites .-> I13
+  D9["#9 decision (deprecated)"] -. replaced by .-> D15["#15 decision"]
+  I13 -. cites .-> D15
+```
 
-**Retention** follows salience: `high` forever, `medium` a year, `low` 90 days — except that an open work item, a constraint or an important entry is kept until it is resolved. `journal feedback` gives the operator every project's `ai-feedback` entries in one view.
+### ⚙️ How the journal is built
+
+- **The daemon owns every journal.** `claudebase journal …` never opens a file. It sends the request to the daemon, which works out the caller's project and is the only writer. Nothing is written into the project directory.
+- **One SQLite file per project** in `~/.claude/claudebase/journals/`, named `<folder>-<12 hex of sha256(key)>.db`. The key is the repository (`git:host/owner/repo`) when the project has a remote, so every checkout shares one journal, local or joined through `--daemon`. Without a remote the key is the directory itself. The file records its own project, so the daemon lists projects without a separate index.
+- **Tables:**
+  - `entries` — the text, category, salience, agent, session, feature, source;
+  - `entry_tags`;
+  - `entry_flags` — one row per flag, with `closed_at` / `closed_by` / `resolution`, so closing keeps the history;
+  - `entry_links` — `from_id, to_id, kind`;
+  - `entries_fts` — FTS5;
+  - `entries_vec` — sqlite-vec, 384-dimensional multilingual-e5-small embeddings.
+- **Search is hybrid.** BM25 over `entries_fts` and K-NN over `entries_vec` are fused by reciprocal rank (RRF, k = 60). Tag, category, flag and date filters are SQL. `deprecated` hits rank last. Until the encoder model is on disk (`claudebase warmup`), search is keyword-only.
+- **Writes are deduplicated.** The same text in the same category within 30 days is not stored twice. Edges from an entry's text are parsed when it is written. Journals written before links existed get their edges filled in from the text once.
+- **Sharing is a routing table.** Checkouts of one repository already share a journal. For anything else, such as a folder without a remote or a fork, `journal share <folder>` adds a row to the daemon's `journal_shares` table, and from then on that folder's reads and writes go to this journal. The folder's own entries are merged in, with their flags and edges remapped. `journal unshare <folder>` deletes the row and copies the journal as it is at that moment (`VACUUM INTO`) into the folder's own independent file. Agents do this only when the operator asks (`/claudebase-journal-share`).
+- **Retention follows salience:** `high` forever, `medium` a year, `low` 90 days. An open work item, a `constraint` or an `important` entry is kept until it is resolved.
+- **`journal feedback`** gives the operator every project's `ai-feedback` entries in one view. It is refused to agents and to remote clients.
 
 ## 🧰 Machines and conversations
 

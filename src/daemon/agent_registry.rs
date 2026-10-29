@@ -1355,8 +1355,7 @@ pub fn drain_dnd_tick(
 /// DND, because the recurring `drain_dnd_tick` task only picks up
 /// rows whose `dnd_until_ts < now()` AND IS NOT NULL — clearing DND
 /// to NULL would otherwise leave queued messages permanently
-/// undelivered (regression caught by live Wave 5 QA, doc_id #10 in
-/// the insights corpus).
+/// undelivered (regression caught by live Wave 5 QA).
 ///
 /// Returns the same `DrainableMessage` shape as `drain_dnd_tick` so
 /// the handler can reuse the bus.publish + mark_delivered loop. The
@@ -1464,7 +1463,7 @@ pub fn resolve_routing(
 /// transitioned orphaned→dead) and `remaining_orphaned` (rows still in
 /// state='orphaned' after the reap).
 ///
-/// **Unit note (insight #12)**: the wire param is in SECONDS per
+/// **Unit note**: the wire param is in SECONDS per
 /// FR-ACD-5.4 PRD spec; `last_pinged_at` is stored in MILLISECONDS
 /// (`now_millis()` convention). The cutoff arithmetic multiplies by
 /// 1000 here so the WHERE clause is unit-coherent.

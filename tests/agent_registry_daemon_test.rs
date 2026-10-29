@@ -3,7 +3,7 @@
 //! Exercises `agent_register` → `agent_list_alive` → `agent_unregister` →
 //! `agent_reap` against a real daemon over its UDS surface, confirming the
 //! response shapes callers depend on (notably `reaped_count`, whose name a
-//! prior regression got wrong — insight #12 / TC-5.4).
+//! prior regression got wrong — TC-5.4).
 //!
 //! Formerly `agent_registry_mcp_test.rs`, which drove these calls through
 //! `claudebase plugin serve` — the MCP stdio bridge. That bridge was removed in
@@ -201,7 +201,7 @@ async fn registry_lifecycle_over_the_daemon_socket() {
     assert_eq!(unreg_payload.get("unregistered"), Some(&json!(true)));
     assert_eq!(unreg_payload.get("previous_state"), Some(&json!("alive")));
 
-    // --- reap: the field is `reaped_count`, never `reaped` (insight #12) ---
+    // --- reap: the field is `reaped_count`, never `reaped` (TC-5.4) ---
     let reap = client
         .call("agent_reap", json!({ "older_than_secs": 0 }), 6)
         .await
@@ -214,7 +214,7 @@ async fn registry_lifecycle_over_the_daemon_socket() {
     );
     assert!(
         reap_payload.get("reaped").is_none(),
-        "reap response MUST NOT use `reaped` (insight #12)"
+        "reap response MUST NOT use `reaped` (TC-5.4)"
     );
     assert!(reap_payload.get("remaining_orphaned").is_some());
 

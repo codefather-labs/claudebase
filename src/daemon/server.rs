@@ -2473,7 +2473,7 @@ async fn handle_agent_list_alive(
 /// is in seconds (per FR-ACD-5.4); internal arithmetic converts to
 /// milliseconds to match `last_pinged_at` column units.
 ///
-/// Wire shape per insight #12: `{"reaped_count": N, "remaining_orphaned": N}` —
+/// Wire shape: `{"reaped_count": N, "remaining_orphaned": N}` —
 /// `reaped_count` (NOT `reaped`) is the field name TC-5.4 jq path expects.
 async fn handle_agent_reap(
     id: serde_json::Value,

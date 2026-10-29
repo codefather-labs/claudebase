@@ -259,10 +259,11 @@ The following items are explicitly excluded from this feature:
 
 ## §16. Agent Insights Base — removed
 
-Superseded by the project journal (`claudebase journal`, CHANGELOG `[Unreleased]`): agents journal
-decisions and findings per project, the daemon owns the journals, and the insights corpus with its
-`general` / `project` split is gone. A project's old `.claude/knowledge/insights.db` is imported into
-its journal on first use. Protocol: `prompts/rules/project-journal.md`.
+Superseded by the project journal (`claudebase journal`): agents journal decisions and findings per
+project, and the daemon owns the journals. The insights corpus, its CLI, its hooks and its schema are
+gone: the knowledge index (schema v6) drops the v4/v5 insight columns and the `insight_tags` table.
+A project's old `.claude/knowledge/insights.db` is imported into its journal on first use.
+Protocol: `prompts/rules/project-journal.md`.
 
 ## §17. Agent Chat Daemon + Telegram Bridge + ASR Pipeline + Claude Code Plugin
 
@@ -277,7 +278,7 @@ its journal on first use. Protocol: `prompts/rules/project-journal.md`.
 **Status:** [PLANNED]
 **Date:** 2026-05-17
 **Priority:** High
-**Related:** §16 (Agent Insights Base — `chat.db` and `agent_registry` extend the SQLite sibling-file pattern established by `insights.db`). §15 (Vector + Multimodal Retrieval Backend — UDS IPC framing follows the same single-binary, zero-Python constraint). §11 (pdfium — `daemon install` post-install hook extends the pattern from `install_pdfium_binary` in `install.sh`). Plan source: `.claude/plan.md` (374 lines, read in full this session).
+**Related:** §15 (Vector + Multimodal Retrieval Backend — UDS IPC framing follows the same single-binary, zero-Python constraint). §11 (pdfium — `daemon install` post-install hook extends the pattern from `install_pdfium_binary` in `install.sh`). Plan source: `.claude/plan.md` (374 lines, read in full this session).
 
 Changelog: Adds a persistent claudebase daemon with Telegram bridge, voice transcription via Whisper, Parakeet/NeMo, or NVIDIA NIM, and a chat-based communication channel between Claude Code agents and the user.
 
@@ -298,7 +299,7 @@ As the SDLC pipeline operator, I want a persistent Telegram bot backed by a loca
 #### FR-ACD-1: Daemon Lifecycle — `claudebase daemon` Subcommand Tree (Slice 2, plan lines 119–128)
 
 1. **FR-ACD-1.1:** `claudebase daemon install [--yes] [--no-start]` MUST generate the per-OS service unit (systemd user unit on Linux, launchd user agent plist on macOS, Windows Service via `sc.exe`), write `~/.claude/plugins/claudebase/.mcp.json` (the user-level Claude Code plugin descriptor), and register the service. The operation MUST be idempotent — re-running on an already-installed system is a no-op with exit 0.
-2. **FR-ACD-1.2:** `claudebase daemon uninstall [--keep-data]` MUST remove the service unit and deregister the service. With `--keep-data`, `chat.db`, `insights.db`, `secrets.toml`, and `daemon.toml` MUST be preserved. Without `--keep-data`, those files MUST also be removed.
+2. **FR-ACD-1.2:** `claudebase daemon uninstall [--keep-data]` MUST remove the service unit and deregister the service. With `--keep-data`, `chat.db`, `secrets.toml`, and `daemon.toml` MUST be preserved. Without `--keep-data`, those files MUST also be removed.
 3. **FR-ACD-1.3:** `claudebase daemon start` MUST activate the service via the OS-native mechanism (`systemctl --user start claudebase`, `launchctl load ...`, Windows `sc start`).
 4. **FR-ACD-1.4:** `claudebase daemon stop` MUST deactivate the service gracefully.
 5. **FR-ACD-1.5:** `claudebase daemon restart` MUST execute stop then start.
@@ -446,7 +447,7 @@ N/A. `claudebase` has no HTTP API today. The daemon UDS (`$XDG_RUNTIME_DIR/claud
 
 ### 17.7 Schema Changes
 
-Two new SQLite files are introduced alongside the existing `index.db` and `insights.db`:
+Two new SQLite files are introduced alongside the existing `index.db`:
 
 #### `chat.db` — Schema v5 (Slice 3, plan lines 130–143)
 
@@ -456,7 +457,7 @@ Introduced in schema migration v5 in `src/migrations.rs`:
 -- chat.db: user-level singleton at ~/.claude/knowledge/chat.db
 -- (NOT per-project — the daemon is per-OS-user; chat threads cross project boundaries
 -- e.g. one Telegram thread spans whatever project Claude Code is currently in)
--- index.db and insights.db remain per-project at <project>/.claude/knowledge/
+-- index.db remains per-project at <project>/.claude/knowledge/
 -- This pinning resolves OQ-ACD-4 per architect [STRUCTURAL] #1 at bootstrap Step 3.
 -- A `user_level_chat_db_path()` helper in src/store.rs bypasses resolve_project_root().
 CREATE TABLE IF NOT EXISTS chat_threads (
@@ -527,7 +528,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS agent_registry_thread_name_alive_idx
     WHERE state = 'alive' AND chat_thread_id IS NOT NULL;
 ```
 
-Both migrations are registered via `src/migrations.rs` following the existing `apply_v2`, `apply_v3`, `apply_v4` pattern. Both are additive — they do NOT modify `index.db` or `insights.db`.
+Both migrations are registered via `src/migrations.rs` following the existing `apply_v2`, `apply_v3`, `apply_v4` pattern. Both are additive — they do NOT modify `index.db`.
 
 ### 17.8 UI Changes
 
@@ -1173,304 +1174,10 @@ Done-button finalization emits the SAME frame shape as FR-MAT-11.5 amended above
 
 ---
 
-## §19. claudebase v0.9 cut — port-forward v0.7 insights surface
+## §19. claudebase v0.9 cut — port-forward v0.7 insights surface — removed
 
-**Status:** [PLANNED]
-**Date:** 2026-06-04
-**Priority:** High
-**Related:** §16 (Agent Insights Base — this section extends the insights corpus with schema v5, dual-DB routing, and tag vocabulary; the fundamental `insight create / search` CLI surface from §16 is extended, not replaced). §18 (Multi-Agent Telegram Routing on v0.6 Foundation — the 38 commits on `feat/multi-agent-on-v0.6` are the v0.9 baseline; this section documents the Wave A + Wave D additions on top of that baseline). Implementation plan: `.claude/plan.md` (v2, 265 lines, read in full this session). Product plan: `docs/plans/claudebase-v0.9-product-plan.md` (committed `15b9460`).
-
-Changelog: Cross-session insights now work again — the insights corpus tracks categories and tags, survives migration from any prior schema version, and two new Claude Code hooks remind agents to query the corpus on every new context and every prompt.
-
-### 19.1 Feature Description
-
-v0.7 and v0.8 were declared broken by the operator after extended debugging (`docs/plans/claudebase-v0.9-product-plan.md` §1 — root cause not isolated; forward-debug cost exceeded rebuild cost). The `feat/multi-agent-on-v0.6` branch rebuilt the Telegram product surface from scratch on the v0.6 baseline, live-verifying each delta. That branch is now the v0.9 release vehicle. This PRD section covers the two waves of additional work required before v0.9 ships: **Wave A** (port-forward v0.7's insights corpus and operational tooling) and **Wave D** (release infrastructure).
-
-Wave A is a code-reuse exercise, not a re-architecture. The v0.7 source code (commits `1161570`, `ff30d9f`, `c0eebca`, `2719e25`, `afddf71`, `cccef44`, `4bc9a9c`, `385efff`, `cb45b4d`, `0b92384`, `e43ca12`) is cherry-picked onto the v0.6+ baseline. The architect's pre-review focuses on compatibility with the 38 existing branch commits — not on re-deriving the v0.7 architecture which was already shipped upstream. Two BLOCKER files (`src/store.rs` wholesale rewrite and `src/cli.rs` breaking-change) require deliberate reconciliation; both are gated on architect pre-review before implementation.
-
-The load-bearing constraint for this entire section is the **backward-compatibility MANDATE** (operator directive 2026-06-04): any `insights.db` on the operator's box that was created by a prior v0.6 installation MUST continue to function after v0.9's schema v5 migration — without data loss, without `error: index database invalid` lockouts, and without requiring `claudebase ingest --reset`. Silent data loss is rejected. The migration MUST either repair the corrupt state in place, or exit cleanly with the documented `repair-required` message and a recovery path.
-
-Wave B (Telegram polish, KP2/KP3 live-evidence, bug #2 bridge reconnect, bug #8 daemon hang) and Wave C (multi-bot fleet, multi-bot long-poll, `/start` inline menu, `startproject`, `daemon setup`) are **deferred to v0.10** by operator decision 2026-06-04. The v0.6+ branch's KP1-verified Telegram work ships as-is in v0.9. The `CHANGELOG.md` entry MUST state that KP2/KP3 forum-topic routing is architecturally complete but live-evidence is pending v0.10.
-
-### 19.2 User Stories
-
-1. As the SDLC pipeline operator, I want `claudebase insight create --category project --tags v9-cut-smoke "Mira test"` to succeed so that agent insights persist across sessions without the `error: index database invalid` lockout that blocks cross-session learning today.
-2. As the SDLC pipeline operator, I want `claudebase insight search "Mira test" --tag v9-cut-smoke --salience high --top-k 3 --json` to return the insight I just created so that agents can retrieve prior-session observations by tag.
-3. As the SDLC pipeline operator, I want `claudebase insight tags --json` to return a merged tag vocabulary from both the local project DB and the global DB so that I can browse and filter the corpus across projects.
-4. As the SDLC pipeline operator, opening a new Claude Code session should automatically remind me to query the insights corpus so that I do not start sessions cold when prior-session observations are available.
-5. As the SDLC pipeline operator, submitting a prompt to Claude Code should inject a short cognitive self-check reminder so that agents habitually run the three protocols without me prompting them.
-6. As the SDLC pipeline operator, I want `claudebase run` to register the current project in `~/.claude/knowledge/projects.json` so that `insight search --project <slug>` can locate the project's local insights DB without me specifying a path.
-7. As the SDLC pipeline operator, I want `/update-claudebase` to update the installed binary and restart the daemon in one step so that I never have to manually stop the daemon, replace the binary, and restart it.
-8. As the SDLC pipeline operator with an existing `insights.db` from an older claudebase install, I want v0.9's schema v5 migration to preserve all my existing rows with correct `category` and `project_slug` backfill so that no historical observations are lost.
-9. As the SDLC pipeline operator, if my `insights.db` is in a corrupt state, I want v0.9 to exit with a clear `repair-required` message and a documented recovery path rather than silently corrupting data.
-
-### 19.3 Functional Requirements
-
-#### FR-V9-1: Schema v5 Migration + Global Resolver (Slice 1)
-
-1. **FR-V9-1.1 (schema v5 delta):** `src/store.rs` MUST apply the following additive schema delta when `open_or_init` is called against any insights DB at schema versions v1 through v4:
-   - `ALTER TABLE documents ADD COLUMN category TEXT NOT NULL DEFAULT 'project';`
-   - `ALTER TABLE documents ADD COLUMN project_slug TEXT;`
-   - `CREATE TABLE insight_tags(doc_id INTEGER NOT NULL, tag TEXT NOT NULL, PRIMARY KEY(doc_id, tag), FOREIGN KEY(doc_id) REFERENCES documents(id) ON DELETE CASCADE);`
-   - `CREATE INDEX insight_tags_tag_idx ON insight_tags(tag);`
-2. **FR-V9-1.2 (4-path migration semantics):** The migration MUST converge all four entry paths to schema v5: v1→v5, v2→v5, v3→v5, v4→v5. Each path applies the delta via `apply_v5_delta_and_backfill(tx, db_path)`. Schema version is updated to 5 after successful migration. Four synthetic fixture DBs (`tests/fixtures/synthetic-v{1,2,3,4}.db`, 3 rows each with known payload) MUST all pass migration with row-count preservation + `category`/`project_slug` backfill correct.
-3. **FR-V9-1.3 (v4→v5 backfill for agent rows):** After the schema DDL is applied, existing agent rows MUST be backfilled: `category = 'project'`, `project_slug` derived from `feature_slug` column (if present), a default tag inserted in `insight_tags` (one row per agent document using `feature_slug` as the tag value, or `'untagged'` when `feature_slug` is NULL). Books-corpus rows MUST remain untouched.
-4. **FR-V9-1.4 (backward-compat repair-required exit):** When the migration cannot repair a DB (schema version unrecognised, or structural corruption detected by `validate_schema_inner()` on versions `1..=5`), the binary MUST exit 1 with the literal stderr line `error: index database invalid; run \`claudebase ingest --reset\` to recover`. MUST NOT silently corrupt data. MUST NOT proceed with a partially-migrated DB.
-5. **FR-V9-1.5 (global resolver):** A new public function `resolve_global_insights_path() -> PathBuf` MUST return `~/.claude/knowledge/insights.db`. A corresponding `open_global_insights_db() -> Option<Connection>` MUST attempt to open that path; when the global DB is missing or unopenable, it MUST return `None` without error (the caller falls back to local-only operation).
-
-#### FR-V9-2: `insight create` Breaking-Change CLI Contract (Slices 2a + 2b)
-
-1. **FR-V9-2.1 (required flags):** `InsightCreateArgs` MUST add two REQUIRED flags: `--category <general|project>` (enum; exits 2 if absent) and `--tags <comma-separated>` (one or more tags; exits 2 if absent).
-2. **FR-V9-2.2 (optional project flag):** An optional `--project <slug>` flag MUST be added to allow explicit project scoping when the caller is not in the project's cwd.
-3. **FR-V9-2.3 (tag normalisation):** Tag values MUST be normalised before storage: strip leading `#`, lowercase, trim whitespace, deduplicate within the call. Example: `"#v9-cut-smoke, V9-cut-smoke, v9-cut-smoke "` normalises to a single tag `"v9-cut-smoke"`.
-4. **FR-V9-2.4 (dual-DB write routing):** `--category general` MUST write the insight to `~/.claude/knowledge/insights.db` (global DB). `--category project` MUST write to `<cwd>/.claude/knowledge/insights.db` (local DB). Existing exact-sha and semantic dedup MUST be preserved per-DB independently.
-5. **FR-V9-2.5 (tag row writes):** After inserting the document row, the handler MUST insert one row per normalised tag into `insight_tags(doc_id, tag)`. The insert MUST use `INSERT OR IGNORE` to be idempotent.
-
-#### FR-V9-3: `insight search` Dual-DB Read + Tag/Category/Project Filters (Slices 3a + 3b)
-
-1. **FR-V9-3.1 (`rrf_fuse_hits` function):** A new `pub fn rrf_fuse_hits(local: Vec<SearchHit>, general: Vec<SearchHit>, top_k: usize) -> Vec<SearchHit>` MUST be added to `src/search.rs`. The function fuses hits keyed on `(source_corpus, chunk_id)` using Reciprocal Rank Fusion (k=60). It MUST handle the case where the same `chunk_id` appears in both lists without panicking.
-2. **FR-V9-3.2 (dual-DB read):** `insight search` MUST query both the local DB and the global DB (if present), fuse results via `rrf_fuse_hits`, and return the top-K fused list. When the global DB is absent or corrupt, the search MUST fall back to local-only with a stderr warning — it MUST NOT exit 1.
-3. **FR-V9-3.3 (tag filter — parameterised SQL only):** The `--tag <t>` filter (repeatable, OR-semantics) MUST be implemented as a parameterised SQL `WHERE chunk_id IN (SELECT doc_id FROM insight_tags WHERE tag IN (?,?,...))` with bound parameters. Building the filter via `format!()` string interpolation is PROHIBITED — any such pattern is a SQL injection vector and a security violation.
-4. **FR-V9-3.4 (additional filters):** The following optional filters MUST be added to `insight search`, `insight list`, `insight random`: `--tag <repeatable>`, `--category <general|project>`, `--project <slug>`. The `insight gc` and `insight delete` subcommands MUST also gain `--category`.
-5. **FR-V9-3.5 (existing regression safety):** All 11 existing `cli_search_e2e` tests MUST continue to pass after the dual-DB changes.
-
-#### FR-V9-4: `insight tags` Subcommand (Slice 4)
-
-1. **FR-V9-4.1 (new subcommand):** A new `claudebase insight tags` subcommand MUST be added with `InsightTagsArgs` parsed by `src/cli.rs` and dispatched to `run_insight_tags()` in `src/main.rs`.
-2. **FR-V9-4.2 (merged semantics):** "Merged" output MUST mean: union of `(tag, count)` pairs from local DB and global DB, deduplicated by exact tag string, with `count` = sum of per-DB counts for that tag. Sort order MUST be `count DESC, tag ASC` (deterministic tie-breaking on alphabetical tag).
-3. **FR-V9-4.3 (missing global DB — no error):** When the global DB path does not exist, the global contribution is zero across all tags. The subcommand MUST NOT materialise an empty DB file, MUST NOT exit 1, and MUST NOT emit a warning — it silently omits the global contribution.
-4. **FR-V9-4.4 (JSON output shape):** `--json` MUST output a JSON array of `{"tag": string, "count": integer}` objects in the specified sort order.
-
-#### FR-V9-5: Project Registry (Slice 5)
-
-1. **FR-V9-5.1 (new file):** `src/registry.rs` MUST be added to the crate, declared via `pub mod registry;` in `src/lib.rs`.
-2. **FR-V9-5.2 (`upsert_project` semantics):** `pub fn upsert_project(root: &Path) -> Result<(), String>` MUST write or update a `ProjectEntry` for the given path in `~/.claude/knowledge/projects.json`. The `project_slug` MUST be the canonicalised basename of `root` — never derived from user-supplied input. Writes MUST be atomic: write to a temp file in the same directory, then rename (avoids partial-write corruption).
-3. **FR-V9-5.3 (`resolve_project_path` API):** `pub fn resolve_project_path(slug: &str) -> Option<PathBuf>` MUST read `projects.json` and return the `path` for the entry whose slug matches, or `None` if not found.
-4. **FR-V9-5.4 (`claudebase run` integration):** The `run_claude_with_preset` function in `src/main.rs` MUST call `upsert_project(&cwd)` as its first action, before spawning the child process. The call MUST be non-fatal — a registry write failure MUST log a warning and continue; it MUST NOT prevent `claudebase run` from launching the CLI.
-5. **FR-V9-5.5 (reconciliation with per-project config):** The project registry is the cross-cutting index of all projects. The per-project `.claudebase/config.json` (added in commit `25189bc`) is the per-project source of truth for `session_id` and `name`. These two files MUST NOT conflict; `upsert_project` reads neither `.claudebase/config.json` nor the global registry — it derives the slug from the filesystem path only.
-
-#### FR-V9-6: UserPromptSubmit Self-Check Hook (Slices 6a + 6b + 6c)
-
-1. **FR-V9-6.1 (hook scripts):** Two new hook scripts MUST be created: `hooks/claudebase-selfcheck-reminder.sh` and `hooks/claudebase-selfcheck-reminder.ps1`. Both MUST emit valid JSON `{"hookSpecificOutput": {"additionalContext": "..."}}` on stdout when invoked.
-2. **FR-V9-6.2 (ASCII-only PowerShell constraint):** All `.ps1` hook files shipped by this feature MUST contain ONLY ASCII bytes (codepoint ≤ 127). Non-ASCII glyphs (emoji, em-dashes, curly quotes, bullets) are PROHIBITED in `.ps1` files. Verification: `(Get-Content $f -Encoding Byte | Where-Object { $_ -gt 127 }).Count -eq 0` MUST return `True` for every `.ps1` hook file. This constraint exists because Windows PowerShell 5.1 parses no-BOM scripts in the local code page (not UTF-8); multi-byte UTF-8 sequences corrupt string literals.
-3. **FR-V9-6.3 (installer wiring — idempotent):** `install.sh` and `install.ps1` MUST wire both `.sh` and `.ps1` hooks into `~/.claude/settings.json` under `hooks.UserPromptSubmit`. Wiring MUST use dedup-by-command-string equality: the installer reads the existing array, extracts the `command` field from each entry, and skips appending if a matching `command` string is already present. Running the installer twice MUST produce zero new entries in the second run.
-4. **FR-V9-6.4 (`prompts/` repo-shipped directory):** The `prompts/rules/` directory IS the repo-shipped source for rule files. The installer MUST deploy these files to `~/.claude/rules/` using `cp -n` (shell) or `Copy-Item -ErrorAction SilentlyContinue` (PowerShell) so that operator-customised files in `~/.claude/rules/` are NOT overwritten.
-5. **FR-V9-6.5 (modification to `claudebase-insight-capture` hooks):** If `hooks/claudebase-insight-capture.{sh,ps1}` already exist on the branch, MUST apply the compact-reason update from commit `0b92384` and the ASCII-only fix from `e43ca12`. If they do not exist, MUST create them as new files ported from v0.7.
-
-#### FR-V9-7: SessionStart Read-Insights-on-New-Context Hook (Slice 7)
-
-1. **FR-V9-7.1 (hook scripts):** Two new hook scripts MUST be created: `hooks/claudebase-read-insights-reminder.sh` and `hooks/claudebase-read-insights-reminder.ps1`. Both MUST be ASCII-only (same constraint as FR-V9-6.2). Both MUST emit JSON with `additionalContext` containing the literal substring `claudebase insight tags`.
-2. **FR-V9-7.2 (installer wiring — idempotent):** `install.sh` and `install.ps1` MUST wire both hooks into `~/.claude/settings.json` under `hooks.SessionStart` using the same dedup-by-command-string pattern as FR-V9-6.3. Running the installer twice MUST produce zero new entries in the second run.
-3. **FR-V9-7.3 (firing condition):** The hook fires on session `start`, `resume`, and post-compact events. This is the standard `SessionStart` event type; no special-casing is required by the hook scripts themselves.
-
-#### FR-V9-8: `/update-claudebase` Skill + Daemon-State Preservation (Slice 8)
-
-1. **FR-V9-8.1 (skill file):** `prompts/commands/update-claudebase.md` MUST be created, containing a slash-command specification that instructs the agent to update the claudebase binary by reading the project's README first and running the appropriate install path.
-2. **FR-V9-8.2 (daemon-state preservation — 6-step contract):** The skill MUST instruct the agent to follow this exact sequence:
-   - Step 1: Run `claudebase daemon status --json` and capture the pre-update PID.
-   - Step 2: Verify that the fresh binary's version is GREATER than the running version (refuse downgrade).
-   - Step 3: Stop the daemon via `claudebase daemon stop`.
-   - Step 4: Replace the binary atomically (write to a temp path, then rename to final path).
-   - Step 5: Restart the daemon via `claudebase daemon start`.
-   - Step 6: Verify the new PID is different from the pre-update PID AND `claudebase daemon status` returns `running`.
-3. **FR-V9-8.3 (reads-README-first discipline):** The skill MUST instruct the agent to fetch and read the project README before executing any install command, so the install path used by the skill matches the README's documented install one-liner and never drifts from it.
-4. **FR-V9-8.4 (no downgrade):** The skill MUST abort with an error message if the fresh binary version is ≤ the currently-running version. It MUST NOT replace the binary in that case.
-
-#### FR-V9-9: `prompts/` Repo-Shipped Directory + Installer Deploy (Slice 6a)
-
-1. **FR-V9-9.1 (repo structure):** The `prompts/` directory MUST exist at the repo root after this feature lands. Subdirectory `prompts/rules/` MUST contain at minimum: `cognitive-self-check.md`, `knowledge-base.md`, `knowledge-base-tool.md`, `tool-limitations.md` (ported from v0.7 commit `cb45b4d`).
-2. **FR-V9-9.2 (content verification):** Content of these files MUST be byte-identical to their v0.7 counterparts (verified via `git show cb45b4d:<path>` diff at implementation time).
-3. **FR-V9-9.3 (installer deploy — no-clobber):** The installer MUST deploy `prompts/rules/*` → `~/.claude/rules/` and `prompts/commands/*` → `~/.claude/commands/` using no-clobber semantics (`cp -n` on shell; `Copy-Item -ErrorAction SilentlyContinue` on PowerShell). Existing operator customisations MUST NOT be overwritten.
-
-### 19.4 Non-Functional Requirements
-
-1. **NFR-V9-1 (backward-compat MANDATE — no silent data loss):** The schema v5 migration MUST NOT silently discard or corrupt any row that exists in an insights DB at any prior schema version (v1 through v4). This is an absolute constraint. A migration that silently loses data is a CRITICAL defect regardless of test coverage. The only permitted data-loss outcomes are (a) the explicit `claudebase ingest --reset` path chosen by the operator, or (b) GC of expired low/medium-salience rows. — salience: high.
-2. **NFR-V9-2 (ASCII-only `.ps1` hooks for Windows PowerShell 5.1):** Every `.ps1` file shipped by this feature MUST contain only ASCII bytes. Windows PowerShell 5.1 on operator's box (Windows 11 Home 10.0.26200) parses no-BOM scripts in the local ANSI code page, not UTF-8. Multi-byte UTF-8 sequences corrupt string literals — this caused a production breakage in v0.7 (commit `e43ca12` was the fix). — salience: high.
-3. **NFR-V9-3 (installer idempotency):** Running `install.sh --yes` or `install.ps1` more than once MUST be a no-op with respect to `~/.claude/settings.json` hook entries and `~/.claude/rules/` file state. No duplicate hook entries. No overwritten operator customisations. — salience: medium.
-4. **NFR-V9-4 (parameterised SQL — no injection vector):** Any SQL filter that incorporates user-supplied tag strings MUST use bound parameters (`?, ?, ...` placeholders). Building a SQL string via `format!()` or string concatenation with user input is PROHIBITED. This applies specifically to the `WHERE tag IN (?,?,...)` pattern in `insight search` and `insight tags`. — salience: high.
-5. **NFR-V9-5 (no new Cargo dependencies):** Wave A MUST introduce zero new entries in `Cargo.toml`. The implementation uses only existing dependencies (`rusqlite`, `serde_json`, `std::fs`). — salience: medium.
-
-### 19.5 Acceptance Criteria
-
-These four criteria are the v0.9 release gate. All must pass before `/merge-ready` is invoked.
-
-| ID | Criterion | Evidence Required |
-|---|---|---|
-| **AC-V9-1** | `claudebase insight create --category project --tags v9-cut-smoke --salience high "Mira test"` succeeds on operator's box AND writes a row to the cwd-local `insights.db`. | Shell stdout (exit 0) + SQL `SELECT count(*) FROM documents WHERE source_type LIKE 'agent-%'` returns ≥1 row after the call. Captured in `docs/qa/evidence/claudebase-v0.9/AC-V9-1-create-stdout.txt` and `AC-V9-1-sql-count.txt`. |
-| **AC-V9-2** | After AC-V9-1's row is inserted, `claudebase insight search "Mira test" --tag v9-cut-smoke --salience high --top-k 3 --json` exits 0 AND the JSON array contains the row inserted by AC-V9-1. | Shell stdout MUST be a non-empty JSON array; one element MUST contain the body substring `Mira test` AND `salience: "high"`; exit code MUST be 0; stderr MUST NOT contain `error: index database invalid`. Captured in `docs/qa/evidence/claudebase-v0.9/AC-V9-2-search-stdout.json`. |
-| **AC-V9-3** | `claudebase insight tags --json` returns the merged tag vocabulary from cwd-local + global DBs, where merged means: union by tag, count = sum across DBs, sorted by `count DESC, tag ASC`. | JSON array of `{"tag": string, "count": integer}` objects; MUST contain `{"tag": "v9-cut-smoke", "count": 1}` after AC-V9-1's row is inserted; sort order verified via jq assertion. Captured in `docs/qa/evidence/claudebase-v0.9/AC-V9-3-tags-stdout.json` and `AC-V9-3-merged-semantics-assertion.txt`. |
-| **AC-V9-4** | `claudebase --version` reports `0.9.0` after running `/update-claudebase` skill AND the `claudebase-v0.9.0` git tag exists with a GitHub release attached. | `git tag --list 'claudebase-v0.9.0'` returns the tag; `gh release view claudebase-v0.9.0` shows a non-draft release with Linux + macOS + Windows binary assets. |
-
-**Backward-compat MANDATE:** AC-V9-1 and AC-V9-2 MUST also pass against operator's existing `insights.db` at `C:\Users\madwh\.claude\knowledge\insights.db` in its current (corrupt) state. The migration MUST either (a) repair the DB in place with rows preserved, OR (b) exit with the literal stderr `error: index database invalid; run \`claudebase ingest --reset\` to recover`. Evidence captured in `docs/qa/evidence/claudebase-v0.9/TC-V9-5-pre-migration-rows.txt` and `TC-V9-5-post-migration-rows.txt`.
-
-### 19.6 Affected Components
-
-**Modified (port-forward — v0.7 source taken wholesale or near-wholesale):**
-
-- `src/store.rs` — BLOCKER: full rewrite of `open_or_init_v2` to the 4-path v1→v5 / v2→v5 / v3→v5 / v4→v5 converging migration (sourced from v0.7 commit `1161570`).
-- `src/cli.rs` — BLOCKER: `InsightCreateArgs` gains required `--category {general|project}` enum and required `--tags <comma-separated>` Vec<String>; new `InsightTagsArgs` + `Tags` enum variant added to `InsightSubcommand`; additional filter flags on `InsightSearchArgs`, `InsightListArgs`, `InsightRandomArgs` (sourced from v0.7 commits `c0eebca` + `afddf71` + `2719e25`).
-- `src/main.rs` — `upsert_project(&cwd)` call at top of `run_claude_with_preset`; new match arm `InsightSubcommand::Tags(a) => run_insight_tags(&a)`; dual-DB call sites for search/list/random/gc/delete.
-- `src/lib.rs` — `pub mod registry;` alphabetic insert.
-- `src/search.rs` — `pub fn rrf_fuse_hits(...)` extraction; `rrf_fuse_corpora()` refactored to 7-line wrapper; dual-DB search call sites (sourced from v0.7 commit `afddf71`).
-- `install.sh` + `install.ps1` — hook-wiring additions for UserPromptSubmit + SessionStart hooks; `prompts/` → `~/.claude/` deploy step.
-- `README.md` — `/update-claudebase` skill banner update.
-- `CHANGELOG.md` — NEW at repo root; `[0.9.0]` block with v0.6+ Telegram work summary + Wave A port-forward summary + KP2/KP3 deferred-evidence note.
-- `Cargo.toml` — version bump `0.6.0` → `0.9.0`.
-- `Cargo.lock` — regen after version bump.
-
-**Created:**
-
-- `src/registry.rs` — project registry (new file, sourced from v0.7 commit `cccef44`).
-- `hooks/claudebase-selfcheck-reminder.sh` + `hooks/claudebase-selfcheck-reminder.ps1`
-- `hooks/claudebase-read-insights-reminder.sh` + `hooks/claudebase-read-insights-reminder.ps1`
-- `hooks/claudebase-insight-capture.sh` + `hooks/claudebase-insight-capture.ps1` (if not already on branch; else modified)
-- `prompts/rules/cognitive-self-check.md`
-- `prompts/rules/knowledge-base.md`
-- `prompts/rules/knowledge-base-tool.md`
-- `prompts/rules/tool-limitations.md`
-- `prompts/commands/update-claudebase.md`
-- `tests/store_v5_test.rs` + `tests/store_global_resolver_test.rs` + `tests/fixtures/synthetic-v{1,2,3,4}.db`
-- `tests/cli_insight_create_args_test.rs` + `tests/cli_insight_create_routing_test.rs`
-- `tests/rrf_fuse_hits_test.rs` + `tests/cli_insight_dual_db_test.rs` + `tests/cli_insight_tags_test.rs`
-- `tests/registry_test.rs`
-- `docs/use-cases/claudebase-v0.9-cut_use_cases.md`
-- `docs/qa/claudebase-v0.9-cut_test_cases.md`
-- `docs/qa/evidence/claudebase-v0.9/` (evidence directory populated by Slice 10)
-- `.github/workflows/release.yml` (if missing)
-
-**Preserved bit-for-bit (frozen — operator directive 2026-06-04):**
-
-- All `src/daemon/*` files modified by the 38 v0.6+ branch commits.
-- `src/plugin/bridge.rs` (target_agent_id filter from commit `0ba2c41`).
-- `src/plugin/mcp.rs` (TOOL_WHITELIST with `chat_ask` + `chat_list_pending_asks`).
-- `src/project_config.rs` (`.claudebase/config.json` from commit `25189bc`).
-- `docs/PRD.md` §18 + §18.10 (multi-agent TG + Slice 8 AR-9 amendment).
-
-### 19.7 Schema Changes
-
-The following SQL DDL constitutes the complete v5 schema delta applied by `apply_v5_delta_and_backfill(tx, db_path)` in `src/store.rs`:
-
-```sql
--- Column additions to documents table (applied via ALTER TABLE — additive)
-ALTER TABLE documents ADD COLUMN category TEXT NOT NULL DEFAULT 'project';
-ALTER TABLE documents ADD COLUMN project_slug TEXT;
-
--- New tags table (ON DELETE CASCADE from documents.id)
-CREATE TABLE IF NOT EXISTS insight_tags (
-    doc_id  INTEGER NOT NULL,
-    tag     TEXT    NOT NULL,
-    PRIMARY KEY (doc_id, tag),
-    FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
-);
-
--- Index on tag column for tag-filter queries
-CREATE INDEX IF NOT EXISTS insight_tags_tag_idx ON insight_tags(tag);
-```
-
-Backfill SQL semantics (executed within the same transaction as the DDL):
-
-```sql
--- Backfill category for all existing rows (agent rows inherit 'project')
-UPDATE documents SET category = 'project' WHERE category IS NULL OR category = '';
-
--- Backfill project_slug from feature_slug where available
-UPDATE documents SET project_slug = feature_slug
-WHERE feature_slug IS NOT NULL AND feature_slug != '';
-
--- Insert one default tag per agent document using feature_slug as tag
--- (rows whose feature_slug IS NULL receive tag 'untagged')
-INSERT OR IGNORE INTO insight_tags (doc_id, tag)
-SELECT id, COALESCE(feature_slug, 'untagged')
-FROM documents
-WHERE source_type LIKE 'agent-%';
-```
-
-These migrations are idempotent: the `ALTER TABLE` statements are guarded by `PRAGMA table_info` column-existence checks before execution; `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` are unconditionally idempotent; the `INSERT OR IGNORE` is idempotent by the primary key constraint.
-
-This schema change applies to `insights.db` files only (both local `<project>/.claude/knowledge/insights.db` and global `~/.claude/knowledge/insights.db`). The `index.db` books corpus, `chat.db`, and `claudebase.db` are unaffected.
-
-### 19.8 Risks and Dependencies
-
-**R-V9-CUT-1 (BLOCKER #1: `src/store.rs` open_or_init_v2 wholesale rewrite).** v0.7's migration logic replaces the v4-only init code with a 4-path v1→v5 converging migration. A line-by-line cherry-pick will not apply cleanly against the 38 v0.6+ branch commits that touch `store.rs`. The mitigation is to take v0.7's `store.rs` wholesale at Slice 1, immediately verify against a copy of operator's actual `insights.db` (NOT a synthetic test DB) as part of the Slice 1 done-condition. The backward-compat MANDATE is satisfied by this verification, not by code-reading the migration body. Salience: high.
-
-**R-V9-CUT-2 (BLOCKER #2: `src/cli.rs` InsightCreateArgs breaking-change).** v0.7 makes `--category` and `--tags` REQUIRED flags. Operator's SDLC config already mandates these flags via UserPromptSubmit hook reminders every prompt turn — the deployed binary is behind the contract agents already expect. The mitigation is that Slice 2 ships in the same release as Slices 6-7 (the hook scripts), so the binary and the hooks align simultaneously. No ecosystem-wide breakage window exists. Salience: high.
-
-**R-V9-CUT-3 (Operator's current `insights.db` is corrupt).** The current state returns `error: index database invalid; re-ingest required` on every `insight create` call (followup #7 from `docs/plans/claudebase-v0.9-product-plan.md` §2). The schema version on disk is unknown without a binary that handles the invalid state. The mitigation is Slice 1's done-condition: the implementer snapshots operator's actual DB to `tests/fixtures/operator-db-snapshot.db` (gitignored, local-only), runs the v0.9 migration against the snapshot, and verifies either (a) rows are preserved + tag/category backfill is correct, OR (b) the literal repair-required stderr message is emitted + exit code is 1. Silent data loss fails the done-condition. Salience: high.
-
-**R-V9-CUT-4 (install.ps1 hook-wiring reconciliation with our `a615d9c` Start-Process daemon block).** The Explore agent #2 verdict on this risk was ADDITIVE: v0.7's hook-wiring additions land in a separate section of `install.ps1` BEFORE the daemon-spawn block; there is no overlap. The mitigation is the Slice 6c implementer applying v0.7's hook-wiring patch on top of the current `install.ps1` and verifying the post-install daemon-spawn block still runs end-to-end. Salience: medium.
-
-**R-V9-CUT-5 (Schema-version assumption — operator's DB might be at v1, not v4).** The v0.6 baseline initialises fresh DBs at schema v4. If the operator's DB pre-dates that install, it could be at v1, v2, or v3. The v0.7 migration handles all four paths to v5, so this is not a real risk — only a verification step in Slice 1. The done-condition's synthetic-fixture pass (which exercises all four entry paths) covers this. Salience: low.
-
-**R-V9-CUT-6 (Wave A code-REUSE directive must not be interpreted as blind cherry-pick).** The operator's directive says "code REUSE, NOT a re-architecture." This means using v0.7's source code as the implementation, not re-deriving the design. However, R-V9-CUT-1 and R-V9-CUT-2 BOTH require deliberate reconciliation — the v0.7 commits cannot be applied mechanically without considering the 38 v0.6+ branch commits. The mitigation is that both BLOCKER slices (1 and 2a) spawn `architect` pre-review gates, so reconciliation is supervised. Salience: medium.
-
-**R-V9-CUT-7 (KP2/KP3 live evidence is pending and ships in v0.9 unverified).** Operator accepted this scope trade-off in the 2026-06-04 scope-cut decision: KP1 LIVE-verified is good enough for v0.9; KP2/KP3 require operator to set up a group with forum topics and 3 CC sessions, which is deferred to v0.10. The mitigation is that the `CHANGELOG.md` `[0.9.0]` entry MUST explicitly state "KP2/KP3 forum-topic routing architecturally complete; live-evidence capture deferred to v0.10." Salience: medium.
-
-## Facts
-
-### Verified facts
-
-- `.claude/plan.md` lines 1–265 read in full this session — source: Read tool call this session — salience: high.
-- `docs/plans/claudebase-v0.9-product-plan.md` lines 1–493 read in full this session — source: Read tool call this session — salience: high.
-- `docs/PRD.md` last top-level section is §18 (confirmed via Grep on `^## §` pattern this session); §19 is the next available section number — source: Grep output `## §18. Multi-Agent Telegram Routing...` at line 783 this session — salience: high.
-- PRD file ends at line 1299 (last content line) per Read offset=1290 limit=10 call this session — source: Read tool call this session — salience: medium.
-- v5 schema delta identifiers (column names, table name, FK constraint, index name) copied verbatim from `.claude/plan.md` §External contracts entry — source: plan.md lines 192–197 this session — salience: high.
-- 4 success criteria (AC-V9-1 through AC-V9-4) copied verbatim from `.claude/plan.md` §Success Criteria table — source: plan.md lines 22–31 this session — salience: high.
-- 7 risks (R-V9-CUT-1 through R-V9-CUT-7) ported from `.claude/plan.md` §Risks & Dependencies — source: plan.md lines 141–149 this session — salience: high.
-- Files Likely Affected list (Modified / Created / Preserved-bit-for-bit) ported from `.claude/plan.md` lines 108–139 this session — salience: medium.
-- The `--with-resources` and role-planner steps are NOT in scope for this PRD-writer invocation (prd-writer only) — source: task prompt from orchestrator this session — salience: low.
-- Knowledge base `index.db` exists at `<project>/.claude/knowledge/index.db` but contains 0 documents (verified via `claudebase status --json --project-root` call this session). Corpus scope relevance: No overlap — task is software-feature specification; no domain books are indexed. Topical queries silently skipped per `~/.claude/rules/knowledge-base-tool.md` § Corpus scope relevance protocol. — salience: low.
-- Insights corpus (`insights.db`) absent in this project workspace; `insight search` queries skipped silently per activation-sentinel rule — salience: low.
-
-### External contracts
-
-- **v5 schema identifiers (commit `1161570` via Explore agent #1 cited in `.claude/plan.md:192–197`):**
-  - column `documents.category TEXT NOT NULL DEFAULT 'project'` — source: `.claude/plan.md:197` — verified: yes (plan.md read this session) — salience: high.
-  - column `documents.project_slug TEXT` — source: `.claude/plan.md:197` — verified: yes — salience: high.
-  - table `insight_tags(doc_id INTEGER NOT NULL, tag TEXT NOT NULL, PRIMARY KEY(doc_id, tag), FOREIGN KEY(doc_id) REFERENCES documents(id) ON DELETE CASCADE)` — source: `.claude/plan.md:197` — verified: yes — salience: high.
-  - index `insight_tags_tag_idx ON insight_tags(tag)` — source: `.claude/plan.md:197` — verified: yes — salience: high.
-- **v0.7 `apply_v5_delta_and_backfill(tx, db_path)` symbol** — source: `.claude/plan.md:192` (Explore agent #1 citation of commit `1161570`) — verified: yes (plan.md read this session) — salience: high.
-- **v0.7 `validate_schema_inner()` extended to `1..=5`** — source: `.claude/plan.md:192` — verified: yes — salience: high.
-- **v0.7 `InsightCreateArgs` REQUIRED `--category <general|project>` + REQUIRED `--tags <comma-separated>` + optional `--project <slug>`** — source: `.clone/plan.md:193` (Explore agent #2 citation of commit `c0eebca`) — verified: yes — salience: high.
-- **v0.7 `src/registry.rs` API symbols:** `pub struct ProjectEntry`, `pub fn upsert_project(root: &Path) -> Result<(), String>`, `pub fn resolve_project_path(slug: &str) -> Option<PathBuf>` — source: `.claude/plan.md:194` (Explore agent #1 citation of commit `cccef44`) — verified: yes — salience: high.
-- **v0.7 hook script paths:** `hooks/claudebase-selfcheck-reminder.{sh,ps1}`, `hooks/claudebase-read-insights-reminder.{sh,ps1}`, `hooks/claudebase-insight-capture.{sh,ps1}` — source: `.claude/plan.md:195` (commits `cb45b4d` + `385efff` + `0b92384` + `e43ca12`) — verified: yes — salience: medium.
-- **v0.7 `/update-claudebase` skill spec** — symbol: skill name `update-claudebase`, protocol "read README → execute install → report version delta" — source: `.claude/plan.md:196` (commit `4bc9a9c`) — verified: yes — salience: medium.
-- **SQLite `INSERT OR IGNORE`** — symbol: `INSERT OR IGNORE INTO insight_tags(doc_id, tag) ...` — standard SQLite conflict-resolution clause — source: standard SQLite docs; idempotency via PRIMARY KEY constraint — verified: yes (standard SQL, no version dependency) — salience: medium.
-- **`rrf_fuse_hits` keyed on `(source_corpus, chunk_id)`** — source: `.claude/plan.md:80` (Slice 3a done-condition) — verified: yes — salience: high.
-
-### Assumptions
-
-- The backfill SQL `COALESCE(feature_slug, 'untagged')` correctly handles the case where `feature_slug` column exists in the v1–v4 schema but some rows have NULL values. Risk: if `feature_slug` column does not exist in v1 schema, the backfill SELECT fails. How to verify: Slice 1 implementer inspects v1 schema via `PRAGMA table_info(documents)` against the synthetic-v1 fixture before running backfill. Salience: medium.
-- The six-step daemon-state preservation contract in FR-V9-8.2 is sufficient for the skill to reliably update the binary. Risk: the daemon `stop` → binary-replace → daemon `start` dance assumes `claudebase daemon stop` blocks until the old process terminates. How to verify: Slice 8 implementer adds a post-stop existence check (poll `daemon status` until it returns `stopped` before binary replace). Salience: medium.
-- The `cp -n` / `Copy-Item -ErrorAction SilentlyContinue` no-clobber semantics for the `prompts/` → `~/.claude/` deploy step will not silently fail on directories vs files. Risk: `cp -n` on a path that is a directory (not a file) may have different behaviour across BSD vs GNU coreutils. How to verify: Slice 6c implementer tests the deploy on both macOS (BSD cp) and Linux (GNU cp) to confirm `-n` works uniformly. Salience: low.
-
-### Open questions
-
-- OQ-V9-CUT-1 (resolved in plan): Slice 1 implementer copies operator's actual DB to `tests/fixtures/operator-db-snapshot.db` (gitignored) for local backward-compat verification. The resolution is recorded in `.claude/plan.md:248`. Salience: medium.
-- OQ-V9-CUT-2: Whether the SessionStart onboarding hook AND the subagent-onboarding hook are already deployed on operator's box. Slice 6 + 7 implementers verify before patching installers. Salience: low.
-- OQ-V9-CUT-3: Operator explicit sign-off that `v0.9.0` is the correct semver label (not `v0.7.0-rebuild` or `v1.0.0`). Recommendation in product plan §7 R-V9-1 is to keep `v0.9.0` and explain via CHANGELOG. Salience: low.
-
-## Decisions
-
-### Inbound validation
-
-- Task received: write PRD §19 from `.claude/plan.md` as source of truth. Challenged: no — the plan is coherent, approved by operator 2026-06-04, and the inbound task description maps 1:1 onto the plan's deliverables checklist entry for the PRD section. No contradiction with §18 found (§19 extends the insights corpus; §18 extends the Telegram routing; different subsystems). Outcome: proceeded. Salience: high.
-- The plan's `### Symptom-only patches` entry acknowledges that the v0.7/v0.8 root cause was not isolated. Protocol 3 check: does executing this PRD section amplify that unresolved root cause? No — the PRD documents the port-forward approach explicitly (FR-V9-1 through FR-V9-9 are all additive, not cover-ups). The risk is documented in R-V9-CUT-1 through R-V9-CUT-7 and in the `### Symptom-only patches` entry of the plan. Outcome: proceeded. Salience: high.
-
-### Decisions made
-
-- Section number §19 chosen (next available after §18). Q1 hack? no | Q2 sane? yes | Q3 alternatives? — no other section numbers available — Q4 cause | Q5 n/a. Salience: low.
-- AC-V9-1 through AC-V9-4 copied verbatim from the implementation plan's `## Success Criteria` table, including the deterministic AC-V9-2 wording with `Mira test` + `v9-cut-smoke` tag. Decision: do not paraphrase ACs — verbatim copy is the only way to ensure the qa-engineer's `/qa-cycle` execution targets the same criterion the planner designed. Q1 hack? no | Q2 sane? yes | Q3 alternatives? paraphrase — rejected (drift risk) | Q4 cause | Q5 n/a. Salience: high.
-- Schema DDL in §19.7 presented as a full SQL block rather than prose description. Decision: implementers and reviewers need the exact DDL; a prose description of column types invites misreading. Q1 hack? no | Q2 sane? yes | Q3 alternatives? prose only — rejected (less precise) | Q4 cause | Q5 n/a. Salience: medium.
-- `COALESCE(feature_slug, 'untagged')` chosen as the backfill tag default for rows with NULL `feature_slug`. Decision: `'untagged'` is a safe explicit sentinel that survives in the tag vocabulary without misleading operators. Alternatives: `''` (empty tag — would contaminate tag vocabulary), `NULL` (impossible — `tag TEXT NOT NULL`), `project_slug` (circular — `project_slug` is also being backfilled in the same transaction). Q1 hack? no | Q2 sane? yes | Q3 alternatives? listed above, all rejected | Q4 cause | Q5 n/a. Salience: medium.
-- Waves B and C deferred to v0.10 per operator directive 2026-06-04. This is an operator scope decision, not a technical decision by prd-writer. Recorded here to make the deferral explicit and reviewable. Salience: high.
-
-### Hacks / workarounds acknowledged
-
-(none — this PRD section documents a principled port-forward of already-shipped v0.7 architecture; no shortcuts taken in the requirements)
-
-### Symptom-only patches (with root-cause links)
-
-- The v0.7/v0.8 root cause of brokenness was not isolated (operator's `docs/plans/claudebase-v0.9-product-plan.md` §1). v0.9 ships from the rebuild branch with v0.7's insights surface ported on top. Symptom: operator's box returns `error: index database invalid; re-ingest required` on every `insight create`. Root cause that remains: unknown (possibly a migration interaction between v0.6 schema and a v0.7 partial-apply, or a pre-existing DB corruption). Tracked at: `.claude/plan.md` §Symptom-only patches + `docs/plans/claudebase-v0.9-product-plan.md` §2 open bug #7. The Slice 1 done-condition (test against operator's actual DB snapshot) is the only verification that the migration correctly handles this specific real-world state. Salience: high.
+This section specified the insights corpus of v0.9 (schema v5, `insight create / search / tags`, the
+read-insights and insight-capture hooks). All of it was retired with §16; see there.
 
 ---
 
@@ -1680,7 +1387,7 @@ Backfill: existing rows receive `NULL` for all five new columns. Legacy rows whe
 
 The `chat_messages` table is unchanged by this migration. The column name is `thread_id` (verified at `src/daemon/chat.rs:431` — `thread_id TEXT NOT NULL`); agent-to-agent messages insert with `thread_id = 'agent:<to_agent_id>'`.
 
-This schema change applies to `chat.db` (the daemon's operational database). `index.db` (books corpus), `insights.db` (agent insights), and `claudebase.db` are unaffected.
+This schema change applies to `chat.db` (the daemon's operational database). `index.db` (books corpus) and `claudebase.db` are unaffected.
 
 ### 20.8 Out of Scope (this feature)
 

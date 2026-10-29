@@ -10,7 +10,7 @@
 //!   filesystem checks (model file presence + sha). Powers
 //!   `daemon doctor --asr`.
 //!
-//! The trait uses `#[async_trait]` (architect insight #11): native
+//! The trait uses `#[async_trait]` (architect decision): native
 //! `async fn` in traits creates Send-bound friction at `dyn Asr`
 //! boundaries — the macro returns `Pin<Box<dyn Future + Send>>` which
 //! sidesteps the issue. The one-heap-alloc-per-call cost is acceptable

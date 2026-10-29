@@ -15,7 +15,7 @@ NOT `#[tokio::main]`). The tokio runtime is constructed lazily inside
 `crate::daemon::run_tokio()` helper, and ONLY for those two CLI arms.
 
 Why: every other CLI subcommand (`ingest`, `search`, `list`, `status`,
-`page`, `insight ...`) is fully synchronous. Turning `main` into
+`page`, `journal ...`) is fully synchronous. Turning `main` into
 `#[tokio::main]` would force the entire binary to bootstrap the
 multi-thread runtime even for `claudebase --version`, wasting startup
 time and forcing every subcommand to deal with tokio context where none

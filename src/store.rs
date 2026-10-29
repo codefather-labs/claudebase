@@ -9,7 +9,7 @@
 //!
 //! `open_or_init` opens the SQLite file (creating its parent dirs as needed),
 //! flips `journal_mode` to WAL (NFR-1.6 / FR-2.7), and runs the v1 schema.
-//! `validate_schema` confirms the four-table shape and `schema_version=1`.
+//! `validate_schema` confirms the four-table shape and a known `schema_version`.
 
 use std::path::Path;
 use std::sync::Once;
@@ -171,78 +171,36 @@ CREATE TABLE IF NOT EXISTS pages (
 CREATE INDEX IF NOT EXISTS pages_doc_page_idx ON pages(doc_id, page_no);
 "#;
 
-/// V4 schema delta — agent-insights metadata. Additive and non-destructive.
-///
-/// Adds six nullable columns to `documents` so the same SQLite shape can host
-/// either the user-curated books corpus (all metadata NULL, today's behavior)
-/// or the new agent-written insights corpus (metadata populated by
-/// `claudebase remember`). Books-corpus rows remain unaffected; back-compat
-/// preserved via the NULL default on every new column.
-///
-/// Columns:
-///   - `source_type`     — enum of the insight kind (e.g. reflection-observation,
-///                         consolidator-drift, red-team-objection, decision-record,
-///                         assumption-log, hack-acknowledged). NULL for book docs.
-///   - `agent_name`      — emitting SDLC agent (planner, reflection, etc.).
-///   - `session_id`      — Claude Code session UUID for trace linking.
-///   - `feature_slug`    — feature this insight belongs to (matches `.claude/plan.md` feature).
-///   - `salience`        — `high` | `medium` | `low` per cognitive-self-check rule;
-///                         drives retention (high=∞, medium=1y, low=90d).
-///   - `parent_artifact` — file path of the artifact the insight was extracted from.
-///
-/// Indexes on the four filter columns most likely to appear in `claudebase recall`
-/// WHERE clauses (source_type / agent_name / feature_slug / salience).
-///
-/// SQL discipline: static `&str` literal, no user-data interpolation.
-const SCHEMA_V4_DELTA: &str = r#"
-ALTER TABLE documents ADD COLUMN source_type     TEXT;
-ALTER TABLE documents ADD COLUMN agent_name      TEXT;
-ALTER TABLE documents ADD COLUMN session_id      TEXT;
-ALTER TABLE documents ADD COLUMN feature_slug    TEXT;
-ALTER TABLE documents ADD COLUMN salience        TEXT;
-ALTER TABLE documents ADD COLUMN parent_artifact TEXT;
-CREATE INDEX IF NOT EXISTS idx_documents_source_type ON documents(source_type);
-CREATE INDEX IF NOT EXISTS idx_documents_agent_name  ON documents(agent_name);
-CREATE INDEX IF NOT EXISTS idx_documents_feature     ON documents(feature_slug);
-CREATE INDEX IF NOT EXISTS idx_documents_salience    ON documents(salience);
+/// The schema version a current index carries. v4 and v5 added columns and a
+/// tag table for the agent-insights corpus; that corpus became the project
+/// journal (`journal.rs`), so v6 is the v3 shape again with those objects
+/// dropped from any index that still has them.
+pub const SCHEMA_VERSION: i64 = 6;
+
+/// What v4/v5 added for insights, dropped on the way to v6. Indexes go
+/// before the columns they cover: SQLite refuses to drop an indexed column.
+const DROP_INSIGHTS: &str = r#"
+DROP INDEX IF EXISTS idx_documents_source_type;
+DROP INDEX IF EXISTS idx_documents_agent_name;
+DROP INDEX IF EXISTS idx_documents_feature;
+DROP INDEX IF EXISTS idx_documents_salience;
+DROP INDEX IF EXISTS idx_documents_category;
+DROP INDEX IF EXISTS idx_insight_tags_tag;
+DROP TABLE IF EXISTS insight_tags;
 "#;
 
-/// V5 schema delta — insights-hybrid-corpus categorization + normalized tags.
-/// Additive and non-destructive (FR-IHC-1.1..1.3).
-///
-/// Adds two nullable columns to `documents` so an insight row can record which
-/// corpus it belongs to and which project it came from:
-///   - `category`     — `general` | `project` for insight rows; NULL for books
-///                      rows (the books corpus never carries a category).
-///   - `project_slug` — basename of the per-project db path the insight was
-///                      written against; NULL for general insights + books rows.
-///
-/// Adds a normalized many-to-one tags table so a single insight can carry
-/// several tags without a delimited blob in the documents row:
-///   - `insight_tags(doc_id, tag)` — UNIQUE(doc_id, tag) dedups repeated tags;
-///     ON DELETE CASCADE so deleting an insight removes its tags.
-///
-/// Two indexes back the most common WHERE/JOIN filters:
-///   - `idx_documents_category` on documents(category)
-///   - `idx_insight_tags_tag`   on insight_tags(tag)
-///
-/// Books-corpus rows (`source_path NOT LIKE 'agent:%'`) are untouched by this
-/// delta — `category` defaults to NULL and no `insight_tags` rows are created
-/// for them. See `open_or_init_v2`'s v4→5 branch for the backfill that only
-/// targets insight rows.
-///
-/// SQL discipline: static `&str` literal, no user-data interpolation.
-const SCHEMA_V5_DELTA: &str = r#"
-ALTER TABLE documents ADD COLUMN category     TEXT;
-ALTER TABLE documents ADD COLUMN project_slug TEXT;
-CREATE INDEX IF NOT EXISTS idx_documents_category ON documents(category);
-CREATE TABLE IF NOT EXISTS insight_tags (
-  doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-  tag    TEXT NOT NULL,
-  UNIQUE(doc_id, tag)
-);
-CREATE INDEX IF NOT EXISTS idx_insight_tags_tag ON insight_tags(tag);
-"#;
+/// The insight columns of `documents`, each with its static DROP statement
+/// (SQL stays literal, see the module docs).
+const INSIGHT_COLUMNS: [(&str, &str); 8] = [
+    ("source_type", "ALTER TABLE documents DROP COLUMN source_type"),
+    ("agent_name", "ALTER TABLE documents DROP COLUMN agent_name"),
+    ("session_id", "ALTER TABLE documents DROP COLUMN session_id"),
+    ("feature_slug", "ALTER TABLE documents DROP COLUMN feature_slug"),
+    ("salience", "ALTER TABLE documents DROP COLUMN salience"),
+    ("parent_artifact", "ALTER TABLE documents DROP COLUMN parent_artifact"),
+    ("category", "ALTER TABLE documents DROP COLUMN category"),
+    ("project_slug", "ALTER TABLE documents DROP COLUMN project_slug"),
+];
 
 /// Open (or create) the SQLite database at `db_path` with v2 schema enabled.
 /// Loads the sqlite-vec extension at connection-open time (architect OQ-2
@@ -250,9 +208,11 @@ CREATE INDEX IF NOT EXISTS idx_insight_tags_tag ON insight_tags(tag);
 /// rusqlite's `load_extension` feature, preserving the security posture).
 ///
 /// Migration semantics for existing DBs:
-///   - Fresh DB (schema_version absent): apply SCHEMA_V1 + SCHEMA_V2_DELTA, stamp version=2
+///   - Fresh DB (schema_version absent): apply SCHEMA_V1 + V2 + V3, stamp version=6
 ///   - schema_version=1: caller MUST run `migrations::migrate_v1_to_v2` (destructive re-ingest)
-///   - schema_version=2: idempotent no-op (CREATE ... IF NOT EXISTS clauses)
+///   - schema_version=2..=5: brought to v6 in one transaction (v3 objects added,
+///     the insight objects of v4/v5 dropped); books rows keep their data
+///   - schema_version=6: idempotent re-open
 ///
 /// Returns the connection on success. Caller is responsible for invoking
 /// migration if the DB is at v1 and needs upgrading.
@@ -269,223 +229,89 @@ pub fn open_or_init_v2(db_path: &Path) -> Result<Connection, StoreError> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.execute_batch(SCHEMA_V1)?;
-    // Apply v2 delta only on fresh DBs (no schema_version row) OR when
-    // schema_version=2 (idempotent CREATE IF NOT EXISTS for chunks_vec; the
-    // ALTER TABLE statements would error on re-run for v2-already DBs, so we
-    // gate them via current_version).
     let v: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
         .unwrap_or(0);
     if v == 0 {
-        // Fresh DB — apply v2 + v3 + v4 + v5 deltas and stamp version=5.
         conn.execute_batch(SCHEMA_V2_DELTA)?;
         conn.execute_batch(SCHEMA_V3_DELTA)?;
-        conn.execute_batch(SCHEMA_V4_DELTA)?;
-        conn.execute_batch(SCHEMA_V5_DELTA)?;
         conn.execute(
             "INSERT INTO schema_version(version) VALUES (?1)",
-            rusqlite::params![5i64],
+            rusqlite::params![SCHEMA_VERSION],
         )?;
-    } else if v == 2 {
-        // v2 → v4 progression. Additive + non-destructive: page columns +
-        // pages table from v3, then the six agent-insights metadata columns
-        // from v4. Existing chunks keep NULL page_start/page_end + NULL
-        // insights metadata (pages table is empty until `claudebase
-        // reindex-pages` runs; insights metadata stays NULL on books-corpus
-        // rows). Then carry through v4→v5 (category/project_slug columns +
-        // insight_tags table + backfill) so a v2 db converges on v5 in one
-        // open. Wrap in a transaction so a partially-failed v2→v5 rolls back.
-        let tx = conn.transaction()?;
-        tx.execute_batch(SCHEMA_V3_DELTA)?;
-        tx.execute_batch(SCHEMA_V4_DELTA)?;
-        apply_v5_delta_and_backfill(&tx, db_path)?;
-        tx.commit()?;
-    } else if v == 3 {
-        // Already at v3 — ensure forward-compat objects exist (CREATE IF NOT
-        // EXISTS for both vec0 and pages so a corruption-free re-open is
-        // idempotent).
-        //
-        // Legacy v3 shape (Slice 12 first iteration before merge with main):
-        // pages had `page_num` column instead of `page_no`. Detect that shape
-        // and rename the column in-place — SQLite 3.25+ supports
-        // `ALTER TABLE ... RENAME COLUMN`. The data (doc_id, page_text) is
-        // schema-equivalent so the rename is a no-data-loss operation.
-        let has_page_num: bool = conn
-            .query_row(
-                "SELECT 1 FROM pragma_table_info('pages') WHERE name = 'page_num'",
-                [],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
-        if has_page_num {
-            conn.execute_batch(
-                "ALTER TABLE pages RENAME COLUMN page_num TO page_no; \
-                 DROP INDEX IF EXISTS idx_pages_doc;",
-            )?;
+    } else if (2..SCHEMA_VERSION).contains(&v) {
+        if v >= 3 {
+            converge_v3(&conn)?;
         }
-        conn.execute_batch(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(embedding float[384]); \
-             CREATE TABLE IF NOT EXISTS pages ( \
-               id INTEGER PRIMARY KEY, \
-               doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, \
-               page_no INTEGER NOT NULL, \
-               text TEXT NOT NULL, \
-               UNIQUE(doc_id, page_no) \
-             ); \
-             CREATE INDEX IF NOT EXISTS pages_doc_page_idx ON pages(doc_id, page_no);",
-        )?;
-        // v3 → v5 progression. Apply the agent-insights metadata columns +
-        // indexes (v4), then category/project_slug + insight_tags + backfill
-        // (v5) so a v3 db converges on v5 in one open. Additive + non-
-        // destructive on the books corpus: rows that existed at v3 stay valid;
-        // the v4/v5 columns are NULL on all books rows.
         let tx = conn.transaction()?;
-        tx.execute_batch(SCHEMA_V4_DELTA)?;
-        apply_v5_delta_and_backfill(&tx, db_path)?;
-        tx.commit()?;
-    } else if v == 4 {
-        // v4 → v5 upgrade. Before applying the v5 delta we defensively ensure
-        // every v4 column exists (a partially-failed prior v4 migration could
-        // have left version=4 stamped without all six columns; the v5 backfill
-        // references `feature_slug`, so it must exist first). `ALTER TABLE ...
-        // ADD COLUMN` is not idempotent natively — probe pragma and add only
-        // the missing ones.
-        let v4_cols = [
-            "source_type", "agent_name", "session_id",
-            "feature_slug", "salience", "parent_artifact",
-        ];
-        for col in v4_cols {
-            let exists: bool = conn
-                .query_row(
-                    "SELECT 1 FROM pragma_table_info('documents') WHERE name = ?1",
-                    rusqlite::params![col],
-                    |_| Ok(true),
-                )
-                .unwrap_or(false);
-            if !exists {
-                let stmt = format!("ALTER TABLE documents ADD COLUMN {col} TEXT");
-                conn.execute_batch(&stmt)?;
-            }
+        if v == 2 {
+            tx.execute_batch(SCHEMA_V3_DELTA)?;
         }
-        conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_documents_source_type ON documents(source_type); \
-             CREATE INDEX IF NOT EXISTS idx_documents_agent_name  ON documents(agent_name); \
-             CREATE INDEX IF NOT EXISTS idx_documents_feature     ON documents(feature_slug); \
-             CREATE INDEX IF NOT EXISTS idx_documents_salience    ON documents(salience);",
-        )?;
-        // Apply the v5 delta + insight-row backfill transactionally so a
-        // partially-failed v4→v5 rolls back cleanly.
-        let tx = conn.transaction()?;
-        apply_v5_delta_and_backfill(&tx, db_path)?;
+        drop_insights(&tx)?;
+        tx.execute("UPDATE schema_version SET version = ?1", rusqlite::params![SCHEMA_VERSION])?;
         tx.commit()?;
-    } else if v == 5 {
-        // Already at v5 — idempotent re-open. A partially-failed prior v4→v5
-        // migration could have left version=5 stamped without the two columns
-        // or the insight_tags table; probe each and add the missing ones.
-        // `ALTER TABLE ... ADD COLUMN` is not idempotent natively, so we probe
-        // pragma first (mirrors the v4 probe loop above).
-        let v5_cols = ["category", "project_slug"];
-        for col in v5_cols {
-            let exists: bool = conn
-                .query_row(
-                    "SELECT 1 FROM pragma_table_info('documents') WHERE name = ?1",
-                    rusqlite::params![col],
-                    |_| Ok(true),
-                )
-                .unwrap_or(false);
-            if !exists {
-                let stmt = format!("ALTER TABLE documents ADD COLUMN {col} TEXT");
-                conn.execute_batch(&stmt)?;
-            }
-        }
-        // insight_tags table + both indexes are CREATE ... IF NOT EXISTS, so
-        // re-creating them is a safe idempotent converge for a partial prior
-        // migration that added columns but skipped the table/indexes.
-        conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_documents_category ON documents(category); \
-             CREATE TABLE IF NOT EXISTS insight_tags ( \
-               doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, \
-               tag    TEXT NOT NULL, \
-               UNIQUE(doc_id, tag) \
-             ); \
-             CREATE INDEX IF NOT EXISTS idx_insight_tags_tag ON insight_tags(tag);",
-        )?;
     }
     // v == 1: caller runs migrate_v1_to_v2 explicitly. We don't auto-migrate
     // here because migration is destructive (architect-resolved).
     Ok(conn)
 }
 
-/// Derive the `project_slug` value backfilled into v5 insight rows from the
-/// db path. We use the basename of the db file's grand-parent directory —
-/// i.e. the project root name — falling back to the file stem, then to the
-/// literal `"unknown"` so the column is never NULL for an `agent:%` row.
+/// A v3+ index: make sure the v3 objects exist (CREATE IF NOT EXISTS, so a
+/// re-open is idempotent).
 ///
-/// Example: `/Users/x/proj/.claude/knowledge/insights.db` → `"proj"`
-/// (`.claude/knowledge/insights.db` ⇒ walk up three components to `proj`).
-/// A bare `insights.db` with no project ancestry → `"insights"` (file stem).
-fn derive_project_slug(db_path: &Path) -> String {
-    // .../<proj>/.claude/knowledge/insights.db
-    //                    ^knowledge ^.claude  ^<proj>
-    db_path
-        .parent() // knowledge
-        .and_then(|p| p.parent()) // .claude
-        .and_then(|p| p.parent()) // <proj>
-        .and_then(|p| p.file_name())
-        .map(|s| s.to_string_lossy().into_owned())
-        .or_else(|| {
-            db_path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-        })
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
+/// Legacy v3 shape (Slice 12 first iteration before merge with main): pages
+/// had `page_num` instead of `page_no`. Detect that shape and rename the
+/// column in place — SQLite 3.25+ supports `ALTER TABLE ... RENAME COLUMN`;
+/// the data is schema-equivalent, so nothing is lost.
+fn converge_v3(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_page_num: bool = conn
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('pages') WHERE name = 'page_num'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if has_page_num {
+        conn.execute_batch(
+            "ALTER TABLE pages RENAME COLUMN page_num TO page_no; \
+             DROP INDEX IF EXISTS idx_pages_doc;",
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(embedding float[384]); \
+         CREATE TABLE IF NOT EXISTS pages ( \
+           id INTEGER PRIMARY KEY, \
+           doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, \
+           page_no INTEGER NOT NULL, \
+           text TEXT NOT NULL, \
+           UNIQUE(doc_id, page_no) \
+         ); \
+         CREATE INDEX IF NOT EXISTS pages_doc_page_idx ON pages(doc_id, page_no);",
+    )
 }
 
-/// Apply the V5 schema delta + insight-row backfill within an open transaction,
-/// then stamp `schema_version = 5`. Shared by the v2/v3/v4 upgrade branches so
-/// any pre-v5 db converges on v5 in a single open — the backfill SQL lives in
-/// exactly one place.
-///
-/// Backfill semantics (FR-IHC-1.5, FR-IHC-1.6):
-///   - Only `documents` rows whose `source_path LIKE 'agent:%'` (the insight
-///     rows) are touched. Books-corpus rows are left with `category IS NULL`
-///     and zero `insight_tags` rows.
-///   - `category` ⇒ `'project'` (existing local insights are project-scoped).
-///   - `project_slug` ⇒ db-path-derived basename (see `derive_project_slug`).
-///     Guarded by `category IS NULL` so a re-run is a no-op on already-tagged
-///     rows.
-///   - One default tag per insight ⇒ `COALESCE(NULLIF(feature_slug,''),'untagged')`.
-///     `INSERT OR IGNORE` so the `UNIQUE(doc_id, tag)` constraint silently
-///     dedups on re-run / partial-prior-migration.
-///
-/// SQL discipline: `project_slug` value is parameterized (`?1`); every other
-/// statement is a static literal with no user-data interpolation.
-fn apply_v5_delta_and_backfill(
-    tx: &rusqlite::Transaction<'_>,
-    db_path: &Path,
-) -> Result<(), rusqlite::Error> {
-    tx.execute_batch(SCHEMA_V5_DELTA)?;
-    let slug = derive_project_slug(db_path);
-    tx.execute(
-        "UPDATE documents SET category = 'project', project_slug = ?1 \
-         WHERE source_path LIKE 'agent:%' AND category IS NULL",
-        rusqlite::params![slug],
-    )?;
-    tx.execute_batch(
-        "INSERT OR IGNORE INTO insight_tags(doc_id, tag) \
-         SELECT id, COALESCE(NULLIF(feature_slug, ''), 'untagged') \
-         FROM documents WHERE source_path LIKE 'agent:%';",
-    )?;
-    tx.execute(
-        "UPDATE schema_version SET version = ?1",
-        rusqlite::params![5i64],
-    )?;
+/// Drop whatever of the v4/v5 insight objects this index has: a v4 index has
+/// no v5 columns, and a partially-failed old migration may have left any
+/// subset, so each column is probed before it is dropped.
+fn drop_insights(tx: &rusqlite::Transaction<'_>) -> Result<(), rusqlite::Error> {
+    tx.execute_batch(DROP_INSIGHTS)?;
+    for (col, drop) in INSIGHT_COLUMNS {
+        let exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('documents') WHERE name = ?1",
+                rusqlite::params![col],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if exists {
+            tx.execute_batch(drop)?;
+        }
+    }
     Ok(())
 }
 
-/// Confirm the four expected objects exist, `schema_version` row is in `1..=2`
-/// (forward-compat for iter-2), and `chunks_fts` is an FTS5 virtual table.
+/// Confirm the four expected objects exist, `schema_version` row is in
+/// `1..=SCHEMA_VERSION`, and `chunks_fts` is an FTS5 virtual table.
 ///
 /// Returns `IndexError::Corrupt` on ANY structural mismatch — including raw
 /// rusqlite errors raised during the probe (a truncated database file, a file
@@ -541,13 +367,9 @@ fn validate_schema_inner(conn: &Connection) -> Result<(), rusqlite::Error> {
         return Err(rusqlite::Error::QueryReturnedNoRows);
     }
 
-    // schema_version row exists and is in 1..=5 (forward-compat through v5
-    // insights-hybrid-corpus categorization — documents.category /
-    // project_slug + the insight_tags table). v4 added the agent-insights
-    // metadata columns (source_type / agent_name / session_id / feature_slug /
-    // salience / parent_artifact).
+    // schema_version row exists and is a version this binary knows.
     let v: i64 = conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))?;
-    if !(1..=5).contains(&v) {
+    if !(1..=SCHEMA_VERSION).contains(&v) {
         return Err(rusqlite::Error::QueryReturnedNoRows);
     }
 

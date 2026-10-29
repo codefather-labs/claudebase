@@ -37,7 +37,7 @@ Long text goes on stdin: `claudebase journal add - --category decision --tag x <
 
 What counts:
 
-- **decision** — a choice between alternatives: what was chosen, why, what was rejected and why.
+- **decision** — a choice between alternatives, made by the operator or by you; every one gets its own entry: who decided, what was chosen, why, what was rejected and why.
 - **finding** — something learned about the code, a system, a tool or the domain that was not obvious: a cause found, a constraint discovered, a behaviour verified.
 - **bug** — a defect found: symptom, cause, where, whether fixed.
 - **assumption-falsified** — something believed that turned out wrong, and what is true instead.
@@ -80,6 +80,8 @@ Rules for the branch:
 - **Evidence or nothing.** If the protocol fails, the branch stays open. Fix the code, add a new implementation entry, verify again.
 - **Never flag `--verified` without having run the checks**, and never with only a claim ("works", "tested"). Reviewers trust that flag.
 - **Work that is dropped** closes with a reason instead of evidence: `claudebase journal close T --abandon --resolution "<why>"`.
+
+**A bug is a branch too.** Every bug you find gets its own entry the moment you find it, flagged `--todo` so the fix hangs from it: `journal add "<symptom, cause, where>" --category bug --todo` (#B). The fix is a separate entry, `"Fixes journal#B: … Verification protocol: …" --unverified` (#F). Prove it, then `"Verifies journal#F: <what was run, its output>" --verified`, and `journal close B`.
 
 ## Sharing a journal between folders
 
@@ -127,6 +129,7 @@ claudebase journal unmark 37 --important
 ```
 
 - Read `journal agenda` on a fresh context window. Constraints are binding.
+- Flag important remarks and findings `--important`, and product or technical rules, policies and constraints `--constraint`, when you write them.
 - Never act on a `deprecated` entry. Treat an `unverified` or `disputed` one as an assumption.
 - When an entry stops being true, mark it `--deprecated` and cite it from the entry that replaces it.
 - When you settle a question, fix a problem or finish a todo that has an entry, close it with a `--resolution` that says how. Reopen it if it comes back.

@@ -54,18 +54,16 @@ fn pragma_journal_mode_is_wal() {
 }
 
 #[test]
-fn schema_version_is_five_on_fresh_v2_db() {
-    // insights-hybrid-corpus Slice 1: open_or_init_v2 applies SCHEMA_V1 + V2 +
-    // V3 + V4 + V5 deltas and stamps version=5 on a fresh DB (sqlite-vec + page
-    // columns + pages table + agent-insights metadata columns + insights
-    // categorization columns + insight_tags table all installed in one shot).
+fn schema_version_is_current_on_fresh_v2_db() {
+    // open_or_init_v2 applies SCHEMA_V1 + V2 + V3 on a fresh DB and stamps
+    // the current version.
     let tmp = tempfile::tempdir().expect("tempdir");
     let db_path = tmp.path().join("index.db");
     let conn = store::open_or_init_v2(&db_path).expect("open_or_init_v2");
     let v: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
         .expect("read schema_version");
-    assert_eq!(v, 5);
+    assert_eq!(v, claudebase::store::SCHEMA_VERSION);
 }
 
 #[test]

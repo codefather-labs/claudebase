@@ -335,7 +335,7 @@ async fn test_telegram_restart_window_deduped() -> Result<()> {
     // This test will validate:
     // - Atomic transaction wrapping (message_insert + daemon_state UPDATE) per directive 7
     // - Offset checkpoint correctly prevents duplicate delivery
-    // - No unique constraint needed on (thread_id, telegram_message_id) — insight #9
+    // - No unique constraint needed on (thread_id, telegram_message_id)
     //   Instead: relies on transactional offset-advance to skip already-processed messages
 
     Ok(())

@@ -119,7 +119,8 @@ WHAT GETS INSTALLED:
                                             /claudebase-setup-claude-token,
                                             /claudebase-journal-share
   ~/.claude/hooks/claudebase-channel-contract.sh   SessionStart - how outside messages arrive
-  ~/.claude/hooks/claudebase-journal-reminder.sh   SessionStart - read and keep the project journal
+  ~/.claude/hooks/claudebase-journal-reminder.sh   SessionStart - read and keep the project journal;
+                                            UserPromptSubmit - the journaling policy
   ~/.claude/hooks/claudebase-selfcheck-reminder.sh UserPromptSubmit - self-check reminder
   ~/.claude/hooks/claudebase-agent-routing-reminder.sh  PreToolUse:EnterPlanMode - peers exist
   ~/.claude/hooks/claudebase-feature-describe.sh   PostToolUse:ExitPlanMode - publish the plan
@@ -131,8 +132,7 @@ WHAT GETS INSTALLED:
                                             typescript-lsp, so agents get call hierarchy and references
 
 WHAT IS *REMOVED* (reverse migration, idempotent):
-  the old Stop[insight-capture] and SessionStart[read-insights] hooks, the
-  claudebase patch inside the official Anthropic Telegram plugin, and the
+  the claudebase patch inside the official Anthropic Telegram plugin, and the
   retired claudebase@claudebase-dev marketplace.
 
 AFTER INSTALLING:
@@ -504,6 +504,10 @@ EOF
 #     agent responds, injects a SHORT agent-only reminder of the three
 #     cognitive-self-check protocols (the rule it reminds about,
 #     cognitive-self-check.md, ships from claudebase too).
+#   - UserPromptSubmit -> claudebase-journal-reminder.sh again — the same hook
+#     reads the event and gives only the operator's journaling policy (bug ->
+#     fix unverified -> verified evidence, important, constraint); pool workers
+#     get nothing.
 #
 # Idempotent — jq merge is by command-string equality, so re-running never
 # duplicates an entry.
@@ -513,12 +517,6 @@ install_claudebase_hooks() {
   local settings="$CLAUDE_DIR/settings.json"
 
   mkdir -p "$hooks_dir"
-
-  # Remove retired hook files: the Stop insight-capture hook (superseded by the
-  # UserPromptSubmit reminder) and the read-insights reminder (superseded by the
-  # journal reminder when insights became the journal).
-  rm -f "$hooks_dir/claudebase-insight-capture.sh" "$hooks_dir/claudebase-insight-capture.ps1"
-  rm -f "$hooks_dir/claudebase-read-insights-reminder.sh" "$hooks_dir/claudebase-read-insights-reminder.ps1"
 
   local hook_files=(claudebase-selfcheck-reminder.sh claudebase-selfcheck-reminder.ps1 claudebase-journal-reminder.sh claudebase-journal-reminder.ps1 claudebase-agent-routing-reminder.sh claudebase-agent-routing-reminder.ps1 claudebase-feature-describe.sh claudebase-feature-describe.ps1 claudebase-channel-contract.sh claudebase-channel-contract.ps1)
   for hook in "${hook_files[@]}"; do
@@ -542,15 +540,13 @@ install_claudebase_hooks() {
   if ! command -v jq >/dev/null 2>&1; then
     log_warn "jq required for settings.json hook merge — add manually:"
     log_warn '  hooks.UserPromptSubmit[*].hooks[*].command = ~/.claude/hooks/claudebase-selfcheck-reminder.sh'
+    log_warn '  hooks.UserPromptSubmit[*].hooks[*].command = ~/.claude/hooks/claudebase-journal-reminder.sh'
     log_warn '  hooks.SessionStart[*].hooks[*].command = ~/.claude/hooks/claudebase-journal-reminder.sh'
     log_warn '  hooks.SessionStart[*].hooks[*].command = ~/.claude/hooks/claudebase-channel-contract.sh'
-    log_warn '  (and remove any hook entry pointing at claudebase-insight-capture.sh or claudebase-read-insights-reminder.sh)'
     return 0
   fi
 
-  local stop_cmd="$HOME/.claude/hooks/claudebase-insight-capture.sh"
   local selfcheck_cmd="$HOME/.claude/hooks/claudebase-selfcheck-reminder.sh"
-  local readins_cmd="$HOME/.claude/hooks/claudebase-read-insights-reminder.sh"
   local journal_cmd="$HOME/.claude/hooks/claudebase-journal-reminder.sh"
   local routing_cmd="$HOME/.claude/hooks/claudebase-agent-routing-reminder.sh"
   local describe_cmd="$HOME/.claude/hooks/claudebase-feature-describe.sh"
@@ -560,43 +556,30 @@ install_claudebase_hooks() {
   local channel_cmd="$HOME/.claude/hooks/claudebase-channel-contract.sh"
   local tmp; tmp="$(mktemp)"
 
-  # (1) Ensure .hooks.UserPromptSubmit has exactly one matcher block with our
-  #     command. (2) Actively UNWIRE the retired Stop insight-capture hook:
-  #     drop matcher blocks whose only command was claudebase-insight-capture,
-  #     and remove that command from any shared block. Foreign matchers stay.
-  # (3) Idempotently wire the SessionStart journal reminder, and unwire the
-  #     read-insights reminder it replaced. Match by
-  #     command-string equality across ALL SessionStart blocks (foreign blocks
-  #     and the SDLC onboarding block are preserved). The official SessionStart
-  #     shape nests command under a matcher block: {matcher, hooks[{type,command}]}.
+  # Each hook is wired once per event, matched by command-string equality
+  # across ALL blocks of that event, so foreign blocks (the SDLC onboarding
+  # one included) are preserved. The official SessionStart shape nests the
+  # command under a matcher block: {matcher, hooks[{type,command}]}.
   if jq \
-      --arg stop_cmd "$stop_cmd" \
       --arg selfcheck_cmd "$selfcheck_cmd" \
-      --arg readins_cmd "$readins_cmd" \
       --arg journal_cmd "$journal_cmd" \
       --arg routing_cmd "$routing_cmd" \
       --arg describe_cmd "$describe_cmd" \
       --arg channel_cmd "$channel_cmd" \
       '
       .hooks //= {}
-      | .hooks.Stop //= []
       | .hooks.UserPromptSubmit //= []
-      | .hooks.Stop |=
-          (if any(.[]?; (.hooks // []) | any(.command == $stop_cmd))
-           then .
-           else . + [{"hooks": [{"type": "command", "command": $stop_cmd}]}]
-           end)
       | .hooks.UserPromptSubmit |=
           (if any(.[]?; (.hooks // []) | any(.command == $selfcheck_cmd))
            then .
            else . + [{"hooks": [{"type": "command", "command": $selfcheck_cmd}]}]
            end)
+      | .hooks.UserPromptSubmit |=
+          (if any(.[]?; (.hooks // []) | any(.command == $journal_cmd))
+           then .
+           else . + [{"hooks": [{"type": "command", "command": $journal_cmd}]}]
+           end)
       | .hooks.SessionStart //= []
-      | .hooks.SessionStart |=
-          (map(if (.hooks | type) == "array"
-               then (.hooks |= map(select(.command != $readins_cmd)))
-                    | select(.hooks | length > 0)
-               else . end))
       | .hooks.SessionStart |=
           (if any(.[]?; (.hooks // []) | any(.command == $journal_cmd))
            then .
@@ -624,19 +607,12 @@ install_claudebase_hooks() {
            then .
            else . + [{"matcher": "ExitPlanMode", "hooks": [{"type": "command", "command": $describe_cmd}]}]
            end)
-      | (if (.hooks.Stop // []) | length > 0 then
-           .hooks.Stop |= (
-             map(.hooks |= (map(select(.command != $stop_cmd))))
-             | map(select((.hooks // []) | length > 0))
-           )
-         else . end)
-      | (if (.hooks.Stop // []) | length == 0 then del(.hooks.Stop) else . end)
       ' \
       "$settings" > "$tmp" 2>/dev/null \
      && jq -e . "$tmp" >/dev/null 2>&1; then
     mv "$tmp" "$settings"
     chmod 0644 "$settings"
-    log_ok "settings.json (UserPromptSubmit[selfcheck] + SessionStart[journal,channel-contract] wired; retired Stop[insight-capture] + SessionStart[read-insights] unwired)"
+    log_ok "settings.json (UserPromptSubmit[selfcheck,journal] + SessionStart[journal,channel-contract] wired)"
   else
     rm -f "$tmp"
     log_warn "settings.json hook merge failed; please add manually"

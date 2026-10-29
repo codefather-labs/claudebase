@@ -6,6 +6,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **The journaling policy rides every prompt.** The journal reminder hook now also fires on
+  UserPromptSubmit and gives only the policy: a bug you find gets an entry (`--category bug --todo`),
+  its fix a separate entry `Fixes journal#B` flagged `--unverified` with the verification protocol, the
+  proof an entry `Verifies journal#F` flagged `--verified`, then the bug closes; every decision, the operator's or
+  the agent's, an entry `--category decision` saying who decided; important findings
+  go in `--important`, product and technical rules `--constraint`. On a session start it still gives
+  the full reminder. Pool workers get nothing on a prompt. The same policy is in
+  `rules/project-journal.md`.
+
+### Removed
+
+- **What was left of insights.** The knowledge index moves to schema v6: an existing index drops the
+  v4/v5 insight columns (`source_type`, `agent_name`, `session_id`, `feature_slug`, `salience`,
+  `parent_artifact`, `category`, `project_slug`) and the `insight_tags` table on first open; books and
+  their chunks stay. The installers no longer clean up the insight-capture and read-insights hooks of
+  pre-0.9 installs; the insight-only plan, use cases and QA cases are gone from `docs/`. A project's
+  old `insights.db` is still imported into its journal on first use.
+
+### Fixed
+
+- `README.md` names `agent rename --new-callback-token` again (the hooks contract test failed on the
+  rewritten README).
+
 ## [0.20.0] - 2026-10-28
 
 ### Added

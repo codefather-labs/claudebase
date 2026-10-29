@@ -131,8 +131,7 @@ WHAT GETS INSTALLED:
                                       pyright-lsp, typescript-lsp: call hierarchy and references
 
 WHAT IS *REMOVED* (reverse migration, idempotent):
-  the old Stop[insight-capture] and SessionStart[read-insights] hooks, the
-  claudebase patch inside the official Anthropic Telegram plugin, and the
+  the claudebase patch inside the official Anthropic Telegram plugin, and the
   retired claudebase@claudebase-dev marketplace.
 
 AFTER INSTALLING:
@@ -588,23 +587,16 @@ function Register-BashAllowlist {
 #     the terminal arrive, and that a reply only leaves through a CLI call)
 #   - SessionStart -> claudebase-journal-reminder.ps1 (read and keep the journal)
 #   - UserPromptSubmit -> claudebase-selfcheck-reminder.ps1 (self-check nudge)
+#   - UserPromptSubmit -> claudebase-journal-reminder.ps1 again (the journaling policy;
+#     the hook reads which event fired)
 #   - PreToolUse:EnterPlanMode -> claudebase-agent-routing-reminder.ps1
 #   - PostToolUse:ExitPlanMode -> claudebase-feature-describe.ps1
-# The retired Stop[insight-capture] and SessionStart[read-insights] hooks are
-# actively UNWIRED and their files deleted -- see below.
 # Idempotent -- dedup by command-string equality so re-running never duplicates.
 # ============================================================================
 function Install-ClaudebaseHooks {
     $hooksDir = Join-Path $Script:ClaudeDir 'hooks'
     $settings = Join-Path $Script:ClaudeDir 'settings.json'
     New-Item -ItemType Directory -Force -Path $hooksDir | Out-Null
-
-    # Remove retired hook files: Stop insight-capture, and the read-insights
-    # reminder the journal reminder replaced.
-    foreach ($old in 'claudebase-insight-capture.sh', 'claudebase-insight-capture.ps1', 'claudebase-read-insights-reminder.sh', 'claudebase-read-insights-reminder.ps1') {
-        $p = Join-Path $hooksDir $old
-        if (Test-Path $p) { Remove-Item -Force $p }
-    }
 
     # Deploy both variants of the self-check reminder + journal reminder;
     # Windows wires the .ps1 variants.
@@ -616,9 +608,7 @@ function Install-ClaudebaseHooks {
         Write-Ok "hooks/$hook"
     }
 
-    $stopCmd = "powershell -NoProfile -File `"$(Join-Path $hooksDir 'claudebase-insight-capture.ps1')`""
     $selfcheckCmd = "powershell -NoProfile -File `"$(Join-Path $hooksDir 'claudebase-selfcheck-reminder.ps1')`""
-    $readinsCmd = "powershell -NoProfile -File `"$(Join-Path $hooksDir 'claudebase-read-insights-reminder.ps1')`""
     $journalCmd = "powershell -NoProfile -File `"$(Join-Path $hooksDir 'claudebase-journal-reminder.ps1')`""
     $routingCmd = "powershell -NoProfile -File `"$(Join-Path $hooksDir 'claudebase-agent-routing-reminder.ps1')`""
     # pty-transport v0.10 -- the external-channel contract must be in context
@@ -658,22 +648,13 @@ function Install-ClaudebaseHooks {
         }
 
         & $mergeEvent 'UserPromptSubmit' $selfcheckCmd
+        & $mergeEvent 'UserPromptSubmit' $journalCmd
 
         # Idempotent merge of the SessionStart journal reminder by command-string
-        # equality, after unwiring the read-insights reminder it replaced.
-        # Official SessionStart shape: {matcher, hooks[{type,command}]}.
+        # equality. Official SessionStart shape: {matcher, hooks[{type,command}]}.
         if (-not ($json.hooks.PSObject.Properties.Name -contains 'SessionStart')) {
             $json.hooks | Add-Member -NotePropertyName 'SessionStart' -NotePropertyValue @() -Force
         }
-        $ssKept = @()
-        foreach ($entry in @($json.hooks.SessionStart)) {
-            if ($entry.hooks) {
-                $entry.hooks = @($entry.hooks | Where-Object { $_.command -ne $readinsCmd })
-                if (@($entry.hooks).Count -eq 0) { continue }
-            }
-            $ssKept += $entry
-        }
-        $json.hooks.SessionStart = $ssKept
         $ssExisting = @($json.hooks.SessionStart)
         $ssAlready = $false
         foreach ($entry in $ssExisting) {
@@ -737,28 +718,13 @@ function Install-ClaudebaseHooks {
             $json.hooks.PostToolUse = @($postExisting) + $postNewEntry
         }
 
-        # Unwire the retired Stop insight-capture hook: strip its command from
-        # any Stop matcher block, drop now-empty blocks, drop empty Stop key.
-        if ($json.hooks.PSObject.Properties.Name -contains 'Stop') {
-            $kept = @()
-            foreach ($entry in @($json.hooks.Stop)) {
-                if ($entry.hooks) {
-                    $entry.hooks = @($entry.hooks | Where-Object { $_.command -ne $stopCmd })
-                }
-                if ($entry.hooks -and @($entry.hooks).Count -gt 0) { $kept += $entry }
-            }
-            if ($kept.Count -gt 0) { $json.hooks.Stop = $kept }
-            else { $json.hooks.PSObject.Properties.Remove('Stop') }
-        }
-
         $json | ConvertTo-Json -Depth 12 | Set-Content -Path $settings -Encoding UTF8
-        Write-Ok "settings.json (UserPromptSubmit[selfcheck] + SessionStart[journal, channel-contract] wired; retired Stop[insight-capture] + SessionStart[read-insights] unwired)"
+        Write-Ok "settings.json (UserPromptSubmit[selfcheck, journal] + SessionStart[journal, channel-contract] wired)"
     } catch {
         Write-Warn "settings.json hook merge failed ($($_.Exception.Message)); add manually:"
-        Write-Warn "  hooks.Stop[*].hooks[*].command = $stopCmd"
         Write-Warn "  hooks.UserPromptSubmit[*].hooks[*].command = $selfcheckCmd"
+        Write-Warn "  hooks.UserPromptSubmit[*].hooks[*].command = $journalCmd"
         Write-Warn "  hooks.SessionStart[*].hooks[*].command = $journalCmd"
-        Write-Warn "  (and remove any hook entry pointing at claudebase-insight-capture.ps1 or claudebase-read-insights-reminder.ps1)"
     }
 }
 

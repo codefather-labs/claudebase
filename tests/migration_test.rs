@@ -69,11 +69,9 @@ fn migrate_v1_to_v2_with_auto_reingest_env_succeeds() {
     let v: i64 = conn2
         .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
         .expect("v2 stamp");
-    // open_or_init_v2 now applies SCHEMA_V2_DELTA + SCHEMA_V3_DELTA +
-    // SCHEMA_V4_DELTA + SCHEMA_V5_DELTA on a fresh DB and stamps version=5
-    // (insights-hybrid-corpus category/project_slug + insight_tags on top of
-    // v4's agent-insights metadata columns on documents).
-    assert_eq!(v, 5, "post-migration re-init should stamp version=5");
+    // open_or_init_v2 applies SCHEMA_V2_DELTA + SCHEMA_V3_DELTA on a fresh DB
+    // and stamps the current version.
+    assert_eq!(v, claudebase::store::SCHEMA_VERSION, "post-migration re-init should stamp the current version");
 }
 
 #[test]

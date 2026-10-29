@@ -85,7 +85,7 @@ pub fn migrate_v1_to_v2(conn: &mut Connection) -> Result<MigrationOutcome, Store
          DROP TABLE IF EXISTS documents;",
     )?;
     // Reset schema_version row so the next open_or_init_v2 sees a fresh DB
-    // and applies SCHEMA_V1 + V2 + V3 + V4 deltas and stamps version=4.
+    // and applies SCHEMA_V1 + V2 + V3 and stamps the current version.
     conn.execute("DELETE FROM schema_version", [])?;
     Ok(MigrationOutcome::Migrated)
 }

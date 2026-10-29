@@ -150,7 +150,7 @@ async-trait = "0.1"
 # Opus codec — pure-Rust decoder, RFC 8251 conformant, no FFI. Telegram
 # voice notes are always Opus-in-Ogg per Telegram Bot API spec. Picked
 # over the `opus = "0.3"` C-binding crate to keep the single-binary
-# contract intact (architect insight #10 — the v1 plan-bug fix).
+# contract intact (the v1 plan-bug fix).
 opus-decoder = "0.1"
 #
 # Ogg container parser — pure Rust. Pairs with `opus-decoder` to read

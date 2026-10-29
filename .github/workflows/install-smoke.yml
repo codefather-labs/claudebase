@@ -180,14 +180,18 @@ jobs:
               || { echo "settings.json has no $ev hook wired"; exit 1; }
           done
 
-          # The journal reminder replaced the read-insights one: wired once, and
-          # the old one gone from both the hooks dir and settings.json.
-          jq -e '[.hooks.SessionStart[].hooks[].command | select(endswith("/claudebase-journal-reminder.sh"))] | length == 1' \
-            "$HOME/.claude/settings.json" >/dev/null || { echo "journal reminder not wired exactly once"; exit 1; }
-          if grep -q 'read-insights' "$HOME/.claude/settings.json"; then echo "read-insights hook still wired"; exit 1; fi
-          test ! -e "$HOME/.claude/hooks/claudebase-read-insights-reminder.sh" || { echo "read-insights hook file left behind"; exit 1; }
-          bash "$HOME/.claude/hooks/claudebase-journal-reminder.sh" | jq -r '.hookSpecificOutput.additionalContext' \
+          # The journal reminder rides two events, wired once under each: the
+          # full reminder on a session start, the journaling policy on a prompt.
+          for ev in SessionStart UserPromptSubmit; do
+            jq -e "[.hooks.$ev[].hooks[].command | select(endswith(\"/claudebase-journal-reminder.sh\"))] | length == 1" \
+              "$HOME/.claude/settings.json" >/dev/null || { echo "journal reminder not wired exactly once under $ev"; exit 1; }
+          done
+          echo '{"hook_event_name":"SessionStart"}' | bash "$HOME/.claude/hooks/claudebase-journal-reminder.sh" \
+            | jq -r '.hookSpecificOutput.additionalContext' \
             | grep -qF 'claudebase journal add' || { echo "journal reminder does not teach journal add"; exit 1; }
+          echo '{"hook_event_name":"UserPromptSubmit"}' | bash "$HOME/.claude/hooks/claudebase-journal-reminder.sh" \
+            | jq -e '.hookSpecificOutput | .hookEventName == "UserPromptSubmit" and (.additionalContext | contains("Verifies journal#"))' \
+            >/dev/null || { echo "journal reminder gives no policy on a prompt"; exit 1; }
 
           # The contract has to teach every prefix the transport can produce; a
           # session meeting an unexplained one cannot recover on its own.
@@ -518,7 +522,13 @@ jobs:
           }
           $ss = @($s.hooks.SessionStart | ForEach-Object { $_.hooks } | ForEach-Object { $_.command })
           if (@($ss | Where-Object { $_ -like '*claudebase-journal-reminder.ps1*' }).Count -ne 1) { Write-Host "journal reminder not wired exactly once"; exit 1 }
-          if (@($ss | Where-Object { $_ -like '*read-insights*' }).Count -ne 0) { Write-Host "read-insights hook still wired"; exit 1 }
+          $ups = @($s.hooks.UserPromptSubmit | ForEach-Object { $_.hooks } | ForEach-Object { $_.command })
+          if (@($ups | Where-Object { $_ -like '*claudebase-journal-reminder.ps1*' }).Count -ne 1) { Write-Host "journal policy not wired exactly once on UserPromptSubmit"; exit 1 }
+          $hook = "$env:USERPROFILE\.claude\hooks\claudebase-journal-reminder.ps1"
+          $out = '{"hook_event_name":"UserPromptSubmit"}' | powershell -NoProfile -File $hook | ConvertFrom-Json
+          if ($out.hookSpecificOutput.hookEventName -ne 'UserPromptSubmit' -or $out.hookSpecificOutput.additionalContext -notlike '*Verifies journal#*') { Write-Host "journal reminder gives no policy on a prompt"; exit 1 }
+          $out = '{"hook_event_name":"SessionStart"}' | powershell -NoProfile -File $hook | ConvertFrom-Json
+          if ($out.hookSpecificOutput.additionalContext -notlike '*claudebase journal add*') { Write-Host "journal reminder gives no reminder on a session start"; exit 1 }
           Write-Host "hooks wired"
 
       # Windows refuses to overwrite a RUNNING .exe, and the daemon from the

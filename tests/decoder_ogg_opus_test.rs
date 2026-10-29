@@ -7,7 +7,7 @@
 //! sample-rate + channels, downmixes stereo if present, resamples
 //! 48 k → 16 k via `rubato::SincFixedIn`.
 //!
-//! Architect insight #10 (the v1 plan-bug): `symphonia` does NOT have an
+//! The v1 plan-bug: `symphonia` does NOT have an
 //! `opus` codec feature in 0.6.x. The container layer is handled by the
 //! `ogg` crate; the codec layer by `opus-decoder`. This test pins the
 //! contract: `decode_ogg_opus_to_16k_mono_pcm(&bytes) -> Result<Vec<f32>>`

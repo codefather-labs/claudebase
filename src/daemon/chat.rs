@@ -170,7 +170,7 @@ pub fn build_channel_notification_agent_to_agent(
     drained_from_dnd: bool,
 ) -> Value {
     let thread = format!("agent:{target_agent_id}");
-    // Slice 8 hotfix #2 (Wave 5 live QA, doc_id #13 in insights corpus):
+    // Slice 8 hotfix #2 (Wave 5 live QA):
     // Round 1 added the 5 TG-shape keys but kept extra distinguishers
     // (kind / target_agent_id / from_agent_id / thread / drained_from_dnd /
     // source) in meta — frames STILL dropped because CC's channel

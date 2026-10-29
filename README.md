@@ -166,7 +166,7 @@ curl -sS -X POST "http://127.0.0.1:8585/callback/<nick>?label=ci" \
      -H "X-Api-Token: $(cat ~/.claude/callback-tokens/<nick>)" --data-binary 'build failed'
 ```
 
-Tokens belong to a nick and follow a rename. The HTTP listener stays on loopback unless explicitly opened. Inside a session, `/claudebase-daemon-callback-info` and `/claudebase-daemon-setup-auth-token` explain and set this up.
+Tokens belong to a nick and follow a rename; `agent rename --new-callback-token` retires the old one instead. The HTTP listener stays on loopback unless explicitly opened. Inside a session, `/claudebase-daemon-callback-info` and `/claudebase-daemon-setup-auth-token` explain and set this up.
 
 ## 👥 Many sessions
 

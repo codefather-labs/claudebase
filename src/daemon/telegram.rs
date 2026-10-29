@@ -14,7 +14,7 @@
 //!    offset bump live in one rusqlite transaction. If the daemon crashes
 //!    mid-batch BEFORE commit, the next restart re-processes the same
 //!    batch from the prior offset — schema v5 has NO unique constraint
-//!    on `(thread_id, telegram_message_id)` (insight #9), so safety
+//!    on `(thread_id, telegram_message_id)`, so safety
 //!    relies on the transactional offset-advance alone.
 //!
 //! 3. Errors:

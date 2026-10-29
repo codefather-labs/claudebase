@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.22.1] - 2026-10-29
+
+### Fixed
+
+- **The Linux x64 binary starts on ubuntu 24.04 and debian 13 again.** v0.21.0 and v0.22.0 were built
+  on `ubuntu-latest`, which GitHub moved to ubuntu 26.04: the binary needed glibc 2.43 and exited with
+  "version `GLIBC_2.43' not found" on ubuntu 24.04 (2.39) and debian 13 (2.41), so the installer
+  installed no binary. The build is pinned to ubuntu 24.04 again, and the release now fails when a
+  Linux binary needs a glibc newer than 2.39. linux-arm64 was not affected.
+- **The installer says why a downloaded binary does not run**, instead of only "failed --version smoke".
+
 ## [0.22.0] - 2026-10-29
 
 ### Added

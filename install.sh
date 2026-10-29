@@ -29,7 +29,7 @@ set -u
 # this constant sat at 0.9.2 through four releases because nothing checked it,
 # and every fresh install in that window silently got a binary two minor
 # versions old.
-CLAUDEBASE_VERSION_FALLBACK="0.22.0"
+CLAUDEBASE_VERSION_FALLBACK="0.22.1"
 CLAUDEBASE_PDFIUM_VERSION="chromium/7802"
 REPO_URL="https://github.com/codefather-labs/claudebase.git"
 RELEASE_BASE="https://github.com/codefather-labs/claudebase/releases/download"
@@ -368,8 +368,9 @@ install_binary() {
   fi
 
   chmod +x "$tmp"
-  if ! "$tmp" --version >/dev/null 2>&1; then
-    log_warn "downloaded binary failed --version smoke; not installing"
+  local smoke_err
+  if ! smoke_err=$("$tmp" --version 2>&1 >/dev/null); then
+    log_warn "downloaded binary failed --version smoke; not installing: $(printf '%s' "$smoke_err" | head -n 1)"
     rm -f "$tmp"
     return 0
   fi

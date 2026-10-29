@@ -91,8 +91,12 @@ jobs:
           - platform: darwin-arm64
             runs-on: macos-14
             target: aarch64-apple-darwin
+          # Pinned, never ubuntu-latest: a binary links the glibc of the runner
+          # it was built on. ubuntu-latest moved to 26.04 (glibc 2.43) in
+          # October 2026 and v0.21.0 / v0.22.0 failed to start on ubuntu 24.04
+          # and debian 13. The glibc ceiling step below catches the next move.
           - platform: linux-x64
-            runs-on: ubuntu-latest
+            runs-on: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
           - platform: linux-arm64
             runs-on: ubuntu-24.04-arm
@@ -180,6 +184,20 @@ jobs:
           # darwin-arm64 ~30 MB. The check guards against a sudden jump (a
           # dependency pulled in by accident), not against steady growth.
           test "$size" -le 50331648
+
+      # The newest glibc the binary needs must be one the oldest supported
+      # distros ship: ubuntu 24.04 has 2.39, debian 13 has 2.41.
+      - name: glibc ceiling (runs on ubuntu 24.04 / debian 13)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/claudebase"
+          need=$(objdump -T "$BIN" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -n 1)
+          echo "binary needs glibc $need"
+          if [ "$(printf '%s\n' "$need" 2.39 | sort -V | tail -n 1)" != 2.39 ]; then
+            echo "ERROR: needs glibc $need, above 2.39 — it will not start on ubuntu 24.04"
+            exit 1
+          fi
 
       - name: Smoke test (--version exits 0)
         shell: bash

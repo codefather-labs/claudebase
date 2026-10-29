@@ -517,6 +517,7 @@ pub async fn serve(_args: &DaemonServeArgs) -> anyhow::Result<()> {
     // 30s, panic-safe via tokio::spawn supervisor, rate-limited at 10
     // messages per agent per tick per FR-C2C-5.5.
     spawn_dnd_drain_task(bus.clone());
+    crate::daemon::reminders::spawn_reminder_task(bus.clone());
     // Retention for every project journal (salience-driven TTL).
     crate::daemon::journal_tools::spawn_maintenance();
     // Pool leases: expiry, lost workers, retention (docs/design/pool-dispatch.md).

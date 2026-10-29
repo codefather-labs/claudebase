@@ -42,11 +42,15 @@ esac
 
 policy='[journal policy] Journal as you work (~/.claude/rules/project-journal.md):
   - Every bug you find gets an entry: claudebase journal add "<symptom, cause, where>" --category bug --todo  -> #B
+  - When you plan a fix or feature, its entry carries the test protocol: what to test after it (regressions too), how,
+    under which conditions, which evidence proves it. A result read from metrics of a long pipeline: record them before, then after.
   - Every fix gets its own entry, linked and unverified, with the protocol that will prove it:
       "Fixes journal#B: <what changed, where, commit>. Verification protocol: <steps, expected results>" --category update --unverified  -> #F
   - Every fix is proven. Run the protocol, then add the evidence:
-      "Verifies journal#F: <what was run, its output>" --category verification --verified, then: claudebase journal close B
+      "Verifies journal#F: <what was checked, regressions included, how, under which conditions, how many times, the output, metrics before/after>" --category verification --verified [--proof <file|url>], then: claudebase journal close B
+    unverified is lifted only by such a separate entry; under evidence-first (claudebase journal policy) it needs --proof too.
   - Every decision, made by the operator or by you: its own entry --category decision, saying who decided, what was chosen, why, what was rejected.
+  - Something you must come back to: --reminder --every 20m; it returns to this session until you close it.
   - Important remarks and findings: --important. Product and technical rules, policies, constraints: --constraint.'
 
 if [ "$event" = UserPromptSubmit ]; then
@@ -86,6 +90,7 @@ While you work, journal every decision you make, every finding you uncover and e
 - Flag important remarks and findings --important, and product or technical rules, policies and constraints --constraint.
 - Before a non-trivial decision, search for an earlier one on the same subject; if you reverse it, write "Replaces journal#<id>" (or "Fixes journal#<id>") - that text becomes a link both entries show - and mark the old one --deprecated if it is no longer true.
 - Flags say what an entry is: --todo --question --problem --reminder --unverified --disputed --ai-feedback (work items, closed with `journal close <id> --resolution "<how>"`, reopened with `journal reopen <id>`) and --constraint --important --deprecated (marks, removed with `journal unmark`). Flag an existing entry with `journal mark <id> --deprecated`; when something stops being true, mark it deprecated. Suggestions for improving claudebase itself go in with --ai-feedback.
+- Something to come back to later, even after this session ends: `journal add "<what>" --every 20m` (sets --reminder). The daemon returns it to this session as [reminder #N] every interval while it is open and the session is online; close it when done.
 
 If `journal add` answers that it needs a session started with `claudebase run`, tell the operator once and carry on without it.
 

@@ -228,7 +228,7 @@ async fn entries_carry_work_items_a_session_closes_and_reopens() {
         journal(&home, &s.dir, Some(&s), &["close", &todo.to_string()])
             .failure()
             .stderr(predicates::str::contains("--verified"));
-        let proof = j(&["add", &format!("Verifies journal#{todo}: benchmark ran, 3x faster"), "--category", "verification", "--verified", "--tag", "perf", "--json"])["id"].as_i64().unwrap();
+        let proof = j(&["add", &format!("Verifies journal#{todo}: benchmark ran 3 times on the dev box, 3x faster each time"), "--category", "verification", "--verified", "--tag", "perf", "--json"])["id"].as_i64().unwrap();
         let tree = journal(&home, &s.dir, Some(&s), &["branch", &proof.to_string()]).success().get_output().stdout.clone();
         let tree = String::from_utf8_lossy(&tree);
         assert!(tree.contains(&format!("branch of todo #{todo} — verified (verified in #{proof})")) && tree.contains(&format!("verifies #{proof}")), "{tree}");

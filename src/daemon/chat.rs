@@ -711,6 +711,35 @@ pub fn build_channel_notification_callback(
     })
 }
 
+/// A journal reminder coming back to the session that wrote it. Same shape as
+/// a callback frame, with its own source so the session sees
+/// `[reminder #N]` and not a message from somewhere else.
+pub fn build_channel_notification_reminder(
+    content: &str,
+    entry_id: i64,
+    target_agent_id: &str,
+    message_id: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/claude/channel",
+        "params": {
+            "content": content,
+            "meta": {
+                "source": "reminder",
+                "entry_id": entry_id.to_string(),
+                "target_agent_id": target_agent_id,
+                // Read only by supervisors that predate `source: reminder`.
+                "from_agent": format!("reminder-{entry_id}"),
+                "chat_id": format!("agent:{target_agent_id}"),
+                "thread": format!("agent:{target_agent_id}"),
+                "message_id": message_id,
+                "ts": chrono::Utc::now().to_rfc3339(),
+            }
+        }
+    })
+}
+
 /// `nick_memory` — the nick an operator (or the session itself) CHOSE for a
 /// working directory, as opposed to the project-name default.
 ///

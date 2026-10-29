@@ -28,7 +28,7 @@ One Rust binary and a local daemon. Claude Code itself runs unmodified.
 | **Sessions you can reach** | `claudebase run` starts `claude` under a terminal supervisor. Telegram messages, messages from other sessions, HTTP callbacks and socket writes arrive in the session's input as prefixed lines. Replies go out through the CLI. |
 | **Many agents, many machines** | Sessions have names, list and message each other, and can join the daemon of another machine. A pool of sessions can serve model calls for a gateway. |
 | **A project journal** | Agents record decisions, findings and changes; the next session finds them by tag, category and meaning. Entries carry flags (todo, unverified, deprecated, …) and links that form a graph. Every feature or fix runs as a branch from a todo to a verified entry with evidence. |
-| **Operational glue** | The daemon runs as a service, a machine gets one Claude subscription token for all its sessions, conversations move between machines, and the installer sets up language servers for Claude Code's LSP tool. |
+| **Operational glue** | The daemon runs as a service, a machine gets one Claude subscription token for all its sessions, and conversations move between machines. |
 | **Agent toolkit** | Rules, hooks, skills, commands and agents installed into `~/.claude/`, so every session knows the contract above without being told. |
 
 A local knowledge base (hybrid search over your PDFs and notes) is also included; it is described at the [end](#-knowledge-base-books-and-documents).
@@ -58,15 +58,13 @@ What the installer does, in order:
 
 1. Downloads the release binary for your platform (or builds it with `--local`).
 2. Installs the agent toolkit into `~/.claude/` and wires the hooks into `settings.json`.
-3. Sets up language servers for Claude Code's LSP tool, so agents get callers, callees and references instead of grepping: `rust-analyzer`, `pyright`, `typescript-language-server` and their official Claude Code plugins. It installs Rust (rustup) and Node.js (Homebrew / nvm / winget) first when they are missing.
-4. Starts the daemon as a user service. On Linux it enables linger, so the daemon survives logout; without a systemd user manager (containers, WSL) it runs in the background.
-5. Downloads the models: the e5 encoder (~490 MB) for semantic search and the speech model (~1.5 GB) for voice notes. Both show a progress bar.
-6. Ends with a **Checks** list (binary, daemon, hooks, rules, models, language servers) and exits non-zero when a required one fails.
+3. Starts the daemon as a user service. On Linux it enables linger, so the daemon survives logout; without a systemd user manager (containers, WSL) it runs in the background.
+4. Downloads the models: the e5 encoder (~490 MB) for semantic search and the speech model (~1.5 GB) for voice notes. Both show a progress bar.
+5. Ends with a **Checks** list (binary, daemon, hooks, rules, models) and exits non-zero when a required one fails.
 
 | Option | Effect |
 |---|---|
 | `--no-models` / `-NoModels` | Skip both model downloads. Journal search stays keyword-only until `claudebase warmup`; voice notes fetch their model on first use. |
-| `--no-lsp` / `-NoLsp` | Skip the language servers and the toolchains installed for them. |
 | `CLAUDEBASE_VERSION=x.y.z` | Install a specific release. |
 | `CLAUDEBASE_SKIP_WHISPER=1` | Skip the speech model only. |
 | `CLAUDEBASE_SKIP_DAEMON=1` | Do not set up the daemon. |
@@ -233,7 +231,8 @@ claudebase journal agenda                                   # what is still open
 | Flag | Meaning | Ends with |
 |---|---|---|
 | `--todo` `--question` `--problem` `--reminder` | work items | `journal close <id> --resolution "<how>"` |
-| `--unverified` | a hypothesis, or an implementation not yet proven | `close` once checked |
+| `--every 20m` (on `add`) | a reminder that comes back: the daemon puts the entry into the input of the session that wrote it as `[reminder #N]`, every interval, until it is closed. Only that session gets it, never while it is offline; one due while it was away arrives when it is back. Unlike a session's cron, it outlives the session | `journal close <id>` |
+| `--unverified` | a hypothesis, or an implementation not yet proven | `close` once a separate `Verifies journal#N` entry carries the evidence: what was checked, how, under which conditions, how many times. With `journal policy --evidence-first on` it must also point at proofs (`--proof <file\|url>`) |
 | `--disputed` | contradicts another entry | `close` once settled |
 | `--ai-feedback` | an agent's suggestion for claudebase itself | `close` once handled |
 | `--constraint` | a rule to follow, not weigh | `unmark` |
@@ -316,11 +315,10 @@ claudebase chat clone <id|name> <new>   # a copy that /resume lists separately
 | | |
 |---|---|
 | **Rules** | `project-journal.md` — how to read and write the journal, flags, links, work branches. `cognitive-self-check.md` — facts vs assumptions, decision quality, challenging the task. |
-| **Hooks** | SessionStart: the message contract and the journal reminder (also after `/clear`). UserPromptSubmit: the self-check reminder. Around plan mode: peers exist; publish what was decided. |
+| **Hooks** | SessionStart: the message contract and the journal reminder (also after `/clear`). UserPromptSubmit: the self-check reminder and the journaling policy. Around plan mode: peers exist; publish what was decided. |
 | **Skills** | `/claudebase-daemon-change-nick`, `-callback-info`, `-setup-auth-token`, `/claudebase-setup-remote-daemon`, `/claudebase-setup-claude-token`, `/claudebase-chat-dump`, `/claudebase-chat-load`, `/claudebase-journal-share` |
 | **Commands** | `/reflect`, `/consolidate`, `/update-claudebase`, `/knowledge-ingest` |
 | **Agents** | `reflection` and `consolidator` — passes that look for drift and blind spots across the work |
-| **Language servers** | rust-analyzer, pyright, typescript-language-server + their Claude Code plugins |
 
 ## 📚 Knowledge base (books and documents)
 

@@ -107,6 +107,18 @@ CREATE TABLE IF NOT EXISTS entry_links (
     UNIQUE(from_id, to_id, kind)
 );
 CREATE INDEX IF NOT EXISTS entry_links_to ON entry_links(to_id);
+CREATE TABLE IF NOT EXISTS entry_reminders (
+    entry_id   INTEGER PRIMARY KEY REFERENCES entries(id) ON DELETE CASCADE,
+    every_secs INTEGER NOT NULL,
+    next_at    INTEGER NOT NULL,
+    nick       TEXT NOT NULL,
+    host       TEXT
+);
+CREATE TABLE IF NOT EXISTS entry_proofs (
+    entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+    proof    TEXT NOT NULL,
+    UNIQUE(entry_id, proof)
+);
 ";
 
 /// How one entry refers to another. Read from the text (`journal#N`, see
@@ -449,6 +461,13 @@ pub struct NewEntry {
     pub source_artifact: Option<String>,
     /// [`FLAGS`] to set, open.
     pub flags: Vec<String>,
+    /// Where the evidence is: files, screenshots, logs, URLs (`--proof`).
+    pub proofs: Vec<String>,
+    /// Bring the entry back to its author every this many seconds until it
+    /// is closed (`--every`). Implies the `reminder` flag; needs `remind_to`.
+    pub remind_every: Option<i64>,
+    /// Who it comes back to: the writing session's nick, and its host.
+    pub remind_to: Option<(String, Option<String>)>,
     /// Do not read `journal#N` references from the text: an entry imported
     /// from another journal numbers them in that journal.
     pub foreign: bool,
@@ -471,7 +490,18 @@ pub fn add(conn: &mut Connection, entry: &NewEntry, now: i64) -> Result<(AddStat
     if body.chars().count() > MAX_BODY_CHARS {
         bail!("the entry is longer than {MAX_BODY_CHARS} characters; a journal entry is a note — link the document instead (--source-artifact)");
     }
-    let flags = normalize_flags(&entry.flags)?;
+    let mut flags = normalize_flags(&entry.flags)?;
+    if let Some(every) = entry.remind_every {
+        if every < MIN_REMIND_SECS {
+            bail!("--every must be at least {} minute(s)", MIN_REMIND_SECS / 60);
+        }
+        if entry.remind_to.is_none() {
+            bail!("a reminder comes back to the session that wrote it: --every needs a session started with `claudebase run`");
+        }
+        if !flags.iter().any(|f| f == "reminder") {
+            flags = normalize_flags(&[flags.clone(), vec!["reminder".to_string()]].concat())?;
+        }
+    }
     // A todo or a question is often the whole point of the entry; its flag
     // then names it, unless a category says more.
     let category = normalize_label(&entry.category).or_else(|| flags.first().cloned());
@@ -500,6 +530,8 @@ pub fn add(conn: &mut Connection, entry: &NewEntry, now: i64) -> Result<(AddStat
         // The same note again still teaches us its tags and flags.
         insert_tags(&tx, id, &tags)?;
         insert_flags(&tx, id, &flags, now)?;
+        insert_proofs(&tx, id, &entry.proofs)?;
+        insert_reminder(&tx, id, entry, now)?;
         tx.commit()?;
         return Ok((AddStatus::Deduped, id));
     }
@@ -524,6 +556,8 @@ pub fn add(conn: &mut Connection, entry: &NewEntry, now: i64) -> Result<(AddStat
     let id = tx.last_insert_rowid();
     insert_tags(&tx, id, &tags)?;
     insert_flags(&tx, id, &flags, now)?;
+    insert_proofs(&tx, id, &entry.proofs)?;
+    insert_reminder(&tx, id, entry, now)?;
     if !entry.foreign {
         insert_links(&tx, id, body)?;
     }
@@ -568,6 +602,162 @@ fn insert_flags(conn: &Connection, id: i64, flags: &[String], now: i64) -> Resul
     Ok(())
 }
 
+/// Shortest reminder interval: the daemon looks for due reminders every 30 s.
+pub const MIN_REMIND_SECS: i64 = 60;
+
+fn insert_reminder(conn: &Connection, id: i64, entry: &NewEntry, now: i64) -> Result<()> {
+    let (Some(every), Some((nick, host))) = (entry.remind_every, entry.remind_to.as_ref()) else { return Ok(()) };
+    conn.execute(
+        "INSERT OR REPLACE INTO entry_reminders(entry_id, every_secs, next_at, nick, host) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![id, every, now + every, nick, host],
+    )?;
+    Ok(())
+}
+
+/// A reminder whose time has come.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DueReminder {
+    pub id: i64,
+    pub body: String,
+    pub every_secs: i64,
+    pub nick: String,
+    pub host: Option<String>,
+}
+
+/// Reminders due at `now`: an open `reminder` flag and `next_at` reached. A
+/// closed one stays in the table, silent, so `reopen` brings it back.
+pub fn due_reminders(conn: &Connection, now: i64) -> Result<Vec<DueReminder>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT r.entry_id, e.body, r.every_secs, r.nick, r.host FROM entry_reminders r \
+         JOIN entries e ON e.id = r.entry_id \
+         JOIN entry_flags f ON f.entry_id = r.entry_id AND f.flag = 'reminder' AND f.closed_at IS NULL \
+         WHERE r.next_at <= ?1 ORDER BY r.next_at",
+    )?;
+    let rows = stmt.query_map(params![now], |r| {
+        Ok(DueReminder { id: r.get(0)?, body: r.get(1)?, every_secs: r.get(2)?, nick: r.get(3)?, host: r.get(4)? })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// The reminder reached its author: next time is one interval from now, not
+/// from when it was due, so one that waited out an absence does not burst.
+pub fn reminder_sent(conn: &Connection, id: i64, now: i64) -> Result<()> {
+    conn.execute("UPDATE entry_reminders SET next_at = ?2 + every_secs WHERE entry_id = ?1", params![id, now])?;
+    Ok(())
+}
+
+fn reminder_of(conn: &Connection, id: i64) -> Result<Option<Reminder>> {
+    Ok(conn
+        .query_row(
+            "SELECT every_secs, next_at, nick FROM entry_reminders WHERE entry_id = ?1",
+            params![id],
+            |r| Ok(Reminder { every_secs: r.get(0)?, next_at: r.get(1)?, nick: r.get(2)? }),
+        )
+        .optional()?)
+}
+
+fn insert_proofs(conn: &Connection, id: i64, proofs: &[String]) -> Result<()> {
+    let mut stmt = conn.prepare_cached("INSERT OR IGNORE INTO entry_proofs(entry_id, proof) VALUES (?1, ?2)")?;
+    for p in proofs.iter().map(|p| p.trim()).filter(|p| !p.is_empty()) {
+        stmt.execute(params![id, p])?;
+    }
+    Ok(())
+}
+
+/// Text an evidence entry must carry beyond its `journal#N` references: what
+/// was checked, how, under which conditions, how many times. Short enough
+/// for one honest sentence, long enough to refuse "Verifies journal#5: ok".
+pub const MIN_EVIDENCE_CHARS: usize = 40;
+
+/// Project policy: evidence must point at proofs (`--proof`: screenshots,
+/// logs, files, URLs), not only describe them. Kept in the journal, so every
+/// checkout and machine sharing it follows the same rule.
+const EVIDENCE_FIRST_KEY: &str = "policy.evidence_first";
+
+pub fn evidence_first(conn: &Connection) -> Result<bool> {
+    let v: Option<String> = conn
+        .query_row("SELECT value FROM journal_meta WHERE key = ?1", params![EVIDENCE_FIRST_KEY], |r| r.get(0))
+        .optional()?;
+    Ok(v.as_deref() == Some("1"))
+}
+
+pub fn set_evidence_first(conn: &Connection, on: bool) -> Result<()> {
+    if on {
+        conn.execute(
+            "INSERT OR REPLACE INTO journal_meta(key, value) VALUES (?1, '1')",
+            params![EVIDENCE_FIRST_KEY],
+        )?;
+    } else {
+        conn.execute("DELETE FROM journal_meta WHERE key = ?1", params![EVIDENCE_FIRST_KEY])?;
+    }
+    Ok(())
+}
+
+/// Why entry `e` does not count as evidence, or `None` when it does: a
+/// separate, live entry describing the check in its own words — and, under
+/// evidence-first, pointing at at least one proof.
+fn evidence_gap(conn: &Connection, e: i64) -> Result<Option<String>> {
+    if has_open_flag(conn, e, "deprecated")? {
+        return Ok(Some(format!("#{e} is deprecated")));
+    }
+    let body: String = conn.query_row("SELECT body FROM entries WHERE id = ?1", params![e], |r| r.get(0))?;
+    let mut text = body.to_lowercase();
+    for (id, _) in parse_refs(&body) {
+        text = text.replace(&format!("journal#{id}"), "").replace(&format!("#{id}"), "");
+    }
+    let said = text.split_whitespace().collect::<Vec<_>>().join(" ").chars().count();
+    if said < MIN_EVIDENCE_CHARS {
+        return Ok(Some(format!(
+            "#{e} says too little ({said} characters besides its references; {MIN_EVIDENCE_CHARS} at least)"
+        )));
+    }
+    if evidence_first(conn)? && proofs_of(conn, e)?.is_empty() {
+        return Ok(Some(format!("#{e} points at no proof, and this project is evidence-first")));
+    }
+    Ok(None)
+}
+
+/// The entry that proves `id`: one that `verifies` it and is evidence by
+/// [`evidence_gap`]. `Err` explains what is missing.
+fn proof_of(conn: &Connection, id: i64) -> Result<std::result::Result<i64, String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT from_id FROM entry_links WHERE to_id = ?1 AND kind = 'verifies' AND from_id != ?1 ORDER BY from_id",
+    )?;
+    let candidates: Vec<i64> = stmt.query_map(params![id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    let mut gaps = Vec::new();
+    for c in candidates {
+        match evidence_gap(conn, c)? {
+            None => return Ok(Ok(c)),
+            Some(g) => gaps.push(g),
+        }
+    }
+    Ok(Err(gaps.join("; ")))
+}
+
+fn evidence_howto(conn: &Connection, id: i64) -> Result<String> {
+    let proofs = if evidence_first(conn)? {
+        " This project is evidence-first: add --proof <file|screenshot|log|url> (repeatable) to that entry."
+    } else {
+        " Add --proof <file|url> when there is something to point at."
+    };
+    Ok(format!(
+        "Add a separate entry: claudebase journal add \"Verifies journal#{id}: <what was checked, how, \
+         under which conditions, how many times, the result>\" --category verification.{proofs}"
+    ))
+}
+
+/// The gate on `unverified`: it is lifted only by a separate entry carrying
+/// the evidence (operator constraint 2026-10-29).
+fn require_proof(conn: &Connection, id: i64) -> Result<i64> {
+    match proof_of(conn, id)? {
+        Ok(e) => Ok(e),
+        Err(gaps) => {
+            let why = if gaps.is_empty() { "no entry verifies it".to_string() } else { gaps };
+            bail!("#{id} stays unverified: {why}. {}", evidence_howto(conn, id)?)
+        }
+    }
+}
+
 fn exists(conn: &Connection, id: i64) -> Result<bool> {
     Ok(conn.query_row("SELECT 1 FROM entries WHERE id = ?1", params![id], |_| Ok(())).optional()?.is_some())
 }
@@ -601,6 +791,9 @@ pub fn unmark(conn: &mut Connection, id: i64, flags: &[String]) -> Result<Vec<St
     let tx = write_tx(conn)?;
     if !exists(&tx, id)? {
         bail!("no entry {id}");
+    }
+    if flags.iter().any(|f| f == "unverified") && has_open_flag(&tx, id, "unverified")? {
+        require_proof(&tx, id)?;
     }
     let mut removed = Vec::new();
     for flag in flags {
@@ -666,23 +859,44 @@ pub fn close_with(
         bail!("entry {id} has nothing open to close");
     }
 
+    let mut resolution = resolution.map(str::to_owned);
+    if targets.iter().any(|f| f == "unverified") {
+        match mode {
+            CloseMode::Checked => {
+                let e = require_proof(&tx, id)?;
+                if resolution.is_none() {
+                    resolution = Some(format!("verified: journal#{e}"));
+                }
+            }
+            CloseMode::Abandon if resolution.is_none() => {
+                bail!("--abandon needs --resolution \"<why it will not be checked>\"")
+            }
+            // A todo's branch prefixes it below.
+            CloseMode::Abandon if !targets.iter().any(|f| f == "todo") => {
+                resolution = resolution.map(|r| format!("abandoned: {r}"));
+            }
+            _ => {}
+        }
+    }
+
     // A todo is the root of a branch: everything that implements, verifies,
     // fixes or cites it, downstream. It closes as one, and only on evidence.
     let mut also: Vec<i64> = Vec::new();
-    let mut resolution = resolution.map(str::to_owned);
     if targets.iter().any(|f| f == "todo") && mode != CloseMode::Restore {
         let branch = branch_ids(&tx, id)?;
         match mode {
             CloseMode::Checked => {
-                let verified = branch
-                    .iter()
-                    .copied()
-                    .find(|e| *e != id && has_open_flag(&tx, *e, "verified").unwrap_or(false));
+                let verified = branch.iter().copied().find(|e| {
+                    *e != id
+                        && has_open_flag(&tx, *e, "verified").unwrap_or(false)
+                        && matches!(evidence_gap(&tx, *e), Ok(None))
+                });
                 let Some(v) = verified else {
                     bail!(
                         "todo {id} cannot close yet: its branch has no entry flagged --verified. \
                          Add one that cites the implementation (\"Verifies journal#<id>\") and carries the evidence \
-                         that it works — commands run, their output, what was checked — then close #{id}. \
+                         that it works — what was checked, how, under which conditions, how many times, the output \
+                         ({MIN_EVIDENCE_CHARS}+ characters; under evidence-first also --proof <file|url>) — then close #{id}. \
                          If the work was dropped instead, close it with --abandon --resolution \"<why>\"."
                     );
                 };
@@ -711,6 +925,11 @@ pub fn close_with(
     }
     for e in also {
         for flag in open_work_items(&tx, e)? {
+            // A hypothesis in the branch is lifted only by its own evidence;
+            // without it, it stays open for the agenda to show.
+            if flag == "unverified" && mode == CloseMode::Checked && proof_of(&tx, e)?.is_err() {
+                continue;
+            }
             tx.execute(
                 "UPDATE entry_flags SET closed_at = ?1, closed_by = ?2, resolution = ?3 WHERE entry_id = ?4 AND flag = ?5",
                 params![now, by, resolution, e, flag],
@@ -1044,6 +1263,19 @@ pub struct Entry {
     /// References to and from other entries.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<Link>,
+    /// Where the evidence this entry carries is: files, screenshots, URLs.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub proofs: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remind: Option<Reminder>,
+}
+
+/// An entry that comes back to its author while its `reminder` is open.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Reminder {
+    pub every_secs: i64,
+    pub next_at: i64,
+    pub nick: String,
 }
 
 /// One edge as seen from an entry: `out` — this entry `kind`s `id` (cites,
@@ -1110,6 +1342,8 @@ fn entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
         tags: Vec::new(),
         flags: Vec::new(),
         links: Vec::new(),
+        proofs: Vec::new(),
+        remind: None,
     })
 }
 
@@ -1142,8 +1376,16 @@ fn attach_tags(conn: &Connection, entries: &mut [Entry]) -> Result<()> {
         set.sort_by_key(|f| FLAGS.iter().position(|k| *k == f.flag));
         e.flags = set;
         e.links = links_of(conn, e.id)?;
+        e.proofs = proofs_of(conn, e.id)?;
+        e.remind = reminder_of(conn, e.id)?;
     }
     Ok(())
+}
+
+fn proofs_of(conn: &Connection, id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached("SELECT proof FROM entry_proofs WHERE entry_id = ?1 ORDER BY rowid")?;
+    let rows = stmt.query_map(params![id], |r| r.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 fn links_of(conn: &Connection, id: i64) -> Result<Vec<Link>> {
@@ -1564,6 +1806,10 @@ pub fn merge_into(dst: &mut Connection, src: &Connection) -> Result<(usize, usiz
             feature: e.feature.clone(),
             source_artifact: e.source_artifact.clone(),
             flags: e.flags.iter().map(|f| f.flag.clone()).collect(),
+            proofs: e.proofs.clone(),
+            // A reminder belongs to a session of this journal's machine.
+            remind_every: None,
+            remind_to: None,
             // Links are copied below by id; the text's numbers are src's.
             foreign: true,
         };
@@ -1759,6 +2005,9 @@ fn copy_insights(conn: &mut Connection, legacy: &Path) -> Result<usize> {
             feature: row.feature,
             source_artifact: row.artifact,
             flags: Vec::new(),
+            proofs: Vec::new(),
+            remind_every: None,
+            remind_to: None,
             foreign: false,
         };
         // An unusable old row (empty, oversized) is skipped rather than
@@ -2292,6 +2541,97 @@ mod tests {
     }
 
     #[test]
+    fn unverified_is_lifted_only_by_separate_evidence() {
+        let (_d, mut c) = journal();
+        let mut hyp = entry("the bus stalls because of WAL checkpoints", "finding", &["bus"]);
+        hyp.flags = vec!["unverified".into()];
+        let (_, h) = add(&mut c, &hyp, 1).unwrap();
+        let open = |c: &Connection| get(c, h).unwrap().unwrap().flags.iter().any(|f| f.flag == "unverified" && f.open);
+
+        // No evidence: neither close nor unmark lifts it.
+        let err = close(&mut c, h, &[], None, Some("checked"), 2).unwrap_err().to_string();
+        assert!(err.contains("no entry verifies it") && err.contains(&format!("Verifies journal#{h}")), "{err}");
+        assert!(unmark(&mut c, h, &["unverified".into()]).is_err());
+        assert!(open(&c));
+
+        // A verifying entry that says too little does not count.
+        let (_, thin) = add(&mut c, &entry(&format!("Verifies journal#{h}: ok"), "verification", &["bus"]), 3).unwrap();
+        let err = close(&mut c, h, &[], None, None, 4).unwrap_err().to_string();
+        assert!(err.contains(&format!("#{thin} says too little")), "{err}");
+
+        // Evidence-first: a description alone is not enough, a proof is.
+        set_evidence_first(&c, true).unwrap();
+        let said = format!("Verifies journal#{h}: ran the load test 3 times on the 4060 box, checkpoint stalls 4-6 s each time");
+        let (_, v) = add(&mut c, &entry(&said, "verification", &["bus"]), 5).unwrap();
+        let err = close(&mut c, h, &[], None, None, 6).unwrap_err().to_string();
+        assert!(err.contains("evidence-first") && err.contains("--proof"), "{err}");
+        let mut proved = entry(&format!("{said}; trace attached"), "verification", &["bus"]);
+        proved.proofs = vec!["docs/qa/bus-trace.png".into(), " ".into()];
+        let (_, p) = add(&mut c, &proved, 7).unwrap();
+        assert_eq!(get(&c, p).unwrap().unwrap().proofs, vec!["docs/qa/bus-trace.png"]);
+        assert_eq!(close(&mut c, h, &[], Some("w"), None, 8).unwrap(), vec!["unverified"]);
+        let f = &get(&c, h).unwrap().unwrap().flags[0];
+        assert_eq!(f.resolution, Some(format!("verified: journal#{p}")));
+
+        // Without evidence-first the description suffices; unmark is gated too.
+        set_evidence_first(&c, false).unwrap();
+        assert!(!evidence_first(&c).unwrap());
+        let mut hyp2 = entry("the encoder download has no IPv4 fallback", "finding", &["encoder"]);
+        hyp2.flags = vec!["unverified".into()];
+        let (_, h2) = add(&mut c, &hyp2, 9).unwrap();
+        let _ = v;
+        add(&mut c, &entry(&format!("Verifies journal#{h2}: forced IPv6-only DNS twice, download hung both times"), "verification", &["encoder"]), 10).unwrap();
+        assert_eq!(unmark(&mut c, h2, &["unverified".into()]).unwrap(), vec!["unverified"]);
+
+        // Dropping the check is allowed, with a reason, and says so.
+        let mut hyp3 = entry("maybe the ARM build is slower", "finding", &["build"]);
+        hyp3.flags = vec!["unverified".into()];
+        let (_, h3) = add(&mut c, &hyp3, 11).unwrap();
+        assert!(close_with(&mut c, h3, &[], None, None, 12, CloseMode::Abandon).is_err());
+        close_with(&mut c, h3, &[], None, Some("no ARM target"), 12, CloseMode::Abandon).unwrap();
+        assert_eq!(get(&c, h3).unwrap().unwrap().flags[0].resolution.as_deref(), Some("abandoned: no ARM target"));
+    }
+
+    #[test]
+    fn a_reminder_comes_back_to_its_author_until_closed() {
+        let (_d, mut c) = journal();
+        let me = Some(("mira".to_string(), Some("box".to_string())));
+        // Without an interval a reminder is a plain work item.
+        let mut plain = entry("look at the flaky test", "", &["ci"]);
+        plain.flags = vec!["reminder".into()];
+        plain.remind_to = me.clone();
+        let (_, p) = add(&mut c, &plain, 0).unwrap();
+        assert!(get(&c, p).unwrap().unwrap().remind.is_none());
+
+        let mut r = entry("benchmark the bus", "todo", &["bus"]);
+        r.remind_every = Some(30);
+        r.remind_to = me.clone();
+        assert!(add(&mut c, &r, 0).unwrap_err().to_string().contains("at least"));
+        r.remind_every = Some(600);
+        r.remind_to = None;
+        assert!(add(&mut c, &r, 0).unwrap_err().to_string().contains("claudebase run"));
+        r.remind_to = me;
+        let (_, id) = add(&mut c, &r, 1000).unwrap();
+        let got = get(&c, id).unwrap().unwrap();
+        assert!(got.flags.iter().any(|f| f.flag == "reminder" && f.open), "--every sets --reminder");
+        assert_eq!(got.remind, Some(Reminder { every_secs: 600, next_at: 1600, nick: "mira".into() }));
+
+        assert!(due_reminders(&c, 1599).unwrap().is_empty());
+        let due = due_reminders(&c, 1600).unwrap();
+        assert_eq!(due, vec![DueReminder { id, body: "benchmark the bus".into(), every_secs: 600, nick: "mira".into(), host: Some("box".into()) }]);
+        // Delivered late (the author was away): the next one is an interval after delivery.
+        reminder_sent(&c, id, 5000).unwrap();
+        assert!(due_reminders(&c, 5599).unwrap().is_empty());
+        assert_eq!(due_reminders(&c, 5600).unwrap().len(), 1);
+
+        // Closed: silent. Reopened: back.
+        close(&mut c, id, &["reminder".into()], Some("mira"), Some("done"), 5700).unwrap();
+        assert!(due_reminders(&c, 99_999).unwrap().is_empty());
+        reopen(&mut c, id, &["reminder".into()]).unwrap();
+        assert_eq!(due_reminders(&c, 99_999).unwrap().len(), 1);
+    }
+
+    #[test]
     fn branches_link_into_a_graph_without_swallowing_each_other() {
         let (_d, mut c) = journal();
         let todo = |c: &mut Connection, body: &str, at| {
@@ -2311,7 +2651,7 @@ mod tests {
         let bi = flagged(&mut c, &format!("Implements journal#{b}, building on journal#{ai}"), "unverified", 4);
         // And a fix in B's branch for something in A's: still B's (its todo is nearer).
         let bf = flagged(&mut c, &format!("Implements journal#{b}. Fixes journal#{ai}"), "unverified", 5);
-        flagged(&mut c, &format!("Verifies journal#{ai}"), "verified", 6);
+        flagged(&mut c, &format!("Verifies journal#{ai}: the pinned-dispatch e2e test passed three runs in a row"), "verified", 6);
 
         let ba = branch(&c, a).unwrap().unwrap();
         assert_eq!(ba.entries.iter().map(|e| e.entry.id).collect::<Vec<_>>(), vec![a, ai, 6]);

@@ -85,7 +85,7 @@ Every in-scope artifact carries both blocks, `## Decisions` immediately after `#
 The blocks explain one artifact; the journal carries them across sessions (`~/.claude/rules/project-journal.md`). Before deciding, search it (`claudebase journal search "<keywords>" --tag <tag>`) and cite the hits you rely on as `journal#<id>`. After deciding, add one entry per decision, finding or falsified assumption, plus an `update` entry per change, using the same salience tag.
 
 The blocks map onto journal flags, so they outlive the artifact:
-- An `### Assumptions` entry goes in with `--unverified`, and is closed once checked.
+- An `### Assumptions` entry goes in with `--unverified`. It is closed only after a separate `Verifies journal#N` entry says what was checked, how, under which conditions and how many times (with `--proof` when the project is evidence-first), or with `--abandon --resolution` when the check is dropped.
 - An `### Open questions` entry goes in with `--question`.
 - A hack's removal path goes in with `--todo`.
 - A contradiction between sources goes in with `--disputed`.

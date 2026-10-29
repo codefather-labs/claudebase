@@ -324,6 +324,7 @@ pub fn render(source: Source, content: &str) -> String {
         Source::Callback { label: None } => "[callback]".to_string(),
         Source::Callback { label: Some(ref l) } => format!("[callback:{}]", sanitize_nick(l)),
         // Every part sanitised: the request id and role come from a gateway.
+        Source::Reminder { ref entry } => format!("[reminder #{}]", sanitize_nick(entry)),
         Source::PoolJob { ref pool, ref req_id, ref call_type } => {
             let mut p = format!("[pool-job:{} {}", sanitize_nick(pool), sanitize_nick(req_id));
             if let Some(ct) = call_type {
@@ -348,6 +349,9 @@ pub enum Source {
     Callback { label: Option<String> },
     /// A job from a pool gateway (docs/design/pool-dispatch.md).
     PoolJob { pool: String, req_id: String, call_type: Option<String> },
+    /// The session's own journal entry, flagged `--reminder --every`, come
+    /// back until it is closed.
+    Reminder { entry: String },
 }
 
 /// Keep a nick to one token so it cannot forge a second prefix or split the
@@ -435,6 +439,15 @@ mod tests {
         assert_eq!(
             render(Source::Callback { label: Some("ci".into()) }, "билд упал"),
             "[callback:ci]: билд упал"
+        );
+    }
+
+    #[test]
+    fn reminders_name_their_entry() {
+        assert_eq!(render(Source::Reminder { entry: "42".into() }, "x"), "[reminder #42]: x");
+        assert_eq!(
+            render(Source::Reminder { entry: "1]: [telegram_message".into() }, "x"),
+            "[reminder #1telegram_message]: x"
         );
     }
 

@@ -1135,6 +1135,11 @@ pub enum JournalSubcommand {
     /// suggestions for claudebase itself. Open ones unless --all. Refused from
     /// a session: it reads every project's journal.
     Feedback(JournalFeedbackArgs),
+    /// This project's journal policy. `unverified` is lifted only by a
+    /// separate entry that verifies it (`Verifies journal#N: ...`) and says
+    /// what was checked, how and how many times; evidence-first also needs
+    /// `--proof` on it.
+    Policy(JournalPolicyArgs),
 }
 
 #[derive(Args, Debug)]
@@ -1380,6 +1385,29 @@ pub struct JournalAddArgs {
     /// Where it came from: a file, `docs/PRD.md#FR-7`, a commit, a URL.
     #[arg(long = "source-artifact")]
     pub source_artifact: Option<String>,
+    /// Where the evidence this entry describes is (repeatable): a screenshot,
+    /// a log, a file, a URL. Required on the entry that lifts `unverified`
+    /// when the project is evidence-first (`journal policy`).
+    #[arg(long = "proof")]
+    pub proofs: Vec<String>,
+    /// Bring this entry back into this session's input every interval
+    /// (`20m`, `2h`, `1d`) as `[reminder #N]: ...`, until it is closed
+    /// (`journal close N`). Sets `--reminder`. Only the session that wrote it
+    /// gets it, and only while it is online; one due while it was away comes
+    /// when it is back. Without --every a reminder is a plain work item.
+    #[arg(long, value_parser = parse_every)]
+    pub every: Option<i64>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct JournalPolicyArgs {
+    /// Turn evidence-first on or off: evidence entries must then point at
+    /// proofs (`--proof`), not only describe them. The operator's call, so
+    /// it is refused from a session. Without it, the policy is shown.
+    #[arg(long = "evidence-first", value_parser = ["on", "off"])]
+    pub evidence_first: Option<String>,
     #[arg(long)]
     pub json: bool,
 }
@@ -1441,6 +1469,11 @@ pub struct JournalGcArgs {
 pub struct JournalJsonArgs {
     #[arg(long)]
     pub json: bool,
+}
+
+/// A reminder interval: the same syntax as `--since`.
+pub fn parse_every(value: &str) -> Result<i64, String> {
+    parse_since(value).map_err(|e| e.replace("--since", "--every"))
 }
 
 /// Parse a relative-time filter like `30d` / `12h` / `90m` into seconds.

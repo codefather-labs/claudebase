@@ -6,6 +6,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **`unverified` is lifted only by evidence.** `journal close` and `journal unmark` refuse to clear an
+  `unverified` flag until a separate entry verifies it (`Verifies journal#N`) and describes the check
+  (what, how, under which conditions, how many times; 40+ characters beside its references). A todo's
+  branch closes only on such an entry too, and leaves a hypothesis without its own evidence open.
+  `--abandon --resolution` records a dropped check as abandoned.
+- **Reminders that come back.** `journal add "<what>" --every 20m` (sets `--reminder`) makes the
+  daemon put the entry into the input of the session that wrote it, as `[reminder #N]: ...`, every
+  interval until the entry is closed. Only that session gets it, addressed by its nick, so a resumed
+  conversation still does; nothing is sent while it is offline or in DND, and a reminder that came due
+  meanwhile arrives within 30 s of its return. Unlike a session's cron, it outlives the session.
+  Without `--every`, a reminder stays a plain work item. `journal get` shows the schedule.
+- **A planned fix carries its test protocol.** The journal rule and the per-prompt policy now ask for
+  the test protocol when a fix or feature is planned, in its todo: what to test afterwards, regressions
+  included, how, under which conditions, and which evidence proves it. When the result can only be read
+  from metrics of a long pipeline, those metrics are recorded before the change and again, measured the
+  same way, in the evidence entry.
+- **Evidence-first projects.** `claudebase journal policy --evidence-first on|off` (the operator, from a
+  plain terminal; refused from a session) makes the evidence entry also point at proofs:
+  `journal add --proof <file|screenshot|log|url>` (repeatable), shown by `journal get`.
+
+### Removed
+
+- **The installers no longer set up language servers.** Neither `install.sh` nor `install.ps1`
+  installs Rust, Node.js, rust-analyzer, pyright, typescript-language-server or their Claude Code
+  plugins any more: the toolchains broke the install on hosts that had nothing to do with them, the
+  latest when Node.js 26 (LTS since 2026-10-28) needed `libatomic.so.1`, which a bare ubuntu:24.04
+  lacks, and `npm install -g` failed with a misleading hint. Language servers and plugins installed
+  earlier are left as they are. `--no-lsp` / `-NoLsp` are still accepted and do nothing; `--local`
+  still installs a minimal rustup when cargo is missing, to build the binary.
+
 ## [0.21.0] - 2026-10-29
 
 ### Added

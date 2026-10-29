@@ -649,6 +649,14 @@ fn classify_with(meta: &Value, sender_hint: Option<String>, resolve_nick: bool) 
         );
     }
 
+    if field("source").as_deref() == Some("reminder") {
+        let thread = thread_field
+            .clone()
+            .or_else(|| chat_field.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        return (thread, Source::Reminder { entry: field("entry_id").unwrap_or_default() });
+    }
+
     if field("source").as_deref() == Some("callback") {
         let label = field("label").filter(|l| !l.is_empty());
         let thread = thread_field
@@ -1142,6 +1150,16 @@ mod classify_tests {
         let (thread, source) = classify(&meta_of(&frame), None);
         assert_eq!(thread, "agent:target-agent-id");
         assert_eq!(source, Source::Callback { label: Some("ci".to_string()) });
+    }
+
+    #[test]
+    fn a_journal_reminder_is_a_reminder() {
+        let frame = crate::daemon::chat::build_channel_notification_reminder(
+            "benchmark the bus", 42, "target-agent-id", "msg-11",
+        );
+        let (thread, source) = classify(&meta_of(&frame), None);
+        assert_eq!(thread, "agent:target-agent-id");
+        assert_eq!(source, Source::Reminder { entry: "42".to_string() });
     }
 
     #[test]

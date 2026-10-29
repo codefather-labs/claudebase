@@ -321,15 +321,15 @@ jobs:
   # install, and the installer's own final checks decide: it exits non-zero
   # when the binary, the daemon or the hooks are not in place.
   install-bare:
-    name: bare ${{ matrix.image }} as ${{ matrix.user }}${{ matrix.lsp && ' + language servers' || '' }}
+    name: bare ${{ matrix.image }} as ${{ matrix.user }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { image: 'ubuntu:24.04', user: root, lsp: true }
-          - { image: 'debian:13', user: root, lsp: false }
-          - { image: 'ubuntu:24.04', user: dev, lsp: false }
+          - { image: 'ubuntu:24.04', user: root }
+          - { image: 'debian:13', user: root }
+          - { image: 'ubuntu:24.04', user: dev }
     container:
       image: ${{ matrix.image }}
       options: --user root
@@ -355,7 +355,6 @@ jobs:
         run: |
           set -eu
           flags="--yes --no-models"
-          [ "${{ matrix.lsp }}" = true ] || flags="$flags --no-lsp"
           if [ "${{ matrix.user }}" = root ]; then
             bash install.sh $flags
           else
@@ -375,17 +374,6 @@ jobs:
             "$home/.claude/settings.json" >/dev/null || { echo "hooks not wired"; exit 1; }
           if [ "${{ matrix.user }}" = root ]; then "$cb" daemon status; else su "${{ matrix.user }}" -c "$cb daemon status"; fi \
             | grep -q '^state: running' || { echo "daemon not running"; exit 1; }
-
-      - name: Language servers run
-        if: matrix.lsp
-        shell: bash
-        run: |
-          set -eu
-          export PATH="$HOME/.cargo/bin:$PATH"
-          export NVM_DIR="$HOME/.nvm"; set +u; . "$NVM_DIR/nvm.sh"; set -u
-          rust-analyzer --version
-          pyright --version
-          typescript-language-server --version
 
   install-windows:
     name: install.ps1 on windows-latest

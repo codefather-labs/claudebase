@@ -31,6 +31,7 @@ pub mod journal_tools;
 pub mod pending_asks;
 pub mod pool;
 pub mod remote;
+pub mod reminders;
 pub mod server;
 pub mod session_tools;
 pub mod subscribe_client;

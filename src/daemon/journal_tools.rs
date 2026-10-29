@@ -34,6 +34,8 @@ struct Caller {
     /// Present for a session; `None` for a directory read.
     agent_id: Option<String>,
     nick: Option<String>,
+    /// The session's machine, as the registry names it.
+    host: Option<String>,
 }
 
 /// Run one `journal_*` tool. Errors are operator-facing messages.
@@ -87,6 +89,7 @@ fn dispatch(tool: &str, args: &Value) -> Result<Value> {
         "journal_unshare" => unshare(&dir, args),
         "journal_shares" => shares(),
         "journal_feedback" => feedback(&dir, args),
+        "journal_policy" => policy(&dir, args),
         "journal_unlink" => unlink(&dir, args),
         other => bail!("unknown journal tool `{other}`"),
     }
@@ -117,7 +120,7 @@ fn resolve(args: &Value, need_session: bool) -> Result<Caller> {
             Some(key) => key,
             None => journal::project_key(project_id.as_deref(), &path),
         };
-        return Ok(Caller { project, path, agent_id: Some(agent_id.into()), nick });
+        return Ok(Caller { project, path, agent_id: Some(agent_id.into()), nick, host: Some(host) });
     }
     if need_session {
         bail!(
@@ -140,11 +143,11 @@ fn resolve(args: &Value, need_session: bool) -> Result<Caller> {
         shared_key(&conn, &host, &cwd)?
     };
     if let Some(project) = shared {
-        return Ok(Caller { project, path: cwd, agent_id: None, nick: None });
+        return Ok(Caller { project, path: cwd, agent_id: None, nick: None, host: None });
     }
     let key = journal::project_key(str_arg(args, "project_id").as_deref(), &cwd);
     let project = if key != cwd && journal::journal_path(&dir, &key).exists() { key } else { nearest_journal(&dir, &cwd) };
-    Ok(Caller { project, path: cwd, agent_id: None, nick: None })
+    Ok(Caller { project, path: cwd, agent_id: None, nick: None, host: None })
 }
 
 // ---------------------------------------------------------------------------
@@ -297,6 +300,27 @@ fn nearest_journal(dir: &Path, cwd: &Path) -> PathBuf {
 
 /// Open the caller's journal. A session's journal is created on first use, and
 /// that is when its old `insights.db` is brought in.
+/// Show the project's journal policy, or — from the operator's own terminal
+/// only — change it. A session cannot: the policy is what binds agents, and an
+/// agent that could lift it would not be bound by it.
+fn policy(dir: &Path, args: &Value) -> Result<Value> {
+    let set = args.get("evidence_first").and_then(Value::as_bool);
+    if set.is_some() && str_arg(args, "agent_id").is_some() {
+        bail!("the journal policy is the operator's to change: run `claudebase journal policy` in a plain terminal, not from a session");
+    }
+    let caller = resolve(args, false)?;
+    let conn = open(dir, &caller)?
+        .ok_or_else(|| anyhow!("no journal for {} yet: it is created by the first `journal add` from a session", caller.project.display()))?;
+    if let Some(on) = set {
+        journal::set_evidence_first(&conn, on)?;
+    }
+    Ok(json!({
+        "project": project_json(&caller),
+        "evidence_first": journal::evidence_first(&conn)?,
+        "min_evidence_chars": journal::MIN_EVIDENCE_CHARS,
+    }))
+}
+
 fn open(dir: &Path, caller: &Caller) -> Result<Option<rusqlite::Connection>> {
     let create = caller.agent_id.is_some();
     if create {
@@ -349,6 +373,11 @@ fn add(dir: &Path, args: &Value) -> Result<Value> {
         feature: str_arg(args, "feature"),
         source_artifact: str_arg(args, "source_artifact"),
         flags: str_list(args, "flags"),
+        proofs: str_list(args, "proofs"),
+        remind_every: args.get("every_secs").and_then(Value::as_i64),
+        // The session's own nick, never `--agent`: a reminder goes back to
+        // the session that wrote it and to no other.
+        remind_to: caller.nick.clone().map(|n| (n, caller.host.clone())),
         foreign: false,
     };
     let (status, id) = journal::add(&mut conn, &entry, journal::now_secs())?;
@@ -379,7 +408,7 @@ fn import(dir: &Path, args: &Value) -> Result<Value> {
     if entries.len() > MAX_IMPORT_BATCH {
         bail!("at most {MAX_IMPORT_BATCH} entries per call, got {}", entries.len());
     }
-    let caller = Caller { project, path, agent_id: None, nick: None };
+    let caller = Caller { project, path, agent_id: None, nick: None, host: None };
     adopt(dir, &caller);
     let mut conn = journal::open(dir, &caller.project, true)?.expect("created on demand");
     let now = journal::now_secs();
@@ -399,6 +428,9 @@ fn import(dir: &Path, args: &Value) -> Result<Value> {
             feature: str_arg(e, "feature"),
             source_artifact: str_arg(e, "source_artifact"),
             flags: flags.iter().filter_map(|f| str_arg(f, "flag")).collect(),
+            proofs: str_list(e, "proofs"),
+            remind_every: None,
+            remind_to: None,
             // Its `journal#N` numbers entries of the source journal.
             foreign: true,
         };

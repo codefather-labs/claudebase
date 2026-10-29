@@ -58,20 +58,28 @@ How to write one:
 
 Every feature or fix you implement runs as a branch of the journal graph, in this order:
 
-1. **Before you start: a todo.** What will be done and why.
+1. **Before you start: a todo with its test protocol.** What will be done and why, and — written now, while planning, not after the code exists — the **test protocol** that will prove it:
+   - **what to test after the change**: the fix or feature itself, and the **regressions** — the neighbouring behaviour it can break, named one by one;
+   - **how**: the commands, tests, live checks or scenarios to run;
+   - **under which conditions**: environment, machine, data, load, how many runs;
+   - **what evidence proves it**: the output, number, log line or screenshot each check must show to count as passed.
+
+   When the result can only be read from **physical metrics of a long pipeline** (latency, throughput, memory, error rate, accuracy, a run's duration or cost), measure them **before** the change, under the conditions the protocol names, and record the baseline in the todo or in an entry of its own (`Baseline for journal#T: <metric = value, how and where measured>`). The evidence entry then gives the same metrics **after**, measured the same way, next to the baseline.
    ```bash
-   claudebase journal add "<what and why>" --todo --tag <tag>                         # -> #T
+   claudebase journal add "<what and why>. Test protocol: <what, incl. regressions; how; conditions; expected evidence>. Baseline: <metric = value, measured how>" \
+     --todo --tag <tag>                                                                  # -> #T
    ```
-2. **After implementing: the implementation, unverified.** It links to the todo and carries the **verification protocol**: how to prove it works — the commands, tests or live checks, and what each must show.
+2. **After implementing: the implementation, unverified.** It links to the todo and carries the **verification protocol**: the todo's test protocol as it now stands — the commands, tests or live checks, regressions included, and what each must show. If the work changed what has to be checked, say what and why.
    ```bash
    claudebase journal add "Implements journal#T: <what changed, where, commit>. Verification protocol: <steps and expected results>" \
      --category update --unverified --tag <tag>                                          # -> #I
    ```
-3. **After running the protocol: the evidence, verified.** It links to the implementation and records what was actually run and what it showed: command output, test results, measured numbers.
+3. **After running the protocol: the evidence, verified.** It links to the implementation and records what was actually run and what it showed: command output, test results, the regression checks, measured numbers — for a metric with a baseline, before and after side by side.
    ```bash
    claudebase journal add "Verifies journal#I: <what was run, its output, what it proves>" \
-     --category verification --verified --tag <tag>                                      # -> #V
+     --category verification --verified --tag <tag> [--proof <file|screenshot|log|url>]  # -> #V
    ```
+   **`unverified` is lifted only by evidence, and claudebase enforces it.** `journal close` and `journal unmark` refuse to lift an `unverified` flag until a *separate* entry verifies it (`Verifies journal#N`) and says in its own words what was checked, how, under which conditions and how many times, at least 40 characters beyond the references. When the project is **evidence-first** (`claudebase journal policy` shows it; the operator sets it), that entry must also point at the proofs with `--proof` (repeatable): screenshots, logs, files, URLs. Giving up on a check is `journal close <id> --abandon --resolution "<why>"`, which records it as abandoned, not verified.
 4. **Then close the branch:** `claudebase journal close T`. The todo refuses to close until its branch holds a `--verified` entry. When it closes, the open work items of the whole branch close with it, resolved as `verified: journal#V`.
 
 Rules for the branch:
@@ -81,7 +89,7 @@ Rules for the branch:
 - **Never flag `--verified` without having run the checks**, and never with only a claim ("works", "tested"). Reviewers trust that flag.
 - **Work that is dropped** closes with a reason instead of evidence: `claudebase journal close T --abandon --resolution "<why>"`.
 
-**A bug is a branch too.** Every bug you find gets its own entry the moment you find it, flagged `--todo` so the fix hangs from it: `journal add "<symptom, cause, where>" --category bug --todo` (#B). The fix is a separate entry, `"Fixes journal#B: … Verification protocol: …" --unverified` (#F). Prove it, then `"Verifies journal#F: <what was run, its output>" --verified`, and `journal close B`.
+**A bug is a branch too.** Every bug you find gets its own entry the moment you find it, flagged `--todo` so the fix hangs from it: `journal add "<symptom, cause, where>. Test protocol: <...>" --category bug --todo` (#B); the test protocol (with regressions, conditions, expected evidence, and a baseline when the result is a metric) is written when the fix is planned — in the bug entry, or in the entry that plans the fix. The fix is a separate entry, `"Fixes journal#B: … Verification protocol: …" --unverified` (#F). Prove it, then `"Verifies journal#F: <what was run, its output>" --verified`, and `journal close B`.
 
 ## Sharing a journal between folders
 
@@ -109,8 +117,8 @@ Any entry can carry flags, so one found by meaning alone still says what it is:
 | `--todo` | something to do | `close` |
 | `--question` | an open question | `close` (the answer) |
 | `--problem` | an unresolved problem | `close` (the fix) |
-| `--reminder` | something to come back to | `close` |
-| `--unverified` | a hypothesis or assumption, not yet checked | `close` (confirmed / falsified) |
+| `--reminder` | something to come back to; with `--every 20m` (on `add`) the daemon puts it back into YOUR session's input as `[reminder #N]` every interval until you close it — only to the session that wrote it, never while it is offline, on return if it came due meanwhile | `close` |
+| `--unverified` | a hypothesis or assumption, not yet checked | `close` (confirmed / falsified), only once a separate `Verifies journal#N` entry carries the evidence |
 | `--disputed` | contradicts another entry | `close` (who was right; mark the loser deprecated) |
 | `--ai-feedback` | your suggestion for improving claudebase itself | `close` (handled) |
 | `--constraint` | a rule to follow, not weigh | `unmark` |

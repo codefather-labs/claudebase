@@ -59,6 +59,8 @@ fn request(sub: JournalSubcommand) -> Result<(&'static str, Value, bool)> {
                 "agent": a.agent,
                 "feature": a.feature,
                 "source_artifact": a.source_artifact,
+                "proofs": a.proofs,
+                "every_secs": a.every,
                 "flags": a.flags.names(),
                 // Claude Code exports the conversation id into every tool
                 // shell; it links the entry back to the transcript.
@@ -105,6 +107,11 @@ fn request(sub: JournalSubcommand) -> Result<(&'static str, Value, bool)> {
         JournalSubcommand::Unshare(a) => ("journal_unshare", target(&a.path)?, a.json),
         JournalSubcommand::Shares(a) => ("journal_shares", json!({}), a.json),
         JournalSubcommand::Feedback(a) => ("journal_feedback", json!({ "all": a.all }), a.json),
+        JournalSubcommand::Policy(a) => (
+            "journal_policy",
+            json!({ "evidence_first": a.evidence_first.map(|v| v == "on") }),
+            a.json,
+        ),
         JournalSubcommand::Branch(a) => ("journal_branch", json!({ "id": a.id }), a.json),
         JournalSubcommand::Agenda(a) => ("journal_agenda", json!({ "limit": a.limit }), a.json),
     })
@@ -335,6 +342,17 @@ fn render(tool: &str, p: &Value) -> String {
                     out.push_str(&format!("{label}: {v}\n"));
                 }
             }
+            if let Some(r) = e["remind"].as_object() {
+                out.push_str(&format!(
+                    "reminds {} every {} min, next {}\n",
+                    r["nick"].as_str().unwrap_or("?"),
+                    r["every_secs"].as_i64().unwrap_or(0) / 60,
+                    r["next_at"].as_i64().map(date).unwrap_or_default()
+                ));
+            }
+            for proof in e["proofs"].as_array().cloned().unwrap_or_default() {
+                out.push_str(&format!("proof: {}\n", proof.as_str().unwrap_or("")));
+            }
             for f in e["flags"].as_array().cloned().unwrap_or_default() {
                 let name = f["flag"].as_str().unwrap_or("");
                 if f["open"] == true {
@@ -463,6 +481,13 @@ fn render(tool: &str, p: &Value) -> String {
             }
             out
         }
+        "journal_policy" => format!(
+            "journal of {project}\n  evidence-first: {}\n  unverified is lifted only by a separate entry \"Verifies journal#N: ...\" \
+             that says what was checked, how, under which conditions and how many times ({}+ characters){}",
+            if p["evidence_first"] == true { "on" } else { "off" },
+            p["min_evidence_chars"],
+            if p["evidence_first"] == true { ", and points at proofs with --proof" } else { "" },
+        ),
         "journal_unlink" => format!("unlinked #{} from #{} ({} link(s))", p["id"], p["to"], p["removed"]),
         "journal_delete" => format!("deleted #{} from the journal of {project}", p["deleted"]),
         "journal_mark" | "journal_unmark" | "journal_close" | "journal_reopen" => {

@@ -9,19 +9,28 @@ name: claudebase release
 # Triggered by:
 #   - pushing a tag matching `claudebase-v*` (cuts a GitHub Release)
 #   - manual `workflow_dispatch` (build verification only — no release)
+#   - manual `workflow_dispatch` with `tag`: rebuild that existing release's
+#     sources with THIS workflow and replace its linux-x64 binary. For a
+#     release whose binary was built wrong (v0.21.0 / v0.22.0 on ubuntu 26.04,
+#     glibc 2.43): the old tag still carries the old workflow.
 
 on:
   push:
     tags:
       - 'claudebase-v*'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag (claudebase-vX.Y.Z) whose linux-x64 binary to rebuild and replace; empty = build check only'
+        required: false
+        default: ''
 
 # Default least-privilege; the `release` job re-declares write access for itself.
 permissions:
   contents: read
 
 concurrency:
-  group: claudebase-release-${{ github.ref }}
+  group: claudebase-release-${{ github.ref }}-${{ inputs.tag }}
   cancel-in-progress: true
 
 jobs:
@@ -53,7 +62,7 @@ jobs:
   # Verbatim runner labels per architect decision (load-bearing for Slice 4):
   #   - darwin-arm64 → macos-14
   #   - darwin-x64   → macos-13
-  #   - linux-x64    → ubuntu-latest
+  #   - linux-x64    → ubuntu-24.04 (pinned, see the matrix)
   #   - linux-arm64  → ubuntu-22.04-arm
   #   - windows-x64  → windows-latest
   # TODO(iter-3.1): Windows build deferred if pdf.rs unix-only imports prevent
@@ -107,6 +116,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -329,3 +340,42 @@ jobs:
           # (the job needs `build`). Only linux-arm64 is best-effort, so its
           # binary can be missing here.
           fail_on_unmatched_files: false
+
+  # ---------------------------------------------------------------------------
+  # Job 4 — replace the linux-x64 binary of an existing release
+  # (workflow_dispatch with `tag`). The build above checked out that tag and
+  # passed the glibc ceiling; the version check makes sure the binary is the
+  # tag's own before it overwrites the published one.
+  # ---------------------------------------------------------------------------
+  replace-asset:
+    name: replace linux-x64 of ${{ inputs.tag }}
+    needs: build
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'workflow_dispatch' && inputs.tag != ''
+    permissions:
+      contents: write
+    steps:
+      - name: Download the linux-x64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: claudebase-linux-x64
+          path: dist
+
+      - name: Check it is the tag's version and starts
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          case "$TAG" in claudebase-v*) ;; *) echo "ERROR: tag must be claudebase-vX.Y.Z, got $TAG"; exit 1 ;; esac
+          chmod +x dist/claudebase-linux-x64
+          got=$(dist/claudebase-linux-x64 --version | awk '{print $2}')
+          echo "binary says $got"
+          test "$got" = "${TAG#claudebase-v}"
+
+      - name: Replace the release asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          gh release upload "$TAG" dist/claudebase-linux-x64 --clobber -R "$GITHUB_REPOSITORY"

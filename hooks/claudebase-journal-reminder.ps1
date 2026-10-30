@@ -83,7 +83,20 @@ While you work, journal every decision you make, every finding you uncover and e
 If `journal add` answers that it needs a session started with `claudebase run`, tell the operator once and carry on without it.
 
 Full protocol: ~/.claude/rules/project-journal.md
+
+Mind maps - working memory for a long task or research: `claudebase mindmap new "<topic>"`, then `mindmap add <map> "<short note>" --kind fact|hypothesis|question|decision|task|idea|dead-end [--parent n<id>] [--ref <journal id>]`, `mindmap link <map> n<a> n<b> --label "contradicts"`, `mindmap chain <map> "<name>" <entry> <entry> ...`, `mindmap done|drop <map> n<id>`. Read it back with `mindmap show <map>`; draw it with `mindmap svg <map> -o map.svg` or `mindmap send <map>` (Telegram); `mindmap close <map>` when the task is done. A map is yours alone: another session may only read it by id.
 '@
+    # This session's open mind maps only (the daemon lists a session its own),
+    # bounded so a daemon that does not answer cannot hold up the start.
+    if ($env:CLAUDEBASE_AGENT_ID -and (Get-Command claudebase -ErrorAction SilentlyContinue)) {
+        $job = Start-Job -ScriptBlock { claudebase mindmap list --brief 2>$null }
+        $maps = ''
+        if (Wait-Job $job -Timeout 3) { $maps = ((Receive-Job $job) -join "`n").Trim() }
+        Remove-Job $job -Force -ErrorAction SilentlyContinue
+        if ($maps) {
+            $reminder += "`n`n[mind maps] Your open mind maps - read the one for your current work with claudebase mindmap show <id> before you continue it:`n" + $maps
+        }
+    }
 }
 
 $out = [ordered]@{

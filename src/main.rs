@@ -68,6 +68,7 @@ fn main() -> std::process::ExitCode {
         Command::ReindexPages(a) => a.project_root.as_deref(),
         // The journal lives with the daemon, not under a project root.
         Command::Journal(_) => None,
+        Command::Mindmap(_) => None,
         Command::Auth(_) => None,
         Command::Pool(_) => None,
         // Daemon / Plugin do NOT operate on a project filesystem — they
@@ -114,6 +115,7 @@ fn main() -> std::process::ExitCode {
         Command::Journal(args) => {
             simple_async(claudebase::journal_cli::run(args.sub), "journal")
         }
+        Command::Mindmap(args) => simple_async(claudebase::mindmap_cli::run(args.sub), "mindmap"),
         Command::Auth(args) => simple_async(claudebase::remote_cli::auth(args.sub), "auth"),
         Command::Pool(args) => simple_async(claudebase::pool_cli::run(args.sub), "pool"),
         Command::Daemon(args) => match args.sub {

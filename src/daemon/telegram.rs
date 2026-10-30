@@ -111,6 +111,40 @@ pub struct KeyboardOutbound {
 
 static OUTBOUND_TG_KEYBOARD: OnceLock<mpsc::UnboundedSender<KeyboardOutbound>> = OnceLock::new();
 
+/// An image or a file for the operator — a rendered mind map. Same drain
+/// loop and `Bot` as the text path; `ack` carries the sent message id or the
+/// (redacted) error back to the caller.
+pub struct FileOutbound {
+    pub chat_id: i64,
+    pub thread_id: Option<i64>,
+    pub bytes: Vec<u8>,
+    pub file_name: String,
+    pub caption: String,
+    /// `sendPhoto` when false; `sendDocument` (any size and shape) when true.
+    pub as_document: bool,
+    pub ack: tokio::sync::oneshot::Sender<Result<i64>>,
+}
+
+static OUTBOUND_TG_FILE: OnceLock<mpsc::UnboundedSender<FileOutbound>> = OnceLock::new();
+
+/// Queue a photo or document; the receiver yields the Telegram message id.
+pub fn enqueue_outbound_tg_file(
+    chat_id: i64,
+    thread_id: Option<i64>,
+    bytes: Vec<u8>,
+    file_name: String,
+    caption: String,
+    as_document: bool,
+) -> Result<tokio::sync::oneshot::Receiver<Result<i64>>> {
+    let tx = OUTBOUND_TG_FILE
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("telegram is not running in this daemon (no bot configured)"))?;
+    let (ack, rx) = tokio::sync::oneshot::channel();
+    tx.send(FileOutbound { chat_id, thread_id, bytes, file_name, caption, as_document, ack })
+        .map_err(|e| anyhow::anyhow!("file outbound channel closed: {e}"))?;
+    Ok(rx)
+}
+
 /// Push an outbound Telegram message from any task. Returns Ok(()) on
 /// successful enqueue (does NOT wait for HTTP send completion). Returns
 /// Err if telegram long-poll is not running OR the channel is closed.
@@ -1467,6 +1501,10 @@ pub fn spawn_long_poll(
     }
     // Slice 8 — parallel channel for `chat_ask` keyboard outbounds.
     let (kb_tx, kb_rx) = mpsc::unbounded_channel::<KeyboardOutbound>();
+    let (file_tx, file_rx) = mpsc::unbounded_channel::<FileOutbound>();
+    if OUTBOUND_TG_FILE.set(file_tx).is_err() {
+        tracing::warn!("OUTBOUND_TG_FILE already initialised — second spawn_long_poll call ignored");
+    }
     if OUTBOUND_TG_KEYBOARD.set(kb_tx).is_err() {
         tracing::warn!(
             "OUTBOUND_TG_KEYBOARD already initialised — second spawn_long_poll call ignored"
@@ -1507,7 +1545,7 @@ pub fn spawn_long_poll(
         // the daemon's other tasks keep running.
         let token_str = token.as_str().to_string();
         if let Err(e) =
-            run_long_poll(token, bus, asr, asr_max_concurrent, outbound_rx, kb_rx).await
+            run_long_poll(token, bus, asr, asr_max_concurrent, outbound_rx, kb_rx, file_rx).await
         {
             tracing::error!(
                 error = %redact_error_string(&format!("{e:#}"), &token_str),
@@ -1610,6 +1648,7 @@ async fn run_long_poll(
     asr_max_concurrent: Option<usize>,
     mut outbound_rx: mpsc::UnboundedReceiver<(i64, Option<i64>, String, Option<String>)>,
     mut kb_rx: mpsc::UnboundedReceiver<KeyboardOutbound>,
+    mut file_rx: mpsc::UnboundedReceiver<FileOutbound>,
 ) -> Result<()> {
     // Allow tests / local dev to point at a mock Telegram endpoint via
     // TELOXIDE_API_URL. teloxide 0.17 reads this env var directly via
@@ -1923,6 +1962,46 @@ async fn run_long_poll(
                     tracing::warn!("keyboard outbound channel disconnected (no more chat_ask traffic)");
                     break;
                 }
+            }
+        }
+
+        // Photos and documents (rendered mind maps). Fewer per iteration:
+        // each is an upload.
+        for _ in 0..4 {
+            match file_rx.try_recv() {
+                Ok(f) => {
+                    use teloxide::payloads::{SendDocumentSetters, SendPhotoSetters};
+                    use teloxide::requests::Requester;
+                    use teloxide::types::{ChatId, InputFile, MessageId, ThreadId};
+                    let FileOutbound { chat_id, thread_id, bytes, file_name, caption, as_document, ack } = f;
+                    let file = InputFile::memory(bytes).file_name(file_name);
+                    let thread = thread_id.map(|t| ThreadId(MessageId(t as i32)));
+                    let sent = if as_document {
+                        let mut req = bot.send_document(ChatId(chat_id), file).caption(caption);
+                        if let Some(t) = thread {
+                            req = req.message_thread_id(t);
+                        }
+                        req.await
+                    } else {
+                        let mut req = bot.send_photo(ChatId(chat_id), file).caption(caption);
+                        if let Some(t) = thread {
+                            req = req.message_thread_id(t);
+                        }
+                        req.await
+                    };
+                    match sent {
+                        Ok(msg) => {
+                            tracing::info!(chat_id, thread_id = ?thread_id, message_id = msg.id.0, as_document, "telegram file sent");
+                            let _ = ack.send(Ok(msg.id.0 as i64));
+                        }
+                        Err(e) => {
+                            let redacted = redact_error_string(&format!("{e}"), &token_for_error_redaction);
+                            tracing::warn!(chat_id, error = %redacted, "telegram file send failed");
+                            let _ = ack.send(Err(anyhow::anyhow!("telegram send failed: {redacted}")));
+                        }
+                    }
+                }
+                Err(_) => break,
             }
         }
 

@@ -25,17 +25,17 @@ use serde_json::{json, Value};
 use crate::journal::{self, Filter, NewEntry, SearchMode};
 
 /// Who is asking, and therefore which journal.
-struct Caller {
+pub(super) struct Caller {
     /// What the journal is filed under (`journal::project_key`).
-    project: PathBuf,
+    pub(super) project: PathBuf,
     /// The directory the caller works in — on ITS machine, which for a
     /// session joined from elsewhere is not this one.
-    path: PathBuf,
+    pub(super) path: PathBuf,
     /// Present for a session; `None` for a directory read.
-    agent_id: Option<String>,
-    nick: Option<String>,
+    pub(super) agent_id: Option<String>,
+    pub(super) nick: Option<String>,
     /// The session's machine, as the registry names it.
-    host: Option<String>,
+    pub(super) host: Option<String>,
 }
 
 /// Run one `journal_*` tool. Errors are operator-facing messages.
@@ -91,11 +91,12 @@ fn dispatch(tool: &str, args: &Value) -> Result<Value> {
         "journal_feedback" => feedback(&dir, args),
         "journal_policy" => policy(&dir, args),
         "journal_unlink" => unlink(&dir, args),
+        t if t.starts_with("journal_mindmap_") => super::mindmap_tools::dispatch(t, &dir, args),
         other => bail!("unknown journal tool `{other}`"),
     }
 }
 
-fn resolve(args: &Value, need_session: bool) -> Result<Caller> {
+pub(super) fn resolve(args: &Value, need_session: bool) -> Result<Caller> {
     let agent_id = str_arg(args, "agent_id");
     let token = str_arg(args, "session_token");
     if let (Some(agent_id), Some(token)) = (agent_id.as_deref(), token.as_deref()) {
@@ -321,7 +322,7 @@ fn policy(dir: &Path, args: &Value) -> Result<Value> {
     }))
 }
 
-fn open(dir: &Path, caller: &Caller) -> Result<Option<rusqlite::Connection>> {
+pub(super) fn open(dir: &Path, caller: &Caller) -> Result<Option<rusqlite::Connection>> {
     let create = caller.agent_id.is_some();
     if create {
         adopt(dir, caller);
@@ -354,7 +355,7 @@ fn adopt(dir: &Path, caller: &Caller) {
     }
 }
 
-fn project_json(caller: &Caller) -> Value {
+pub(super) fn project_json(caller: &Caller) -> Value {
     json!(caller.project.to_string_lossy())
 }
 
@@ -747,7 +748,7 @@ pub fn spawn_maintenance() {
     });
 }
 
-fn str_arg(args: &Value, key: &str) -> Option<String> {
+pub(super) fn str_arg(args: &Value, key: &str) -> Option<String> {
     args.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(String::from)
 }
 

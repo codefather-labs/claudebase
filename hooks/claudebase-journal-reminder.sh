@@ -7,9 +7,11 @@
 # decision, finding and update while working. The journal itself lives with the
 # claudebase daemon, one per project directory `claudebase run` started in.
 #
-# This hook emits TEXT ONLY - it does NOT itself invoke `claudebase`. The agent
-# decides whether the read applies (it is conditional on a fresh context) and
-# runs the CLI calls itself.
+# The journal part is TEXT ONLY: the agent decides whether the read applies
+# (it is conditional on a fresh context) and runs the CLI calls itself. The one
+# call this hook makes is `claudebase mindmap list --brief`, bounded by a 3 s
+# timeout, to name THIS session's open mind maps (the daemon lists a session
+# its own maps only - another session never sees them here).
 #
 # UserPromptSubmit (every prompt): injects only the operator's journaling
 # policy - bugs, fixes and the evidence for them each get their own entry,
@@ -94,7 +96,22 @@ While you work, journal every decision you make, every finding you uncover and e
 
 If `journal add` answers that it needs a session started with `claudebase run`, tell the operator once and carry on without it.
 
-Full protocol: ~/.claude/rules/project-journal.md'
+Full protocol: ~/.claude/rules/project-journal.md
+
+Mind maps - working memory for a long task or research: `claudebase mindmap new "<topic>"`, then `mindmap add <map> "<short note>" --kind fact|hypothesis|question|decision|task|idea|dead-end [--parent n<id>] [--ref <journal id>]`, `mindmap link <map> n<a> n<b> --label "contradicts"`, `mindmap chain <map> "<name>" <entry> <entry> ...`, `mindmap done|drop <map> n<id>`. Read it back with `mindmap show <map>`; draw it with `mindmap svg <map> -o map.svg` or `mindmap send <map>` (Telegram); `mindmap close <map>` when the task is done. A map is yours alone: another session may only read it by id.'
+  if [ -n "${CLAUDEBASE_AGENT_ID:-}" ] && command -v claudebase >/dev/null 2>&1; then
+    if command -v timeout >/dev/null 2>&1; then
+      maps=$(timeout 3 claudebase mindmap list --brief 2>/dev/null || true)
+    else
+      maps=$(claudebase mindmap list --brief 2>/dev/null || true)
+    fi
+    if [ -n "$maps" ]; then
+      reminder="$reminder
+
+[mind maps] Your open mind maps - read the one for your current work with claudebase mindmap show <id> before you continue it:
+$maps"
+    fi
+  fi
 fi
 
 if command -v jq >/dev/null 2>&1; then

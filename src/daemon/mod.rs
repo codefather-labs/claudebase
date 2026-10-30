@@ -28,6 +28,7 @@ pub mod client;
 pub mod config;
 pub mod ipc;
 pub mod journal_tools;
+pub mod mindmap_tools;
 pub mod pending_asks;
 pub mod pool;
 pub mod remote;

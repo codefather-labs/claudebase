@@ -118,7 +118,8 @@ WHAT GETS INSTALLED:
                                             /claudebase-setup-claude-token,
                                             /claudebase-journal-share
   ~/.claude/hooks/claudebase-channel-contract.sh   SessionStart - how outside messages arrive
-  ~/.claude/hooks/claudebase-journal-reminder.sh   SessionStart - read and keep the project journal;
+  ~/.claude/hooks/claudebase-journal-reminder.sh   SessionStart - read and keep the project journal,
+                                            and this session's open mind maps;
                                             UserPromptSubmit - the journaling policy
   ~/.claude/hooks/claudebase-selfcheck-reminder.sh UserPromptSubmit - self-check reminder
   ~/.claude/hooks/claudebase-agent-routing-reminder.sh  PreToolUse:EnterPlanMode - peers exist

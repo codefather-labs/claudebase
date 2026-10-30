@@ -450,7 +450,7 @@ function Register-BashAllowlist {
 # Install claudebase hooks into ~/.claude/hooks/ and wire into settings.json:
 #   - SessionStart -> claudebase-channel-contract.ps1 (how messages from outside
 #     the terminal arrive, and that a reply only leaves through a CLI call)
-#   - SessionStart -> claudebase-journal-reminder.ps1 (read and keep the journal)
+#   - SessionStart -> claudebase-journal-reminder.ps1 (read and keep the journal; this session's open mind maps)
 #   - UserPromptSubmit -> claudebase-selfcheck-reminder.ps1 (self-check nudge)
 #   - UserPromptSubmit -> claudebase-journal-reminder.ps1 again (the journaling policy;
 #     the hook reads which event fired)

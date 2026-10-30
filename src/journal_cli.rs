@@ -255,7 +255,7 @@ pub async fn import_entries(
     Ok(report)
 }
 
-fn with_caller(mut args: Value) -> Value {
+pub(crate) fn with_caller(mut args: Value) -> Value {
     let env = |k| std::env::var(k).ok().filter(|s: &String| !s.is_empty());
     if let (Some(id), Some(token)) = (env(AGENT_ID_ENV), env(SESSION_TOKEN_ENV)) {
         args["agent_id"] = json!(id);

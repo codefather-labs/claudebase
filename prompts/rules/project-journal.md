@@ -144,4 +144,24 @@ claudebase journal unmark 37 --important
 - Write todos and questions down instead of leaving them in the conversation, where the next session will not see them.
 - An open work item, a constraint or an important mark keeps its entry past retention.
 
+## Mind maps — working memory for a long task
+
+For a long task, a research question or a hunt for a cause, keep a mind map next to the journal. The journal holds what is settled. The map holds where you are: the topic, what you know, what you suspect, what you ruled out, and how these connect.
+
+```bash
+claudebase mindmap new "<topic>"                                              # -> map M, root n1
+claudebase mindmap add M "<short note>" --kind fact|hypothesis|question|decision|task|idea|goal|dead-end|note \
+  [--parent n<id>] [--ref <journal id>]
+claudebase mindmap link M n<a> n<b> --label "contradicts" [--ref <journal id>]
+claudebase mindmap chain M "<name>" <entry> <entry> ...                       # an ordered line of journal entries
+claudebase mindmap done|drop|undo M n<id>
+claudebase mindmap show M                                                     # read it back
+claudebase mindmap close M                                                    # when the task is done
+```
+
+- Keep nodes short, and keep the detail in the journal: point a node or a link at the entries it rests on with `--ref`.
+- After a compaction or resume, the session-start reminder names your open maps. Read the one for your current work with `mindmap show` before you continue it.
+- A map is yours alone. Another session may read it by id but cannot write to it, and you cannot write to another session's map.
+- `mindmap svg M -o map.svg`, `mindmap send M` (Telegram) and `mindmap url M` (a live page) show the map to the operator. Use them when the operator asks, or when a picture says more than the outline.
+
 Not for the journal: narration of routine steps (running tests, reading files), restatements of the task, and secrets or credentials of any kind. A commit message does not replace an `update` entry: the journal is searched by tag and category across sessions, git history is not.

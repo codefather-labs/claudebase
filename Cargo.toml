@@ -205,6 +205,8 @@ vt100 = "0.15"
 # both libort_sys and libsherpa_onnx_sys. Linking sherpa-onnx as a shared
 # library keeps one ONNX Runtime in the process instead of two in the archive.
 sherpa-onnx = { version = "1.13", optional = true, default-features = false, features = ["shared"] }
+resvg = { version = "0.45.1", default-features = false, features = ["text"] }
+ttf-parser = "0.25.1"
 
 # Slice 2 — Windows Service install/uninstall/lifecycle via the
 # `windows-service` crate. Gated behind `cfg(windows)` so the build graph

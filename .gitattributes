@@ -24,3 +24,6 @@
 *.dll  binary
 *.bin  binary
 *.onnx binary
+
+# Fonts are binary (assets/fonts, embedded into the binary).
+*.ttf binary

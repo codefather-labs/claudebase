@@ -28,6 +28,7 @@ One Rust binary and a local daemon. Claude Code itself runs unmodified.
 | **Sessions you can reach** | `claudebase run` starts `claude` under a terminal supervisor. Telegram messages, messages from other sessions, HTTP callbacks and socket writes arrive in the session's input as prefixed lines. Replies go out through the CLI. |
 | **Many agents, many machines** | Sessions have names, list and message each other, and can join the daemon of another machine. A pool of sessions can serve model calls for a gateway. |
 | **A project journal** | Agents record decisions, findings and changes; the next session finds them by tag, category and meaning. Entries carry flags (todo, unverified, deprecated, …) and links that form a graph. Every feature or fix runs as a branch from a todo to a verified entry with evidence. |
+| **Mind maps** | A session keeps a working map of a long task or a piece of research: a tree of short notes around one topic, cross-links, journal entries behind each node and link, chains of entries. The map is the session's own. The daemon draws it as SVG, sends it to Telegram or serves a live page. |
 | **Operational glue** | The daemon runs as a service, a machine gets one Claude subscription token for all its sessions, and conversations move between machines. |
 | **Agent toolkit** | Rules, hooks, skills, commands and agents installed into `~/.claude/`, so every session knows the contract above without being told. |
 
@@ -298,6 +299,30 @@ graph LR
 - **Retention follows salience:** `high` forever, `medium` a year, `low` 90 days. An open work item, a `constraint` or an `important` entry is kept until it is resolved.
 - **`journal feedback`** gives the operator every project's `ai-feedback` entries in one view. It is refused to agents and to remote clients.
 
+## 🗺️ Mind maps
+
+The journal keeps what a project learned. A mind map is a session's working memory while it is still learning: a long task, a research question, a hunt for a cause. The topic sits in the middle. Notes branch off it, and each note has a kind: goal, fact, hypothesis, question, decision, idea, task, dead end or note. Links run across branches ("contradicts", "explains"). Any node or link can point at journal entries, and a **chain** is a named, ordered sequence of entries, unique within its map, such as the story of a fix.
+
+```bash
+claudebase mindmap new "why is the pool slow under load"         # -> map #3, root n1
+claudebase mindmap add 3 "queue grows when the bus saturates" --kind fact --ref 41
+claudebase mindmap add 3 "single writer task" --kind hypothesis --parent n2
+claudebase mindmap link 3 n3 n2 --label explains --ref 42
+claudebase mindmap chain 3 "the fix" 41 42 57                    # journal#41 › #42 › #57
+claudebase mindmap done 3 n3                                     # or: drop (a path not taken), undo
+claudebase mindmap show 3                                        # the outline, read back into context
+claudebase mindmap svg 3 -o map.svg                              # light/dark follows the viewer
+claudebase mindmap send 3                                        # a PNG to the operator in Telegram
+claudebase mindmap url 3                                         # the live page, redrawn every 2 s
+claudebase mindmap close 3                                       # kept and readable, no longer reminded
+```
+
+- **A map is its session's.** It belongs to the nick and host that made it, so a resumed conversation keeps it. Only the owner writes to it. Another session of the project may read it by id, and is never told it exists. `mindmap list` shows a session its own maps, and from a plain terminal every map of the project.
+- **It comes back after a compaction.** On session start, resume, `/clear` and compaction, the journal hook names the session's open maps (one daemon call, at most 3 s). The agent reads the one it needs with `mindmap show`, so nothing is pushed into the context by default.
+- **It is stored in the project's journal file:** `mindmaps`, `mindmap_nodes`, `mindmap_edges`, `mindmap_node_refs`, `mindmap_edge_refs`, `mindmap_chains`, `mindmap_chain_steps`. `journal share` carries maps along with entry ids renumbered, and `unshare` copies them. Deleting a journal entry removes it from every map that pointed at it.
+- **Drawing:** a two-sided tree. Each subtree has its own band, so nodes never overlap. A branch keeps its colour, a border shows the node's kind, done nodes are bold, dropped ones faded and struck through. The PNG for Telegram is rendered by resvg with an embedded Noto Sans (Latin, Cyrillic, Greek; SIL OFL), since a server may have no fonts. A map too large or too long for a Telegram photo goes as a file.
+- **The live page** is served at `/mindmap/<view token>` on the daemon's HTTP listener, which is off by default and binds to loopback (`claudebase daemon callback enable`). The 128-bit token in the URL is the only credential. Only `GET` is accepted.
+
 ## 🧰 Machines and conversations
 
 ```bash
@@ -315,7 +340,7 @@ claudebase chat clone <id|name> <new>   # a copy that /resume lists separately
 | | |
 |---|---|
 | **Rules** | `project-journal.md` — how to read and write the journal, flags, links, work branches. `cognitive-self-check.md` — facts vs assumptions, decision quality, challenging the task. |
-| **Hooks** | SessionStart: the message contract and the journal reminder (also after `/clear`). UserPromptSubmit: the self-check reminder and the journaling policy. Around plan mode: peers exist; publish what was decided. |
+| **Hooks** | SessionStart: the message contract, and the journal reminder with this session's open mind maps (also after `/clear` and compaction). UserPromptSubmit: the self-check reminder and the journaling policy. Around plan mode: peers exist; publish what was decided. |
 | **Skills** | `/claudebase-daemon-change-nick`, `-callback-info`, `-setup-auth-token`, `/claudebase-setup-remote-daemon`, `/claudebase-setup-claude-token`, `/claudebase-chat-dump`, `/claudebase-chat-load`, `/claudebase-journal-share` |
 | **Commands** | `/reflect`, `/consolidate`, `/update-claudebase`, `/knowledge-ingest` |
 | **Agents** | `reflection` and `consolidator` — passes that look for drift and blind spots across the work |

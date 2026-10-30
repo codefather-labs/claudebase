@@ -615,6 +615,14 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, bus: &SharedBus) -
         }
     }
 
+    // A mind map's live page (journal#92): GET only, the map's view token in
+    // the path is the credential — a browser cannot send X-Api-Token.
+    if target.starts_with("/mindmap/") {
+        let (status, content_type, body) = mindmap_page(&method, &target).await;
+        respond_raw(&mut stream, status, content_type, &body).await?;
+        return Ok(());
+    }
+
     // The pool API (docs/design/pool-dispatch.md) shares this listener: its own
     // routes, methods, token kind and a larger body (a dispatch carries images).
     if target.starts_with("/pool/") {
@@ -700,6 +708,78 @@ fn extract_text(body: &str) -> String {
 
 fn find_head_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// `GET /mindmap/<token>` — the page; `GET /mindmap/<token>.svg` — the
+/// drawing it refreshes from.
+async fn mindmap_page(method: &str, target: &str) -> (&'static str, &'static str, Vec<u8>) {
+    if !method.eq_ignore_ascii_case("GET") {
+        return ("405 Method Not Allowed", "text/plain; charset=utf-8", b"use GET".to_vec());
+    }
+    let rest = target.trim_start_matches("/mindmap/");
+    let rest = rest.split('?').next().unwrap_or_default();
+    let (token, svg_only) = match rest.strip_suffix(".svg") {
+        Some(t) => (t.to_string(), true),
+        None => (rest.to_string(), false),
+    };
+    let found = tokio::task::spawn_blocking(move || super::mindmap_tools::find_by_token(&token)).await;
+    let map = match found {
+        Ok(Ok(Some(map))) => map,
+        Ok(Ok(None)) => return ("404 Not Found", "text/plain; charset=utf-8", b"no such mind map".to_vec()),
+        Ok(Err(e)) => {
+            tracing::warn!(error = %format!("{e:#}"), "mindmap page: lookup failed");
+            return ("500 Internal Server Error", "text/plain; charset=utf-8", b"lookup failed".to_vec());
+        }
+        Err(_) => return ("500 Internal Server Error", "text/plain; charset=utf-8", b"lookup failed".to_vec()),
+    };
+    let svg = crate::mindmap_svg::render_svg(&map, crate::mindmap_svg::Theme::Auto);
+    if svg_only {
+        return ("200 OK", "image/svg+xml; charset=utf-8", svg.into_bytes());
+    }
+    let title = map.summary.title.replace('&', "&amp;").replace('<', "&lt;");
+    let page = MINDMAP_PAGE.replace("{{TITLE}}", &title).replace("{{SVG}}", &svg);
+    ("200 OK", "text/html; charset=utf-8", page.into_bytes())
+}
+
+/// Redraws every 2 s from `<token>.svg`; click toggles fit-to-width.
+const MINDMAP_PAGE: &str = r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}} — mind map</title>
+<style>
+:root{--bg:#f8fafc;--fg:#0f172a;--mu:#64748b}
+@media (prefers-color-scheme: dark){:root{--bg:#0b1120;--fg:#e2e8f0;--mu:#94a3b8}}
+html,body{margin:0;background:var(--bg);color:var(--fg);font:13px system-ui,sans-serif}
+#bar{position:sticky;top:0;padding:8px 16px;color:var(--mu);background:var(--bg)}
+#map{overflow:auto;padding:0 16px 16px}
+#map.fit svg{width:100%;height:auto}
+</style></head><body>
+<div id="bar">live · updates every 2 s · click the map to toggle fit / full size · <span id="st"></span></div>
+<div id="map" class="fit">{{SVG}}</div>
+<script>
+const box=document.getElementById('map'),st=document.getElementById('st');
+box.addEventListener('click',()=>box.classList.toggle('fit'));
+let last=box.innerHTML;
+async function tick(){
+  try{
+    const r=await fetch(location.pathname.replace(/\/$/,'')+'.svg',{cache:'no-store'});
+    if(r.ok){const t=await r.text();if(t!==last){box.innerHTML=t;last=t;}st.textContent='updated '+new Date().toLocaleTimeString();}
+    else{st.textContent='map gone ('+r.status+')';}
+  }catch(e){st.textContent='daemon unreachable';}
+}
+setInterval(tick,2000);
+</script></body></html>
+"#;
+
+async fn respond_raw(stream: &mut tokio::net::TcpStream, status: &str, content_type: &str, body: &[u8]) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(body).await?;
+    stream.flush().await?;
+    Ok(())
 }
 
 async fn respond(

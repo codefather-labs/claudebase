@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **Mind maps** (`claudebase mindmap`). A session's working memory for a long task: a tree of short
+  notes around a topic, each with a kind (goal, fact, hypothesis, question, decision, idea, task, dead
+  end, note) and a state (open, done, dropped), plus cross-links with labels. Any node or link can point
+  at journal entries, and chains are named, ordered sequences of entries, unique within their map.
+  - A map belongs to the session that made it (nick and host) and only that session writes to it.
+    Another session of the project can read it by id. `mindmap list` and the session-start reminder
+    show a session its own open maps only.
+  - Maps are stored in the project's journal and travel with `journal share` / `unshare`, entry ids
+    renumbered.
+  - `mindmap svg` draws the map as SVG that follows the viewer's light or dark theme. `mindmap send`
+    sends it to the operator in Telegram as a PNG, or as a file when it is too large for a photo; this
+    is the first non-text Telegram output. `mindmap url` gives a live page on the daemon's HTTP
+    listener, redrawn every 2 s.
+  - Rendering adds resvg 0.45 and an embedded Noto Sans Regular (SIL OFL 1.1, `assets/fonts/`).
+
 ## [0.22.1] - 2026-10-29
 
 ### Fixed

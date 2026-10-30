@@ -398,6 +398,7 @@ fn open_file(path: &Path) -> Result<Connection> {
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
     conn.execute_batch(SCHEMA).context("apply journal schema")?;
+    conn.execute_batch(crate::mindmap::SCHEMA).context("apply mind-map schema")?;
     let mut conn = conn;
     backfill_links(&mut conn).context("journal links backfill")?;
     Ok(conn)
@@ -1843,6 +1844,8 @@ pub fn merge_into(dst: &mut Connection, src: &Connection) -> Result<(usize, usiz
             }
         }
     }
+    // Mind maps point at entries by id: renumbered through the same map.
+    crate::mindmap::merge(dst, src, &map).context("copy the mind maps")?;
     Ok((written, merged))
 }
 

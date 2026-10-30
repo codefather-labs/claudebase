@@ -340,6 +340,11 @@ pub enum Command {
     /// recorded by agents and searched by tag and category. Held by the
     /// daemon, one per project.
     Journal(JournalArgs),
+    /// Mind maps: a session's working memory for a long task — a tree of
+    /// short notes around one topic, cross-links, journal references and
+    /// chains of entries. Owned by the session that makes them; drawn as SVG,
+    /// sent to Telegram, or shown live by the daemon.
+    Mindmap(MindmapArgs),
     /// The Claude subscription token of the machine whose daemon is in use:
     /// hand it over once, and every Claude started there is signed in.
     Auth(AuthArgs),
@@ -952,6 +957,186 @@ pub struct DaemonConfigShowArgs {
 pub struct JournalArgs {
     #[command(subcommand)]
     pub sub: JournalSubcommand,
+}
+
+#[derive(Args, Debug)]
+pub struct MindmapArgs {
+    #[command(subcommand)]
+    pub sub: MindmapSubcommand,
+}
+
+/// A journal entry id: `12`, `#12` or `journal#12`.
+pub fn parse_entry_ref(raw: &str) -> Result<i64, String> {
+    let t = raw.trim();
+    let t = t.strip_prefix("journal").unwrap_or(t);
+    let t = t.strip_prefix('#').unwrap_or(t);
+    t.parse::<i64>().map_err(|_| format!("`{raw}` is not a journal entry id (12, #12 or journal#12)"))
+}
+
+/// A node id as `show` prints it (`n12`) or bare (`12`).
+pub fn parse_node_ref(raw: &str) -> Result<i64, String> {
+    let t = raw.trim();
+    t.strip_prefix('n').unwrap_or(t).parse::<i64>().map_err(|_| format!("`{raw}` is not a node id (12 or n12)"))
+}
+
+/// A link id as `show` prints it (`l3`) or bare (`3`).
+pub fn parse_link_ref(raw: &str) -> Result<i64, String> {
+    let t = raw.trim();
+    t.strip_prefix('l').unwrap_or(t).parse::<i64>().map_err(|_| format!("`{raw}` is not a link id (3 or l3)"))
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MindmapSubcommand {
+    /// Start a map; its title is the root topic. Prints the map id.
+    New {
+        title: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// This session's maps (from a plain terminal: every map of the project).
+    List {
+        /// Closed maps too.
+        #[arg(long)]
+        closed: bool,
+        /// One line per map, for hooks and scripts.
+        #[arg(long)]
+        brief: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// A map as an outline: nodes (nN), links (lN), journal references, chains.
+    /// Any session of the project may read any map by id.
+    Show {
+        map: i64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add a node under --parent (default: the root topic).
+    Add {
+        map: i64,
+        text: String,
+        #[arg(long, value_parser = parse_node_ref)]
+        parent: Option<i64>,
+        /// goal | fact | hypothesis | question | decision | idea | task | dead-end | note
+        #[arg(long, default_value = "note")]
+        kind: String,
+        /// A journal entry this node rests on (repeatable).
+        #[arg(long = "ref", value_parser = parse_entry_ref)]
+        refs: Vec<i64>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change a node's text or kind (the root's text is the map's title).
+    Edit {
+        map: i64,
+        #[arg(value_parser = parse_node_ref)]
+        node: i64,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+    },
+    /// Move a node and its subtree under another parent.
+    Mv {
+        map: i64,
+        #[arg(value_parser = parse_node_ref)]
+        node: i64,
+        #[arg(long, value_parser = parse_node_ref)]
+        parent: i64,
+    },
+    /// Mark a node done.
+    Done {
+        map: i64,
+        #[arg(value_parser = parse_node_ref)]
+        node: i64,
+    },
+    /// Mark a node dropped (a path not taken; kept, drawn faded).
+    Drop {
+        map: i64,
+        #[arg(value_parser = parse_node_ref)]
+        node: i64,
+    },
+    /// Make a done or dropped node open again.
+    Undo {
+        map: i64,
+        #[arg(value_parser = parse_node_ref)]
+        node: i64,
+    },
+    /// Remove a node and everything under it.
+    Rm {
+        map: i64,
+        #[arg(value_parser = parse_node_ref)]
+        node: i64,
+    },
+    /// Cross-link two nodes ("contradicts", "depends on", ...).
+    Link {
+        map: i64,
+        #[arg(value_parser = parse_node_ref)]
+        from: i64,
+        #[arg(value_parser = parse_node_ref)]
+        to: i64,
+        #[arg(long, default_value = "")]
+        label: String,
+        #[arg(long = "ref", value_parser = parse_entry_ref)]
+        refs: Vec<i64>,
+    },
+    /// Remove a cross-link.
+    Unlink {
+        map: i64,
+        #[arg(value_parser = parse_link_ref)]
+        link: i64,
+    },
+    /// Point a node (--node) or a link (--link) at journal entries.
+    Ref {
+        map: i64,
+        #[arg(long, value_parser = parse_node_ref, conflicts_with = "link")]
+        node: Option<i64>,
+        #[arg(long, value_parser = parse_link_ref)]
+        link: Option<i64>,
+        #[arg(required = true, value_parser = parse_entry_ref)]
+        entries: Vec<i64>,
+        /// Remove these references instead.
+        #[arg(long)]
+        remove: bool,
+    },
+    /// A named, ordered sequence of journal entries; unique in its map.
+    Chain {
+        map: i64,
+        name: String,
+        #[arg(value_parser = parse_entry_ref)]
+        entries: Vec<i64>,
+        /// Remove the chain of that name instead.
+        #[arg(long)]
+        remove: bool,
+    },
+    /// Close a map: kept and readable, no longer in the session's reminder.
+    Close { map: i64 },
+    /// Reopen a closed map.
+    Reopen { map: i64 },
+    /// Delete a map for good.
+    Delete { map: i64 },
+    /// Draw the map as SVG (to stdout, or -o FILE).
+    Svg {
+        map: i64,
+        #[arg(short = 'o', long)]
+        output: Option<std::path::PathBuf>,
+        /// auto (follows the viewer's light/dark), light or dark.
+        #[arg(long, default_value = "auto")]
+        theme: String,
+    },
+    /// Send the drawing to the operator in Telegram (the chat this session answers in).
+    Send {
+        map: i64,
+        #[arg(long, default_value = "light")]
+        theme: String,
+        #[arg(long)]
+        caption: Option<String>,
+        /// Telegram thread, when the destination is ambiguous.
+        #[arg(long)]
+        thread: Option<String>,
+    },
+    /// The map's live page on the daemon's HTTP listener.
+    Url { map: i64 },
 }
 
 #[derive(Args, Debug)]

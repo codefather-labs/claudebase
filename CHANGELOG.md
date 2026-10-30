@@ -6,7 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-## [0.23.0] - 2026-10-30
+## [0.23.1] - 2026-10-30
+
+### Fixed
+
+- **The release builds macOS on macos-15.** GitHub retires the macos-14 runner image on 2026-11-02,
+  and one of its brownouts cancelled the darwin-arm64 build of v0.23.0, so that tag never became a
+  release. v0.23.1 is v0.23.0 (mind maps) with the macOS build moved.
+
+## [0.23.0] - 2026-10-30 (tagged, not released)
 
 ### Added
 

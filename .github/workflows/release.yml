@@ -60,7 +60,7 @@ jobs:
   # ---------------------------------------------------------------------------
   # Job 2 — cross-platform release build matrix.
   # Verbatim runner labels per architect decision (load-bearing for Slice 4):
-  #   - darwin-arm64 → macos-14
+  #   - darwin-arm64 → macos-15
   #   - darwin-x64   → macos-13
   #   - linux-x64    → ubuntu-24.04 (pinned, see the matrix)
   #   - linux-arm64  → ubuntu-22.04-arm
@@ -98,7 +98,9 @@ jobs:
       matrix:
         include:
           - platform: darwin-arm64
-            runs-on: macos-14
+            # macos-14 is retired on 2026-11-02 and its brownouts cancelled the
+            # v0.23.0 build (journal#99). macos-15 is arm64 as well.
+            runs-on: macos-15
             target: aarch64-apple-darwin
           # Pinned, never ubuntu-latest: a binary links the glibc of the runner
           # it was built on. ubuntu-latest moved to 26.04 (glibc 2.43) in

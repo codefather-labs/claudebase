@@ -186,9 +186,13 @@ jobs:
             jq -e "[.hooks.$ev[].hooks[].command | select(endswith(\"/claudebase-journal-reminder.sh\"))] | length == 1" \
               "$HOME/.claude/settings.json" >/dev/null || { echo "journal reminder not wired exactly once under $ev"; exit 1; }
           done
-          echo '{"hook_event_name":"SessionStart"}' | bash "$HOME/.claude/hooks/claudebase-journal-reminder.sh" \
-            | jq -r '.hookSpecificOutput.additionalContext' \
-            | grep -qF 'claudebase journal add' || { echo "journal reminder does not teach journal add"; exit 1; }
+          # Read the whole output before matching: `| grep -q` exits at the first
+          # match, the writer still writing gets SIGPIPE, and pipefail fails the
+          # step (it did once the reminder grew past what jq writes at once).
+          start=$(echo '{"hook_event_name":"SessionStart"}' | bash "$HOME/.claude/hooks/claudebase-journal-reminder.sh" \
+            | jq -r '.hookSpecificOutput.additionalContext')
+          grep -qF 'claudebase journal add' <<<"$start" || { echo "journal reminder does not teach journal add"; exit 1; }
+          grep -qF 'claudebase mindmap' <<<"$start" || { echo "journal reminder does not teach mind maps"; exit 1; }
           echo '{"hook_event_name":"UserPromptSubmit"}' | bash "$HOME/.claude/hooks/claudebase-journal-reminder.sh" \
             | jq -e '.hookSpecificOutput | .hookEventName == "UserPromptSubmit" and (.additionalContext | contains("Verifies journal#"))' \
             >/dev/null || { echo "journal reminder gives no policy on a prompt"; exit 1; }
@@ -372,8 +376,8 @@ jobs:
           jqb=$(command -v jq || echo "$home/.claude/tools/claudebase/bin/jq")
           "$jqb" -e '[.hooks.SessionStart[]?.hooks[]?.command] | any(test("claudebase-channel-contract"))' \
             "$home/.claude/settings.json" >/dev/null || { echo "hooks not wired"; exit 1; }
-          if [ "${{ matrix.user }}" = root ]; then "$cb" daemon status; else su "${{ matrix.user }}" -c "$cb daemon status"; fi \
-            | grep -q '^state: running' || { echo "daemon not running"; exit 1; }
+          if [ "${{ matrix.user }}" = root ]; then status=$("$cb" daemon status || true); else status=$(su "${{ matrix.user }}" -c "$cb daemon status" || true); fi
+          grep -q '^state: running' <<<"$status" || { echo "daemon not running: $status"; exit 1; }
 
   install-windows:
     name: install.ps1 on windows-latest

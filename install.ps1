@@ -295,12 +295,12 @@ function Install-Binary {
     Write-Info "Downloading claudebase.exe v$($Script:ClaudebaseVersion)..."
     $got = $false
     try {
-        Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing -MaximumRedirection 5 -TimeoutSec 120
+        Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing -MaximumRedirection 5 -TimeoutSec 1800
         $got = $true
     } catch {
         Write-Warn "v$($Script:ClaudebaseVersion) not downloadable yet; falling back to the latest release"
         try {
-            Invoke-WebRequest -Uri $fallbackUrl -OutFile $tmp -UseBasicParsing -MaximumRedirection 5 -TimeoutSec 120
+            Invoke-WebRequest -Uri $fallbackUrl -OutFile $tmp -UseBasicParsing -MaximumRedirection 5 -TimeoutSec 1800
             $got = $true
         } catch {
             Write-Warn "claudebase binary download failed: $($_.Exception.Message)"
@@ -617,7 +617,7 @@ function Install-Pdfium {
     New-Item -ItemType Directory -Force -Path $staging | Out-Null
 
     try {
-        Invoke-WebRequest -Uri $url -OutFile $tmpArchive -UseBasicParsing -MaximumRedirection 5 -TimeoutSec 120
+        Invoke-WebRequest -Uri $url -OutFile $tmpArchive -UseBasicParsing -MaximumRedirection 5 -TimeoutSec 1800
     } catch {
         Write-Warn "pdfium download failed: $($_.Exception.Message)"
         Write-Warn "  PDF extraction will fail at runtime; install manually or skip PDF ingestion"

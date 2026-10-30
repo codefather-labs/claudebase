@@ -342,10 +342,14 @@ install_binary() {
   local fallback_url="${REPO_URL%.git}/releases/latest/download/${asset}"
   local tmp; tmp="$(mktemp)"
 
+  # No limit on the whole download: a 40 MB binary over a slow link takes
+  # minutes, and `--max-time 120` cut it off at half on a 170 KB/s line. A
+  # transfer is abandoned when it stalls (under 1 KB/s for 60 s) instead;
+  # wget's --timeout is per read already.
   fetch_binary() {
     local from="$1"
     if command -v curl >/dev/null 2>&1; then
-      curl --proto '=https' --tlsv1.2 -fsSL --max-redirs 5 --max-time 120 "$from" -o "$tmp"
+      curl --proto '=https' --tlsv1.2 -fsSL --max-redirs 5 --connect-timeout 30 --speed-limit 1024 --speed-time 60 "$from" -o "$tmp"
     elif command -v wget >/dev/null 2>&1; then
       wget --https-only --secure-protocol=TLSv1_2 --max-redirect=5 --timeout=120 -q -O "$tmp" "$from"
     else
@@ -731,7 +735,7 @@ install_pdfium() {
     trap 'rm -f "$tmp_archive"; rm -rf "$staging" 2>/dev/null' EXIT
 
     if command -v curl >/dev/null 2>&1; then
-      if ! curl --proto '=https' --tlsv1.2 -fsSL --max-redirs 5 --max-time 120 "$url" -o "$tmp_archive"; then
+      if ! curl --proto '=https' --tlsv1.2 -fsSL --max-redirs 5 --connect-timeout 30 --speed-limit 1024 --speed-time 60 "$url" -o "$tmp_archive"; then
         log_warn "pdfium download failed (curl); skipping PDF support"; return 0
       fi
     elif command -v wget >/dev/null 2>&1; then

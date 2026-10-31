@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-10-31
+
 ### Added
 
 - **Shared mind maps.** `mindmap new --shared` or `mindmap share <map>` (the owner only) makes a map

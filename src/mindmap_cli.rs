@@ -130,7 +130,7 @@ fn render(tool: &str, p: &Value, brief: bool) -> String {
                         m["id"],
                         if flow { "flowchart " } else { "" },
                         m["title"].as_str().unwrap_or_default(),
-                        m["nodes"].as_i64().unwrap_or(1).saturating_sub(1),
+                        m["node_count"].as_i64().unwrap_or(1).saturating_sub(1),
                         m["open_nodes"],
                         ago(m["updated_at"].as_i64().unwrap_or(0))
                     );

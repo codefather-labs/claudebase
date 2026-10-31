@@ -399,3 +399,123 @@ fn without_a_daemon_the_conversation_loads_and_the_journal_waits() {
     assert!(text.contains("the journal was NOT imported") && text.contains("claudebase journal import"), "{text}");
     assert!(b.folder().join(format!("{ID}.jsonl")).is_file());
 }
+
+async fn ok(c: &mut common::Client, tool: &str, args: Value) -> Value {
+    let r = c.call(tool, args, 9).await.unwrap();
+    common::payload(&r).unwrap_or_else(|| panic!("{tool} failed: {r}"))
+}
+
+/// journal#120: the links between entries and the project's mind maps travel
+/// too — renumbered when the target journal already has entries of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn links_and_mind_maps_travel_with_the_conversation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = Machine::new(tmp.path(), "a");
+    let b = Machine::with_project(tmp.path(), "b", "elsewhere");
+    seed(&a);
+
+    let _da = daemon_for(&a).await;
+    let a_dir = a.project.to_str().unwrap().to_owned();
+    let mut client = common::Client::connect(&common::socket_under(&a.home)).await.unwrap();
+    let reg = client
+        .call(
+            "agent_register",
+            serde_json::json!({"agent_id": "mira-1", "name": "mira", "session_token": "tok", "cwd": a_dir, "host": "host-a", "pid": std::process::id()}),
+            1,
+        )
+        .await
+        .unwrap();
+    assert!(reg.get("error").is_none(), "{reg}");
+    let s = |extra: Value| {
+        let mut v = serde_json::json!({"agent_id": "mira-1", "session_token": "tok"});
+        for (k, x) in extra.as_object().unwrap() {
+            v[k] = x.clone();
+        }
+        v
+    };
+    let entries = serde_json::json!([
+        {"body": "the pool queue grows under load", "category": "finding", "tags": ["pool"], "created_at": 1_700_000_000},
+        {"body": "measured: queue flat after the shard", "category": "verification", "tags": ["pool"], "created_at": 1_700_000_100},
+        {"body": "shard the writer task", "category": "decision", "tags": ["pool"], "created_at": 1_700_000_200},
+    ]);
+    let r = ok(&mut client, "journal_import", serde_json::json!({"cwd": a_dir, "entries": entries})).await;
+    let ids: Vec<i64> = r["ids"].as_array().unwrap().iter().map(|v| v.as_i64().unwrap()).collect();
+    let (finding, proof, decision) = (ids[0], ids[1], ids[2]);
+    ok(&mut client, "journal_import_links", serde_json::json!({"cwd": a_dir, "links": [[proof, finding, "verifies"], [decision, finding, "cites"]]})).await;
+    // A shared mind map and a private flowchart, pointing at the entries.
+    let m = ok(&mut client, "journal_mindmap_new", s(serde_json::json!({"title": "pool", "shared": true}))).await["map"].as_i64().unwrap();
+    let n1 = ok(&mut client, "journal_mindmap_add", s(serde_json::json!({"map": m, "text": "queue grows", "kind": "fact", "refs": [finding]}))).await["node"].as_i64().unwrap();
+    let n2 = ok(&mut client, "journal_mindmap_add", s(serde_json::json!({"map": m, "text": "shard it", "kind": "decision", "refs": [decision]}))).await["node"].as_i64().unwrap();
+    ok(&mut client, "journal_mindmap_link", s(serde_json::json!({"map": m, "from": n2, "to": n1, "label": "fixes", "refs": [proof]}))).await;
+    ok(&mut client, "journal_mindmap_chain", s(serde_json::json!({"map": m, "name": "story", "entries": [finding, decision, proof]}))).await;
+    let f = ok(&mut client, "journal_mindmap_new", s(serde_json::json!({"title": "request path", "layout": "flowchart", "direction": "right"}))).await["map"].as_i64().unwrap();
+    let start = ok(&mut client, "journal_mindmap_add", s(serde_json::json!({"map": f, "text": "request", "kind": "start"}))).await["node"].as_i64().unwrap();
+    ok(&mut client, "journal_mindmap_add", s(serde_json::json!({"map": f, "text": "queue", "kind": "data", "after": start, "label": "enqueue", "refs": [finding]}))).await;
+    let chat = rusqlite::Connection::open(a.home.join(".claude/knowledge/chat.db")).unwrap();
+    claudebase::daemon::agent_registry::remember_conversation_nick(&chat, ID, "mira", 1).unwrap();
+    drop(chat);
+
+    let (a2, b2) = (a, b);
+    let (_a, b, archive) = tokio::task::spawn_blocking(move || {
+        let out = a2.run(&["chat", "dump", ID]).success().get_output().stdout.clone();
+        let text = String::from_utf8_lossy(&out).into_owned();
+        assert!(text.contains("journal: 3 entries") && text.contains("mind maps: 2"), "{text}");
+        let archive = archive_path(&out);
+        (a2, b2, archive)
+    })
+    .await
+    .unwrap();
+
+    // b's journal already has an entry: everything from a is renumbered.
+    let _db = daemon_for(&b).await;
+    let b_dir = b.project.to_str().unwrap().to_owned();
+    let mut bc = common::Client::connect(&common::socket_under(&b.home)).await.unwrap();
+    ok(&mut bc, "journal_import", serde_json::json!({"cwd": b_dir, "entries": [{"body": "b was here first", "category": "finding", "tags": ["b"], "created_at": 1_600_000_000}]})).await;
+    let carried = b.project.join("carried.zip");
+    fs::copy(&archive, &carried).unwrap();
+    let b = tokio::task::spawn_blocking(move || {
+        let out = b.run(&["chat", "load", "carried.zip"]).success().get_output().stdout.clone();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("3 entries written") && text.contains("2 links restored") && text.contains("2 mind maps imported"), "{text}");
+        b
+    })
+    .await
+    .unwrap();
+
+    let listed = ok(&mut bc, "journal_list", serde_json::json!({"cwd": b_dir})).await;
+    let by_body = |body: &str| listed["entries"].as_array().unwrap().iter().find(|e| e["body"] == body).unwrap().clone();
+    let (nf, np, nd) = (by_body("the pool queue grows under load"), by_body("measured: queue flat after the shard"), by_body("shard the writer task"));
+    let (nf_id, np_id, nd_id) = (nf["id"].as_i64().unwrap(), np["id"].as_i64().unwrap(), nd["id"].as_i64().unwrap());
+    assert_ne!(nf_id, finding, "renumbered behind b's own entry");
+    let links_of = |e: &Value| e["links"].as_array().cloned().unwrap_or_default();
+    assert!(links_of(&np).iter().any(|l| l["kind"] == "verifies" && l["dir"] == "out" && l["id"] == nf_id), "{np}");
+    assert!(links_of(&nd).iter().any(|l| l["kind"] == "cites" && l["dir"] == "out" && l["id"] == nf_id), "{nd}");
+    assert_eq!(links_of(&nf).len(), 2, "both shown on the cited entry: {nf}");
+
+    let maps = ok(&mut bc, "journal_mindmap_list", serde_json::json!({"cwd": b_dir, "closed": true})).await;
+    let maps = maps["maps"].as_array().unwrap().clone();
+    assert_eq!(maps.len(), 2, "{maps:?}");
+    let pool = maps.iter().find(|m| m["title"] == "pool").unwrap();
+    assert_eq!((pool["owner_nick"].as_str(), pool["shared"].as_bool()), (Some("mira"), Some(true)));
+    assert_eq!(pool["owner_host"].as_str(), Some(claudebase::daemon::agent_registry::this_host().as_str()), "it lives here now");
+    let shown = ok(&mut bc, "journal_mindmap_show", serde_json::json!({"cwd": b_dir, "map": pool["id"]})).await;
+    let pm = &shown["map"];
+    let refs: Vec<i64> = pm["nodes"].as_array().unwrap().iter().flat_map(|n| n["refs"].as_array().unwrap().iter().map(|r| r.as_i64().unwrap())).collect();
+    assert!(refs.contains(&nf_id) && refs.contains(&nd_id), "{refs:?}");
+    assert_eq!(pm["edges"][0]["label"], "fixes");
+    assert_eq!(pm["edges"][0]["refs"], serde_json::json!([np_id]));
+    assert_eq!(pm["chains"][0]["entries"], serde_json::json!([nf_id, nd_id, np_id]));
+    let flow = maps.iter().find(|m| m["title"] == "request path").unwrap();
+    assert_eq!((flow["layout"].as_str(), flow["direction"].as_str()), (Some("flowchart"), Some("right")));
+    let fm = ok(&mut bc, "journal_mindmap_show", serde_json::json!({"cwd": b_dir, "map": flow["id"]})).await;
+    assert_eq!(fm["map"]["edges"][0]["label"], "enqueue");
+
+    // Loading again adds nothing.
+    tokio::task::spawn_blocking(move || {
+        let out = b.run(&["journal", "import", "carried.zip"]).success().get_output().stdout.clone();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("0 entries written, 3 already there") && text.contains("0 links restored, 2 already there") && text.contains("0 mind maps imported, 2 already there"), "{text}");
+    })
+    .await
+    .unwrap();
+}

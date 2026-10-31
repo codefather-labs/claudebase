@@ -10,6 +10,7 @@
 //! session/...          <claude-dir>/projects/<slug>/<id>/      subagents, tool results
 //! file-history/...     <claude-dir>/file-history/<id>/         /rewind backups
 //! journal.jsonl        the project's journal, one entry per line (from the daemon)
+//! mindmaps.json        the project's mind maps and flowcharts, whole (from the daemon)
 //! ```
 //!
 //! The manifest also carries the nick the conversation answers to. Both are
@@ -62,13 +63,16 @@ const FORMAT: &str = "claudebase-chat-dump";
 /// Bumped when a reader of the previous version could misread the archive.
 /// 2: `journal.jsonl` and the manifest's `nick` — a version-1 reader refuses
 /// the unknown entry, and should say "update" rather than "unexpected entry".
-const VERSION: u32 = 2;
+/// 3: `mindmaps.json` (journal#120) — same reason.
+const VERSION: u32 = 3;
 
 const MANIFEST: &str = "manifest.json";
 const TRANSCRIPT: &str = "transcript.jsonl";
 const SESSION_DIR: &str = "session";
 const FILE_HISTORY_DIR: &str = "file-history";
 const JOURNAL: &str = "journal.jsonl";
+const MINDMAPS: &str = "mindmaps.json";
+const MAX_MINDMAPS_BYTES: u64 = 64 << 20;
 /// Bounds on what is read from an untrusted `journal.jsonl`.
 const MAX_JOURNAL_BYTES: u64 = 256 << 20;
 const MAX_JOURNAL_ENTRIES: usize = 200_000;
@@ -93,6 +97,9 @@ struct Manifest {
     /// Entries in `journal.jsonl`; absent when the archive has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     journal_entries: Option<usize>,
+    /// Maps in `mindmaps.json`; absent when the archive has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mindmaps: Option<usize>,
 }
 
 /// What claudebase keeps about the conversation and its directory, fetched by
@@ -101,6 +108,8 @@ struct Manifest {
 pub struct DumpExtras {
     /// The project journal, oldest first; `None` when none is to be packed.
     pub journal: Option<Vec<Value>>,
+    /// Every mind map of the project, whole; empty when there are none.
+    pub mindmaps: Vec<Value>,
     pub nick: Option<String>,
 }
 
@@ -113,6 +122,7 @@ pub struct DumpReport {
     pub files: usize,
     pub bytes_in: u64,
     pub journal_entries: Option<usize>,
+    pub mindmaps: usize,
 }
 
 /// What [`load_conversation`] produced.
@@ -129,6 +139,8 @@ pub struct LoadReport {
     pub nick: Option<String>,
     /// Entries waiting in the archive's `journal.jsonl` (see [`read_journal`]).
     pub journal_entries: usize,
+    /// Maps waiting in the archive's `mindmaps.json` (see [`read_mindmaps`]).
+    pub mindmaps: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +187,7 @@ pub fn dump_conversation(
             claudebase_version: env!("CARGO_PKG_VERSION").to_owned(),
             nick: extras.nick.clone(),
             journal_entries: extras.journal.as_ref().map(Vec::len),
+            mindmaps: (!extras.mindmaps.is_empty()).then_some(extras.mindmaps.len()),
         };
         zip.start_file(MANIFEST, options(0))?;
         zip.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
@@ -212,6 +225,11 @@ pub fn dump_conversation(
             }
             files += 1;
         }
+        if !extras.mindmaps.is_empty() {
+            zip.start_file(MINDMAPS, options(0))?;
+            serde_json::to_writer(&mut zip, &extras.mindmaps)?;
+            files += 1;
+        }
         zip.finish()?.flush()?;
         Ok((files, bytes))
     })();
@@ -223,6 +241,7 @@ pub fn dump_conversation(
             files,
             bytes_in,
             journal_entries: extras.journal.as_ref().map(Vec::len),
+            mindmaps: extras.mindmaps.len(),
         }),
         Err(e) => {
             let _ = fs::remove_file(&archive);
@@ -414,6 +433,7 @@ pub fn load_conversation(
                 Some(MANIFEST) if rest.is_empty() => continue,
                 // Read by `read_journal` and handed to the daemon.
                 Some(JOURNAL) if rest.is_empty() => continue,
+                Some(MINDMAPS) if rest.is_empty() => continue,
                 Some(TRANSCRIPT) if rest.is_empty() => None,
                 Some(SESSION_DIR) if !rest.is_empty() => Some(&stage_session),
                 Some(FILE_HISTORY_DIR) if !rest.is_empty() => Some(&stage_history),
@@ -467,6 +487,7 @@ pub fn load_conversation(
             lines,
             nick: if new_id { None } else { manifest.nick },
             journal_entries: manifest.journal_entries.unwrap_or(0),
+            mindmaps: manifest.mindmaps.unwrap_or(0),
         }),
         Err(e) => {
             for dir in [&stage_session, &stage_history] {
@@ -524,6 +545,26 @@ pub fn read_journal(archive_path: &Path) -> Result<Vec<Value>> {
         }
     }
     Ok(out)
+}
+
+/// The mind maps packed in `archive` (as `journal_mindmap_export` gave them);
+/// empty when it has none. Each is validated again when the daemon writes it.
+pub fn read_mindmaps(archive_path: &Path) -> Result<Vec<Value>> {
+    let file = fs::File::open(archive_path).with_context(|| format!("open {}", archive_path.display()))?;
+    let mut zip = zip::ZipArchive::new(BufReader::new(file))
+        .with_context(|| format!("{} is not a zip archive", archive_path.display()))?;
+    let entry = match zip.by_name(MINDMAPS) {
+        Ok(e) => e,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut entry.take(MAX_MINDMAPS_BYTES), &mut buf)?;
+    let v: Value = serde_json::from_slice(&buf).with_context(|| format!("{MINDMAPS} is not JSON"))?;
+    match v {
+        Value::Array(maps) => Ok(maps),
+        _ => bail!("{MINDMAPS} is not a list of maps"),
+    }
 }
 
 #[cfg(test)]

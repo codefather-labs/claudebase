@@ -17,12 +17,14 @@ use crate::daemon::client::DaemonClient;
 pub async fn run(sub: JournalSubcommand) -> Result<String> {
     if let JournalSubcommand::Import(a) = sub {
         let entries = crate::chat_transfer::read_journal(&a.archive)?;
+        let maps = crate::chat_transfer::read_mindmaps(&a.archive)?;
         let cwd = std::env::current_dir()?;
         // Without the conversation this has no id to map, but the archive
         // still says where the project was.
         let source = crate::chat_transfer::archive_source_project(&a.archive)?;
         let moved = Moved { session: None, source_project: source.as_deref() };
-        let r = import_entries(&cwd, entries, moved).await?;
+        let mut r = import_entries(&cwd, entries, moved).await?;
+        import_mindmaps(&cwd, maps, &mut r).await?;
         return Ok(if a.json { serde_json::to_string_pretty(&r.to_json())? } else { r.describe() });
     }
     let (tool, args, json_out) = request(sub)?;
@@ -177,18 +179,32 @@ pub struct ImportReport {
     pub written: u64,
     pub merged: u64,
     pub refused: Vec<Value>,
+    /// Source entry id -> its id in this journal, for every entry that landed.
+    pub ids: std::collections::HashMap<i64, i64>,
+    /// Links between the imported entries: added, already there.
+    pub links: (u64, u64),
+    /// Mind maps: imported, already there, refused.
+    pub maps: (u64, u64, u64),
 }
 
 impl ImportReport {
     pub fn to_json(&self) -> Value {
-        json!({ "project": self.project, "written": self.written, "merged": self.merged, "refused": self.refused })
+        json!({
+            "project": self.project, "written": self.written, "merged": self.merged, "refused": self.refused,
+            "links_added": self.links.0, "links_kept": self.links.1,
+            "maps_imported": self.maps.0, "maps_kept": self.maps.1, "maps_refused": self.maps.2,
+        })
     }
 
     pub fn describe(&self) -> String {
         let mut s = format!(
-            "journal: {} entries written, {} already there ({})",
-            self.written, self.merged, self.project
+            "journal: {} entries written, {} already there; {} links restored, {} already there; \
+             {} mind maps imported, {} already there ({})",
+            self.written, self.merged, self.links.0, self.links.1, self.maps.0, self.maps.1, self.project
         );
+        if self.maps.2 > 0 {
+            s.push_str(&format!("\n{} mind maps refused", self.maps.2));
+        }
         if !self.refused.is_empty() {
             s.push_str(&format!("\n{} refused, e.g. {}", self.refused.len(), self.refused[0]["error"]));
         }
@@ -242,6 +258,13 @@ pub async fn import_entries(
             .await?;
         report.written += r["written"].as_u64().unwrap_or(0);
         report.merged += r["merged"].as_u64().unwrap_or(0);
+        // Where each source entry landed. A daemon older than this client
+        // returns no ids: then links and maps cannot be renumbered.
+        for (e, new) in batch.iter().zip(r["ids"].as_array().cloned().unwrap_or_default()) {
+            if let (Some(old), Some(new)) = (e.get("id").and_then(Value::as_i64), new.as_i64()) {
+                report.ids.insert(old, new);
+            }
+        }
         if let Some(p) = r["project"].as_str() {
             report.project = p.to_owned();
         }
@@ -252,7 +275,74 @@ pub async fn import_entries(
             report.refused.push(f);
         }
     }
+    // Links travel inside each entry (`links: [{kind, dir, id}]`), each one
+    // twice — out of one entry and into the other; the outgoing side is enough.
+    let mut links: Vec<Value> = Vec::new();
+    for e in &entries {
+        let Some(from) = e.get("id").and_then(Value::as_i64).and_then(|o| report.ids.get(&o).copied()) else { continue };
+        for l in e.get("links").and_then(Value::as_array).cloned().unwrap_or_default() {
+            if l.get("dir").and_then(Value::as_str) != Some("out") {
+                continue;
+            }
+            let (Some(to), Some(kind)) = (l.get("id").and_then(Value::as_i64).and_then(|o| report.ids.get(&o).copied()), l.get("kind").and_then(Value::as_str)) else { continue };
+            links.push(json!([from, to, kind]));
+        }
+    }
+    for batch in links.chunks(crate::daemon::journal_tools::MAX_IMPORT_BATCH * 8) {
+        let r = client
+            .call_tool("journal_import_links", json!({ "cwd": project.to_string_lossy(), "project_id": project_id, "links": batch }))
+            .await?;
+        report.links.0 += r["added"].as_u64().unwrap_or(0);
+        report.links.1 += r["kept"].as_u64().unwrap_or(0);
+    }
     Ok(report)
+}
+
+/// Every mind map of directory `project`'s journal, for an archive.
+pub async fn export_mindmaps(project: &std::path::Path) -> Result<Vec<Value>> {
+    let mut client = DaemonClient::connect().await?;
+    let r = client
+        .call_tool(
+            "journal_mindmap_export",
+            json!({ "cwd": project.to_string_lossy(), "project_id": crate::project_id::resolve_project_id(project) }),
+        )
+        .await?;
+    Ok(r["maps"].as_array().cloned().unwrap_or_default())
+}
+
+/// Write `maps` into the journal of directory `project`, their journal
+/// references renumbered through `report.ids` (from [`import_entries`]); the
+/// counts go into the report. They now live on this machine.
+pub async fn import_mindmaps(project: &std::path::Path, maps: Vec<Value>, report: &mut ImportReport) -> Result<()> {
+    if maps.is_empty() {
+        return Ok(());
+    }
+    let mut out = Vec::with_capacity(maps.len());
+    for m in maps {
+        match serde_json::from_value::<crate::mindmap::Map>(m) {
+            Ok(mut map) => {
+                crate::mindmap::renumber(&mut map, &report.ids);
+                out.push(serde_json::to_value(map)?);
+            }
+            Err(_) => report.maps.2 += 1,
+        }
+    }
+    let mut client = DaemonClient::connect().await?;
+    let r = client
+        .call_tool(
+            "journal_mindmap_import",
+            json!({
+                "cwd": project.to_string_lossy(),
+                "project_id": crate::project_id::resolve_project_id(project),
+                "host": crate::daemon::agent_registry::this_host(),
+                "maps": out,
+            }),
+        )
+        .await?;
+    report.maps.0 += r["imported"].as_u64().unwrap_or(0);
+    report.maps.1 += r["kept"].as_u64().unwrap_or(0);
+    report.maps.2 += r["refused"].as_array().map(|a| a.len() as u64).unwrap_or(0);
+    Ok(())
 }
 
 pub(crate) fn with_caller(mut args: Value) -> Value {

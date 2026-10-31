@@ -78,6 +78,9 @@ fn dispatch(tool: &str, args: &Value) -> Result<Value> {
         "journal_gc" => gc(&dir, args),
         "journal_projects" => Ok(json!({ "journals": journal::list_journals(&dir)? })),
         "journal_import" => import(&dir, args),
+        "journal_import_links" => import_links(&dir, args),
+        "journal_mindmap_export" => mindmap_export(&dir, args),
+        "journal_mindmap_import" => mindmap_import(&dir, args),
         "journal_mark" => mark(&dir, args),
         "journal_unmark" => unmark(&dir, args),
         "journal_close" => close(&dir, args),
@@ -414,6 +417,9 @@ fn import(dir: &Path, args: &Value) -> Result<Value> {
     let mut conn = journal::open(dir, &caller.project, true)?.expect("created on demand");
     let now = journal::now_secs();
     let (mut written, mut merged, mut refused) = (0, 0, Vec::new());
+    // The id each entry got here, in order (null when refused): what the
+    // caller renumbers links and mind-map references with.
+    let mut ids: Vec<Value> = Vec::with_capacity(entries.len());
     for (i, e) in entries.iter().enumerate() {
         // Flags travel as `journal_list` prints them: `[{flag, open, ...}]`.
         let flags: Vec<&Value> = e.get("flags").and_then(Value::as_array).map(|a| a.iter().collect()).unwrap_or_default();
@@ -440,6 +446,7 @@ fn import(dir: &Path, args: &Value) -> Result<Value> {
         match journal::add(&mut conn, &entry, created) {
             Ok((journal::AddStatus::Written, id)) => {
                 written += 1;
+                ids.push(json!(id));
                 for f in flags.iter().filter(|f| f.get("open").and_then(Value::as_bool) == Some(false)) {
                     let (Some(flag), at) = (str_arg(f, "flag"), f.get("closed_at").and_then(Value::as_i64)) else { continue };
                     let at = at.unwrap_or(now).min(now);
@@ -454,11 +461,89 @@ fn import(dir: &Path, args: &Value) -> Result<Value> {
                     );
                 }
             }
-            Ok((_, _)) => merged += 1,
-            Err(err) => refused.push(json!({ "index": i, "error": format!("{err:#}") })),
+            Ok((_, id)) => {
+                merged += 1;
+                ids.push(json!(id));
+            }
+            Err(err) => {
+                ids.push(Value::Null);
+                refused.push(json!({ "index": i, "error": format!("{err:#}") }))
+            }
         }
     }
-    Ok(json!({ "written": written, "merged": merged, "refused": refused, "project": project_json(&caller) }))
+    Ok(json!({ "written": written, "merged": merged, "refused": refused, "ids": ids, "project": project_json(&caller) }))
+}
+
+/// The journal a directory imports into, as `import` resolves it.
+fn import_target(dir: &Path, args: &Value) -> Result<(Caller, rusqlite::Connection)> {
+    let cwd = str_arg(args, "cwd").ok_or_else(|| anyhow!("cwd required: the directory to import into"))?;
+    let path = PathBuf::from(cwd);
+    if !path.is_absolute() {
+        bail!("cwd must be an absolute path");
+    }
+    let project = journal::project_key(str_arg(args, "project_id").as_deref(), &path);
+    let caller = Caller { project, path, agent_id: None, nick: None, host: None };
+    adopt(dir, &caller);
+    let conn = journal::open(dir, &caller.project, true)?.expect("created on demand");
+    Ok((caller, conn))
+}
+
+/// Links between imported entries, already renumbered for this journal:
+/// `links: [[from, to, kind], ...]`. A link that is there already is kept.
+fn import_links(dir: &Path, args: &Value) -> Result<Value> {
+    let (caller, mut conn) = import_target(dir, args)?;
+    let links = args.get("links").and_then(Value::as_array).ok_or_else(|| anyhow!("links required (array)"))?;
+    if links.len() > MAX_IMPORT_BATCH * 8 {
+        bail!("at most {} links per call", MAX_IMPORT_BATCH * 8);
+    }
+    let (mut added, mut kept, mut refused) = (0, 0, 0);
+    for l in links {
+        let (Some(from), Some(to), Some(kind)) = (l.get(0).and_then(Value::as_i64), l.get(1).and_then(Value::as_i64), l.get(2).and_then(Value::as_str)) else {
+            refused += 1;
+            continue;
+        };
+        match journal::link(&mut conn, from, to, kind) {
+            Ok(true) => added += 1,
+            Ok(false) => kept += 1,
+            Err(_) => refused += 1,
+        }
+    }
+    Ok(json!({ "added": added, "kept": kept, "refused": refused, "project": project_json(&caller) }))
+}
+
+/// Every mind map of a directory's journal, whole — what a conversation
+/// archive packs. A read, like `journal_list` from a plain terminal.
+fn mindmap_export(dir: &Path, args: &Value) -> Result<Value> {
+    let caller = resolve(args, false)?;
+    let Some(conn) = open(dir, &caller)? else {
+        return Ok(json!({ "project": project_json(&caller), "maps": [] }));
+    };
+    Ok(json!({ "project": project_json(&caller), "maps": crate::mindmap::export_all(&conn)? }))
+}
+
+/// Maps from an archive, their journal references already renumbered for
+/// this journal. They now live on `host`, the machine importing them.
+fn mindmap_import(dir: &Path, args: &Value) -> Result<Value> {
+    let (caller, mut conn) = import_target(dir, args)?;
+    let maps = args.get("maps").and_then(Value::as_array).ok_or_else(|| anyhow!("maps required (array)"))?;
+    let host = str_arg(args, "host");
+    let now = journal::now_secs();
+    let (mut imported, mut kept, mut refused) = (0, 0, Vec::new());
+    for (i, m) in maps.iter().enumerate() {
+        let map: crate::mindmap::Map = match serde_json::from_value(m.clone()) {
+            Ok(map) => map,
+            Err(e) => {
+                refused.push(json!({ "index": i, "error": format!("not a mind map: {e}") }));
+                continue;
+            }
+        };
+        match crate::mindmap::import(&mut conn, &map, host.as_deref(), now) {
+            Ok(Some(_)) => imported += 1,
+            Ok(None) => kept += 1,
+            Err(e) => refused.push(json!({ "index": i, "error": format!("{e:#}") })),
+        }
+    }
+    Ok(json!({ "imported": imported, "kept": kept, "refused": refused, "project": project_json(&caller) }))
 }
 
 fn filter(args: &Value) -> Result<Filter> {

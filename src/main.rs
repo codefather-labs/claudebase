@@ -874,12 +874,19 @@ fn run_chat_dump(args: &cli::ChatDumpArgs) -> anyhow::Result<String> {
             None
         }
     };
+    let mindmaps = match claudebase::daemon::run_tokio(claudebase::journal_cli::export_mindmaps(&project)) {
+        Ok(m) => m,
+        Err(e) => {
+            notes.push(format!("WARNING: the mind maps are NOT in this archive — the daemon did not give them ({e:#})."));
+            Vec::new()
+        }
+    };
     let nick = conversation_nick(&id);
-    let extras = chat_transfer::DumpExtras { journal, nick };
+    let extras = chat_transfer::DumpExtras { journal, mindmaps, nick };
     let r = chat_transfer::dump_conversation(&claude_dir, &cwd, &id, args.out.as_deref(), &extras)?;
     let size = std::fs::metadata(&r.archive).map(|m| m.len()).unwrap_or(0);
     let mut msg = format!(
-        "dumped {}{} ({} files, {:.1} MB -> {:.1} MB)\njournal: {}\nnick: {}\narchive: {}\non the other machine, from the project directory:\n  claudebase chat load {}",
+        "dumped {}{} ({} files, {:.1} MB -> {:.1} MB)\njournal: {}\nmind maps: {}\nnick: {}\narchive: {}\non the other machine, from the project directory:\n  claudebase chat load {}",
         r.session_id,
         r.title.as_deref().map(|t| format!(" `{t}`")).unwrap_or_default(),
         r.files,
@@ -889,6 +896,7 @@ fn run_chat_dump(args: &cli::ChatDumpArgs) -> anyhow::Result<String> {
             Some(n) => format!("{n} entries of {}", project.display()),
             None => format!("none for {}", project.display()),
         },
+        r.mindmaps,
         extras.nick.as_deref().unwrap_or("(none remembered)"),
         r.archive.display(),
         r.archive.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
@@ -923,13 +931,19 @@ fn run_chat_load(args: &cli::ChatLoadArgs) -> anyhow::Result<String> {
         msg.push_str(&format!("\nproject paths moved: {from} -> {}", cwd.display()));
     }
     msg.push_str(&format!("\n{}", load_nick(&r)));
-    if r.journal_entries > 0 {
+    if r.journal_entries > 0 || r.mindmaps > 0 {
         let entries = chat_transfer::read_journal(&args.archive)?;
+        let maps = chat_transfer::read_mindmaps(&args.archive)?;
         let moved = claudebase::journal_cli::Moved {
             session: (r.session_id != r.source_id).then_some((r.source_id.as_str(), r.session_id.as_str())),
             source_project: r.source_cwd.as_deref(),
         };
-        match claudebase::daemon::run_tokio(claudebase::journal_cli::import_entries(&cwd, entries, moved)) {
+        let imported = claudebase::daemon::run_tokio(async {
+            let mut report = claudebase::journal_cli::import_entries(&cwd, entries, moved).await?;
+            claudebase::journal_cli::import_mindmaps(&cwd, maps, &mut report).await?;
+            Ok::<_, anyhow::Error>(report)
+        });
+        match imported {
             Ok(report) => msg.push_str(&format!("\n{}", report.describe())),
             Err(e) => msg.push_str(&format!(
                 "\nWARNING: the journal was NOT imported — the daemon did not answer ({e:#}).\n\

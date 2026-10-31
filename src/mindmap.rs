@@ -21,7 +21,7 @@ use std::collections::HashMap;
 
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Applied with the journal schema on every open (`journal::open_file`).
 pub const SCHEMA: &str = "
@@ -135,7 +135,7 @@ pub struct Owner {
     pub host: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MapSummary {
     pub id: i64,
     pub title: String,
@@ -145,13 +145,16 @@ pub struct MapSummary {
     pub shared: bool,
     pub layout: String,
     pub direction: String,
+    /// How many nodes, the root included. Named apart from `Map::nodes`,
+    /// which flattens this summary into the same object.
+    #[serde(rename = "node_count")]
     pub nodes: i64,
     pub open_nodes: i64,
     pub created_at: i64,
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
     pub id: i64,
     pub parent: Option<i64>,
@@ -163,7 +166,7 @@ pub struct Node {
     pub author: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Edge {
     pub id: i64,
     pub from: i64,
@@ -172,7 +175,7 @@ pub struct Edge {
     pub refs: Vec<i64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chain {
     pub id: i64,
     pub name: String,
@@ -180,7 +183,7 @@ pub struct Chain {
 }
 
 /// A whole map, nodes in tree order (parent before child, siblings by `ord`).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Map {
     #[serde(flatten)]
     pub summary: MapSummary,
@@ -879,6 +882,126 @@ pub fn delete(conn: &Connection, map: i64) -> Result<()> {
     Ok(())
 }
 
+/// Write a map read from elsewhere (a conversation archive, another
+/// project's journal) into this journal; its journal references are already
+/// renumbered for this journal by the caller. A reference to an entry this
+/// journal does not have is dropped, a chain that would lose a step is
+/// skipped. `owner_host` is the machine the map now lives on — a resumed
+/// conversation there must own it again. A map already imported (same title,
+/// owner and creation time) is left as it is: `Ok(None)`.
+pub fn import(conn: &mut Connection, map: &Map, owner_host: Option<&str>, now: i64) -> Result<Option<i64>> {
+    let s = &map.summary;
+    let layout = normalize_layout(&s.layout)?;
+    let direction = if DIRECTIONS.contains(&s.direction.as_str()) { s.direction.clone() } else { "down".to_string() };
+    let state = if s.state == "closed" { "closed" } else { "open" };
+    let t = tx(conn)?;
+    let seen: Option<i64> = t
+        .query_row(
+            "SELECT id FROM mindmaps WHERE title = ?1 AND owner_nick = ?2 AND created_at = ?3",
+            params![s.title, s.owner_nick, s.created_at],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if seen.is_some() {
+        return Ok(None);
+    }
+    t.execute(
+        "INSERT INTO mindmaps(title, owner_nick, owner_host, state, view_token, created_at, updated_at, shared, layout, direction) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![s.title, s.owner_nick, owner_host.or(s.owner_host.as_deref()), state, view_token(), s.created_at, s.updated_at.min(now), s.shared, layout, direction],
+    )?;
+    let id = t.last_insert_rowid();
+    let exists = |e: &i64| -> bool {
+        t.query_row("SELECT 1 FROM entries WHERE id = ?1", params![e], |_| Ok(())).optional().ok().flatten().is_some()
+    };
+    // `load` gives nodes parent first.
+    let mut nodes: HashMap<i64, i64> = HashMap::new();
+    for (ord, n) in map.nodes.iter().enumerate() {
+        let parent = match n.parent {
+            None => None,
+            Some(p) => match nodes.get(&p) {
+                Some(np) => Some(*np),
+                None => continue,
+            },
+        };
+        let kind = if n.parent.is_none() { "topic".to_string() } else { normalize_kind(&n.kind, &layout)? };
+        let st = if NODE_STATES.contains(&n.state.as_str()) { n.state.as_str() } else { "open" };
+        t.execute(
+            "INSERT INTO mindmap_nodes(map_id, parent_id, kind, text, state, ord, created_at, author) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![id, parent, kind, n.text, st, ord as i64, s.created_at, n.author],
+        )?;
+        let new = t.last_insert_rowid();
+        nodes.insert(n.id, new);
+        for e in n.refs.iter().filter(|e| exists(e)) {
+            t.execute("INSERT OR IGNORE INTO mindmap_node_refs(node_id, entry_id) VALUES (?1, ?2)", params![new, e])?;
+        }
+    }
+    for e in &map.edges {
+        let (Some(f), Some(to)) = (nodes.get(&e.from), nodes.get(&e.to)) else { continue };
+        t.execute(
+            "INSERT OR IGNORE INTO mindmap_edges(map_id, from_node, to_node, label) VALUES (?1, ?2, ?3, ?4)",
+            params![id, f, to, e.label],
+        )?;
+        let edge: i64 = t.query_row(
+            "SELECT id FROM mindmap_edges WHERE from_node = ?1 AND to_node = ?2 AND label = ?3",
+            params![f, to, e.label],
+            |r| r.get(0),
+        )?;
+        for r in e.refs.iter().filter(|r| exists(r)) {
+            t.execute("INSERT OR IGNORE INTO mindmap_edge_refs(edge_id, entry_id) VALUES (?1, ?2)", params![edge, r])?;
+        }
+    }
+    for c in &map.chains {
+        if c.entries.len() < 2 || !c.entries.iter().all(|e| exists(e)) {
+            continue;
+        }
+        t.execute(
+            "INSERT OR IGNORE INTO mindmap_chains(map_id, name, signature, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![id, c.name, signature(&c.entries), s.created_at],
+        )?;
+        let chain = t.last_insert_rowid();
+        for (pos, e) in c.entries.iter().enumerate() {
+            t.execute("INSERT OR IGNORE INTO mindmap_chain_steps(chain_id, pos, entry_id) VALUES (?1, ?2, ?3)", params![chain, pos as i64, e])?;
+        }
+    }
+    t.commit()?;
+    Ok(Some(id))
+}
+
+/// Every map of the journal, whole — what a conversation archive carries.
+pub fn export_all(conn: &Connection) -> Result<Vec<Map>> {
+    let ids: Vec<i64> = {
+        let mut stmt = conn.prepare("SELECT id FROM mindmaps ORDER BY id")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(m) = load(conn, id)? {
+            out.push(m);
+        }
+    }
+    Ok(out)
+}
+
+/// Renumber a map's journal references through `entries` (source id ->
+/// this journal's id); a reference with no mapping is dropped, a chain that
+/// loses a step is dropped whole.
+pub fn renumber(map: &mut Map, entries: &HashMap<i64, i64>) {
+    for n in map.nodes.iter_mut() {
+        n.refs = n.refs.iter().filter_map(|e| entries.get(e).copied()).collect();
+    }
+    for e in map.edges.iter_mut() {
+        e.refs = e.refs.iter().filter_map(|r| entries.get(r).copied()).collect();
+    }
+    map.chains.retain_mut(|c| {
+        let mapped: Vec<i64> = c.entries.iter().filter_map(|e| entries.get(e).copied()).collect();
+        let whole = mapped.len() == c.entries.len();
+        c.entries = mapped;
+        whole
+    });
+}
+
 /// Copy every map of `src` into `dst` (journal share), journal references
 /// renumbered through `entries` (src id -> dst id). A reference whose entry
 /// did not come along is dropped; a chain that loses a step is skipped.
@@ -1172,6 +1295,38 @@ mod tests {
         assert_eq!(list(&c, None, true).unwrap().len(), 2, "the operator sees every map");
         delete(&c, m).unwrap();
         assert!(load(&c, m).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_map_survives_json_and_imports_renumbered() {
+        let (_d, mut src) = journal();
+        let e1 = entry(&mut src, "first note about the queue");
+        let e2 = entry(&mut src, "second note about the queue");
+        let spec = NewMap { title: "q", layout: "flowchart", direction: "right", shared: true };
+        let (m, _) = create_map(&mut src, &spec, &mira(), 1).unwrap();
+        let a = add(&mut src, m, &NewNode { kind: "start", text: "in", refs: &[e1], ..Default::default() }, 2).unwrap();
+        add(&mut src, m, &NewNode { kind: "and", text: "both", after: Some(a), label: "yes", refs: &[e2], author: Some("atlas"), ..Default::default() }, 3).unwrap();
+        add_chain(&mut src, m, "line", &[e1, e2], 4).unwrap();
+        let json = serde_json::to_value(load(&src, m).unwrap().unwrap()).unwrap();
+        let mut back: Map = serde_json::from_value(json.clone()).unwrap_or_else(|e| panic!("{e}: {json}"));
+        // Into another journal where the entries are 10 and 11, and one is missing.
+        let dir = tempfile::tempdir().unwrap();
+        let mut dst = journal::open(dir.path(), Path::new("/work/other"), true).unwrap().unwrap();
+        for i in 0..11 {
+            entry(&mut dst, &format!("filler entry number {i} in the other journal"));
+        }
+        let ids: HashMap<i64, i64> = [(e1, 10)].into_iter().collect();
+        renumber(&mut back, &ids);
+        let id = import(&mut dst, &back, Some("host-b"), 9).unwrap().expect("imported");
+        let got = load(&dst, id).unwrap().unwrap();
+        assert_eq!(got.summary.owner_host.as_deref(), Some("host-b"));
+        assert!(got.summary.shared && got.summary.layout == "flowchart" && got.summary.direction == "right");
+        let refs: Vec<i64> = got.nodes.iter().flat_map(|n| n.refs.clone()).collect();
+        assert_eq!(refs, vec![10], "e2 had no mapping: dropped");
+        assert!(got.chains.is_empty(), "a chain that lost a step is skipped");
+        assert_eq!(got.edges[0].label, "yes");
+        assert_eq!(got.nodes.iter().find(|n| n.kind == "and").unwrap().author.as_deref(), Some("atlas"));
+        assert!(import(&mut dst, &back, Some("host-b"), 9).unwrap().is_none(), "a second import is a no-op");
     }
 
     #[test]

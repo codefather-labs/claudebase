@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.24.1] - 2026-10-31
+
+### Fixed
+
+- **A moved conversation brings its whole journal.** `chat dump` / `chat load` (and `journal import
+  <archive>`) carried the journal's entries but lost the links between them and left the mind maps
+  behind. The archive (format version 3) now holds every mind map and flowchart of the project, and
+  loading restores the links (`cites`, `fixes`, `implements`, `verifies`, `replaces`) and the maps,
+  their journal references renumbered for the target journal; a map keeps its owner's nick and now
+  lives on the loading machine. Loading the same archive twice adds nothing. Older claudebase
+  versions refuse a version-3 archive with "update it first".
+- The node count of a mind map in JSON is `node_count` (it collided with the list of nodes, which
+  made a map unreadable once serialised).
+
 ## [0.24.0] - 2026-10-31
 
 ### Added

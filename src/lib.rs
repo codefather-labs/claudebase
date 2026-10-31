@@ -18,6 +18,7 @@ pub mod ingest;
 pub mod journal;
 pub mod mindmap;
 pub mod mindmap_svg;
+pub mod mindmap_flow;
 pub mod mindmap_cli;
 pub mod journal_cli;
 pub mod remote_cli;

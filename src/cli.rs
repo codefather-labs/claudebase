@@ -987,13 +987,29 @@ pub fn parse_link_ref(raw: &str) -> Result<i64, String> {
 
 #[derive(Subcommand, Debug)]
 pub enum MindmapSubcommand {
-    /// Start a map; its title is the root topic. Prints the map id.
+    /// Start a map; its title is the root topic (a flowchart's caption).
+    /// Prints the map id. A project holds any number of maps.
     New {
         title: String,
+        /// mindmap (a tree of notes around the topic) or flowchart (a block
+        /// diagram: ISO 5807 symbols and logic gates joined by arrows).
+        #[arg(long = "type", default_value = "mindmap")]
+        layout: String,
+        /// Flowchart only: down (top to bottom) or right (left to right).
+        #[arg(long, default_value = "down")]
+        direction: String,
+        /// Every session of the project may read and change it.
+        #[arg(long)]
+        shared: bool,
         #[arg(long)]
         json: bool,
     },
-    /// This session's maps (from a plain terminal: every map of the project).
+    /// Share a map you own with every session of the project.
+    Share { map: i64 },
+    /// Stop sharing a map (any session may, once it is shared).
+    Unshare { map: i64 },
+    /// This session's maps and the project's shared ones (from a plain
+    /// terminal: every map of the project).
     List {
         /// Closed maps too.
         #[arg(long)]
@@ -1011,15 +1027,25 @@ pub enum MindmapSubcommand {
         #[arg(long)]
         json: bool,
     },
-    /// Add a node under --parent (default: the root topic).
+    /// Add a node: in a mind map under --parent (default: the root topic); in
+    /// a flowchart --after a node, which draws the arrow to it.
     Add {
         map: i64,
         text: String,
         #[arg(long, value_parser = parse_node_ref)]
         parent: Option<i64>,
-        /// goal | fact | hypothesis | question | decision | idea | task | dead-end | note
-        #[arg(long, default_value = "note")]
-        kind: String,
+        /// Flowchart: the node the arrow comes from.
+        #[arg(long, value_parser = parse_node_ref)]
+        after: Option<i64>,
+        /// Flowchart: the label of that arrow ("yes", "no").
+        #[arg(long, default_value = "")]
+        label: String,
+        /// Mind map: goal | fact | hypothesis | question | decision | idea | task | dead-end | note
+        /// (default note). Flowchart: start | end | process | decision | io | subprocess | document |
+        /// data | manual | prep | connector | delay | note | and | or | not | nand | nor | xor | xnor
+        /// (default process).
+        #[arg(long)]
+        kind: Option<String>,
         /// A journal entry this node rests on (repeatable).
         #[arg(long = "ref", value_parser = parse_entry_ref)]
         refs: Vec<i64>,
@@ -1400,10 +1426,11 @@ pub struct JournalUnlinkArgs {
     pub json: bool,
 }
 
-/// The flags an entry can carry (`journal::FLAGS`). Work items — todo,
-/// question, problem, reminder, unverified, disputed, ai-feedback — stay open
-/// until closed and keep the entry past retention while open. Marks —
-/// constraint, important, deprecated — are removed with `unmark`.
+/// The flags an entry can carry (`journal::FLAGS`), any number at once. Work
+/// items — todo, question, problem, bugreport, reminder, unverified,
+/// disputed, ai-feedback — stay open until closed and keep the entry past
+/// retention while open. Marks — specification, constraint, important, idea,
+/// concept, comment, verified, deprecated — are removed with `unmark`.
 #[derive(Args, Debug, Default, Clone)]
 pub struct JournalFlags {
     /// Something to do.
@@ -1415,6 +1442,10 @@ pub struct JournalFlags {
     /// An unresolved problem.
     #[arg(long)]
     pub problem: bool,
+    /// A defect as reported (symptom, steps, where seen), not yet worked
+    /// through. Its fix runs as a bug branch; close it when handled.
+    #[arg(long)]
+    pub bugreport: bool,
     /// Something to come back to.
     #[arg(long)]
     pub reminder: bool,
@@ -1427,14 +1458,28 @@ pub struct JournalFlags {
     /// An agent's suggestion for improving claudebase itself.
     #[arg(long = "ai-feedback")]
     pub ai_feedback: bool,
-    /// A rule to follow, not to weigh.
+    /// How something must behave — behaviour, isolation boundaries, policies,
+    /// invariants: the spec a feature is built and checked against. Binding,
+    /// like a constraint; the two can go together.
+    #[arg(long)]
+    pub specification: bool,
+    /// A rule, a limit, a constant or an invariant to follow, not to weigh.
     #[arg(long)]
     pub constraint: bool,
     /// An important note.
     #[arg(long)]
     pub important: bool,
-    /// Carries the evidence that a fix or feature works; lets its todo's
-    /// branch close.
+    /// An idea, not yet a plan.
+    #[arg(long)]
+    pub idea: bool,
+    /// A concept: how something is thought about, a model, a term.
+    #[arg(long)]
+    pub concept: bool,
+    /// A remark on something, often on another entry.
+    #[arg(long)]
+    pub comment: bool,
+    /// Declares that the check passed — the entry describes it, `--proof`
+    /// points at the evidence; lets its todo's branch close.
     #[arg(long)]
     pub verified: bool,
     /// No longer true: kept for history, ranked last in a search.
@@ -1448,12 +1493,17 @@ impl JournalFlags {
             (self.todo, "todo"),
             (self.question, "question"),
             (self.problem, "problem"),
+            (self.bugreport, "bugreport"),
             (self.reminder, "reminder"),
             (self.unverified, "unverified"),
             (self.disputed, "disputed"),
             (self.ai_feedback, "ai-feedback"),
+            (self.specification, "specification"),
             (self.constraint, "constraint"),
             (self.important, "important"),
+            (self.idea, "idea"),
+            (self.concept, "concept"),
+            (self.comment, "comment"),
             (self.verified, "verified"),
             (self.deprecated, "deprecated"),
         ]

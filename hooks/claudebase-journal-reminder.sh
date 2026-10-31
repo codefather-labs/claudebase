@@ -10,8 +10,8 @@
 # The journal part is TEXT ONLY: the agent decides whether the read applies
 # (it is conditional on a fresh context) and runs the CLI calls itself. The one
 # call this hook makes is `claudebase mindmap list --brief`, bounded by a 3 s
-# timeout, to name THIS session's open mind maps (the daemon lists a session
-# its own maps only - another session never sees them here).
+# timeout, to name THIS session's open mind maps and, apart, the project's
+# shared ones (the daemon never lists another session's private map).
 #
 # UserPromptSubmit (every prompt): injects only the operator's journaling
 # policy - bugs, fixes and the evidence for them each get their own entry,
@@ -53,7 +53,8 @@ policy='[journal policy] Journal as you work (~/.claude/rules/project-journal.md
     unverified is lifted only by such a separate entry; under evidence-first (claudebase journal policy) it needs --proof too.
   - Every decision, made by the operator or by you: its own entry --category decision, saying who decided, what was chosen, why, what was rejected.
   - Something you must come back to: --reminder --every 20m; it returns to this session until you close it.
-  - Important remarks and findings: --important. Product and technical rules, policies, constraints: --constraint.'
+  - Important remarks and findings: --important. Rules, limits, constants, invariants: --constraint.
+  - Building a feature: specify it first, one entry per rule, --specification (behaviour, isolation boundaries, policies, invariants; with --constraint when it is a rule) --feature <slug>; read the spec before changing the feature; a spec changes only by a Replaces entry.'
 
 if [ "$event" = UserPromptSubmit ]; then
   if [ -n "${CLAUDEBASE_AGENT_ID:-}" ] && command -v claudebase >/dev/null 2>&1 \
@@ -73,7 +74,7 @@ On a fresh context window (session start, resume, post-compact), read before you
 2. Pull what bears on the task, by tag and category - not an exhaustive scan:
      claudebase journal search "<keywords>" --tag <tag>
      claudebase journal list --category decision --tag <tag>
-3. See what is still open, and the constraints of this project (binding):
+3. See what is still open, and the specifications and constraints of this project (binding):
      claudebase journal agenda
 Never act on an entry flagged deprecated; treat unverified or disputed ones as assumptions.
 Before relying on an entry, read it with `claudebase journal get <id>`: its related block shows what replaces, fixes or cites it and the closest entries by meaning, each with its flags.
@@ -91,25 +92,33 @@ While you work, journal every decision you make, every finding you uncover and e
 - Every decision, made by the operator or by you, gets its own entry --category decision: who decided, what was chosen, why, what was rejected.
 - Flag important remarks and findings --important, and product or technical rules, policies and constraints --constraint.
 - Before a non-trivial decision, search for an earlier one on the same subject; if you reverse it, write "Replaces journal#<id>" (or "Fixes journal#<id>") - that text becomes a link both entries show - and mark the old one --deprecated if it is no longer true.
-- Flags say what an entry is: --todo --question --problem --reminder --unverified --disputed --ai-feedback (work items, closed with `journal close <id> --resolution "<how>"`, reopened with `journal reopen <id>`) and --constraint --important --deprecated (marks, removed with `journal unmark`). Flag an existing entry with `journal mark <id> --deprecated`; when something stops being true, mark it deprecated. Suggestions for improving claudebase itself go in with --ai-feedback.
+- Flags say what an entry is, any number per entry: --todo --question --problem --bugreport --reminder --unverified --disputed --ai-feedback (work items, closed with `journal close <id> --resolution "<how>"`, reopened with `journal reopen <id>`) and --specification --constraint --important --idea --concept --comment --verified --deprecated (marks, removed with `journal unmark`). Specifications and constraints are binding: before you build or change a feature, read them (`journal list --specification --feature <slug>`). Flag an existing entry with `journal mark <id> --deprecated`; when something stops being true, mark it deprecated. Suggestions for improving claudebase itself go in with --ai-feedback.
 - Something to come back to later, even after this session ends: `journal add "<what>" --every 20m` (sets --reminder). The daemon returns it to this session as [reminder #N] every interval while it is open and the session is online; close it when done.
 
 If `journal add` answers that it needs a session started with `claudebase run`, tell the operator once and carry on without it.
 
 Full protocol: ~/.claude/rules/project-journal.md
 
-Mind maps - working memory for a long task or research: `claudebase mindmap new "<topic>"`, then `mindmap add <map> "<short note>" --kind fact|hypothesis|question|decision|task|idea|dead-end [--parent n<id>] [--ref <journal id>]`, `mindmap link <map> n<a> n<b> --label "contradicts"`, `mindmap chain <map> "<name>" <entry> <entry> ...`, `mindmap done|drop <map> n<id>`. Read it back with `mindmap show <map>`; draw it with `mindmap svg <map> -o map.svg` or `mindmap send <map>` (Telegram); `mindmap close <map>` when the task is done. A map is yours alone: another session may only read it by id.'
+Mind maps - working memory for a long task or research: `claudebase mindmap new "<topic>"`, then `mindmap add <map> "<short note>" --kind fact|hypothesis|question|decision|task|idea|dead-end [--parent n<id>] [--ref <journal id>]`, `mindmap link <map> n<a> n<b> --label "contradicts"`, `mindmap chain <map> "<name>" <entry> <entry> ...`, `mindmap done|drop <map> n<id>`. Read it back with `mindmap show <map>`; draw it with `mindmap svg <map> -o map.svg` or `mindmap send <map>` (Telegram); `mindmap close <map>` when the task is done. A block diagram instead: `mindmap new "<title>" --type flowchart [--direction right]`, then `mindmap add <map> "<text>" --kind start|process|decision|io|data|document|subprocess|end|and|or|not|xor ... --after n<id> [--label yes]`. A map is yours unless shared (`mindmap new ... --shared` or `mindmap share <map>`): a shared map is read and changed by every session of the project - use it for what all agents keep in sync, such as the architecture.'
   if [ -n "${CLAUDEBASE_AGENT_ID:-}" ] && command -v claudebase >/dev/null 2>&1; then
     if command -v timeout >/dev/null 2>&1; then
       maps=$(timeout 3 claudebase mindmap list --brief 2>/dev/null || true)
     else
       maps=$(claudebase mindmap list --brief 2>/dev/null || true)
     fi
-    if [ -n "$maps" ]; then
+    own=$(printf '%s\n' "$maps" | grep -v '^shared: ' | grep -v '^$' || true)
+    shared=$(printf '%s\n' "$maps" | grep '^shared: ' | sed 's/^shared: //' || true)
+    if [ -n "$own" ]; then
       reminder="$reminder
 
 [mind maps] Your open mind maps - read the one for your current work with claudebase mindmap show <id> before you continue it:
-$maps"
+$own"
+    fi
+    if [ -n "$shared" ]; then
+      reminder="$reminder
+
+[shared mind maps] Shared by other sessions of this project - read the ones that bear on your work with claudebase mindmap show <id>; you may change them, keep them true:
+$shared"
     fi
   fi
 fi

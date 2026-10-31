@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **Shared mind maps.** `mindmap new --shared` or `mindmap share <map>` (the owner only) makes a map
+  every session's: every session of the project reads and changes it, unshare and delete included.
+  That covers every checkout of the repository, joined machines and folders brought in by
+  `journal share`. Each node records the session that added it. The session-start reminder lists the
+  project's shared maps apart from the session's own. Private maps keep the owner-only rule.
+- **Flowcharts** (`mindmap new --type flowchart [--direction down|right]`): a block diagram with
+  ISO 5807 symbols (terminator, process, decision, input/output, predefined process, document, stored
+  data, manual input, preparation, connector, delay, annotation) and logic gates in ANSI/IEEE 91
+  shapes (AND, OR, NOT, NAND, NOR, XOR, XNOR), joined by labelled arrows. `mindmap add --after n<id>
+  --label yes` draws the arrow to the new symbol. Every symbol and arrow can point at journal entries.
+  - The layout is layered: loops are routed back beside the layers, an arrow over several layers passes
+    between symbols, and each branch of a decision leaves through its own vertex.
+  - SVG, PNG for Telegram and the live page all draw it.
+- **Journal flags for spec-driven development and documentation.** `--specification` (how something
+  must behave: behaviour, isolation boundaries, policies, invariants; binding, in the agenda, kept past
+  retention like a constraint), `--bugreport` (a work item: a defect as reported; category `bug`),
+  `--idea`, `--concept`, `--comment` (notes that do not bind, outside the agenda, kept by salience).
+  `--constraint` now also covers limits, constants and invariants. An entry carries any number of
+  flags (`--specification --constraint`). The journal rule gains a "Specifications" section: specify
+  a feature before building it, read the spec before changing it, change a spec only by a
+  `Replaces` entry.
+- Journals written by v0.23 gain the new columns (`shared`, `layout`, `direction`, node `author`) on
+  first open.
+
 ## [0.23.1] - 2026-10-30
 
 ### Fixed

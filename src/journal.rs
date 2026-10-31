@@ -231,31 +231,49 @@ fn backfill_links(conn: &mut Connection) -> Result<()> {
 /// meaning alone still says how far to trust it.
 ///
 /// - Work items, open until a session closes them (`journal close`): todo,
-///   question, problem, reminder, `unverified` (a hypothesis, closed by
-///   checking it), `disputed` (contradicts another entry, closed when settled),
-///   `ai-feedback` (an agent's suggestion for claudebase itself).
-/// - Marks, removed with `unmark`: `constraint` (a rule to follow, not weigh),
-///   `important`, `verified` (the entry carries the evidence that a fix or
-///   feature works — what lets its todo's branch close), `deprecated` (no
-///   longer true; ranked last in a search).
+///   question, problem, `bugreport` (a defect as reported — symptom, steps —
+///   not yet worked through), reminder, `unverified` (a hypothesis, closed by
+///   checking it), `disputed` (contradicts another entry, closed when
+///   settled), `ai-feedback` (an agent's suggestion for claudebase itself).
+/// - Marks, removed with `unmark`: `specification` (how something must
+///   behave: its behaviour, isolation boundaries, policies, invariants — the
+///   spec a feature is built and checked against), `constraint` (a rule, a
+///   limit, a constant, an invariant to follow, not weigh), `important`,
+///   `idea`, `concept`, `comment`, `verified` (a declaration that the check
+///   passed — the entry carries it, its `--proof`s point at the evidence; what
+///   lets its todo's branch close), `deprecated` (no longer true; ranked last
+///   in a search).
 ///
-/// An open work item, a constraint or an important mark keeps its entry past
-/// retention; a verified or deprecated mark does not (salience decides).
-pub const FLAGS: [&str; 11] = [
+/// Flags combine freely: one entry can be a specification and a constraint
+/// at once (operator, 2026-10-31).
+///
+/// An open work item, a specification, a constraint or an important mark
+/// keeps its entry past retention; the other marks do not (salience decides).
+pub const FLAGS: [&str; 16] = [
     "todo",
     "question",
     "problem",
+    "bugreport",
     "reminder",
     "unverified",
     "disputed",
     "ai-feedback",
+    "specification",
     "constraint",
     "important",
+    "idea",
+    "concept",
+    "comment",
     "verified",
     "deprecated",
 ];
 
-const MARKS: [&str; 4] = ["constraint", "important", "verified", "deprecated"];
+const MARKS: [&str; 8] =
+    ["specification", "constraint", "important", "idea", "concept", "comment", "verified", "deprecated"];
+
+/// Marks that neither hold an entry past retention nor belong in the agenda:
+/// history, evidence, and notes kept for what they say.
+pub const PASSIVE: [&str; 5] = ["idea", "concept", "comment", "verified", "deprecated"];
 
 pub fn closable(flag: &str) -> bool {
     !MARKS.contains(&flag)
@@ -399,6 +417,7 @@ fn open_file(path: &Path) -> Result<Connection> {
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
     conn.execute_batch(SCHEMA).context("apply journal schema")?;
     conn.execute_batch(crate::mindmap::SCHEMA).context("apply mind-map schema")?;
+    crate::mindmap::migrate(&conn).context("migrate the mind-map tables")?;
     let mut conn = conn;
     backfill_links(&mut conn).context("journal links backfill")?;
     Ok(conn)
@@ -505,7 +524,9 @@ pub fn add(conn: &mut Connection, entry: &NewEntry, now: i64) -> Result<(AddStat
     }
     // A todo or a question is often the whole point of the entry; its flag
     // then names it, unless a category says more.
-    let category = normalize_label(&entry.category).or_else(|| flags.first().cloned());
+    // Without a category the first flag names the entry; a bug report is a bug.
+    let category = normalize_label(&entry.category)
+        .or_else(|| flags.first().map(|f| if f == "bugreport" { "bug".to_string() } else { f.clone() }));
     let Some(category) = category else {
         bail!("a category is required (--category), e.g. decision, finding, bug");
     };
@@ -1472,8 +1493,8 @@ pub fn related(conn: &Connection, id: i64, similar: usize) -> Result<Related> {
 /// each. Flags with nothing open are left out.
 pub fn agenda(conn: &Connection, limit: usize) -> Result<Vec<(String, i64, Vec<Entry>)>> {
     let mut out = Vec::new();
-    // Evidence and history are not "open": verified and deprecated stay out.
-    for flag in FLAGS.iter().filter(|f| !matches!(**f, "deprecated" | "verified")) {
+    // Evidence, history and plain notes are not "open": the passive marks stay out.
+    for flag in FLAGS.iter().filter(|f| !PASSIVE.contains(f)) {
         let filter = Filter { flags: vec![flag.to_string()], open: Some(true), ..Default::default() };
         let (total, entries) = list(conn, &filter, 0, limit)?;
         if total > 0 {
@@ -1723,7 +1744,7 @@ pub struct GcReport {
 pub fn gc(conn: &Connection, now: i64, dry_run: bool) -> Result<GcReport> {
     let count = |salience: &str, ttl: i64| -> rusqlite::Result<i64> {
         conn.query_row(
-            "SELECT COUNT(*) FROM entries WHERE salience = ?1 AND created_at < ?2 AND id NOT IN (SELECT entry_id FROM entry_flags WHERE closed_at IS NULL AND flag NOT IN ('deprecated', 'verified'))",
+            "SELECT COUNT(*) FROM entries WHERE salience = ?1 AND created_at < ?2 AND id NOT IN (SELECT entry_id FROM entry_flags WHERE closed_at IS NULL AND flag NOT IN ('idea', 'concept', 'comment', 'deprecated', 'verified'))",
             params![salience, now - ttl],
             |r| r.get(0),
         )
@@ -1732,7 +1753,7 @@ pub fn gc(conn: &Connection, now: i64, dry_run: bool) -> Result<GcReport> {
     if !dry_run && report.medium + report.low > 0 {
         conn.execute(
             "DELETE FROM entries WHERE ((salience = 'medium' AND created_at < ?1) OR (salience = 'low' AND created_at < ?2)) \
-             AND id NOT IN (SELECT entry_id FROM entry_flags WHERE closed_at IS NULL AND flag NOT IN ('deprecated', 'verified'))",
+             AND id NOT IN (SELECT entry_id FROM entry_flags WHERE closed_at IS NULL AND flag NOT IN ('idea', 'concept', 'comment', 'deprecated', 'verified'))",
             params![now - MEDIUM_TTL_SECS, now - LOW_TTL_SECS],
         )?;
     }
@@ -2401,6 +2422,42 @@ mod tests {
         assert!(get(&c, rule).unwrap().is_some(), "a constraint is");
         let a = agenda(&c, 10).unwrap();
         assert_eq!(a.iter().map(|(f, _, _)| f.as_str()).collect::<Vec<_>>(), vec!["constraint"]);
+    }
+
+    #[test]
+    fn specifications_constraints_and_notes_combine_and_keep_as_they_should() {
+        let (_d, mut c) = journal();
+        let mut flagged = |body: &str, flags: &[&str]| {
+            let mut e = entry(body, "", &["spec"]);
+            e.flags = flags.iter().map(|f| f.to_string()).collect();
+            e.salience = "low".into();
+            add(&mut c, &e, 1).unwrap().1
+        };
+        // Any number of flags on one entry.
+        let spec = flagged("a session writes only to its own private mind maps", &["specification", "constraint"]);
+        let report = flagged("hook prints nothing after compaction on macOS", &["bugreport"]);
+        let idea = flagged("draw journal branches as flowcharts", &["idea", "concept"]);
+        let note = flagged("this reads well", &["comment"]);
+        let e = get(&c, spec).unwrap().unwrap();
+        assert_eq!(e.flags.iter().map(|f| f.flag.as_str()).collect::<Vec<_>>(), vec!["specification", "constraint"]);
+        assert_eq!(e.category, "specification", "the first flag names an entry without a category");
+        assert_eq!(get(&c, report).unwrap().unwrap().category, "bug", "a bug report is a bug");
+        // A specification is a mark, removed with unmark; a bug report a work item, closed.
+        assert!(close(&mut c, spec, &["specification".into()], None, None, 2).is_err());
+        let a = agenda(&c, 10).unwrap();
+        assert_eq!(
+            a.iter().map(|(f, _, _)| f.as_str()).collect::<Vec<_>>(),
+            vec!["bugreport", "specification", "constraint"],
+            "ideas, concepts and comments are not open work"
+        );
+        // Past retention: the specification and the open report stay, the notes go.
+        c.execute("UPDATE entries SET salience = 'low'", []).unwrap();
+        gc(&c, 1 + 400 * 86_400, false).unwrap();
+        assert!(get(&c, spec).unwrap().is_some());
+        assert!(get(&c, report).unwrap().is_some());
+        assert!(get(&c, idea).unwrap().is_none());
+        assert!(get(&c, note).unwrap().is_none());
+        assert!(normalize_flags(&["proof"]).is_err(), "no proof flag: --proof is the evidence option");
     }
 
     #[test]

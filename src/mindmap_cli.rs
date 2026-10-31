@@ -30,12 +30,19 @@ pub async fn run(sub: S) -> Result<String> {
 
 fn request(sub: S) -> (&'static str, Value, bool, bool) {
     match sub {
-        S::New { title, json } => ("journal_mindmap_new", json!({ "title": title }), json, false),
+        S::New { title, layout, direction, shared, json } => (
+            "journal_mindmap_new",
+            json!({ "title": title, "layout": layout, "direction": direction, "shared": shared }),
+            json,
+            false,
+        ),
+        S::Share { map } => ("journal_mindmap_share", json!({ "map": map, "shared": true }), false, false),
+        S::Unshare { map } => ("journal_mindmap_share", json!({ "map": map, "shared": false }), false, false),
         S::List { closed, brief, json } => ("journal_mindmap_list", json!({ "closed": closed }), json, brief),
         S::Show { map, json } => ("journal_mindmap_show", json!({ "map": map }), json, false),
-        S::Add { map, text, parent, kind, refs, json } => (
+        S::Add { map, text, parent, after, label, kind, refs, json } => (
             "journal_mindmap_add",
-            json!({ "map": map, "text": text, "parent": parent, "kind": kind, "refs": refs }),
+            json!({ "map": map, "text": text, "parent": parent, "after": after, "label": label, "kind": kind, "refs": refs }),
             json,
             false,
         ),
@@ -93,11 +100,22 @@ fn ago(secs: i64) -> String {
 fn render(tool: &str, p: &Value, brief: bool) -> String {
     let map = &p["map"];
     match tool {
-        "journal_mindmap_new" => format!(
-            "mind map #{map} \"{}\" (root n{}) — add nodes: claudebase mindmap add {map} \"<text>\" --kind fact",
+        "journal_mindmap_new" if p["layout"].as_str() == Some("flowchart") => format!(
+            "flowchart #{map} \"{}\"{} — first symbol: claudebase mindmap add {map} \"<text>\" --kind start; \
+             then --after n<id> [--label yes] for each next one",
             p["title"].as_str().unwrap_or_default(),
-            p["root"]
+            if p["shared"].as_bool() == Some(true) { ", shared" } else { "" },
         ),
+        "journal_mindmap_new" => format!(
+            "mind map #{map} \"{}\" (root n{}){} — add nodes: claudebase mindmap add {map} \"<text>\" --kind fact",
+            p["title"].as_str().unwrap_or_default(),
+            p["root"],
+            if p["shared"].as_bool() == Some(true) { ", shared" } else { "" },
+        ),
+        "journal_mindmap_share" if p["shared"].as_bool() == Some(true) => {
+            format!("mind map #{map} is shared: every session of the project may read and change it")
+        }
+        "journal_mindmap_share" => format!("mind map #{map} is no longer shared"),
         "journal_mindmap_list" => {
             let maps = p["maps"].as_array().cloned().unwrap_or_default();
             if maps.is_empty() {
@@ -105,20 +123,30 @@ fn render(tool: &str, p: &Value, brief: bool) -> String {
             }
             maps.iter()
                 .map(|m| {
+                    let owner = m["owner_nick"].as_str().unwrap_or_default();
+                    let flow = m["layout"].as_str() == Some("flowchart");
                     let line = format!(
-                        "#{} \"{}\" — {} nodes, {} open, updated {}",
+                        "#{} {}\"{}\" — {} nodes, {} open, updated {}",
                         m["id"],
+                        if flow { "flowchart " } else { "" },
                         m["title"].as_str().unwrap_or_default(),
-                        m["nodes"],
+                        m["nodes"].as_i64().unwrap_or(1).saturating_sub(1),
                         m["open_nodes"],
                         ago(m["updated_at"].as_i64().unwrap_or(0))
                     );
+                    let shared = m["shared"].as_bool() == Some(true);
+                    let mine = m["mine"].as_bool() == Some(true);
                     if brief {
-                        line
+                        // The session-start hook splits on this prefix: another
+                        // session's shared map goes in its own list.
+                        match (mine, shared) {
+                            (false, true) => format!("shared: {line}, owner {owner}"),
+                            (true, true) => format!("{line} (shared)"),
+                            _ => line,
+                        }
                     } else {
                         let state = m["state"].as_str().unwrap_or_default();
-                        let owner = m["owner_nick"].as_str().unwrap_or_default();
-                        format!("{line} · {state} · owner {owner}")
+                        format!("{line} · {state}{} · owner {owner}", if shared { " · shared" } else { "" })
                     }
                 })
                 .collect::<Vec<_>>()

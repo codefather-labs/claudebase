@@ -110,39 +110,60 @@ Each comes with its flags. `list` and `search` show the links in one line under 
 
 ## Flags — how far to trust an entry, and what is still open
 
-Any entry can carry flags, so one found by meaning alone still says what it is:
+Any entry can carry flags, any number of them at once (`--specification --constraint`, `--todo --important`), so one found by meaning alone still says what it is:
 
 | Flag | Meaning | Ends with |
 |---|---|---|
 | `--todo` | something to do | `close` |
 | `--question` | an open question | `close` (the answer) |
 | `--problem` | an unresolved problem | `close` (the fix) |
+| `--bugreport` | a defect as reported (symptom, steps, where seen), not yet worked through; its fix runs as a bug branch | `close` (handled; category defaults to `bug`) |
 | `--reminder` | something to come back to; with `--every 20m` (on `add`) the daemon puts it back into YOUR session's input as `[reminder #N]` every interval until you close it — only to the session that wrote it, never while it is offline, on return if it came due meanwhile | `close` |
 | `--unverified` | a hypothesis or assumption, not yet checked | `close` (confirmed / falsified), only once a separate `Verifies journal#N` entry carries the evidence |
 | `--disputed` | contradicts another entry | `close` (who was right; mark the loser deprecated) |
 | `--ai-feedback` | your suggestion for improving claudebase itself | `close` (handled) |
-| `--constraint` | a rule to follow, not weigh | `unmark` |
+| `--specification` | how something must behave: behaviour, isolation boundaries, policies, invariants — the spec a feature is built and checked against; binding | `unmark` (or replace it) |
+| `--constraint` | a rule, a limit, a constant or an invariant to follow, not weigh; binding | `unmark` |
 | `--important` | keep in view | `unmark` |
-| `--verified` | carries the evidence that a fix or feature works; lets its todo close | `unmark` |
+| `--idea` | an idea, not yet a plan | `unmark` |
+| `--concept` | a concept: a model, a term, how something is thought about | `unmark` |
+| `--comment` | a remark, often on another entry | `unmark` |
+| `--verified` | declares that the check passed (the entry describes it; `--proof <file\|url>` points at the evidence); lets its todo close | `unmark` |
 | `--deprecated` | no longer true: history only, ranked last in a search | `unmark` |
 
 ```bash
 claudebase journal add "benchmark the bus under load" --todo --tag bus      # category defaults to the flag
 claudebase journal mark 37 --deprecated                                     # flag an existing entry
-claudebase journal agenda                                                   # open work items, constraints, important
+claudebase journal agenda                                                   # open work items, specifications, constraints, important
 claudebase journal list --question --open | --closed
 claudebase journal close 37 --resolution "done: 7935425"                    # all open items, or name them: --todo
 claudebase journal reopen 37
 claudebase journal unmark 37 --important
 ```
 
-- Read `journal agenda` on a fresh context window. Constraints are binding.
-- Flag important remarks and findings `--important`, and product or technical rules, policies and constraints `--constraint`, when you write them.
+- Read `journal agenda` on a fresh context window. Specifications and constraints are binding.
+- Flag important remarks and findings `--important`, and product or technical rules, policies, limits, constants and invariants `--constraint`, when you write them.
 - Never act on a `deprecated` entry. Treat an `unverified` or `disputed` one as an assumption.
 - When an entry stops being true, mark it `--deprecated` and cite it from the entry that replaces it.
 - When you settle a question, fix a problem or finish a todo that has an entry, close it with a `--resolution` that says how. Reopen it if it comes back.
 - Write todos and questions down instead of leaving them in the conversation, where the next session will not see them.
-- An open work item, a constraint or an important mark keeps its entry past retention.
+- An open work item, a specification, a constraint or an important mark keeps its entry past retention; an idea, a concept, a comment, a verified or a deprecated entry lives by its salience.
+
+## Specifications — spec-driven development
+
+The journal and the mind maps are also the project's documentation. Product and technical behaviour is specified before it is built, and built and checked against the spec:
+
+- **Before you build a feature, write its specification**, one entry per rule, each flagged `--specification`: the behaviour (what happens, in which cases), the isolation boundaries (who can see or change what), the policies, the invariants. Tag them with the feature (`--feature <slug>`) and a component tag.
+  ```bash
+  claudebase journal add "<what must hold: behaviour / boundary / policy / invariant>" --category specification \
+    --specification [--constraint] --feature <slug> --tag <component> --salience high
+  ```
+- **Every rule, limit, constant and invariant is a `--constraint`** — on its own entry, or together with `--specification` on the same one.
+- **Before you change a feature, read its specification:** `claudebase journal list --specification --feature <slug>` (or `--tag <component>`). The code follows the spec; a test protocol checks the spec's behaviour and invariants.
+- **A spec changes only by a new entry** that says `Replaces journal#N` and why, decided by the operator or recorded as your decision; mark the old one `--deprecated`. Never edit around a spec silently.
+- **When code and spec disagree,** that is a finding: journal it, and settle it (fix the code, or replace the spec) before you go on.
+- **Ideas, concepts and comments** have their own flags (`--idea`, `--concept`, `--comment`): they document thinking, they do not bind.
+- A shared mind map or flowchart (see below) can draw a feature's design, its nodes pointing at the specification entries with `--ref`.
 
 ## Mind maps — working memory for a long task
 
@@ -161,7 +182,17 @@ claudebase mindmap close M                                                    # 
 
 - Keep nodes short, and keep the detail in the journal: point a node or a link at the entries it rests on with `--ref`.
 - After a compaction or resume, the session-start reminder names your open maps. Read the one for your current work with `mindmap show` before you continue it.
-- A map is yours alone. Another session may read it by id but cannot write to it, and you cannot write to another session's map.
+- A map is yours unless it is shared. Another session may read a private map by id but cannot write to it, and you cannot write to another session's private map.
+- **Shared maps** (`mindmap new "<title>" --shared`, or `mindmap share M` on your own map) are read and changed by every session of the project, unshare and delete included. Use one for what all agents of the project keep in sync, such as its architecture. The session-start reminder lists the shared maps apart from your own. Before you change a shared map, read it, and keep it true: it is other agents' memory too.
+- **Flowcharts** are the other kind of map: a block diagram by the canon, for a process, a request path or a piece of logic.
+  ```bash
+  claudebase mindmap new "<title>" --type flowchart [--direction right] [--shared]
+  claudebase mindmap add M "<text>" --kind start|end|process|decision|io|subprocess|document|data|manual|prep|connector|delay|note \
+    [--after n<id> [--label yes|no]] [--ref <journal id>]
+  claudebase mindmap add M "<what it combines>" --kind and|or|not|nand|nor|xor|xnor --after n<id>   # logic gates
+  claudebase mindmap link M n<a> n<b> --label "<condition>" [--ref <journal id>]                       # any arrow, loops too
+  ```
+  `--after` draws the arrow from that symbol to the new one. Every symbol and arrow can point at journal entries with `--ref` or `mindmap ref`.
 - `mindmap svg M -o map.svg`, `mindmap send M` (Telegram) and `mindmap url M` (a live page) show the map to the operator. Use them when the operator asks, or when a picture says more than the outline.
 
 Not for the journal: narration of routine steps (running tests, reading files), restatements of the task, and secrets or credentials of any kind. A commit message does not replace an `update` entry: the journal is searched by tag and category across sessions, git history is not.

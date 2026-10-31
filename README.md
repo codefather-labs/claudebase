@@ -28,7 +28,7 @@ One Rust binary and a local daemon. Claude Code itself runs unmodified.
 | **Sessions you can reach** | `claudebase run` starts `claude` under a terminal supervisor. Telegram messages, messages from other sessions, HTTP callbacks and socket writes arrive in the session's input as prefixed lines. Replies go out through the CLI. |
 | **Many agents, many machines** | Sessions have names, list and message each other, and can join the daemon of another machine. A pool of sessions can serve model calls for a gateway. |
 | **A project journal** | Agents record decisions, findings and changes; the next session finds them by tag, category and meaning. Entries carry flags (todo, unverified, deprecated, …) and links that form a graph. Every feature or fix runs as a branch from a todo to a verified entry with evidence. |
-| **Mind maps** | A session keeps a working map of a long task or a piece of research: a tree of short notes around one topic, cross-links, journal entries behind each node and link, chains of entries. The map is the session's own. The daemon draws it as SVG, sends it to Telegram or serves a live page. |
+| **Mind maps** | A session keeps a working map of a long task or a piece of research: a tree of short notes around one topic, cross-links, journal entries behind each node and link, chains of entries. Or a block diagram: ISO 5807 symbols and logic gates joined by arrows. A map is its session's own unless shared with every session of the project. The daemon draws it as SVG, sends it to Telegram or serves a live page. |
 | **Operational glue** | The daemon runs as a service, a machine gets one Claude subscription token for all its sessions, and conversations move between machines. |
 | **Agent toolkit** | Rules, hooks, skills, commands and agents installed into `~/.claude/`, so every session knows the contract above without being told. |
 
@@ -227,18 +227,20 @@ claudebase journal get 42                                   # the entry and what
 claudebase journal agenda                                   # what is still open
 ```
 
-**Flags** say how far to trust an entry found by meaning alone:
+**Flags** say how far to trust an entry found by meaning alone, and what kind of entry it is. An entry carries any number of them:
 
 | Flag | Meaning | Ends with |
 |---|---|---|
-| `--todo` `--question` `--problem` `--reminder` | work items | `journal close <id> --resolution "<how>"` |
+| `--todo` `--question` `--problem` `--bugreport` `--reminder` | work items (`--bugreport`: a defect as reported, not yet worked through; category `bug`) | `journal close <id> --resolution "<how>"` |
 | `--every 20m` (on `add`) | a reminder that comes back: the daemon puts the entry into the input of the session that wrote it as `[reminder #N]`, every interval, until it is closed. Only that session gets it, never while it is offline; one due while it was away arrives when it is back. Unlike a session's cron, it outlives the session | `journal close <id>` |
 | `--unverified` | a hypothesis, or an implementation not yet proven | `close` once a separate `Verifies journal#N` entry carries the evidence: what was checked, how, under which conditions, how many times. With `journal policy --evidence-first on` it must also point at proofs (`--proof <file\|url>`) |
 | `--disputed` | contradicts another entry | `close` once settled |
 | `--ai-feedback` | an agent's suggestion for claudebase itself | `close` once handled |
-| `--constraint` | a rule to follow, not weigh | `unmark` |
+| `--specification` | how something must behave: behaviour, isolation boundaries, policies, invariants. Binding; the spec a feature is built and checked against | `unmark` |
+| `--constraint` | a rule, a limit, a constant, an invariant to follow, not weigh | `unmark` |
 | `--important` | keep in view | `unmark` |
-| `--verified` | carries the evidence that something works | `unmark` |
+| `--idea` `--concept` `--comment` | notes that document thinking and do not bind | `unmark` |
+| `--verified` | declares that the check passed; `--proof` points at the evidence | `unmark` |
 | `--deprecated` | no longer true; ranked last in search | `unmark` |
 
 ### 🕸️ The knowledge graph
@@ -296,7 +298,7 @@ graph LR
 - **Search is hybrid.** BM25 over `entries_fts` and K-NN over `entries_vec` are fused by reciprocal rank (RRF, k = 60). Tag, category, flag and date filters are SQL. `deprecated` hits rank last. Until the encoder model is on disk (`claudebase warmup`), search is keyword-only.
 - **Writes are deduplicated.** The same text in the same category within 30 days is not stored twice. Edges from an entry's text are parsed when it is written. Journals written before links existed get their edges filled in from the text once.
 - **Sharing is a routing table.** Checkouts of one repository already share a journal. For anything else, such as a folder without a remote or a fork, `journal share <folder>` adds a row to the daemon's `journal_shares` table, and from then on that folder's reads and writes go to this journal. The folder's own entries are merged in, with their flags and edges remapped. `journal unshare <folder>` deletes the row and copies the journal as it is at that moment (`VACUUM INTO`) into the folder's own independent file. Agents do this only when the operator asks (`/claudebase-journal-share`).
-- **Retention follows salience:** `high` forever, `medium` a year, `low` 90 days. An open work item, a `constraint` or an `important` entry is kept until it is resolved.
+- **Retention follows salience:** `high` forever, `medium` a year, `low` 90 days. An open work item, a `specification`, a `constraint` or an `important` entry is kept until it is resolved.
 - **`journal feedback`** gives the operator every project's `ai-feedback` entries in one view. It is refused to agents and to remote clients.
 
 ## 🗺️ Mind maps
@@ -315,12 +317,28 @@ claudebase mindmap svg 3 -o map.svg                              # light/dark fo
 claudebase mindmap send 3                                        # a PNG to the operator in Telegram
 claudebase mindmap url 3                                         # the live page, redrawn every 2 s
 claudebase mindmap close 3                                       # kept and readable, no longer reminded
+claudebase mindmap share 3                                       # every session of the project reads and changes it
 ```
 
-- **A map is its session's.** It belongs to the nick and host that made it, so a resumed conversation keeps it. Only the owner writes to it. Another session of the project may read it by id, and is never told it exists. `mindmap list` shows a session its own maps, and from a plain terminal every map of the project.
-- **It comes back after a compaction.** On session start, resume, `/clear` and compaction, the journal hook names the session's open maps (one daemon call, at most 3 s). The agent reads the one it needs with `mindmap show`, so nothing is pushed into the context by default.
+A **flowchart** is the other kind of map: a block diagram by the canon, for a process, a request path or a piece of logic.
+
+```bash
+claudebase mindmap new "checkout" --type flowchart --shared      # --direction right: left to right
+claudebase mindmap add 5 "order received" --kind start           # -> n2
+claudebase mindmap add 5 "cart empty?" --kind decision --after n2
+claudebase mindmap add 5 "reject" --kind end --after n3 --label yes
+claudebase mindmap add 5 "paid AND in stock" --kind and --after n3 --label no --ref 61
+claudebase mindmap link 5 n4 n2 --label retry                    # any arrow, loops too
+```
+
+- **A project holds any number of maps,** with free titles, of either kind.
+- **A map is its session's unless it is shared.** It belongs to the nick and host that made it, so a resumed conversation keeps it. Only the owner writes to a private map. Another session of the project may read it by id, and is never told it exists.
+- **A shared map is everyone's.** Its owner shares it (`mindmap new --shared` or `mindmap share`). From then on every session of the project reads and changes it, unshare and delete included. That is every checkout of the repository, sessions joined from other machines, and folders brought in by `journal share`. Each node records the session that added it. Use a shared map for what all agents keep in sync, such as the architecture of the project.
+- **It comes back after a compaction.** On session start, resume, `/clear` and compaction, the journal hook names the session's own open maps and, in a separate list, the project's shared ones (one daemon call, at most 3 s). The agent reads the one it needs with `mindmap show`, so nothing is pushed into the context by default. `mindmap list` shows the same; from a plain terminal it shows every map of the project.
 - **It is stored in the project's journal file:** `mindmaps`, `mindmap_nodes`, `mindmap_edges`, `mindmap_node_refs`, `mindmap_edge_refs`, `mindmap_chains`, `mindmap_chain_steps`. `journal share` carries maps along with entry ids renumbered, and `unshare` copies them. Deleting a journal entry removes it from every map that pointed at it.
-- **Drawing:** a two-sided tree. Each subtree has its own band, so nodes never overlap. A branch keeps its colour, a border shows the node's kind, done nodes are bold, dropped ones faded and struck through. The PNG for Telegram is rendered by resvg with an embedded Noto Sans (Latin, Cyrillic, Greek; SIL OFL), since a server may have no fonts. A map too large or too long for a Telegram photo goes as a file.
+- **Flowchart symbols** (ISO 5807): `start` / `end` (terminator), `process`, `decision` (diamond; each branch leaves through its own vertex), `io` (input/output), `subprocess` (predefined process), `document`, `data` (stored data), `manual` (manual input), `prep` (preparation), `connector`, `delay`, `note` (annotation, tied by a dashed line). **Logic gates** in the distinctive shapes of ANSI/IEEE 91: `and`, `or`, `not`, `nand`, `nor`, `xor`, `xnor`, inputs on the near side. Every symbol and every arrow can point at journal entries, as in a mind map.
+- **Flowchart layout** is layered: an arrow that closes a loop is found and routed back beside the layers, every other arrow goes from one layer to a later one, and an arrow that crosses several layers gets a slot in each, so it passes between symbols instead of through them. `down` (default) or `right`. Crossings are reduced by ordering each layer by its neighbours' positions, not minimised.
+- **Mind-map drawing:** a two-sided tree. Each subtree has its own band, so nodes never overlap. A branch keeps its colour, a border shows the node's kind, done nodes are bold, dropped ones faded and struck through. The PNG for Telegram is rendered by resvg with an embedded Noto Sans (Latin, Cyrillic, Greek; SIL OFL), since a server may have no fonts. A map too large or too long for a Telegram photo goes as a file.
 - **The live page** is served at `/mindmap/<view token>` on the daemon's HTTP listener, which is off by default and binds to loopback (`claudebase daemon callback enable`). The 128-bit token in the URL is the only credential. Only `GET` is accepted.
 
 ## 🧰 Machines and conversations

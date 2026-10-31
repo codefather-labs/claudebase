@@ -205,3 +205,61 @@ async fn a_map_is_its_sessions_alone_and_readable_by_id() -> Result<()> {
     }
     Ok(())
 }
+
+/// journal#107: a shared map — here a flowchart of the architecture — is read
+/// and changed by every session of the project; sharing is its owner's call;
+/// the session-start hook lists it apart from a session's own maps.
+#[tokio::test]
+async fn a_shared_flowchart_is_every_sessions() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let project = tempfile::tempdir()?;
+    let _daemon = Daemon(spawn_daemon(home.path())?);
+    let socket = socket_under(home.path());
+    wait_for_socket(&socket, Duration::from_secs(30)).await?;
+    let mut mira = Client::connect(&socket).await?;
+    register(&mut mira, "mira-1", "mira", project.path()).await?;
+    let mut atlas = Client::connect(&socket).await?;
+    register(&mut atlas, "atlas-1", "atlas", project.path()).await?;
+
+    let e = ok(&mut mira, "journal_add", session("mira-1", json!({ "body": "the daemon is the only writer of the journals", "category": "decision", "tags": ["daemon"] }))).await["id"].as_i64().unwrap();
+    let made = ok(&mut mira, "journal_mindmap_new", session("mira-1", json!({ "title": "request path", "layout": "flowchart", "shared": true }))).await;
+    assert_eq!(made["layout"], json!("flowchart"));
+    let flow = made["map"].as_i64().unwrap();
+    let start = ok(&mut mira, "journal_mindmap_add", session("mira-1", json!({ "map": flow, "text": "CLI call", "kind": "start" }))).await["node"].as_i64().unwrap();
+    // The other session extends it, a gate and an arrow with a journal reference.
+    let gate = ok(&mut atlas, "journal_mindmap_add", session("atlas-1", json!({ "map": flow, "text": "session AND token", "kind": "and", "after": start, "label": "auth" }))).await["node"].as_i64().unwrap();
+    let write = ok(&mut atlas, "journal_mindmap_add", session("atlas-1", json!({ "map": flow, "text": "journal write", "kind": "data", "after": gate }))).await["node"].as_i64().unwrap();
+    ok(&mut atlas, "journal_mindmap_ref", session("atlas-1", json!({ "map": flow, "node": write, "entries": [e] }))).await;
+    let shown = ok(&mut mira, "journal_mindmap_show", session("mira-1", json!({ "map": flow }))).await;
+    let outline = shown["outline"].as_str().unwrap();
+    assert!(outline.starts_with("flowchart #") && outline.contains("(by atlas)") && outline.contains(&format!("journal#{e}")), "{outline}");
+    assert_eq!(ok(&mut atlas, "journal_mindmap_show", session("atlas-1", json!({ "map": flow }))).await["read_only"], json!(false));
+    let svg = ok(&mut atlas, "journal_mindmap_svg", session("atlas-1", json!({ "map": flow, "theme": "light" }))).await;
+    let svg = svg["svg"].as_str().unwrap();
+    assert!(svg.contains("flowchart #") && svg.contains("auth") && svg.contains(&format!("#{e}")));
+
+    // A private map of atlas: mira cannot share or change it.
+    let own = ok(&mut atlas, "journal_mindmap_new", session("atlas-1", json!({ "title": "atlas scratch" }))).await["map"].as_i64().unwrap();
+    let err = refused(&mut mira, "journal_mindmap_share", session("mira-1", json!({ "map": own, "shared": true }))).await;
+    assert!(err.contains("only its owner"), "{err}");
+    refused(&mut mira, "journal_mindmap_add", session("mira-1", json!({ "map": own, "text": "x" }))).await;
+
+    // The hook: atlas sees its own map, and mira's shared one in its own list.
+    let told = hook_output(home.path(), "atlas-1");
+    let own_at = told.find("Your open mind maps").expect("own list");
+    let shared_at = told.find("[shared mind maps]").expect("shared list");
+    assert!(told[own_at..shared_at].contains("atlas scratch"), "{told}");
+    assert!(told[shared_at..].contains("request path") && told[shared_at..].contains("owner mira"), "{told}");
+    let mira_told = hook_output(home.path(), "mira-1");
+    assert!(!mira_told.contains("atlas scratch"), "a private map leaked: {mira_told}");
+
+    // Fully common: the other session may unshare it, and then it is private again.
+    ok(&mut atlas, "journal_mindmap_share", session("atlas-1", json!({ "map": flow, "shared": false }))).await;
+    let err = refused(&mut atlas, "journal_mindmap_add", session("atlas-1", json!({ "map": flow, "text": "late", "kind": "process" }))).await;
+    assert!(err.contains("not shared"), "{err}");
+    // And the owner shares it back; then anyone may delete it.
+    ok(&mut mira, "journal_mindmap_share", session("mira-1", json!({ "map": flow, "shared": true }))).await;
+    ok(&mut atlas, "journal_mindmap_delete", session("atlas-1", json!({ "map": flow }))).await;
+    refused(&mut mira, "journal_mindmap_show", session("mira-1", json!({ "map": flow }))).await;
+    Ok(())
+}

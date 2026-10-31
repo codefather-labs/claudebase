@@ -3,10 +3,11 @@
 //! A map is filed in its project's journal and resolved the way every journal
 //! call is (`journal_tools::resolve`). On top of that, journal#93/#94:
 //!
-//! - writing needs a session, and that session must be the map's owner
-//!   (nick + host); anyone else is refused, whatever the project;
-//! - `list` shows a session its own maps only — the reminder hook reads it,
-//!   so no session is ever told about another's map;
+//! - writing needs a session; a private map takes writes from its owner
+//!   (nick + host) only, a shared map from every session of the project,
+//!   delete and unshare included (journal#107); only the owner shares;
+//! - `list` shows a session its own maps and the shared ones — the reminder
+//!   hook reads it, so no session is told about another's private map;
 //! - any session of the project, or the operator's terminal, reads a map by
 //!   its id;
 //! - the operator's terminal (no session) lists every map and may delete one.
@@ -30,6 +31,7 @@ pub(super) fn dispatch(tool: &str, dir: &Path, args: &Value) -> Result<Value> {
         "journal_mindmap_send" => send(dir, args),
         "journal_mindmap_url" => url(dir, args),
         "journal_mindmap_delete" => delete(dir, args),
+        "journal_mindmap_share" => share(dir, args),
         _ => write(tool, dir, args),
     }
 }
@@ -64,8 +66,13 @@ fn new(dir: &Path, args: &Value) -> Result<Value> {
     let owner = owner_of(&caller)?;
     let mut conn = open(dir, &caller)?.expect("a session journal is always created");
     let title = str_arg(args, "title").ok_or_else(|| anyhow!("title required"))?;
-    let (map, root) = mindmap::create(&mut conn, &title, &owner, journal::now_secs())?;
-    Ok(json!({ "project": project_json(&caller), "map": map, "root": root, "title": title }))
+    let layout = str_arg(args, "layout").unwrap_or_else(|| "mindmap".into());
+    let direction = str_arg(args, "direction").unwrap_or_else(|| "down".into());
+    let shared = args.get("shared").and_then(Value::as_bool).unwrap_or(false);
+    let spec = mindmap::NewMap { title: &title, layout: &layout, direction: &direction, shared };
+    let (map, root) = mindmap::create_map(&mut conn, &spec, &owner, journal::now_secs())?;
+    let layout = mindmap::normalize_layout(&layout)?;
+    Ok(json!({ "project": project_json(&caller), "map": map, "root": root, "title": title, "layout": layout, "shared": shared }))
 }
 
 fn list(dir: &Path, args: &Value) -> Result<Value> {
@@ -74,11 +81,18 @@ fn list(dir: &Path, args: &Value) -> Result<Value> {
     let Some(conn) = open(dir, &caller)? else {
         return Ok(json!({ "project": project_json(&caller), "maps": [], "scope": "none" }));
     };
-    let (maps, scope) = if caller.agent_id.is_some() {
-        (mindmap::list(&conn, Some(&owner_of(&caller)?), closed_too)?, "session")
-    } else {
-        (mindmap::list(&conn, None, closed_too)?, "project")
-    };
+    let viewer = if caller.agent_id.is_some() { Some(owner_of(&caller)?) } else { None };
+    let maps = mindmap::list(&conn, viewer.as_ref(), closed_too)?;
+    let maps: Vec<Value> = maps
+        .into_iter()
+        .map(|m| {
+            let mine = viewer.as_ref().map(|v| m.owned_by(v)).unwrap_or(false);
+            let mut v = serde_json::to_value(&m).unwrap_or_default();
+            v["mine"] = json!(mine);
+            v
+        })
+        .collect();
+    let scope = if viewer.is_some() { "session" } else { "project" };
     Ok(json!({ "project": project_json(&caller), "maps": maps, "scope": scope }))
 }
 
@@ -92,11 +106,11 @@ fn load(dir: &Path, args: &Value) -> Result<(Caller, mindmap::Map)> {
 
 fn show(dir: &Path, args: &Value) -> Result<Value> {
     let (caller, map) = load(dir, args)?;
-    let mine = caller.agent_id.is_none() || owner_of(&caller).map(|o| o.nick == map.summary.owner_nick).unwrap_or(false);
+    let mine = caller.agent_id.is_none() || owner_of(&caller).map(|o| map.summary.owned_by(&o)).unwrap_or(false);
     Ok(json!({
         "project": project_json(&caller),
         "outline": mindmap::outline(&map),
-        "read_only": !mine,
+        "read_only": !(mine || map.summary.shared),
         "map": map,
     }))
 }
@@ -175,10 +189,29 @@ fn delete(dir: &Path, args: &Value) -> Result<Value> {
     let id = i64_arg(args, "map")?;
     let conn = open(dir, &caller)?.ok_or_else(|| anyhow!("no mind map #{id} in this project"))?;
     if caller.agent_id.is_some() {
-        mindmap::check_owner(&conn, id, &owner_of(&caller)?)?;
+        mindmap::check_write(&conn, id, &owner_of(&caller)?)?;
     }
     mindmap::delete(&conn, id)?;
     Ok(json!({ "project": project_json(&caller), "map": id, "deleted": true }))
+}
+
+/// Share a map with every session of the project (its owner only), or stop
+/// sharing it (anyone, once it is shared — journal#107).
+fn share(dir: &Path, args: &Value) -> Result<Value> {
+    let caller = resolve(args, false)?;
+    let id = i64_arg(args, "map")?;
+    let on = args.get("shared").and_then(Value::as_bool).unwrap_or(true);
+    let conn = open(dir, &caller)?.ok_or_else(|| anyhow!("no mind map #{id} in this project"))?;
+    if caller.agent_id.is_some() {
+        let who = owner_of(&caller)?;
+        if on {
+            mindmap::check_owner(&conn, id, &who)?;
+        } else {
+            mindmap::check_write(&conn, id, &who)?;
+        }
+    }
+    mindmap::set_shared(&conn, id, on, journal::now_secs())?;
+    Ok(json!({ "project": project_json(&caller), "map": id, "shared": on }))
 }
 
 /// Every tool that changes a map: a session, and the map's owner.
@@ -187,15 +220,25 @@ fn write(tool: &str, dir: &Path, args: &Value) -> Result<Value> {
     let owner = owner_of(&caller)?;
     let mut conn = open(dir, &caller)?.expect("a session journal is always created");
     let map = i64_arg(args, "map")?;
-    mindmap::check_owner(&conn, map, &owner)?;
+    mindmap::check_write(&conn, map, &owner)?;
     let now = journal::now_secs();
     let c = &mut conn;
     let out = match tool {
         "journal_mindmap_add" => {
             let text = str_arg(args, "text").ok_or_else(|| anyhow!("text required"))?;
-            let kind = str_arg(args, "kind").unwrap_or_else(|| "note".into());
-            let id = mindmap::add_node(c, map, opt_i64(args, "parent"), &kind, &text, &ids(args, "refs"), now)?;
-            json!({ "node": id })
+            let kind = str_arg(args, "kind").unwrap_or_default();
+            let label = str_arg(args, "label").unwrap_or_default();
+            let refs = ids(args, "refs");
+            let spec = mindmap::NewNode {
+                parent: opt_i64(args, "parent"),
+                after: opt_i64(args, "after"),
+                label: &label,
+                kind: &kind,
+                text: &text,
+                refs: &refs,
+                author: Some(&owner.nick),
+            };
+            json!({ "node": mindmap::add(c, map, &spec, now)? })
         }
         "journal_mindmap_edit" => {
             let node = i64_arg(args, "node")?;

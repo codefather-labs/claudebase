@@ -20,7 +20,7 @@ use crate::mindmap::{Map, Node};
 
 /// Noto Sans Regular, SIL OFL 1.1 — see assets/fonts/OFL.txt.
 pub static FONT: &[u8] = include_bytes!("../assets/fonts/NotoSans-Regular.ttf");
-const FONT_FAMILY: &str = "Noto Sans";
+pub(crate) const FONT_FAMILY: &str = "Noto Sans";
 
 const TEXT_SIZE: f64 = 13.0;
 const ROOT_SIZE: f64 = 17.0;
@@ -35,8 +35,8 @@ const MAX_ROOT_W: f64 = 300.0;
 const MAX_LINES: usize = 6;
 const H_GAP: f64 = 64.0;
 const V_GAP: f64 = 14.0;
-const MARGIN: f64 = 32.0;
-const HEADER: f64 = 56.0;
+pub(crate) const MARGIN: f64 = 32.0;
+pub(crate) const HEADER: f64 = 56.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Theme {
@@ -58,18 +58,18 @@ impl Theme {
     }
 }
 
-struct Palette {
-    bg: &'static str,
-    surface: &'static str,
-    text: &'static str,
-    muted: &'static str,
+pub(crate) struct Palette {
+    pub(crate) bg: &'static str,
+    pub(crate) surface: &'static str,
+    pub(crate) text: &'static str,
+    pub(crate) muted: &'static str,
     root_fill: &'static str,
     root_text: &'static str,
-    link: &'static str,
-    label_bg: &'static str,
+    pub(crate) link: &'static str,
+    pub(crate) label_bg: &'static str,
 }
 
-const LIGHT: Palette = Palette {
+pub(crate) const LIGHT: Palette = Palette {
     bg: "#f8fafc",
     surface: "#ffffff",
     text: "#0f172a",
@@ -80,7 +80,7 @@ const LIGHT: Palette = Palette {
     label_bg: "#f8fafc",
 };
 
-const DARK: Palette = Palette {
+pub(crate) const DARK: Palette = Palette {
     bg: "#0b1120",
     surface: "#111827",
     text: "#e2e8f0",
@@ -137,7 +137,7 @@ pub fn text_width(text: &str, size: f64) -> f64 {
 
 /// Greedy word wrap to `max` px; a word wider than a line is cut. At most
 /// MAX_LINES lines, the last one ending in "…" when text was left over.
-fn wrap(text: &str, size: f64, max: f64) -> Vec<String> {
+pub(crate) fn wrap(text: &str, size: f64, max: f64) -> Vec<String> {
     // Widths add up char by char, so each word is measured once.
     let space = text_width(" ", size);
     let mut lines: Vec<String> = Vec::new();
@@ -385,16 +385,19 @@ pub fn layout(map: &Map) -> Vec<Placed> {
     map.nodes.iter().map(|n| placed.remove(&n.id).unwrap()).collect()
 }
 
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
-fn n(v: f64) -> String {
+pub(crate) fn n(v: f64) -> String {
     format!("{:.1}", v)
 }
 
 /// The map as a standalone SVG document.
 pub fn render_svg(map: &Map, theme: Theme) -> String {
+    if map.summary.layout == "flowchart" {
+        return crate::mindmap_flow::render_svg(map, theme);
+    }
     let dark = theme == Theme::Dark;
     let pal = if dark { &DARK } else { &LIGHT };
     let boxes = layout(map);
@@ -661,7 +664,7 @@ mod tests {
     use crate::mindmap::{Chain, Edge, MapSummary};
 
     fn map_of(n_nodes: usize) -> Map {
-        let mut nodes = vec![Node { id: 1, parent: None, kind: "topic".into(), text: "Почему пул тормозит под нагрузкой".into(), state: "open".into(), refs: vec![] }];
+        let mut nodes = vec![Node { id: 1, parent: None, kind: "topic".into(), text: "Почему пул тормозит под нагрузкой".into(), state: "open".into(), refs: vec![], author: None }];
         let kinds = ["fact", "hypothesis", "question", "decision", "idea", "task", "dead-end", "goal", "note"];
         for i in 2..=n_nodes as i64 {
             // A bushy tree: parent among the earlier nodes, deeper as it grows.
@@ -673,6 +676,7 @@ mod tests {
                 text: format!("узел {i}: lock contention on the bus writer, measured under 40 rps"),
                 state: ["open", "done", "dropped"][(i as usize) % 3].into(),
                 refs: if i % 4 == 0 { vec![i, i + 100] } else { vec![] },
+                author: None,
             });
         }
         // Tree order the renderer expects: parents first.
@@ -682,6 +686,9 @@ mod tests {
             owner_nick: "mira".into(),
             owner_host: None,
             state: "open".into(),
+            shared: false,
+            layout: "mindmap".into(),
+            direction: "down".into(),
             nodes: n_nodes as i64,
             open_nodes: 0,
             created_at: 0,

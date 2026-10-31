@@ -82,9 +82,46 @@ CREATE TABLE IF NOT EXISTS mindmap_chain_steps (
 );
 ";
 
-/// What a node is. The root of every map is its `topic`.
+/// Columns added after v0.23.1, whose journals already hold the tables:
+/// `CREATE TABLE IF NOT EXISTS` leaves an existing table as it is, so each is
+/// added here when missing (journal#108).
+const COLUMNS: [(&str, &str, &str); 4] = [
+    ("mindmaps", "shared", "INTEGER NOT NULL DEFAULT 0"),
+    ("mindmaps", "layout", "TEXT NOT NULL DEFAULT 'mindmap'"),
+    ("mindmaps", "direction", "TEXT NOT NULL DEFAULT 'down'"),
+    ("mindmap_nodes", "author", "TEXT"),
+];
+
+/// Bring the mind-map tables of an opened journal up to date.
+pub fn migrate(conn: &Connection) -> Result<()> {
+    for (table, column, decl) in COLUMNS {
+        let has: bool = conn
+            .prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"))?
+            .exists(params![column])?;
+        if !has {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))
+                .with_context(|| format!("add {table}.{column}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// The two kinds of map (journal#107): a two-sided tree of notes around a
+/// topic, and a block diagram of directed arrows between ISO 5807 symbols and
+/// logic gates.
+pub const LAYOUTS: [&str; 2] = ["mindmap", "flowchart"];
+pub const DIRECTIONS: [&str; 2] = ["down", "right"];
+
+/// What a node of a `mindmap` is. The root of every map is its `topic`.
 pub const NODE_KINDS: [&str; 10] =
     ["topic", "goal", "fact", "hypothesis", "question", "decision", "idea", "task", "dead-end", "note"];
+
+/// What a node of a `flowchart` is: ISO 5807 symbols, then logic gates.
+pub const FLOW_KINDS: [&str; 20] = [
+    "start", "end", "process", "decision", "io", "subprocess", "document", "data", "manual", "prep",
+    "connector", "delay", "note", "and", "or", "not", "nand", "nor", "xor", "xnor",
+];
+pub const GATES: [&str; 7] = ["and", "or", "not", "nand", "nor", "xor", "xnor"];
 pub const NODE_STATES: [&str; 3] = ["open", "done", "dropped"];
 pub const MAX_TEXT_CHARS: usize = 2_000;
 pub const MAX_TITLE_CHARS: usize = 200;
@@ -105,6 +142,9 @@ pub struct MapSummary {
     pub owner_nick: String,
     pub owner_host: Option<String>,
     pub state: String,
+    pub shared: bool,
+    pub layout: String,
+    pub direction: String,
     pub nodes: i64,
     pub open_nodes: i64,
     pub created_at: i64,
@@ -119,6 +159,8 @@ pub struct Node {
     pub text: String,
     pub state: String,
     pub refs: Vec<i64>,
+    /// The session that added it — on a shared map, not always the owner.
+    pub author: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -179,13 +221,39 @@ fn clean_text(raw: &str, max: usize, what: &str) -> Result<String> {
     Ok(t.to_string())
 }
 
-pub fn normalize_kind(raw: &str) -> Result<String> {
+/// A node kind as stored, checked against the kinds of the map's layout.
+pub fn normalize_kind(raw: &str, layout: &str) -> Result<String> {
     let k = raw.trim().to_ascii_lowercase().replace(['_', ' '], "-");
-    let k = if k == "deadend" { "dead-end".to_string() } else { k };
-    if NODE_KINDS.contains(&k.as_str()) {
+    let k = match k.as_str() {
+        "deadend" => "dead-end".to_string(),
+        "terminator" | "begin" => "start".into(),
+        "stop" | "finish" => "end".into(),
+        "input" | "output" | "input-output" | "i/o" => "io".into(),
+        "predefined" | "predefined-process" => "subprocess".into(),
+        "database" | "storage" | "stored-data" => "data".into(),
+        "manual-input" => "manual".into(),
+        "preparation" => "prep".into(),
+        _ => k,
+    };
+    let kinds: &[&str] = if layout == "flowchart" { &FLOW_KINDS } else { &NODE_KINDS };
+    if kinds.contains(&k.as_str()) {
         Ok(k)
     } else {
-        bail!("unknown node kind `{raw}` — one of: {}", NODE_KINDS.join(", "))
+        bail!("unknown {layout} node kind `{raw}` — one of: {}", kinds.join(", "))
+    }
+}
+
+pub fn normalize_layout(raw: &str) -> Result<String> {
+    let l = raw.trim().to_ascii_lowercase();
+    let l = match l.as_str() {
+        "mind-map" | "tree" | "classic" => "mindmap".to_string(),
+        "flow" | "flow-chart" | "block" | "diagram" => "flowchart".to_string(),
+        _ => l,
+    };
+    if LAYOUTS.contains(&l.as_str()) {
+        Ok(l)
+    } else {
+        bail!("unknown map type `{raw}` — mindmap or flowchart")
     }
 }
 
@@ -201,16 +269,45 @@ fn same_owner(nick: &str, host: Option<&str>, who: &Owner) -> bool {
         }
 }
 
-/// A new map, with its topic as the root node.
+/// How a new map is set up.
+#[derive(Debug, Clone)]
+pub struct NewMap<'a> {
+    pub title: &'a str,
+    /// `mindmap` or `flowchart`.
+    pub layout: &'a str,
+    /// For a flowchart: `down` (top to bottom) or `right` (left to right).
+    pub direction: &'a str,
+    pub shared: bool,
+}
+
+impl<'a> NewMap<'a> {
+    pub fn mindmap(title: &'a str) -> Self {
+        NewMap { title, layout: "mindmap", direction: "down", shared: false }
+    }
+}
+
+/// A new map of the classic kind, with its topic as the root node.
 pub fn create(conn: &mut Connection, title: &str, owner: &Owner, now: i64) -> Result<(i64, i64)> {
-    let title = clean_text(title, MAX_TITLE_CHARS, "the title")?;
+    create_map(conn, &NewMap::mindmap(title), owner, now)
+}
+
+/// A new map. Its root holds the title: the topic of a mind map, the caption
+/// of a flowchart (which draws no root).
+pub fn create_map(conn: &mut Connection, spec: &NewMap<'_>, owner: &Owner, now: i64) -> Result<(i64, i64)> {
+    let title = clean_text(spec.title, MAX_TITLE_CHARS, "the title")?;
     if owner.nick.trim().is_empty() {
         bail!("a mind map belongs to a named session");
     }
+    let layout = normalize_layout(spec.layout)?;
+    let direction = spec.direction.trim().to_ascii_lowercase();
+    if !DIRECTIONS.contains(&direction.as_str()) {
+        bail!("unknown direction `{}` — down or right", spec.direction);
+    }
     let t = tx(conn)?;
     t.execute(
-        "INSERT INTO mindmaps(title, owner_nick, owner_host, view_token, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-        params![title, owner.nick, owner.host, view_token(), now],
+        "INSERT INTO mindmaps(title, owner_nick, owner_host, view_token, created_at, updated_at, shared, layout, direction) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8)",
+        params![title, owner.nick, owner.host, view_token(), now, spec.shared, layout, direction],
     )?;
     let map = t.last_insert_rowid();
     t.execute(
@@ -233,24 +330,35 @@ fn summary_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MapSummary> {
         updated_at: r.get(6)?,
         nodes: r.get(7)?,
         open_nodes: r.get(8)?,
+        shared: r.get(9)?,
+        layout: r.get(10)?,
+        direction: r.get(11)?,
     })
 }
 
 const SUMMARY_SQL: &str = "SELECT m.id, m.title, m.owner_nick, m.owner_host, m.state, m.created_at, m.updated_at, \
      (SELECT COUNT(*) FROM mindmap_nodes n WHERE n.map_id = m.id), \
-     (SELECT COUNT(*) FROM mindmap_nodes n WHERE n.map_id = m.id AND n.state = 'open' AND n.parent_id IS NOT NULL) \
+     (SELECT COUNT(*) FROM mindmap_nodes n WHERE n.map_id = m.id AND n.state = 'open' AND n.parent_id IS NOT NULL), \
+     m.shared, m.layout, m.direction \
      FROM mindmaps m";
 
-/// The maps of `owner` (every map when `None`: the operator's terminal),
-/// open ones only unless `closed_too`, most recently changed first.
-pub fn list(conn: &Connection, owner: Option<&Owner>, closed_too: bool) -> Result<Vec<MapSummary>> {
+impl MapSummary {
+    pub fn owned_by(&self, who: &Owner) -> bool {
+        same_owner(&self.owner_nick, self.owner_host.as_deref(), who)
+    }
+}
+
+/// The maps `viewer` may see listed: its own and the project's shared ones.
+/// Every map when `None` (the operator's terminal). Open ones only unless
+/// `closed_too`; most recently changed first.
+pub fn list(conn: &Connection, viewer: Option<&Owner>, closed_too: bool) -> Result<Vec<MapSummary>> {
     let mut stmt = conn.prepare(&format!(
-        "{SUMMARY_SQL} WHERE (?1 IS NULL OR m.owner_nick = ?1) AND (?2 OR m.state = 'open') ORDER BY m.updated_at DESC, m.id DESC"
+        "{SUMMARY_SQL} WHERE (?1 OR m.state = 'open') ORDER BY m.updated_at DESC, m.id DESC"
     ))?;
-    let rows = stmt.query_map(params![owner.map(|o| o.nick.as_str()), closed_too], summary_row)?;
+    let rows = stmt.query_map(params![closed_too], summary_row)?;
     let all: Vec<MapSummary> = rows.collect::<rusqlite::Result<_>>()?;
-    Ok(match owner {
-        Some(o) => all.into_iter().filter(|m| same_owner(&m.owner_nick, m.owner_host.as_deref(), o)).collect(),
+    Ok(match viewer {
+        Some(v) => all.into_iter().filter(|m| m.shared || m.owned_by(v)).collect(),
         None => all,
     })
 }
@@ -263,16 +371,51 @@ pub fn view_token_of(conn: &Connection, map: i64) -> Result<Option<String>> {
     Ok(conn.query_row("SELECT view_token FROM mindmaps WHERE id = ?1", params![map], |r| r.get(0)).optional()?)
 }
 
-/// Refuse a write by anyone but the map's owner (journal#94).
-pub fn check_owner(conn: &Connection, map: i64, who: &Owner) -> Result<()> {
-    let row: Option<(String, Option<String>)> = conn
-        .query_row("SELECT owner_nick, owner_host FROM mindmaps WHERE id = ?1", params![map], |r| Ok((r.get(0)?, r.get(1)?)))
+fn owner_row(conn: &Connection, map: i64) -> Result<(String, Option<String>, bool)> {
+    let row = conn
+        .query_row("SELECT owner_nick, owner_host, shared FROM mindmaps WHERE id = ?1", params![map], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
         .optional()?;
-    let Some((nick, host)) = row else { bail!("no mind map #{map} in this project") };
+    row.ok_or_else(|| anyhow::anyhow!("no mind map #{map} in this project"))
+}
+
+/// Refuse anyone but the map's owner — making a map shared is the owner's
+/// call (journal#107).
+pub fn check_owner(conn: &Connection, map: i64, who: &Owner) -> Result<()> {
+    let (nick, host, _) = owner_row(conn, map)?;
     if !same_owner(&nick, host.as_deref(), who) {
-        bail!("mind map #{map} belongs to session `{nick}` — another session may read it (`mindmap show {map}`), only its owner writes");
+        bail!("mind map #{map} belongs to session `{nick}` — only its owner can do that");
     }
     Ok(())
+}
+
+/// Refuse a write to a private map by anyone but its owner (journal#94); a
+/// shared map is everyone's in the project, delete and unshare included
+/// (journal#107).
+pub fn check_write(conn: &Connection, map: i64, who: &Owner) -> Result<()> {
+    let (nick, host, shared) = owner_row(conn, map)?;
+    if !shared && !same_owner(&nick, host.as_deref(), who) {
+        bail!(
+            "mind map #{map} belongs to session `{nick}` and is not shared — another session may read it \
+             (`mindmap show {map}`), only its owner writes or shares it"
+        );
+    }
+    Ok(())
+}
+
+pub fn set_shared(conn: &Connection, map: i64, shared: bool, now: i64) -> Result<()> {
+    let n = conn.execute("UPDATE mindmaps SET shared = ?2, updated_at = ?3 WHERE id = ?1", params![map, shared, now])?;
+    if n == 0 {
+        bail!("no mind map #{map} in this project");
+    }
+    Ok(())
+}
+
+fn layout_of(conn: &Connection, map: i64) -> Result<String> {
+    conn.query_row("SELECT layout FROM mindmaps WHERE id = ?1", params![map], |r| r.get(0))
+        .optional()?
+        .ok_or_else(|| anyhow::anyhow!("no mind map #{map} in this project"))
 }
 
 fn refs_of(conn: &Connection, sql: &str, id: i64) -> Result<Vec<i64>> {
@@ -284,10 +427,19 @@ fn refs_of(conn: &Connection, sql: &str, id: i64) -> Result<Vec<i64>> {
 pub fn load(conn: &Connection, map: i64) -> Result<Option<Map>> {
     let Some(summary) = summary(conn, map)? else { return Ok(None) };
     let mut raw: Vec<(Node, i64)> = {
-        let mut stmt = conn.prepare("SELECT id, parent_id, kind, text, state, ord FROM mindmap_nodes WHERE map_id = ?1 ORDER BY ord, id")?;
+        let mut stmt =
+            conn.prepare("SELECT id, parent_id, kind, text, state, ord, author FROM mindmap_nodes WHERE map_id = ?1 ORDER BY ord, id")?;
         let rows = stmt.query_map(params![map], |r| {
             Ok((
-                Node { id: r.get(0)?, parent: r.get(1)?, kind: r.get(2)?, text: r.get(3)?, state: r.get(4)?, refs: vec![] },
+                Node {
+                    id: r.get(0)?,
+                    parent: r.get(1)?,
+                    kind: r.get(2)?,
+                    text: r.get(3)?,
+                    state: r.get(4)?,
+                    refs: vec![],
+                    author: r.get(6)?,
+                },
                 r.get::<_, i64>(5)?,
             ))
         })?;
@@ -394,6 +546,20 @@ fn is_open(conn: &Connection, map: i64) -> Result<()> {
     Ok(())
 }
 
+/// A node to add. `parent` places it in a mind map's tree; `after` (a
+/// flowchart's) draws the arrow from that node to the new one.
+#[derive(Debug, Clone, Default)]
+pub struct NewNode<'a> {
+    pub parent: Option<i64>,
+    pub after: Option<i64>,
+    /// The label of the `after` arrow ("yes", "no").
+    pub label: &'a str,
+    pub kind: &'a str,
+    pub text: &'a str,
+    pub refs: &'a [i64],
+    pub author: Option<&'a str>,
+}
+
 /// Add a node under `parent` (the root when `None`).
 pub fn add_node(
     conn: &mut Connection,
@@ -404,20 +570,41 @@ pub fn add_node(
     refs: &[i64],
     now: i64,
 ) -> Result<i64> {
-    let kind = normalize_kind(kind)?;
+    add(conn, map, &NewNode { parent, kind, text, refs, ..Default::default() }, now)
+}
+
+pub fn add(conn: &mut Connection, map: i64, spec: &NewNode<'_>, now: i64) -> Result<i64> {
+    let layout = layout_of(conn, map)?;
+    // No kind given: the plainest one of the map's layout.
+    let kind = match spec.kind.trim() {
+        "" if layout == "flowchart" => "process".to_string(),
+        "" => "note".to_string(),
+        k => normalize_kind(k, &layout)?,
+    };
     if kind == "topic" {
         bail!("`topic` is the root's kind; pick another for a node under it");
     }
-    let text = clean_text(text, MAX_TEXT_CHARS, "the node text")?;
+    let text = clean_text(spec.text, MAX_TEXT_CHARS, "the node text")?;
+    let refs = spec.refs;
+    let flow = layout == "flowchart";
+    if flow && spec.parent.is_some() {
+        bail!("a flowchart is not a tree — place the node with --after n<id> (draws the arrow) or link it");
+    }
+    if !flow && spec.after.is_some() {
+        bail!("--after draws a flowchart arrow — in a mind map, place the node with --parent n<id>");
+    }
     let t = tx(conn)?;
     is_open(&t, map)?;
-    let parent = match parent {
+    let parent = match spec.parent {
         Some(p) => {
             node_in(&t, map, p)?;
             p
         }
         None => root_of(&t, map)?,
     };
+    if let Some(a) = spec.after {
+        node_in(&t, map, a)?;
+    }
     let count: i64 = t.query_row("SELECT COUNT(*) FROM mindmap_nodes WHERE map_id = ?1", params![map], |r| r.get(0))?;
     if count >= MAX_NODES {
         bail!("mind map #{map} already has {MAX_NODES} nodes — close it and start another, or prune it");
@@ -429,11 +616,17 @@ pub fn add_node(
         |r| r.get(0),
     )?;
     t.execute(
-        "INSERT INTO mindmap_nodes(map_id, parent_id, kind, text, ord, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![map, parent, kind, text, ord, now],
+        "INSERT INTO mindmap_nodes(map_id, parent_id, kind, text, ord, created_at, author) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![map, parent, kind, text, ord, now, spec.author],
     )?;
     let id = t.last_insert_rowid();
     insert_refs(&t, Target::Node(id), refs)?;
+    if let Some(a) = spec.after {
+        t.execute(
+            "INSERT INTO mindmap_edges(map_id, from_node, to_node, label) VALUES (?1, ?2, ?3, ?4)",
+            params![map, a, id, spec.label.trim()],
+        )?;
+    }
     touch(&t, map, now)?;
     t.commit()?;
     Ok(id)
@@ -446,7 +639,7 @@ pub fn edit_node(conn: &mut Connection, map: i64, node: i64, text: Option<&str>,
     node_in(&t, map, node)?;
     let root = root_of(&t, map)?;
     if let Some(k) = kind {
-        let k = normalize_kind(k)?;
+        let k = if node == root { k.trim().to_string() } else { normalize_kind(k, &layout_of(&t, map)?)? };
         if (node == root) != (k == "topic") {
             bail!("only the root is a `topic`, and the root stays one");
         }
@@ -471,6 +664,9 @@ pub fn move_node(conn: &mut Connection, map: i64, node: i64, parent: i64, now: i
     is_open(&t, map)?;
     node_in(&t, map, node)?;
     node_in(&t, map, parent)?;
+    if layout_of(&t, map)? == "flowchart" {
+        bail!("a flowchart is not a tree — change its arrows with link / unlink");
+    }
     if node == root_of(&t, map)? {
         bail!("the root does not move");
     }
@@ -699,23 +895,39 @@ pub fn merge(dst: &mut Connection, src: &Connection, entries: &HashMap<i64, i64>
             params![old],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         )?;
+        let (shared, layout, direction): (bool, String, String) = src.query_row(
+            "SELECT shared, layout, direction FROM mindmaps WHERE id = ?1",
+            params![old],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
         t.execute(
-            "INSERT INTO mindmaps(title, owner_nick, owner_host, state, view_token, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![title, nick, host, state, view_token(), created, updated],
+            "INSERT INTO mindmaps(title, owner_nick, owner_host, state, view_token, created_at, updated_at, shared, layout, direction) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![title, nick, host, state, view_token(), created, updated, shared, layout, direction],
         )?;
         let map = t.last_insert_rowid();
         let map_of = |e: &i64| entries.get(e).copied();
         let mut nodes: HashMap<i64, i64> = HashMap::new();
         {
             // Parents first: walk by depth.
-            let mut stmt = src.prepare("SELECT id, parent_id, kind, text, state, ord, created_at FROM mindmap_nodes WHERE map_id = ?1")?;
+            let mut stmt =
+                src.prepare("SELECT id, parent_id, kind, text, state, ord, created_at, author FROM mindmap_nodes WHERE map_id = ?1")?;
             let rows = stmt.query_map(params![old], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, i64>(5)?, r.get::<_, i64>(6)?))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                ))
             })?;
             let mut pending: Vec<_> = rows.collect::<rusqlite::Result<_>>()?;
             while !pending.is_empty() {
                 let before = pending.len();
-                pending.retain(|(id, parent, kind, text, st, ord, created)| {
+                pending.retain(|(id, parent, kind, text, st, ord, created, author)| {
                     let new_parent = match parent {
                         None => None,
                         Some(p) => match nodes.get(p) {
@@ -724,8 +936,9 @@ pub fn merge(dst: &mut Connection, src: &Connection, entries: &HashMap<i64, i64>
                         },
                     };
                     let ok = t.execute(
-                        "INSERT INTO mindmap_nodes(map_id, parent_id, kind, text, state, ord, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                        params![map, new_parent, kind, text, st, ord, created],
+                        "INSERT INTO mindmap_nodes(map_id, parent_id, kind, text, state, ord, created_at, author) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        params![map, new_parent, kind, text, st, ord, created, author],
                     );
                     if ok.is_ok() {
                         nodes.insert(*id, t.last_insert_rowid());
@@ -795,12 +1008,23 @@ pub fn merge(dst: &mut Connection, src: &Connection, entries: &HashMap<i64, i64>
 /// reads back into its context.
 pub fn outline(map: &Map) -> String {
     let s = &map.summary;
+    let flow = s.layout == "flowchart";
     let mut out = format!(
-        "mind map #{} \"{}\" — {}, owner {}, {} nodes ({} open)\n",
-        s.id, s.title, s.state, s.owner_nick, s.nodes, s.open_nodes
+        "{} #{} \"{}\" — {}{}, owner {}, {} nodes ({} open)\n",
+        if flow { "flowchart" } else { "mind map" },
+        s.id,
+        s.title,
+        s.state,
+        if s.shared { ", shared with every session of the project" } else { "" },
+        s.owner_nick,
+        s.nodes.saturating_sub(1),
+        s.open_nodes
     );
     let mut depth: HashMap<i64, usize> = HashMap::new();
     for n in &map.nodes {
+        if flow && n.id == map.root {
+            continue;
+        }
         let d = n.parent.and_then(|p| depth.get(&p).copied()).map(|d| d + 1).unwrap_or(0);
         depth.insert(n.id, d);
         let mark = match n.state.as_str() {
@@ -814,10 +1038,15 @@ pub fn outline(map: &Map) -> String {
             format!("  → {}", n.refs.iter().map(|r| format!("journal#{r}")).collect::<Vec<_>>().join(" "))
         };
         let text = n.text.replace('\n', " ");
-        out.push_str(&format!("{}- n{} ({}) {text}{mark}{refs}\n", "  ".repeat(d), n.id, n.kind));
+        let by = match &n.author {
+            Some(a) if *a != s.owner_nick => format!("  (by {a})"),
+            _ => String::new(),
+        };
+        let indent = if flow { String::new() } else { "  ".repeat(d) };
+        out.push_str(&format!("{indent}- n{} ({}) {text}{mark}{refs}{by}\n", n.id, n.kind));
     }
     if !map.edges.is_empty() {
-        out.push_str("links:\n");
+        out.push_str(if flow { "arrows:\n" } else { "links:\n" });
         for e in &map.edges {
             let label = if e.label.is_empty() { String::new() } else { format!(" \"{}\"", e.label) };
             let refs = if e.refs.is_empty() {
@@ -946,11 +1175,101 @@ mod tests {
     }
 
     #[test]
+    fn a_shared_map_is_everyones_a_private_one_its_owners() {
+        let (_d, mut c) = journal();
+        let atlas = Owner { nick: "atlas".into(), host: Some("box".into()) };
+        let spec = NewMap { title: "architecture", layout: "mindmap", direction: "down", shared: true };
+        let (shared, _) = create_map(&mut c, &spec, &mira(), 1).unwrap();
+        let (private, _) = create(&mut c, "mira's research", &mira(), 2).unwrap();
+        // Anyone writes to the shared one, nobody else to the private one.
+        check_write(&c, shared, &atlas).unwrap();
+        assert!(check_write(&c, private, &atlas).unwrap_err().to_string().contains("not shared"));
+        let n = add(&mut c, shared, &NewNode { kind: "fact", text: "the daemon owns the journals", author: Some("atlas"), ..Default::default() }, 3).unwrap();
+        assert_eq!(load(&c, shared).unwrap().unwrap().node(n).unwrap().author.as_deref(), Some("atlas"));
+        assert!(outline(&load(&c, shared).unwrap().unwrap()).contains("(by atlas)"));
+        // Sharing is the owner's call; unsharing a shared map is anyone's.
+        assert!(check_owner(&c, private, &atlas).is_err());
+        check_write(&c, shared, &atlas).unwrap();
+        set_shared(&c, shared, false, 4).unwrap();
+        assert!(check_write(&c, shared, &atlas).is_err(), "private again");
+        set_shared(&c, shared, true, 5).unwrap();
+        // A session lists its own maps and the shared ones.
+        let seen: Vec<i64> = list(&c, Some(&atlas), false).unwrap().iter().map(|m| m.id).collect();
+        assert_eq!(seen, vec![shared]);
+        let mine: Vec<i64> = list(&c, Some(&mira()), false).unwrap().iter().map(|m| m.id).collect();
+        assert_eq!(mine.len(), 2);
+    }
+
+    #[test]
+    fn a_flowchart_takes_symbols_and_gates_and_arrows_not_a_tree() {
+        let (_d, mut c) = journal();
+        let e = entry(&mut c, "the checkout spec, rev 3");
+        let spec = NewMap { title: "checkout", layout: "flow", direction: "right", shared: false };
+        let (f, _) = create_map(&mut c, &spec, &mira(), 1).unwrap();
+        let s = summary(&c, f).unwrap().unwrap();
+        assert_eq!((s.layout.as_str(), s.direction.as_str()), ("flowchart", "right"));
+        let start = add(&mut c, f, &NewNode { kind: "terminator", text: "start", ..Default::default() }, 2).unwrap();
+        let q = add(&mut c, f, &NewNode { kind: "decision", text: "paid?", after: Some(start), refs: &[e], ..Default::default() }, 3).unwrap();
+        let gate = add(&mut c, f, &NewNode { kind: "AND", text: "paid and in stock", after: Some(q), label: "yes", ..Default::default() }, 4).unwrap();
+        let plain = add(&mut c, f, &NewNode { text: "ship", after: Some(gate), ..Default::default() }, 5).unwrap();
+        assert!(add(&mut c, f, &NewNode { kind: "fact", text: "x", ..Default::default() }, 6).is_err(), "mind-map kind in a flowchart");
+        assert!(add(&mut c, f, &NewNode { kind: "process", text: "x", parent: Some(q), ..Default::default() }, 6).is_err(), "no tree");
+        assert!(move_node(&mut c, f, plain, q, 6).is_err());
+        let l = add_edge(&mut c, f, q, plain, "no", &[e], 7).unwrap();
+        let map = load(&c, f).unwrap().unwrap();
+        assert_eq!(map.node(gate).unwrap().kind, "and");
+        assert_eq!(map.node(plain).unwrap().kind, "process", "a flowchart's default kind");
+        assert_eq!(map.node(q).unwrap().refs, vec![e]);
+        let arrows: Vec<(i64, i64, &str)> = map.edges.iter().map(|x| (x.from, x.to, x.label.as_str())).collect();
+        assert!(arrows.contains(&(q, gate, "yes")) && arrows.contains(&(start, q, "")));
+        assert_eq!(map.edges.iter().find(|x| x.id == l).unwrap().refs, vec![e]);
+        assert!(outline(&map).starts_with("flowchart #"));
+        // And the other way: no gates, no --after in a mind map.
+        let (m, _) = create(&mut c, "notes", &mira(), 8).unwrap();
+        assert!(add(&mut c, m, &NewNode { kind: "xor", text: "x", ..Default::default() }, 9).is_err());
+        assert!(add(&mut c, m, &NewNode { kind: "fact", text: "x", after: Some(start), ..Default::default() }, 9).is_err());
+        assert!(create_map(&mut c, &NewMap { title: "t", layout: "gantt", direction: "down", shared: false }, &mira(), 9).is_err());
+    }
+
+    #[test]
+    fn a_journal_from_v0_23_gets_the_new_columns() {
+        // The mind-map tables as v0.23.1 created them, with a map in them.
+        let dir = tempfile::tempdir().unwrap();
+        let project = Path::new("/work/old");
+        let path = journal::journal_path(dir.path(), project);
+        {
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch(
+                "CREATE TABLE mindmaps (id INTEGER PRIMARY KEY, title TEXT NOT NULL, owner_nick TEXT NOT NULL, owner_host TEXT, \
+                 state TEXT NOT NULL DEFAULT 'open', view_token TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+                 CREATE TABLE mindmap_nodes (id INTEGER PRIMARY KEY, map_id INTEGER NOT NULL REFERENCES mindmaps(id) ON DELETE CASCADE, \
+                 parent_id INTEGER REFERENCES mindmap_nodes(id) ON DELETE CASCADE, kind TEXT NOT NULL, text TEXT NOT NULL, \
+                 state TEXT NOT NULL DEFAULT 'open', ord INTEGER NOT NULL, created_at INTEGER NOT NULL);
+                 INSERT INTO mindmaps VALUES (1, 'old map', 'mira', 'box', 'open', 'tok', 1, 1);
+                 INSERT INTO mindmap_nodes VALUES (1, 1, NULL, 'topic', 'old map', 'open', 0, 1);
+                 INSERT INTO mindmap_nodes VALUES (2, 1, 1, 'fact', 'kept', 'open', 0, 1);",
+            )
+            .unwrap();
+        }
+        let c = journal::open(dir.path(), project, false).unwrap().expect("the old file opens");
+        let map = load(&c, 1).unwrap().unwrap();
+        assert!(!map.summary.shared);
+        assert_eq!(map.summary.layout, "mindmap");
+        assert_eq!(map.node(2).unwrap().author, None);
+        // Opening again is a no-op.
+        drop(c);
+        journal::open(dir.path(), project, false).unwrap().unwrap();
+    }
+
+    #[test]
     fn merge_carries_maps_with_renumbered_entries() {
         let (_d, mut src) = journal();
         let e1 = entry(&mut src, "first finding about the cache");
         let e2 = entry(&mut src, "second finding about the cache");
         let (m, _) = create(&mut src, "cache", &mira(), 1).unwrap();
+        let spec = NewMap { title: "flow", layout: "flowchart", direction: "right", shared: true };
+        let (f, _) = create_map(&mut src, &spec, &mira(), 1).unwrap();
+        add(&mut src, f, &NewNode { kind: "or", text: "either", author: Some("atlas"), ..Default::default() }, 2).unwrap();
         let a = add_node(&mut src, m, None, "fact", "a", &[e1], 2).unwrap();
         let b = add_node(&mut src, m, Some(a), "idea", "b", &[], 3).unwrap();
         add_edge(&mut src, m, b, a, "refines", &[e2], 4).unwrap();
@@ -961,8 +1280,12 @@ mod tests {
         let pad = entry(&mut dst, "an entry the destination already had");
         journal::merge_into(&mut dst, &src).unwrap();
         let maps = list(&dst, None, true).unwrap();
-        assert_eq!(maps.len(), 1);
-        let map = load(&dst, maps[0].id).unwrap().unwrap();
+        assert_eq!(maps.len(), 2);
+        let flow = maps.iter().find(|m| m.layout == "flowchart").expect("the flowchart came along");
+        assert!(flow.shared && flow.direction == "right");
+        let fm = load(&dst, flow.id).unwrap().unwrap();
+        assert!(fm.nodes.iter().any(|n| n.kind == "or" && n.author.as_deref() == Some("atlas")));
+        let map = load(&dst, maps.iter().find(|m| m.layout == "mindmap").unwrap().id).unwrap().unwrap();
         assert_eq!(map.nodes.len(), 3);
         let n1 = map.nodes.iter().find(|n| n.text == "a").unwrap();
         assert_eq!(n1.refs.len(), 1);

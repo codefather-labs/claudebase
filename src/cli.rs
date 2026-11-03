@@ -817,6 +817,9 @@ pub enum DaemonSubcommand {
     /// `daemon remote …` — sessions on other machines joining this daemon,
     /// and this machine's sessions joining another's (named profiles).
     Remote(DaemonRemoteArgs),
+    /// `daemon api …` — tokens of the public API of the journal and mind maps
+    /// (`/v1/*` on the callback listener, docs/design/public-api.md).
+    Api(DaemonApiArgs),
     /// `daemon doctor [--asr]` — health-check runtime backends without
     /// performing actual work. Exit 0 = healthy, 1 = unhealthy. The
     /// `--asr` flag scopes to the ASR backend (the only doctor target
@@ -1466,6 +1469,10 @@ pub struct JournalFlags {
     /// A rule, a limit, a constant or an invariant to follow, not to weigh.
     #[arg(long)]
     pub constraint: bool,
+    /// A property that must always hold, stated so it can be checked. Binding,
+    /// like a constraint.
+    #[arg(long)]
+    pub invariant: bool,
     /// An important note.
     #[arg(long)]
     pub important: bool,
@@ -1500,6 +1507,7 @@ impl JournalFlags {
             (self.ai_feedback, "ai-feedback"),
             (self.specification, "specification"),
             (self.constraint, "constraint"),
+            (self.invariant, "invariant"),
             (self.important, "important"),
             (self.idea, "idea"),
             (self.concept, "concept"),
@@ -1929,4 +1937,21 @@ pub struct CallbackTokenArgs {
     /// this command's output keeps the secret.
     #[arg(long)]
     pub reveal: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct DaemonApiArgs {
+    #[command(subcommand)]
+    pub sub: DaemonApiSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DaemonApiSubcommand {
+    /// Issue a token for a program and print it once. Re-issuing for the same
+    /// name retires the old token.
+    Issue(RemoteClientArgs),
+    /// Revoke a program's token.
+    Revoke(RemoteClientArgs),
+    /// The API version and the issued tokens.
+    Status,
 }

@@ -17,6 +17,7 @@
 //! `tokio::task::spawn_blocking`.
 
 pub mod agent_registry;
+pub mod api;
 pub mod asr;
 pub mod auth;
 pub mod channel_state;

@@ -150,6 +150,7 @@ pub fn hostname() -> String {
 pub enum TokenKind {
     Remote,
     Pool,
+    Api,
 }
 
 impl TokenKind {
@@ -158,6 +159,7 @@ impl TokenKind {
         match self {
             TokenKind::Remote => "remote_tokens",
             TokenKind::Pool => "pool_tokens",
+            TokenKind::Api => "api_tokens",
         }
     }
 
@@ -165,6 +167,7 @@ impl TokenKind {
         match self {
             TokenKind::Remote => "cbr_",
             TokenKind::Pool => "cbp_",
+            TokenKind::Api => "cba_",
         }
     }
 }

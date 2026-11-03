@@ -249,7 +249,7 @@ fn backfill_links(conn: &mut Connection) -> Result<()> {
 ///
 /// An open work item, a specification, a constraint or an important mark
 /// keeps its entry past retention; the other marks do not (salience decides).
-pub const FLAGS: [&str; 16] = [
+pub const FLAGS: [&str; 17] = [
     "todo",
     "question",
     "problem",
@@ -260,6 +260,7 @@ pub const FLAGS: [&str; 16] = [
     "ai-feedback",
     "specification",
     "constraint",
+    "invariant",
     "important",
     "idea",
     "concept",
@@ -268,8 +269,8 @@ pub const FLAGS: [&str; 16] = [
     "deprecated",
 ];
 
-const MARKS: [&str; 8] =
-    ["specification", "constraint", "important", "idea", "concept", "comment", "verified", "deprecated"];
+const MARKS: [&str; 9] =
+    ["specification", "constraint", "invariant", "important", "idea", "concept", "comment", "verified", "deprecated"];
 
 /// Marks that neither hold an entry past retention nor belong in the agenda:
 /// history, evidence, and notes kept for what they say.

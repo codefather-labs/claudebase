@@ -123,7 +123,8 @@ Any entry can carry flags, any number of them at once (`--specification --constr
 | `--disputed` | contradicts another entry | `close` (who was right; mark the loser deprecated) |
 | `--ai-feedback` | your suggestion for improving claudebase itself | `close` (handled) |
 | `--specification` | how something must behave: behaviour, isolation boundaries, policies, invariants — the spec a feature is built and checked against; binding | `unmark` (or replace it) |
-| `--constraint` | a rule, a limit, a constant or an invariant to follow, not weigh; binding | `unmark` |
+| `--constraint` | a rule, a limit or a constant to follow, not weigh; binding | `unmark` |
+| `--invariant` | a property that must always hold, stated so it can be checked; binding | `unmark` |
 | `--important` | keep in view | `unmark` |
 | `--idea` | an idea, not yet a plan | `unmark` |
 | `--concept` | a concept: a model, a term, how something is thought about | `unmark` |
@@ -158,7 +159,7 @@ The journal and the mind maps are also the project's documentation. Product and 
   claudebase journal add "<what must hold: behaviour / boundary / policy / invariant>" --category specification \
     --specification [--constraint] --feature <slug> --tag <component> --salience high
   ```
-- **Every rule, limit, constant and invariant is a `--constraint`** — on its own entry, or together with `--specification` on the same one.
+- **Every rule, limit and constant is a `--constraint`, every property that must always hold an `--invariant`** — on its own entry, or together with `--specification` on the same one.
 - **Before you change a feature, read its specification:** `claudebase journal list --specification --feature <slug>` (or `--tag <component>`). The code follows the spec; a test protocol checks the spec's behaviour and invariants.
 - **A spec changes only by a new entry** that says `Replaces journal#N` and why, decided by the operator or recorded as your decision; mark the old one `--deprecated`. Never edit around a spec silently.
 - **When code and spec disagree,** that is a finding: journal it, and settle it (fix the code, or replace the spec) before you go on.

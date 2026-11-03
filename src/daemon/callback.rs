@@ -647,6 +647,33 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, bus: &SharedBus) -
         return Ok(());
     }
 
+    // The public API (docs/design/public-api.md) shares this listener too.
+    if target.starts_with("/v1/") {
+        if let Some((status, reply)) = super::api::refuse_token(token.as_deref()).await {
+            respond(&mut stream, status, &reply).await?;
+            return Ok(());
+        }
+        if content_length > super::api::MAX_BODY {
+            respond(&mut stream, "413 Payload Too Large", &serde_json::json!({
+                "error": "too_large", "message": format!("over {} bytes", super::api::MAX_BODY)
+            })).await?;
+            return Ok(());
+        }
+        let mut body = buf[head_end + 4..].to_vec();
+        let mut big = vec![0u8; 64 * 1024];
+        while body.len() < content_length {
+            let n = stream.read(&mut big).await?;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&big[..n]);
+        }
+        body.truncate(content_length);
+        let (status, reply) = super::api::http(&method.to_ascii_uppercase(), &target, &body).await;
+        respond(&mut stream, status, &reply).await?;
+        return Ok(());
+    }
+
     if !method.eq_ignore_ascii_case("POST") {
         respond(&mut stream, "405 Method Not Allowed", &serde_json::json!({
             "ok": false, "error": "use POST"

@@ -131,6 +131,11 @@ fn main() -> std::process::ExitCode {
                     std::process::ExitCode::SUCCESS
                 }
             },
+            cli::DaemonSubcommand::Api(a) => match a.sub {
+                cli::DaemonApiSubcommand::Issue(a) => simple(claudebase::remote_cli::api_issue(&a.client), "daemon api issue"),
+                cli::DaemonApiSubcommand::Revoke(a) => simple(claudebase::remote_cli::api_revoke(&a.client), "daemon api revoke"),
+                cli::DaemonApiSubcommand::Status => simple(claudebase::remote_cli::api_status(), "daemon api status"),
+            },
             cli::DaemonSubcommand::Remote(a) => match a.sub {
                 cli::DaemonRemoteSubcommand::Enable(a) => {
                     simple(claudebase::remote_cli::enable(&a.bind), "daemon remote enable")

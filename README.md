@@ -237,7 +237,8 @@ claudebase journal agenda                                   # what is still open
 | `--disputed` | contradicts another entry | `close` once settled |
 | `--ai-feedback` | an agent's suggestion for claudebase itself | `close` once handled |
 | `--specification` | how something must behave: behaviour, isolation boundaries, policies, invariants. Binding; the spec a feature is built and checked against | `unmark` |
-| `--constraint` | a rule, a limit, a constant, an invariant to follow, not weigh | `unmark` |
+| `--constraint` | a rule, a limit, a constant to follow, not weigh | `unmark` |
+| `--invariant` | a property that must always hold, stated so it can be checked; binding | `unmark` |
 | `--important` | keep in view | `unmark` |
 | `--idea` `--concept` `--comment` | notes that document thinking and do not bind | `unmark` |
 | `--verified` | declares that the check passed; `--proof` points at the evidence | `unmark` |

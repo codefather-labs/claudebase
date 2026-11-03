@@ -251,3 +251,38 @@ pub async fn auth(sub: crate::cli::AuthSubcommand) -> Result<String> {
         ),
     })
 }
+
+/// `daemon api issue <client>`
+pub fn api_issue(client: &str) -> Result<String> {
+    let conn = chat::open_chat_db().context("open chat.db")?;
+    let token = remote::issue_token(&conn, remote::TokenKind::Api, client)?;
+    Ok(format!(
+        "token issued for `{client}` (any earlier one for that name stops working):\n{token}\n\n\
+         It is shown once and reaches every project on this daemon. Send it as X-Api-Token to /v1/* on the \
+         callback listener (claudebase daemon callback enable). Revoke with: claudebase daemon api revoke {client}"
+    ))
+}
+
+/// `daemon api revoke <client>`
+pub fn api_revoke(client: &str) -> Result<String> {
+    let conn = chat::open_chat_db().context("open chat.db")?;
+    if remote::revoke_token(&conn, remote::TokenKind::Api, client)? {
+        Ok(format!("`{client}` revoked"))
+    } else {
+        bail!("no client `{client}` (claudebase daemon api status)")
+    }
+}
+
+/// `daemon api status`
+pub fn api_status() -> Result<String> {
+    let conn = chat::open_chat_db().context("open chat.db")?;
+    let tokens = remote::list_tokens(&conn, remote::TokenKind::Api)?;
+    let mut out = format!("public API version {}\n", crate::daemon::api::API_VERSION);
+    for t in &tokens {
+        out += &format!("  {} (last used: {:?})\n", t.name, t.last_used_at);
+    }
+    if tokens.is_empty() {
+        out += "  no tokens\n";
+    }
+    Ok(out)
+}

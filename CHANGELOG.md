@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-11-03
+
+### Added
+
+- **A public API of the journal and mind maps** for programs that are not Claude sessions, such as an
+  orchestrator: versioned `/v1/*` routes on the callback listener, a token per client (`claudebase daemon api
+  issue|revoke|status`), the project and author in each request and no session. See `docs/design/public-api.md`.
+  The token reaches every project on the daemon, and the listener is plain HTTP: keep it on loopback or a private
+  network.
+- **`--invariant`**: a property that must always hold, a binding flag like `--constraint`.
+
 ## [0.24.1] - 2026-10-31
 
 ### Fixed

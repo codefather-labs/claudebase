@@ -24,6 +24,9 @@ use serde_json::{json, Value};
 
 use crate::journal::{self, Filter, NewEntry, SearchMode};
 
+/// Set by `handle_api` alone; `handle` strips it from what clients send.
+const API_CALLER: &str = "_api_caller";
+
 /// Who is asking, and therefore which journal.
 pub(super) struct Caller {
     /// What the journal is filed under (`journal::project_key`).
@@ -39,7 +42,24 @@ pub(super) struct Caller {
 }
 
 /// Run one `journal_*` tool. Errors are operator-facing messages.
-pub async fn handle(tool: &str, args: Value) -> Result<Value> {
+pub async fn handle(tool: &str, mut args: Value) -> Result<Value> {
+    // Only `handle_api` may vouch for a caller; never a client's own field.
+    if let Some(fields) = args.as_object_mut() {
+        fields.remove(API_CALLER);
+    }
+    run(tool, args).await
+}
+
+/// The same tools for the public API (`daemon::api`), which has authenticated
+/// the request: a named author in a named project, with no session.
+pub async fn handle_api(tool: &str, project_id: &str, author: &str, mut args: Value) -> Result<Value> {
+    if let Some(fields) = args.as_object_mut() {
+        fields.insert(API_CALLER.into(), json!({ "project_id": project_id, "author": author }));
+    }
+    run(tool, args).await
+}
+
+async fn run(tool: &str, args: Value) -> Result<Value> {
     let tool = tool.to_string();
     let result = tokio::task::spawn_blocking(move || dispatch(&tool, &args).map(|v| (tool, v)))
         .await
@@ -100,6 +120,14 @@ fn dispatch(tool: &str, args: &Value) -> Result<Value> {
 }
 
 pub(super) fn resolve(args: &Value, need_session: bool) -> Result<Caller> {
+    if let Some(api) = args.get(API_CALLER) {
+        let project_id = str_arg(api, "project_id").ok_or_else(|| anyhow!("project_id required"))?;
+        let author = str_arg(api, "author").ok_or_else(|| anyhow!("author required"))?;
+        // Not a directory on this machine: nothing to adopt or import from it.
+        let path = PathBuf::from(format!("/api/{project_id}"));
+        let project = journal::project_key(Some(&project_id), &path);
+        return Ok(Caller { project, path, agent_id: Some(format!("api:{author}")), nick: Some(author), host: Some("api".into()) });
+    }
     let agent_id = str_arg(args, "agent_id");
     let token = str_arg(args, "session_token");
     if let (Some(agent_id), Some(token)) = (agent_id.as_deref(), token.as_deref()) {
@@ -309,8 +337,8 @@ fn nearest_journal(dir: &Path, cwd: &Path) -> PathBuf {
 /// agent that could lift it would not be bound by it.
 fn policy(dir: &Path, args: &Value) -> Result<Value> {
     let set = args.get("evidence_first").and_then(Value::as_bool);
-    if set.is_some() && str_arg(args, "agent_id").is_some() {
-        bail!("the journal policy is the operator's to change: run `claudebase journal policy` in a plain terminal, not from a session");
+    if set.is_some() && (str_arg(args, "agent_id").is_some() || args.get(API_CALLER).is_some()) {
+        bail!("the journal policy is the operator's to change: run `claudebase journal policy` in a plain terminal, not from a session or the API");
     }
     let caller = resolve(args, false)?;
     let conn = open(dir, &caller)?
